@@ -1,4 +1,4 @@
-# Production config template for the Pi. Copy to /home/pi/heatpump-bridge/config.yaml
+# Production config template for the Pi. Copy to /home/pi/a2w-control/heatpump-bridge/config.yaml
 # and fill in the W610 addresses. LEAVE write_enabled FALSE until Phase 2 —
 # Phase 1 is read-only by rule (handoff §8).
 
@@ -27,6 +27,6 @@ guardrails:
   min_write_interval_s: 60
   offline_after_failed_polls: 3
 
-db_path: /home/pi/heatpump-bridge/bridge.db
-ui_dir: /home/pi/heatpump-bridge/ui
+db_path: /home/pi/a2w-control/heatpump-bridge/bridge.db
+ui_dir: /home/pi/a2w-control/heatpump-bridge/ui
 modbus_timeout_s: 5

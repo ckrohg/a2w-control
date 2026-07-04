@@ -16,16 +16,20 @@ UI reachable over Cloudflare Tunnel, everything restarts itself.
 sudo apt update && sudo apt install -y git curl
 curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs a recent python too)
 
-git clone <repo-url> ~/heatpump-bridge            # or rsync the folder from the Mac:
-# rsync -av --exclude .venv --exclude bridge.db heatpump-bridge/ pi@heatpump-pi.local:heatpump-bridge/
-cd ~/heatpump-bridge
+# NOTE: the bridge lives in a subdirectory of the a2w-control workspace repo
+git clone https://github.com/ckrohg/a2w-control.git ~/a2w-control
+cd ~/a2w-control/heatpump-bridge
 uv sync --no-dev
 cp deploy/config.production.yaml config.yaml
 nano config.yaml                                  # set W610 IPs; keep write_enabled: false
 
-# smoke test in the foreground
+# smoke test in the foreground — works BEFORE the W610s exist: the UI comes up
+# with both pumps shown offline, and the service just keeps retrying
 uv run uvicorn bridge.main:app --host 0.0.0.0 --port 8000
 # → http://heatpump-pi.local:8000 from a phone on the LAN
+
+# updates later: cd ~/a2w-control && git pull && cd heatpump-bridge && uv sync --no-dev \
+#   && sudo systemctl restart heatpump-bridge
 ```
 
 ## 3. systemd

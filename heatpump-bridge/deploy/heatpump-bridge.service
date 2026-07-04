@@ -9,9 +9,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/heatpump-bridge
-Environment=BRIDGE_CONFIG=/home/pi/heatpump-bridge/config.yaml
-ExecStart=/home/pi/heatpump-bridge/.venv/bin/uvicorn bridge.main:app --host 127.0.0.1 --port 8000
+WorkingDirectory=/home/pi/a2w-control/heatpump-bridge
+Environment=BRIDGE_CONFIG=/home/pi/a2w-control/heatpump-bridge/config.yaml
+ExecStart=/home/pi/a2w-control/heatpump-bridge/.venv/bin/uvicorn bridge.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 
