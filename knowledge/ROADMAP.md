@@ -33,4 +33,7 @@
 
 ## External dependencies
 
-- Winnie @ Guangdong Macon: CN22 confirmation, pinout, activation, slave address (emailed 2026-07-04, reply pending — upload reply to `knowledge/reference/` when it arrives, plus board photos when the panel is open)
+- Winnie @ Guangdong Macon (emailed 2026-07-04, reply pending — save reply to `knowledge/reference/`):
+  - **BLOCKING (the only real question):** which board connector is the RS-485 BMS port (CN22?), its pin order (A/B/GND/other), and whether it's an independent bus or a parallel tap of the wall-controller bus on CN23 (shared bus = collision risk with the wall controller — architecture-relevant).
+  - Non-blocking extras if she's answering anyway: units of 2063/2088 power regs, temp scaling (1 vs 0.1 °C/bit), what reg 2092 really is (current vs voltage), explicit defrost indicator?
+  - Self-serve, no longer needed from her: slave address (= SW2 DIP, readable on the board; bridge can scan 1–16), activation (doc implies none), pigtail connector (order from a photo).
