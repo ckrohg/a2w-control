@@ -39,6 +39,15 @@ CREATE TABLE IF NOT EXISTS comm_stats (
     io_errors INTEGER, exception_responses INTEGER, reconnects INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_comm_pump_ts ON comm_stats(pump_id, ts);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY,
+    pump_id TEXT NOT NULL,
+    time_hhmm TEXT NOT NULL,     -- Pi-local wall time, "HH:MM"
+    action TEXT NOT NULL,        -- on | off
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_fired_date TEXT         -- "YYYY-MM-DD" of most recent firing (once per day)
+);
 """
 
 
@@ -131,6 +140,32 @@ class Store:
         for r in rows:
             r["detail"] = json.loads(r["detail"]) if r["detail"] else None
         return rows
+
+    # --- schedules (daily on/off timers, superset of the wall controller's 2 groups) --
+    async def list_schedules(self, pump_id: str) -> list[dict]:
+        return await self._query(
+            "SELECT id, time_hhmm, action, enabled FROM schedules WHERE pump_id=?"
+            " ORDER BY time_hhmm", (pump_id,))
+
+    async def add_schedule(self, pump_id: str, time_hhmm: str, action: str) -> None:
+        await self._exec(
+            "INSERT INTO schedules (pump_id, time_hhmm, action) VALUES (?,?,?)",
+            (pump_id, time_hhmm, action))
+
+    async def delete_schedule(self, pump_id: str, schedule_id: int) -> None:
+        await self._exec("DELETE FROM schedules WHERE id=? AND pump_id=?",
+                         (schedule_id, pump_id))
+
+    async def due_schedules(self, hhmm: str, today: str) -> list[dict]:
+        """Enabled rules matching this wall-clock minute that haven't fired today."""
+        return await self._query(
+            "SELECT id, pump_id, time_hhmm, action FROM schedules WHERE enabled=1"
+            " AND time_hhmm=? AND (last_fired_date IS NULL OR last_fired_date<>?)",
+            (hhmm, today))
+
+    async def mark_schedule_fired(self, schedule_id: int, today: str) -> None:
+        await self._exec("UPDATE schedules SET last_fired_date=? WHERE id=?",
+                         (today, schedule_id))
 
     async def get_open_faults(self, pump_id: str) -> dict[str, float]:
         """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —

@@ -297,3 +297,21 @@ class PumpPoller:
             R.REG_ON_OFF, 1 if on else 0, event_type="power_write",
             describe=f"unit switched {'on' if on else 'off'}", source=source)
         return {"on": on, "verified": True}
+
+    async def write_parameter(self, key: str, value: int, source: str) -> dict:
+        """Installer parameter write (2005/2010-2039), clamped to the protocol doc's own
+        range for that parameter. The manual (§2.8) warns against casual changes — the
+        UI puts an explicit warning + confirmation in front of this."""
+        if key not in R.PARAM_BY_KEY:
+            raise GuardrailError(f"unknown parameter: {key}", 404)
+        addr, label, lo, hi = R.PARAM_BY_KEY[key]
+        if not float(value).is_integer() or not (lo <= value <= hi):
+            raise GuardrailError(
+                f"{label}: value {value} outside documented range {lo}–{hi}", 422)
+        raw = int(value) & 0xFFFF  # negatives to two's complement
+        old = next((p["value"] for p in self.snapshot.get("parameters", [])
+                    if p["key"] == key), None)
+        await self._guarded_control_write(
+            addr, raw, event_type="param_write",
+            describe=f"{label}: {old} -> {value}", source=source)
+        return {"key": key, "value": value, "verified": True}

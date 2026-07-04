@@ -240,6 +240,65 @@ async def test_control_writes_refused_when_disabled(rig):
     poller.cfg.write_enabled = True
 
 
+async def test_parameter_write_guarded(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    # happy path: lower the unit's own max water temp; setpoint bounds follow
+    result = await poller.write_parameter("max_water_temp_c", 60, source="test")
+    assert result == {"key": "max_water_temp_c", "value": 60, "verified": True}
+    assert await pump.get_reg(R.REG_MAX_WATER_TEMP) == 60
+    assert poller.snapshot["setpoint_bounds_c"] == [30, 60]
+
+    # negative values encode as two's complement and verify correctly
+    await asyncio.sleep(0.15)  # param writes share one rate-limit lane
+    result = await poller.write_parameter("defrost_enter_coil_c", -5, source="test")
+    assert result["verified"] is True
+    assert R.to_signed(await pump.get_reg(2015)) == -5
+
+    events = await store.get_events("p1", 1)
+    writes = [e for e in events if e["type"] == "param_write" and e["code"] == "accepted"]
+    assert len(writes) == 2
+
+
+async def test_parameter_write_rejects_out_of_doc_range(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_parameter("defrost_enter_coil_c", 5, source="test")  # doc: -15..-1
+    assert exc.value.status_code == 422
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_parameter("not_a_param", 1, source="test")
+    assert exc.value.status_code == 404
+
+
+async def test_scheduler_fires_once_per_day(rig):
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+
+    await store.add_schedule("p1", "06:00", "off")
+    sched = Scheduler(store, {"p1": poller})
+    now = datetime(2026, 7, 4, 6, 0, 10)
+
+    await sched.check_once(now)
+    assert poller.snapshot["on"] is False           # fired through the guarded path
+    await sched.check_once(now)                     # same minute: must not re-fire
+    events = await store.get_events("p1", 1)
+    fired = [e for e in events if e["type"] == "power_write" and e["code"] == "accepted"]
+    assert len(fired) == 1
+    assert fired[0]["detail"]["source"] == "schedule"
+
+    await sched.check_once(datetime(2026, 7, 4, 7, 0))   # different minute: no match
+    assert len([e for e in await store.get_events("p1", 1)
+                if e["type"] == "power_write" and e["code"] == "accepted"]) == 1
+
+    await store.delete_schedule("p1", (await store.list_schedules("p1"))[0]["id"])
+    assert await store.list_schedules("p1") == []
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

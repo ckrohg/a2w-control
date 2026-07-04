@@ -43,14 +43,25 @@ and each mode has its own setpoint register with its own valid range — heating
 write so a stale snapshot can never route a value to the wrong register.
 
 **Control parity principle (owner decision 2026-07-04):** everything the wall controller
-can do (and more) should be possible from the web view. Implemented: setpoint (mode-aware),
-**mode switch heating↔cooling** (reg 2001, only 0/1 ever written, confirmation modal in the
-UI), **unit on/off** (reg 2000, confirmation modal, danger-styled for off). All control
-writes share the guardrail discipline — write_enabled flag, per-control rate limiter
-(mode/power/setpoint each have their own lane), read-back verify, audit event, and an
-immediate re-poll so the UI reflects reality. Deliberately still read-only: installer
-parameters 2010–2039 (manual §2.8 warns against non-professional adjustment) and the
-emergency override (2005) — add later only if a real need appears.
+can do (and more) must be possible from the web view. Wall-controller capability audit
+(factory manual §IV) → web status:
+
+| Wall controller (§IV) | Web view |
+|---|---|
+| 2.2 On/off | ✅ power button + confirm modal (reg 2000) |
+| 2.3 Setpoint | ✅ mode-aware stepper, clamp + verify |
+| 2.4 Mode selection | ✅ Heat/Cool segmented + confirm (reg 2001, 0/1 only) |
+| 2.5 Clock setting | N/A — timers run on the bridge's own clock instead |
+| 2.6 Forced defrost | ❌ **only true gap** — no Modbus register exists; wall-controller-only (▼+function). Ask Winnie if a register exists. |
+| 2.7/2.8 On/off timers (2 groups) | ✅ **superset**: unlimited daily on/off rules, stored in SQLite on the bridge, fire through the guarded audited write path (source=`schedule`), survive reboots, work even if the wall clock is unset |
+| 2.9 Running parameter display (O2…d5) | ✅ Details table maps 1:1 to the manual's list |
+| Installer parameters (params 0–28) | ✅ **writable** from the Unit parameters panel — tap to edit, warning modal citing manual §2.8, value validated against the protocol doc's own range per register, read-back verified, audited (`param_write`) |
+| 2.1 Keyboard lock | N/A — Cloudflare Access is the auth layer |
+| Emergency switch override (reg 2005, no wall equivalent) | ✅ writable like a parameter (0 auto / 1 force on / 2 force off) |
+
+All control writes share the guardrail discipline — write_enabled flag, per-control rate
+limiter lanes (setpoint/mode/power/param each independent), read-back verify, audit event,
+immediate re-poll.
 
 **Layered setpoint MAX (corrected 2026-07-04 against the manual):** the spec table (p.3)
 states max water outlet = **85°C (185°F)**, with rated operation at 75°C down to −12°C

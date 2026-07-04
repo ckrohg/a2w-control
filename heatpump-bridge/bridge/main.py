@@ -13,6 +13,7 @@ from .api import router
 from .config import AppConfig, load_config
 from .guardrails import SetpointGuard
 from .poller import PumpPoller
+from .scheduler import Scheduler
 from .store import Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -30,7 +31,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         app.state.pollers = pollers
         for poller in pollers.values():
             await poller.start()
+        scheduler = Scheduler(store, pollers)
+        scheduler.start()
         yield
+        await scheduler.stop()
         for poller in pollers.values():
             await poller.stop()
         await store.close()

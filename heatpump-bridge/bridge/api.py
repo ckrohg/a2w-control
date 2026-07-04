@@ -30,6 +30,17 @@ class PowerRequest(BaseModel):
     source: str = Field(default="ui", max_length=32)
 
 
+class ParameterRequest(BaseModel):
+    key: str
+    value: int
+    source: str = Field(default="ui", max_length=32)
+
+
+class ScheduleRequest(BaseModel):
+    time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")  # "HH:MM" Pi-local
+    action: Literal["on", "off"]
+
+
 def _pollers(request: Request) -> dict[str, PumpPoller]:
     return request.app.state.pollers
 
@@ -100,6 +111,41 @@ async def write_power(request: Request, pump_id: str, body: PowerRequest):
         return await poller.write_power(body.value, body.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@router.post("/pumps/{pump_id}/parameter")
+async def write_parameter(request: Request, pump_id: str, body: ParameterRequest):
+    poller = _pump(request, pump_id)
+    try:
+        return await poller.write_parameter(body.key, body.value, body.source)
+    except GuardrailError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@router.get("/pumps/{pump_id}/schedules")
+async def list_schedules(request: Request, pump_id: str):
+    poller = _pump(request, pump_id)
+    return await poller.store.list_schedules(pump_id)
+
+
+@router.post("/pumps/{pump_id}/schedules")
+async def add_schedule(request: Request, pump_id: str, body: ScheduleRequest):
+    poller = _pump(request, pump_id)
+    await poller.store.add_schedule(pump_id, body.time, body.action)
+    await poller.store.add_event(
+        pump_id, "schedule_change", code="added", severity="info",
+        message=f"timer added: {body.action} at {body.time}")
+    return await poller.store.list_schedules(pump_id)
+
+
+@router.delete("/pumps/{pump_id}/schedules/{schedule_id}")
+async def delete_schedule(request: Request, pump_id: str, schedule_id: int):
+    poller = _pump(request, pump_id)
+    await poller.store.delete_schedule(pump_id, schedule_id)
+    await poller.store.add_event(
+        pump_id, "schedule_change", code="removed", severity="info",
+        message=f"timer {schedule_id} removed")
+    return await poller.store.list_schedules(pump_id)
 
 
 @router.get("/health")

@@ -1,0 +1,57 @@
+# @purpose: Daily on/off timers — the bridge-side superset of the wall controller's two
+# timer groups (§2.7): any number of rules, per pump, surviving reboots (SQLite), firing
+# through the same guarded write path as a human tap (source="schedule", audited).
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from datetime import datetime
+
+from .guardrails import GuardrailError
+from .poller import PumpPoller
+from .store import Store
+
+log = logging.getLogger(__name__)
+
+CHECK_INTERVAL_S = 20  # < 1 minute so no HH:MM slot is ever skipped
+
+
+class Scheduler:
+    def __init__(self, store: Store, pollers: dict[str, PumpPoller]):
+        self.store = store
+        self.pollers = pollers
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run(), name="scheduler")
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await self.check_once(datetime.now())
+            except Exception:
+                log.exception("scheduler check failed")
+            await asyncio.sleep(CHECK_INTERVAL_S)
+
+    async def check_once(self, now: datetime) -> None:
+        """Fire every enabled rule matching this minute (at most once per rule per day)."""
+        due = await self.store.due_schedules(now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
+        for rule in due:
+            # mark first: a failing write must not retry every 20s for the whole minute
+            await self.store.mark_schedule_fired(rule["id"], now.strftime("%Y-%m-%d"))
+            poller = self.pollers.get(rule["pump_id"])
+            if not poller:
+                continue
+            try:
+                await poller.write_power(rule["action"] == "on", source="schedule")
+                log.info("schedule %s: %s -> %s", rule["id"], rule["pump_id"], rule["action"])
+            except GuardrailError as exc:
+                # already audited by the write path; nothing else to do
+                log.warning("schedule %s failed: %s", rule["id"], exc)

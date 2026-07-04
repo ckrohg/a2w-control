@@ -99,5 +99,7 @@ def test_parameters_and_emergency_decode():
     assert params["heating_start_diff"] == 5
     assert params["defrost_enter_coil_c"] == -3
     assert params["max_water_temp_c"] == 90
-    # every doc-defined parameter register is represented in PARAM_DEFS
-    assert {addr for addr, _, _ in R.PARAM_DEFS} == set(range(2010, 2040))
+    # every doc-defined parameter register (+ emergency 2005) is in PARAM_DEFS
+    assert {d[0] for d in R.PARAM_DEFS} == {2005, *range(2010, 2040)}
+    # writes are range-validated: every def carries the doc's min < max
+    assert all(lo < hi for _, _, _, lo, hi in R.PARAM_DEFS)

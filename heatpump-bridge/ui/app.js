@@ -7,6 +7,7 @@ const MODE_LABELS = { cooling: "Cooling", heating: "Heating", hot_water: "Hot wa
 const state = {
   unit: localStorage.getItem("a2w-unit") === "f" ? "f" : "c",
   detailsOpen: {},      // pump id -> bool, survives re-renders
+  schedules: {},        // pump id -> timer rules
   pumps: [],            // [{id, name}]
   snapshots: {},        // id -> /status payload
   pending: {},          // id -> locally adjusted (unconfirmed) setpoint
@@ -38,6 +39,7 @@ async function refresh() {
     $("#health-dot").className = "dot " + (pumps.some(p => p.online) ? "ok" : "bad");
     await Promise.all(pumps.map(async p => {
       state.snapshots[p.id] = await api(`/api/pumps/${p.id}/status`);
+      state.schedules[p.id] = await api(`/api/pumps/${p.id}/schedules`);
     }));
     if (!state.historyPump && pumps.length) state.historyPump = pumps[0].id;
     if (!state.eventsPump && pumps.length) state.eventsPump = pumps[0].id;
@@ -126,8 +128,18 @@ function renderDetails(id, s) {
       <span class="acv">${d.shared?.ac_voltage_v ? d.shared.ac_voltage_v + " VAC" : ""}</span>
     </div>`;
 
-  const params = (s.parameters || []).map(p =>
-    `<div class="param"><span>${esc(p.label)}</span><b>${p.value}</b></div>`).join("");
+  const params = (s.parameters || []).map(p => `
+    <button class="param" data-param="${esc(p.key)}" title="Edit (${p.min}–${p.max})">
+      <span>${esc(p.label)}</span><b>${p.value} ✎</b>
+    </button>`).join("");
+
+  const timers = (state.schedules[id] || []).map(t => `
+    <div class="timer">
+      <b>${esc(t.time_hhmm)}</b>
+      <span class="pill on ${t.action === "off" ? "bad" : ""}">${t.action.toUpperCase()}</span>
+      <span class="timer-note">daily</span>
+      <button class="timer-del" data-del-timer="${t.id}" title="Remove timer">×</button>
+    </div>`).join("");
 
   return `
     <div class="pills">${pills}</div>
@@ -135,9 +147,19 @@ function renderDetails(id, s) {
       <summary>Details</summary>
       ${table}
     </details>
+    <details class="deep" data-id="${id}-timers" ${state.detailsOpen[id + "-timers"] ? "open" : ""}>
+      <summary>Timers <span class="paramnote">daily on/off, runs on the bridge</span></summary>
+      <div class="timers">${timers || '<div class="empty small">No timers</div>'}
+        <div class="timer-add">
+          <input type="time" class="t-time" value="06:00">
+          <select class="t-action"><option value="on">Turn on</option><option value="off">Turn off</option></select>
+          <button class="t-add" data-add-timer="1">Add</button>
+        </div>
+      </div>
+    </details>
     ${params ? `
     <details class="deep" data-id="${id}-params" ${state.detailsOpen[id + "-params"] ? "open" : ""}>
-      <summary>Unit parameters <span class="paramnote">installer settings, read-only, °C</span></summary>
+      <summary>Unit parameters <span class="paramnote">installer settings — tap to edit, °C</span></summary>
       <div class="params">${params}</div>
     </details>` : ""}`;
 }
@@ -228,6 +250,34 @@ function confirmDialog({ title, body, confirmLabel, danger = false }) {
   });
 }
 
+function promptDialog({ title, body, value, min, max, confirmLabel, danger = false }) {
+  return new Promise(resolve => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal">
+        <h3>${esc(title)}</h3>
+        <p>${esc(body)}</p>
+        <div class="modal-input">
+          <input type="number" value="${value}" min="${min}" max="${max}" step="1">
+          <span class="range">allowed ${min}–${max}</span>
+        </div>
+        <div class="modal-actions">
+          <button class="m-cancel">Cancel</button>
+          <button class="m-confirm ${danger ? "danger" : ""}">${esc(confirmLabel)}</button>
+        </div>
+      </div>`;
+    const input = overlay.querySelector("input");
+    const close = (answer) => { overlay.remove(); resolve(answer); };
+    overlay.querySelector(".m-cancel").onclick = () => close(null);
+    overlay.querySelector(".m-confirm").onclick = () => close(Number(input.value));
+    overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
+    document.body.appendChild(overlay);
+    input.focus();
+    input.select();
+  });
+}
+
 async function guardedPost(path, body, okMessage) {
   try {
     await api(path, {
@@ -281,6 +331,67 @@ document.addEventListener("click", async (e) => {
     });
     if (ok) await guardedPost(`/api/pumps/${id}/power`, { value: turningOn },
       `✓ ${name}: turned ${turningOn ? "on" : "off"}`);
+  }
+});
+
+// installer parameter edit + timers
+document.addEventListener("click", async (e) => {
+  const paramBtn = e.target.closest("[data-param]");
+  const addTimer = e.target.closest("[data-add-timer]");
+  const delTimer = e.target.closest("[data-del-timer]");
+  if (!paramBtn && !addTimer && !delTimer) return;
+  const card = e.target.closest("[data-pump]");
+  if (!card) return;
+  const id = card.dataset.pump;
+  const s = state.snapshots[id] || {};
+  const name = s.name || id;
+
+  if (paramBtn) {
+    const p = (s.parameters || []).find(x => x.key === paramBtn.dataset.param);
+    if (!p) return;
+    const value = await promptDialog({
+      title: `Change "${p.label}"?`,
+      body: `Installer setting on ${name}. The factory warns against casual changes ` +
+            `(manual §2.8) — only proceed if you know why. Current value: ${p.value}.`,
+      value: p.value, min: p.min, max: p.max,
+      confirmLabel: "Write to unit", danger: true,
+    });
+    if (value === null || value === p.value) return;
+    await guardedPost(`/api/pumps/${id}/parameter`, { key: p.key, value },
+      `✓ ${name}: ${p.label} = ${value} (verified)`);
+  }
+
+  if (addTimer) {
+    const timers = card.querySelector(".timer-add");
+    const time = timers.querySelector(".t-time").value;
+    const action = timers.querySelector(".t-action").value;
+    if (!time) return;
+    const ok = await confirmDialog({
+      title: `Add daily timer on ${name}?`,
+      body: `The bridge will turn the unit ${action.toUpperCase()} every day at ${time} ` +
+            `(bridge local time). It fires through the same guarded, audited write path.`,
+      confirmLabel: `Turn ${action} at ${time} daily`,
+      danger: action === "off",
+    });
+    if (!ok) return;
+    try {
+      state.schedules[id] = await api(`/api/pumps/${id}/schedules`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ time, action }),
+      });
+      toast(`✓ ${name}: daily ${action} at ${time}`);
+      renderDashboard();
+    } catch (err) { toast(err.message, true); }
+  }
+
+  if (delTimer) {
+    try {
+      state.schedules[id] = await api(
+        `/api/pumps/${id}/schedules/${delTimer.dataset.delTimer}`, { method: "DELETE" });
+      toast(`Timer removed`);
+      renderDashboard();
+    } catch (err) { toast(err.message, true); }
   }
 });
 

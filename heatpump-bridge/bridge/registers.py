@@ -15,40 +15,43 @@ REG_SETPOINT_HOT_WATER = 2004  # hot water target; bounds 20..value(REG_MAX_WATE
 REG_EMERGENCY = 2005       # 0 follow hardware input, 1 force on, 2 force off
 REG_MAX_WATER_TEMP = 2027  # unit's own max water temp (wall param 17), factory default 55
 
-# Wire-controller parameters 2010-2039 (installer settings; read-only in this bridge).
-# (address, key, label) — labels carry the units; temps here stay degC in the UI.
+# Wire-controller parameters (installer settings) + the emergency override.
+# (address, key, label, min, max) — min/max are the protocol doc's own ranges and are
+# enforced on writes. Labels carry the units; these values stay degC in the UI.
 PARAM_DEFS = (
-    (2010, "heating_start_diff", "Heating restart differential °C"),
-    (2011, "cooling_start_diff", "Cooling restart differential °C"),
-    (2012, "pump_mode", "Water pump mode (0-2)"),
-    (2013, "pump_interval_min", "Pump switching interval min"),
-    (2014, "defrost_interval_min", "Compressor runtime before defrost min"),
-    (2015, "defrost_enter_coil_c", "Coil temp to enter defrost °C"),
-    (2016, "defrost_max_min", "Max defrost time min"),
-    (2017, "defrost_exit_coil_c", "Coil temp to exit defrost °C"),
-    (2018, "defrost_ext_ambient_c", "Ambient for extended defrost cycle °C"),
-    (2019, "defrost_ext_interval_min", "Extended defrost cycle min"),
-    (2020, "defrost_lengthen_dt", "Ambient-coil ΔT to lengthen defrost °C"),
-    (2021, "ambient_min_protect_c", "Low-ambient protection °C"),
-    (2022, "cooling_low_ambient_c", "Cooling low-ambient protection °C"),
-    (2023, "eev_cycle_s", "EEV operation cycle s"),
-    (2024, "fixed_superheat_c", "Fixed-comp target superheat °C"),
-    (2025, "fixed_eev_auto", "Fixed EEV auto (1) / manual (0)"),
-    (2026, "fixed_eev_steps", "Fixed EEV manual steps"),
-    (2027, "max_water_temp_c", "Max water temp (param 17) °C"),
-    (2028, "cooling_min_water_c", "Cooling min water temp °C"),
-    (2029, "electric_heater", "Electric heater installed"),
-    (2030, "heater_ambient_c", "Electric heater enable ambient °C"),
-    (2031, "heater_delay_min", "Electric heater start delay min"),
-    (2032, "fixed_current_max_a", "Fixed-comp current protection A"),
-    (2033, "reduce_frequency", "Reduce working frequency"),
-    (2034, "inverter_superheat_c", "Inverter EEV target superheat °C"),
-    (2035, "control_scheme", "Scheme (0 fast heat, 1 energy save)"),
-    (2036, "module_cycle", "Module adjustment cycle"),
-    (2037, "pump_purge", "Forced pump emptying"),
-    (2038, "low_temp_pump_ambient_c", "Low-temp forced pump ambient °C"),
-    (2039, "timing_lock", "Timing limit lock"),
+    (2005, "emergency_switch", "Emergency switch (0 auto, 1 force on, 2 force off)", 0, 2),
+    (2010, "heating_start_diff", "Heating restart differential °C", 2, 18),
+    (2011, "cooling_start_diff", "Cooling restart differential °C", 2, 18),
+    (2012, "pump_mode", "Water pump mode (0-2)", 0, 2),
+    (2013, "pump_interval_min", "Pump switching interval min", 2, 20),
+    (2014, "defrost_interval_min", "Compressor runtime before defrost min", 20, 90),
+    (2015, "defrost_enter_coil_c", "Coil temp to enter defrost °C", -15, -1),
+    (2016, "defrost_max_min", "Max defrost time min", 5, 20),
+    (2017, "defrost_exit_coil_c", "Coil temp to exit defrost °C", 1, 40),
+    (2018, "defrost_ext_ambient_c", "Ambient for extended defrost cycle °C", -30, 5),
+    (2019, "defrost_ext_interval_min", "Extended defrost cycle min", 20, 90),
+    (2020, "defrost_lengthen_dt", "Ambient-coil ΔT to lengthen defrost °C", 0, 30),
+    (2021, "ambient_min_protect_c", "Low-ambient protection °C", -41, 0),
+    (2022, "cooling_low_ambient_c", "Cooling low-ambient protection °C", -1, 20),
+    (2023, "eev_cycle_s", "EEV operation cycle s", 20, 90),
+    (2024, "fixed_superheat_c", "Fixed-comp target superheat °C", -10, 15),
+    (2025, "fixed_eev_auto", "Fixed EEV auto (1) / manual (0)", 0, 1),
+    (2026, "fixed_eev_steps", "Fixed EEV manual steps", 0, 480),
+    (2027, "max_water_temp_c", "Max water temp (param 17) °C", 20, 90),
+    (2028, "cooling_min_water_c", "Cooling min water temp °C", 3, 15),
+    (2029, "electric_heater", "Electric heater installed", 0, 1),
+    (2030, "heater_ambient_c", "Electric heater enable ambient °C", -41, 45),
+    (2031, "heater_delay_min", "Electric heater start delay min", 0, 60),
+    (2032, "fixed_current_max_a", "Fixed-comp current protection A", 0, 50),
+    (2033, "reduce_frequency", "Reduce working frequency", 0, 1),
+    (2034, "inverter_superheat_c", "Inverter EEV target superheat °C", -10, 15),
+    (2035, "control_scheme", "Scheme (0 fast heat, 1 energy save)", 0, 1),
+    (2036, "module_cycle", "Module adjustment cycle", 5, 240),
+    (2037, "pump_purge", "Forced pump emptying", 0, 1),
+    (2038, "low_temp_pump_ambient_c", "Low-temp forced pump ambient °C", -25, 5),
+    (2039, "timing_lock", "Timing limit lock", 0, 99),
 )
+PARAM_BY_KEY = {key: (addr, label, lo, hi) for addr, key, label, lo, hi in PARAM_DEFS}
 
 # Mode register values -> names, and which setpoint register each mode follows.
 MODE_NAMES = {0: "cooling", 1: "floor_heating", 2: "fan_coil_heating",
@@ -182,8 +185,9 @@ def decode_snapshot(regs: dict[int, int]) -> dict:
         "emergency_override": {0: "auto", 1: "forced_on", 2: "forced_off"}.get(
             regs.get(REG_EMERGENCY, 0), "unknown"),
         "parameters": [
-            {"key": key, "label": label, "value": to_signed(regs[addr])}
-            for addr, key, label in PARAM_DEFS if addr in regs
+            {"key": key, "label": label, "value": to_signed(regs[addr]),
+             "min": lo, "max": hi}
+            for addr, key, label, lo, hi in PARAM_DEFS if addr in regs
         ],
         # "setpoint_c" is always the ACTIVE mode's target (history stays meaningful
         # across mode changes); per-mode values are alongside.
