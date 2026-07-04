@@ -57,9 +57,10 @@ curl -fsSL https://raw.githubusercontent.com/ckrohg/a2w-control/main/heatpump-br
 ```
 
 The script installs git/curl/uv, clones the repo, installs dependencies, creates
-`config.yaml` from the production template, installs + starts the systemd service,
-and health-checks it. It is **idempotent — re-running it later is also the update
-command** (pulls latest code and restarts).
+`~/bridge-data/config.yaml` from the production template (config and database live
+OUTSIDE the repo so updates can never clobber them), installs + starts the systemd
+service and the auto-update timer, and health-checks everything. It is idempotent —
+safe to re-run any time.
 
 Then open **http://heatpump-pi.local:8000** from your phone. Both pumps show
 **OFFLINE** until the W610s exist — that's expected and correct.
@@ -67,11 +68,23 @@ Then open **http://heatpump-pi.local:8000** from your phone. Both pumps show
 ## 3. When the W610s are up
 
 ```bash
-nano ~/a2w-control/heatpump-bridge/config.yaml   # set the two W610 IPs
+nano ~/bridge-data/config.yaml     # set the two W610 IPs
 sudo systemctl restart heatpump-bridge
 ```
 
 Keep `write_enabled: false` until Phase 2 — Phase 1 is read-only by rule (handoff §8).
+
+## 3b. How updates reach the Pi (hands-off)
+
+Code changes are pushed to GitHub; the Pi checks every 15 minutes
+(`heatpump-bridge-update.timer`) and applies new commits automatically:
+pull → reinstall deps → restart → **health check → automatic rollback** to the
+previous commit if the new code doesn't come up healthy (a failed commit is
+quarantined and never retried; the next good commit supersedes it).
+
+- Apply an update immediately: `sudo systemctl start heatpump-bridge-update.service`
+- Watch update activity: `journalctl -u heatpump-bridge-update -f`
+- Turn auto-updates off: `sudo systemctl disable --now heatpump-bridge-update.timer`
 
 ## 4. Remote access (any network, not just home)
 

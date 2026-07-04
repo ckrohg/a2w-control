@@ -10,7 +10,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/a2w-control/heatpump-bridge
-Environment=BRIDGE_CONFIG=/home/pi/a2w-control/heatpump-bridge/config.yaml
+Environment=BRIDGE_CONFIG=/home/pi/bridge-data/config.yaml
 # 0.0.0.0 = reachable from the home LAN (http://heatpump-pi.local:8000).
 # Once Cloudflare Tunnel is set up, change to --host 127.0.0.1 so the tunnel
 # (with its email-OTP auth) is the only way in.

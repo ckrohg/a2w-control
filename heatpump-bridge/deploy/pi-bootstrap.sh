@@ -28,24 +28,34 @@ cd "$HOME/a2w-control/heatpump-bridge"
 echo "==> python dependencies"
 uv sync --no-dev
 
-echo "==> config"
-if [ ! -f config.yaml ]; then
-  cp deploy/config.production.yaml config.yaml
+echo "==> config + data dir (outside the repo so updates can never clobber them)"
+mkdir -p "$HOME/bridge-data"
+if [ ! -f "$HOME/bridge-data/config.yaml" ]; then
   # template paths assume /home/pi — adapt to whatever user was chosen in the imager
-  sed -i "s|/home/pi/a2w-control|$HOME/a2w-control|g" config.yaml
-  echo "    created config.yaml (pumps will show OFFLINE until the W610 IPs are real)"
-  echo "    edit later with: nano ~/a2w-control/heatpump-bridge/config.yaml"
+  sed "s|/home/pi|$HOME|g" deploy/config.production.yaml > "$HOME/bridge-data/config.yaml"
+  echo "    created ~/bridge-data/config.yaml (pumps show OFFLINE until the W610 IPs are real)"
+  echo "    edit later with: nano ~/bridge-data/config.yaml"
 else
-  echo "    config.yaml already exists — leaving it alone"
+  echo "    ~/bridge-data/config.yaml already exists — leaving it alone"
 fi
 
 echo "==> systemd service"
-sed -e "s|/home/pi/a2w-control|$HOME/a2w-control|g" \
+sed -e "s|/home/pi|$HOME|g" \
     -e "s|^User=pi|User=$USER|" \
     deploy/heatpump-bridge.service | sudo tee /etc/systemd/system/heatpump-bridge.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now heatpump-bridge
 sudo systemctl restart heatpump-bridge   # pick up new code when re-run as updater
+
+echo "==> auto-update timer (checks GitHub every 15 min, health-checks, rolls back)"
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart heatpump-bridge" \
+  | sudo tee /etc/sudoers.d/heatpump-bridge >/dev/null
+sudo chmod 440 /etc/sudoers.d/heatpump-bridge
+sed -e "s|/home/pi|$HOME|g" -e "s|^User=pi|User=$USER|" \
+    deploy/heatpump-bridge-update.service | sudo tee /etc/systemd/system/heatpump-bridge-update.service >/dev/null
+sudo cp deploy/heatpump-bridge-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now heatpump-bridge-update.timer
 
 echo "==> waiting for service"
 for _ in $(seq 1 20); do

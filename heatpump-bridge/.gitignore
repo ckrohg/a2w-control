@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 bridge.db*
 .pytest_cache/
+.update-state

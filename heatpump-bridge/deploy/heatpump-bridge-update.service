@@ -1,0 +1,12 @@
+# @purpose: Oneshot unit run by heatpump-bridge-update.timer — pulls new commits from
+# GitHub, restarts the bridge, health-checks, rolls back on failure. Installed and
+# path-adapted by pi-bootstrap.sh.
+[Unit]
+Description=heatpump-bridge auto-update (GitHub pull, health check, rollback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/home/pi/a2w-control/heatpump-bridge/deploy/pi-update.sh

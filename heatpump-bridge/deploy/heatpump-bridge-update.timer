@@ -1,0 +1,13 @@
+# @purpose: Poll GitHub for bridge updates every 15 minutes. Disable auto-updates with:
+#   sudo systemctl disable --now heatpump-bridge-update.timer
+[Unit]
+Description=Check for heatpump-bridge updates every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
