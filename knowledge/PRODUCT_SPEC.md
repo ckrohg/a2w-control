@@ -44,10 +44,14 @@ write so a stale snapshot can never route a value to the wrong register. Mode is
 in the UI but NOT remotely writable (deliberate: heat/cool switchover involves the HBX and
 buffer plant, not just the pump — revisit at Phase 4).
 
-**Layered setpoint MAX:** hardware outlet 85°C > code hard ceiling 65°C (config refuses to
-start above it) > config clamp (55°C) > **live reg 2027** (the unit's own max-water-temp
-parameter, read every poll; effective max = min(config, reg 2027)). Effective bounds are
-in every snapshot (`setpoint_bounds_c`) and shown under the setpoint control in the UI.
+**Layered setpoint MAX (corrected 2026-07-04 against the manual):** the spec table (p.3)
+states max water outlet = **85°C (185°F)**, with rated operation at 75°C down to −12°C
+ambient. Layers: 85°C code hard ceiling (config refuses to start above it) > config clamp
+(default **75°C / 167°F**) > **live reg 2027** (the unit's own max-water-temp parameter,
+read every poll; effective max = min(config, reg 2027)). Effective bounds are in every
+snapshot (`setpoint_bounds_c`) and shown under the setpoint control in the UI.
+⚠️ Reg 2027 (wall param 17) ships at a factory default of 55°C and firmware-caps the
+setpoint — it must be raised on the unit to actually command >55°C / 131°F water.
 
 **Wall-controller parity (added 2026-07-04):** the UI shows everything the wall controller
 can — mode, defrost indicator (heuristic: heating + running + four-way valve energized —

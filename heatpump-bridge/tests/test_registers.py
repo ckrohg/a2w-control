@@ -79,9 +79,25 @@ def test_defrost_heuristic():
 
 
 def test_details_decode():
-    snap = R.decode_snapshot({R.REG_MODE: 1, 2055: 78, 2059: 210, 2061: 38, 2068: 65})
+    snap = R.decode_snapshot({R.REG_MODE: 1, 2053: 180, 2055: 78, 2059: 210,
+                              2061: 38, 2068: 65, 2069: 1, 2070: 2})
     d = snap["details"]["stage1_inverter"]
     assert d["discharge_c"] == 78
     assert d["eev_steps"] == 420       # x2 scaling
+    assert d["aux_eev_steps"] == 180   # raw
     assert d["bus_voltage_v"] == 380   # x10 scaling
     assert d["compressor_hz"] == 65
+    assert d["ee_code"] == (1 << 16) | 2
+
+
+def test_parameters_and_emergency_decode():
+    regs = {R.REG_MODE: 1, R.REG_EMERGENCY: 2, 2010: 5, 2015: 65533,  # -3
+            R.REG_MAX_WATER_TEMP: 90}
+    snap = R.decode_snapshot(regs)
+    assert snap["emergency_override"] == "forced_off"
+    params = {p["key"]: p["value"] for p in snap["parameters"]}
+    assert params["heating_start_diff"] == 5
+    assert params["defrost_enter_coil_c"] == -3
+    assert params["max_water_temp_c"] == 90
+    # every doc-defined parameter register is represented in PARAM_DEFS
+    assert {addr for addr, _, _ in R.PARAM_DEFS} == set(range(2010, 2040))

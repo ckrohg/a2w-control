@@ -12,7 +12,43 @@ REG_MODE = 2001            # 0 cooling, 1 floor heating; modes 2-5 unstable, nev
 REG_SETPOINT_COOLING = 2002  # cooling target; doc bounds 10..25
 REG_SETPOINT_HEATING = 2003  # heating target; bounds 20..value(REG_MAX_WATER_TEMP)
 REG_SETPOINT_HOT_WATER = 2004  # hot water target; bounds 20..value(REG_MAX_WATER_TEMP)
-REG_MAX_WATER_TEMP = 2027  # unit's own max water temp, factory default 55
+REG_EMERGENCY = 2005       # 0 follow hardware input, 1 force on, 2 force off
+REG_MAX_WATER_TEMP = 2027  # unit's own max water temp (wall param 17), factory default 55
+
+# Wire-controller parameters 2010-2039 (installer settings; read-only in this bridge).
+# (address, key, label) — labels carry the units; temps here stay degC in the UI.
+PARAM_DEFS = (
+    (2010, "heating_start_diff", "Heating restart differential °C"),
+    (2011, "cooling_start_diff", "Cooling restart differential °C"),
+    (2012, "pump_mode", "Water pump mode (0-2)"),
+    (2013, "pump_interval_min", "Pump switching interval min"),
+    (2014, "defrost_interval_min", "Compressor runtime before defrost min"),
+    (2015, "defrost_enter_coil_c", "Coil temp to enter defrost °C"),
+    (2016, "defrost_max_min", "Max defrost time min"),
+    (2017, "defrost_exit_coil_c", "Coil temp to exit defrost °C"),
+    (2018, "defrost_ext_ambient_c", "Ambient for extended defrost cycle °C"),
+    (2019, "defrost_ext_interval_min", "Extended defrost cycle min"),
+    (2020, "defrost_lengthen_dt", "Ambient-coil ΔT to lengthen defrost °C"),
+    (2021, "ambient_min_protect_c", "Low-ambient protection °C"),
+    (2022, "cooling_low_ambient_c", "Cooling low-ambient protection °C"),
+    (2023, "eev_cycle_s", "EEV operation cycle s"),
+    (2024, "fixed_superheat_c", "Fixed-comp target superheat °C"),
+    (2025, "fixed_eev_auto", "Fixed EEV auto (1) / manual (0)"),
+    (2026, "fixed_eev_steps", "Fixed EEV manual steps"),
+    (2027, "max_water_temp_c", "Max water temp (param 17) °C"),
+    (2028, "cooling_min_water_c", "Cooling min water temp °C"),
+    (2029, "electric_heater", "Electric heater installed"),
+    (2030, "heater_ambient_c", "Electric heater enable ambient °C"),
+    (2031, "heater_delay_min", "Electric heater start delay min"),
+    (2032, "fixed_current_max_a", "Fixed-comp current protection A"),
+    (2033, "reduce_frequency", "Reduce working frequency"),
+    (2034, "inverter_superheat_c", "Inverter EEV target superheat °C"),
+    (2035, "control_scheme", "Scheme (0 fast heat, 1 energy save)"),
+    (2036, "module_cycle", "Module adjustment cycle"),
+    (2037, "pump_purge", "Forced pump emptying"),
+    (2038, "low_temp_pump_ambient_c", "Low-temp forced pump ambient °C"),
+    (2039, "timing_lock", "Timing limit lock"),
+)
 
 # Mode register values -> names, and which setpoint register each mode follows.
 MODE_NAMES = {0: "cooling", 1: "floor_heating", 2: "fan_coil_heating",
@@ -23,11 +59,13 @@ SETPOINT_REGISTER_FOR_KIND = {"cooling": REG_SETPOINT_COOLING,
                               "heating": REG_SETPOINT_HEATING,
                               "hot_water": REG_SETPOINT_HOT_WATER}
 
-# Layered setpoint ceiling: hardware outlet max is 85degC, but this code refuses to
-# write anything above HARD_MAX even if config asks for it. Config is validated
-# against this; the effective runtime max is min(config, live reg 2027).
+# Layered setpoint ceiling. The installation manual's spec table (p.3) states
+# "Maximum water outlet temperature: 85degC" and rates the unit at 75degC outlet down to
+# -12degC ambient — HARD_MAX is that hardware limit; config defaults to the 75degC rated
+# point. Effective runtime max is still min(config, live reg 2027), and reg 2027 ships
+# at a factory default of 55 — it must be raised on the unit to actually go higher.
 HARD_MIN_SETPOINT_C = 20.0   # register floor for heating setpoint per protocol doc
-HARD_MAX_SETPOINT_C = 65.0
+HARD_MAX_SETPOINT_C = 85.0   # manual: maximum water outlet temperature
 COOLING_REGISTER_RANGE = (10.0, 25.0)  # protocol doc bounds for reg 2002
 
 # --- Read-only telemetry ------------------------------------------------------------
@@ -141,6 +179,12 @@ def decode_snapshot(regs: dict[int, int]) -> dict:
         "mode": mode,
         "mode_name": MODE_NAMES.get(mode, f"unknown({mode})"),
         "mode_kind": kind,
+        "emergency_override": {0: "auto", 1: "forced_on", 2: "forced_off"}.get(
+            regs.get(REG_EMERGENCY, 0), "unknown"),
+        "parameters": [
+            {"key": key, "label": label, "value": to_signed(regs[addr])}
+            for addr, key, label in PARAM_DEFS if addr in regs
+        ],
         # "setpoint_c" is always the ACTIVE mode's target (history stays meaningful
         # across mode changes); per-mode values are alongside.
         "setpoint_c": setpoints.get(kind, setpoints["heating"]),
@@ -190,12 +234,14 @@ def _decode_details(regs: dict[int, int]) -> dict:
         "stage1_inverter": {
             "discharge_c": t(2055), "coil_c": t(2056), "suction_c": t(2057),
             "current_a": _sig(regs, 2058), "eev_steps": (regs.get(2059, 0) * 2) or None,
+            "aux_eev_steps": _sig(regs, 2053),
             "cooling_coil_c": t(2060),
             "bus_voltage_v": (regs.get(2061, 0) * 10) or None,
             "ipm_temp_c": t(2062), "power": _sig(regs, 2063),
             "fan_rpm": _sig(regs, 2064), "high_pressure": _sig(regs, 2065),
             "low_pressure": _sig(regs, 2066), "ac_voltage_v": _sig(regs, 2067),
             "compressor_hz": _sig(regs, 2068),
+            "ee_code": (regs.get(2069, 0) << 16 | regs.get(2070, 0)) or None,
         },
         "stage1_fixed": {
             "discharge_c": t(2071), "coil_c": t(2072), "suction_c": t(2073),
@@ -204,11 +250,16 @@ def _decode_details(regs: dict[int, int]) -> dict:
         "stage2_inverter": {
             "discharge_c": t(2080), "coil_c": t(2081), "suction_c": t(2082),
             "current_a": _sig(regs, 2083), "eev_steps": (regs.get(2084, 0) * 2) or None,
+            "aux_eev_steps": _sig(regs, 2054),
             "cooling_coil_c": t(2085),
             "bus_voltage_v": (regs.get(2086, 0) * 10) or None,
             "ipm_temp_c": t(2087), "power": _sig(regs, 2088),
             "fan_rpm": _sig(regs, 2089), "high_pressure": _sig(regs, 2090),
             "low_pressure": _sig(regs, 2091), "compressor_hz": _sig(regs, 2093),
+            # doc says 2092 "AC current input" but the sys1 twin (2067) is AC voltage —
+            # ambiguous, exposed raw; label carries the caveat. Commissioning item.
+            "ac_input_raw": _sig(regs, 2092),
+            "ee_code": (regs.get(2094, 0) << 16 | regs.get(2095, 0)) or None,
         },
         "stage2_fixed": {
             "discharge_c": t(2096), "coil_c": t(2097), "suction_c": t(2098),
@@ -216,5 +267,6 @@ def _decode_details(regs: dict[int, int]) -> dict:
         },
         "shared": {
             "fixed_fan_rpm": _sig(regs, 2076), "ac_voltage_v": _sig(regs, 2077),
+            "fixed_ee_code": (regs.get(2078, 0) << 16 | regs.get(2079, 0)) or None,
         },
     }

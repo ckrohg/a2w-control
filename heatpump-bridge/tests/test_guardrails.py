@@ -79,9 +79,10 @@ def test_explicit_bounds_override_defaults(guard):
 
 def test_config_rejects_max_above_hard_ceiling():
     with pytest.raises(ValueError):
-        GuardrailConfig(setpoint_max_c=70)   # hard ceiling is 65
+        GuardrailConfig(setpoint_max_c=90)   # hard ceiling = 85 (manual max outlet)
     with pytest.raises(ValueError):
         GuardrailConfig(setpoint_min_c=10)   # register floor is 20
     with pytest.raises(ValueError):
         GuardrailConfig(cooling_setpoint_max_c=30)  # register cap is 25
-    GuardrailConfig(setpoint_max_c=65)       # at the ceiling is allowed
+    GuardrailConfig(setpoint_max_c=85)       # at the hardware ceiling is allowed
+    assert GuardrailConfig().setpoint_max_c == 75  # default = manual's rated point

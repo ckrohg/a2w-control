@@ -208,6 +208,18 @@ clamp meter during commissioning.
 - [ ] Setpoint write: reg 2003 respects 20–reg2027 bounds; confirm reg 2027 value (default 55 °C) on the actual units
 - [ ] Bit-13/14/16 codes in 2114–2115 (garbled in doc)
 
+## Code coverage of this document (audited 2026-07-04)
+
+Every non-reserved register in the protocol doc is decoded by `heatpump-bridge`
+(`bridge/registers.py` + `bridge/faults.py`): control/setpoints 2000–2005 (writes:
+2002/2003 only, mode-aware; 2004 refused; 2000/2001/2005 read-only by design),
+all wire parameters 2010–2039 (snapshot `parameters`, shown in the UI "Unit parameters"
+panel), all telemetry 2050–2100 incl. aux EEVs 2053/2054 and EE codes
+(2069/2070, 2078/2079, 2094/2095, exposed raw), and all status/fault/switch words
+2110–2118. Register 2092 is decoded raw (`ac_input_raw`) — the doc calls it "AC current
+input" but its System-1 twin (2067) is AC *voltage*; resolve during commissioning.
+Unused by design: function code 0x10 (multi-write; single 0x06 writes only).
+
 ## Caveats
 
 Converted from a Word table with merged cells; the original docx had duplicated/

@@ -109,12 +109,15 @@ function renderDetails(id, s) {
       ${detailRow("Comp Hz", [s1.compressor_hz, null, s2.compressor_hz, null])}
       ${detailRow("Current A", cols.map(c => c.current_a))}
       ${detailRow("EEV steps", cols.map(c => c.eev_steps))}
+      ${detailRow("Aux EEV", [s1.aux_eev_steps, null, s2.aux_eev_steps, null])}
       ${detailRow("IPM temp", [s1.ipm_temp_c, null, s2.ipm_temp_c, null], T)}
       ${detailRow("Pressure hi/lo", [
         s1.high_pressure != null ? `${s1.high_pressure}/${s1.low_pressure}` : null, null,
         s2.high_pressure != null ? `${s2.high_pressure}/${s2.low_pressure}` : null, null])}
       ${detailRow("Bus V", [s1.bus_voltage_v, null, s2.bus_voltage_v, null])}
       ${detailRow("Fan rpm", [s1.fan_rpm, null, s2.fan_rpm, null])}
+      ${(s1.ee_code || s2.ee_code || d.shared?.fixed_ee_code)
+        ? detailRow("EE code", [s1.ee_code, d.shared?.fixed_ee_code, s2.ee_code, null]) : ""}
     </table></div>
     <div class="switchline">
       ${pill("Flow " + (sw.water_flow_switch ? "OK" : "LOW"), sw.water_flow_switch, sw.water_flow_switch ? "" : "bad")}
@@ -123,12 +126,20 @@ function renderDetails(id, s) {
       <span class="acv">${d.shared?.ac_voltage_v ? d.shared.ac_voltage_v + " VAC" : ""}</span>
     </div>`;
 
+  const params = (s.parameters || []).map(p =>
+    `<div class="param"><span>${esc(p.label)}</span><b>${p.value}</b></div>`).join("");
+
   return `
     <div class="pills">${pills}</div>
     <details class="deep" data-id="${id}" ${state.detailsOpen[id] ? "open" : ""}>
       <summary>Details</summary>
       ${table}
-    </details>`;
+    </details>
+    ${params ? `
+    <details class="deep" data-id="${id}-params" ${state.detailsOpen[id + "-params"] ? "open" : ""}>
+      <summary>Unit parameters <span class="paramnote">installer settings, read-only, °C</span></summary>
+      <div class="params">${params}</div>
+    </details>` : ""}`;
 }
 
 function renderDashboard() {

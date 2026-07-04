@@ -61,7 +61,17 @@ class FakePump:
         await self.set_reg(R.REG_SETPOINT_COOLING, 16)
         await self.set_reg(R.REG_SETPOINT_HEATING, 45)
         await self.set_reg(R.REG_SETPOINT_HOT_WATER, 50)
-        await self.set_reg(R.REG_MAX_WATER_TEMP, 55)
+        # wire-controller parameters at factory defaults from the protocol doc —
+        # except param 17 (max water temp), raised to 90 here so the full setpoint
+        # range is exercisable in dev; real units ship at 55 (Phase 1 reads the truth)
+        factory = {2010: 5, 2011: 5, 2012: 2, 2013: 5, 2014: 45, 2015: encode(-3),
+                   2016: 8, 2017: 13, 2018: encode(-10), 2019: 45, 2020: 10,
+                   2021: encode(-35), 2022: 5, 2023: 30, 2024: 5, 2025: 1, 2026: 400,
+                   2027: 90, 2028: 12, 2029: 1, 2030: encode(-20), 2031: 30, 2032: 15,
+                   2033: 0, 2034: 5, 2035: 0, 2036: 20, 2037: 0, 2038: encode(-10),
+                   2039: 0}
+        for addr, val in factory.items():
+            await self.set_reg(addr, val)
         await self.set_reg(R.REG_SWITCH_STATUS, (1 << 4) | (1 << 5))  # AC online + water flow OK
         log.info("pump %d: modbus RTU-over-TCP on :%d (device_id=%d)",
                  self.index, self.port, self.device_id)
@@ -153,6 +163,8 @@ class FakePump:
         await self.set_reg(2056, encode(self.ambient - (6 if run1 else 0)))
         await self.set_reg(2057, encode(self.ambient - (2 if run1 else 0)))
         await self.set_reg(2059, 210 if run1 else 0)   # EEV, actual = x2
+        await self.set_reg(2053, 180 if run1 else 0)   # aux EEV (raw 0-500)
+        await self.set_reg(2054, 165 if run2 else 0)
         await self.set_reg(2060, encode(self.tank))
         await self.set_reg(2061, 38)                   # bus V, actual = x10
         await self.set_reg(2062, encode(52 if run1 else self.ambient + 5))

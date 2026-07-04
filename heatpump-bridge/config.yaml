@@ -21,7 +21,9 @@ pumps:
 
 guardrails:
   setpoint_min_c: 30
-  setpoint_max_c: 55        # matches reg 2027 factory default; confirm on the units
+  setpoint_max_c: 75        # 167°F, the manual's rated point (hardware max 85°C).
+                            # NOTE: unit param 17 (reg 2027) ships at 55 — raise it
+                            # on the wall controller to actually go above 55°C.
   min_write_interval_s: 60
   offline_after_failed_polls: 3
 

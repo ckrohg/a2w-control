@@ -23,9 +23,11 @@ class PumpConfig(BaseModel):
 
 
 class GuardrailConfig(BaseModel):
-    # heating setpoint clamp; effective max at runtime = min(this, live reg 2027)
+    # heating setpoint clamp; effective max at runtime = min(this, live reg 2027).
+    # 75degC (167degF) is the manual's rated operating point; hardware max is 85degC.
+    # NOTE: reg 2027 (wall param 17) ships at 55 — raise it on the unit to go higher.
     setpoint_min_c: float = 30.0
-    setpoint_max_c: float = 55.0  # matches reg 2027 factory default; confirm on unit
+    setpoint_max_c: float = 75.0
     # cooling setpoint clamp (reg 2002); register itself only accepts 10-25
     cooling_setpoint_min_c: float = 12.0
     cooling_setpoint_max_c: float = 25.0
