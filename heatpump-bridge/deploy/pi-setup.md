@@ -24,23 +24,26 @@ Any 16 GB+ microSD card. Everything on it will be erased.
 
 ## 1b. Getting the Pi on the network
 
-The Pi 5 has WiFi and gigabit Ethernet built in — pick one, no extra hardware:
+**Decision (2026-07-04): all three devices — the Pi and both W610s — run on WiFi.**
+No Ethernet anywhere; one less wire in the enclosure.
 
-- **WiFi**: nothing to do beyond step 3 above — the credentials you typed into the
-  imager ride in on the SD card and the Pi joins automatically on first boot.
+- The Pi's WiFi needs nothing beyond step 3 above — the credentials typed into the
+  imager ride in on the SD card and it joins automatically on first boot.
   If the WiFi password ever changes, the cleanest headless fix is re-flashing the
   card with new credentials (2 minutes; nothing on the card is precious — the
-  bootstrap script rebuilds everything).
-- **Ethernet**: plug a cable from the router/switch into the Pi. Zero config, works
-  even if WiFi was skipped in the imager. Preferred for an always-on appliance if
-  a jack is practical near where the Pi lives.
+  bootstrap script rebuilds everything). The W610s' WiFi onboarding is in
+  `w610-setup.md`.
+- All **three devices get DHCP reservations** in the router (Pi + both W610s) so
+  addresses never drift.
+- Everything monitoring-related depends on the WiFi router being up — acceptable by
+  design: if WiFi (or the whole bridge stack) dies, the heating chain is untouched.
+  The comm error-rate tracking in the UI is the ongoing check that WiFi is holding
+  up; a wired fallback (Ethernet for the Pi, USR-N510-class wired serial servers
+  for the pumps) remains possible later with only config-level changes.
 
 Note the Pi mostly needs the **home LAN** (to reach the W610s and be reached by your
 phone); actual internet is only used by the bootstrap/update command (GitHub) and
 later by the Cloudflare Tunnel. Both arrive over the same connection automatically.
-
-Once it's up, set a **DHCP reservation** for the Pi in the router so its address
-never changes — same as the W610s.
 
 ## 2. Everything else — one command
 
