@@ -197,6 +197,21 @@ clamp meter during commissioning.
 | 6 | Emergency switch |
 | 7 | Electric heating overheat switch |
 
+## Safe first-connection procedure (Phase 1, works without Winnie's reply)
+
+1. **Power off** → multimeter continuity between CN22 and CN23 data pins.
+   Continuity = shared bus with the wall controller (STOP — CN22 unusable as planned,
+   ask Macon for an alternative). Isolated = dedicated BMS port, proceed.
+2. **Listen before transmitting**: connect only the RS-485 receive path through the
+   isolated repeater and watch for traffic. A dedicated slave port is silent until
+   polled; immediate chatter means it's the wall-controller bus — stop.
+3. Only then send the first read (FC03, regs 2050–2052) and compare against the wall
+   controller display. If no response, swap A/B first, then try slave addresses 1–16
+   (a full scan takes seconds at 2400 baud).
+4. Note: accidental transmission on a shared RS-485 bus causes data collisions, not
+   damage — wall controller may briefly log E21 and recovers when you stop. Fully
+   reversible; the heating chain is never at risk from this procedure.
+
 ## Commissioning verification checklist (Phase 1)
 
 - [ ] Register addressing offset: doc addresses (2000+) vs pymodbus 0-based — read 2050–2052 and sanity-check against wall controller display
