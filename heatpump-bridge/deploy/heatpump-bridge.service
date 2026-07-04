@@ -11,7 +11,10 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/a2w-control/heatpump-bridge
 Environment=BRIDGE_CONFIG=/home/pi/a2w-control/heatpump-bridge/config.yaml
-ExecStart=/home/pi/a2w-control/heatpump-bridge/.venv/bin/uvicorn bridge.main:app --host 127.0.0.1 --port 8000
+# 0.0.0.0 = reachable from the home LAN (http://heatpump-pi.local:8000).
+# Once Cloudflare Tunnel is set up, change to --host 127.0.0.1 so the tunnel
+# (with its email-OTP auth) is the only way in.
+ExecStart=/home/pi/a2w-control/heatpump-bridge/.venv/bin/uvicorn bridge.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=5
 

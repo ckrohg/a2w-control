@@ -1,57 +1,69 @@
 # Raspberry Pi 5 setup — heatpump-bridge
 
-One-time provisioning for the CanaKit Pi 5. End state: bridge on systemd,
-UI reachable over Cloudflare Tunnel, everything restarts itself.
+The idiot-proof path: **the SD card only ever gets the OS**; the bridge installs itself
+with one pasted command afterward. End state: bridge on systemd, UI on the LAN,
+everything restarts itself.
 
-## 1. OS
+## 1. The SD card (on the Mac)
 
-- Raspberry Pi OS Lite 64-bit via Raspberry Pi Imager
-- In the imager, preconfigure: hostname `heatpump-pi`, SSH on, WiFi (or Ethernet — preferred
-  if there's a jack near the enclosure), locale/timezone `America/New_York`
-- Set a DHCP reservation for the Pi in the router (stable LAN IP)
+Any 16 GB+ microSD card. Everything on it will be erased.
 
-## 2. Bridge install
+1. Install the **Raspberry Pi Imager**: `brew install --cask raspberry-pi-imager`
+   (or download from raspberrypi.com/software)
+2. Insert the SD card, open the Imager:
+   - **Choose Device** → Raspberry Pi 5
+   - **Choose OS** → Raspberry Pi OS (other) → **Raspberry Pi OS Lite (64-bit)**
+   - **Choose Storage** → the SD card
+3. Click **Next** → **Edit Settings** (this is the part that makes it headless):
+   - General: hostname **`heatpump-pi`** · username **`pi`** + a password ·
+     WiFi SSID + password + country **US** (skip WiFi if using Ethernet — preferred
+     if there's a jack near the enclosure) · timezone **America/New_York**
+   - Services: **enable SSH**, "use password authentication"
+4. **Write**, wait, eject. That's the whole card — nothing else ever goes on it.
+5. Card into the Pi, power on, give it ~2 minutes on first boot.
 
-```bash
-sudo apt update && sudo apt install -y git curl
-curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (installs a recent python too)
+## 2. Everything else — one command
 
-# NOTE: the bridge lives in a subdirectory of the a2w-control workspace repo
-git clone https://github.com/ckrohg/a2w-control.git ~/a2w-control
-cd ~/a2w-control/heatpump-bridge
-uv sync --no-dev
-cp deploy/config.production.yaml config.yaml
-nano config.yaml                                  # set W610 IPs; keep write_enabled: false
-
-# smoke test in the foreground — works BEFORE the W610s exist: the UI comes up
-# with both pumps shown offline, and the service just keeps retrying
-uv run uvicorn bridge.main:app --host 0.0.0.0 --port 8000
-# → http://heatpump-pi.local:8000 from a phone on the LAN
-
-# updates later: cd ~/a2w-control && git pull && cd heatpump-bridge && uv sync --no-dev \
-#   && sudo systemctl restart heatpump-bridge
-```
-
-## 3. systemd
+From the Mac:
 
 ```bash
-sudo cp deploy/heatpump-bridge.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now heatpump-bridge
-journalctl -u heatpump-bridge -f     # watch it poll
+ssh pi@heatpump-pi.local
 ```
 
-Note the unit binds uvicorn to 127.0.0.1 — remote access is via the tunnel only.
-For LAN-only testing before the tunnel exists, temporarily use `--host 0.0.0.0`.
+then paste:
 
-## 4. Remote access
+```bash
+curl -fsSL https://raw.githubusercontent.com/ckrohg/a2w-control/main/heatpump-bridge/deploy/pi-bootstrap.sh | bash
+```
+
+The script installs git/curl/uv, clones the repo, installs dependencies, creates
+`config.yaml` from the production template, installs + starts the systemd service,
+and health-checks it. It is **idempotent — re-running it later is also the update
+command** (pulls latest code and restarts).
+
+Then open **http://heatpump-pi.local:8000** from your phone. Both pumps show
+**OFFLINE** until the W610s exist — that's expected and correct.
+
+## 3. When the W610s are up
+
+```bash
+nano ~/a2w-control/heatpump-bridge/config.yaml   # set the two W610 IPs
+sudo systemctl restart heatpump-bridge
+```
+
+Keep `write_enabled: false` until Phase 2 — Phase 1 is read-only by rule (handoff §8).
+
+## 4. Remote access (any network, not just home)
 
 See `cloudflared-notes.md`. Summary: cloudflared tunnel → `https://heat.<your-domain>`
-with Cloudflare Access (email OTP) in front. Zero open ports.
+with Cloudflare Access (email OTP) in front, zero open ports. After the tunnel works,
+edit `/etc/systemd/system/heatpump-bridge.service` to `--host 127.0.0.1` so the tunnel
+is the only way in.
 
 ## 5. Sanity checklist
 
 - [ ] `curl localhost:8000/api/health` → pumps_total = 2
 - [ ] Reboot the Pi → service comes back by itself (`Restart=always` + `enable`)
-- [ ] Pull a W610's power → pump goes `offline` in UI, alert event logged, no crash
+- [ ] Set a DHCP reservation for the Pi in the router (stable LAN IP)
+- [ ] Later, pull a W610's power → pump goes `offline` in UI, alert logged, no crash
 - [ ] Error rate visible per pump in the UI comm footer (validates unshielded wiring)
