@@ -21,6 +21,23 @@ covers.)
 **Borrow for Phase 4:** the auth/login dance, endpoint shapes, and zone-call parsing —
 enough to know what the buffer tank and zones are calling for when A2W chooses setpoints.
 
+### HBX WRITE — required in the future (decided 2026-07-04)
+
+Owner requirement: A2W must eventually **write** to the HBX (e.g. change its setpoint to
+match the heat pumps — coordinated control). TempIQ has nothing to borrow here, but the
+path exists:
+
+- HBX's own SensorLinx app "adjusts system parameters" remotely on the ECO-0600 — so a
+  write endpoint exists on `mobile.sensorlinx.co`; TempIQ simply never used it
+- HBX also advertises a server-side API for BMS/BACnet integrations
+- Discovery options, in order: (1) **HAR-capture the SensorLinx app** while changing a
+  setpoint — same methodology TempIQ used to reverse the SPAN Cloud API (see their
+  `server/scripts/intercept-span-api.ts` + `SPAN_API_INTERCEPTION.md` as the template);
+  (2) ask HBX for their BMS API docs; (3) check the ECO-0600 manual for a local BMS/RS-485
+  port as a cloud-free alternative (unconfirmed — nothing found in a quick search)
+- Treat any HBX write with the same guardrail discipline as reg 2003: clamp, read-back
+  verify, rate limit, audit with source
+
 ## SPAN panel — two connectors
 
 ### Cloud (`server/connectors/span-cloud.ts`)

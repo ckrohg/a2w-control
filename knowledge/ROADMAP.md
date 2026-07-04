@@ -19,15 +19,16 @@
 ## Later — Phases 3–4
 
 - [ ] Phase 3: second pump + Cloudflare Tunnel + systemd hardening (`Restart=always`)
-- [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling, HBX awareness — as a new consumer of existing API endpoints
+- [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — as a new consumer of existing API endpoints
+- [ ] Phase 4 (future): **coordinated HP + HBX control** — hard requirement (2026-07-04): A2W must write HBX setpoints so buffer tank and heat pumps work in conjunction. Write path discovery: HAR-capture the SensorLinx app changing a setpoint (TempIQ's SPAN interception methodology is the template), ask HBX for BMS API docs, and check ECO-0600 manual for a local BMS port. Same guardrail discipline as heat pump writes.
 
 ## Decisions deferred
 
 - Notifications beyond in-UI (push/email) — v1.1, after alert quality is proven
 - Predictive control design — after months of run history exist
 - Shielded cabling — only if logged comm error rates say so
-- **TempIQ integration shape** (decided 2026-07-04 to defer): either TempIQ writes the target temp via our guarded setpoint API, or TempIQ feeds signals and A2W's own logic decides. Both are just API consumers — nothing in Phases 0–3 changes. Leaning toward A2W owning the decision logic (guardrails and pump protection live here), but decide when Phase 4 starts.
-- HBX awareness — Phase 4; borrow read/write patterns from TempIQv2 (reference only, NEVER edit that repo)
+- **TempIQ integration shape** (decided 2026-07-04 to defer): either TempIQ writes the target temp via our guarded setpoint API, or TempIQ feeds signals and A2W's own logic decides. Both are just API consumers — nothing in Phases 0–3 changes. Leaning toward A2W owning the decision logic (guardrails and pump protection live here) — and the HP+HBX coordination requirement strengthens that lean, since the coordinator must command both devices and A2W is the only thing that will speak to both.
+- HBX read patterns — borrow from TempIQv2's SensorLinx connector (reference only, NEVER edit that repo); HBX *write* must be discovered, see Phase 4 above and `reference/tempiq-borrowables.md`
 
 ## External dependencies
 
