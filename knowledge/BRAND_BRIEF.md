@@ -1,19 +1,5 @@
-# BRAND BRIEF — a2w-control
+# BRAND BRIEF — A2W Control
 
-> Voice, posture, and visual identity.
+> N/A — personal infrastructure project; no brand needed. UI tone guidance only:
 
-## Voice
-
-(How does this thing sound? Three adjectives + an example sentence.)
-
-## Posture
-
-(What's the relationship with the user? Tool, peer, coach, gatekeeper?)
-
-## Visual
-
-(Mark, palette, typography. Use `/skill brand-architect` to generate options.)
-
-## Anti-patterns
-
-(What this brand explicitly is NOT.)
+Calm, factual, glanceable. Mobile-first. Severity colors that mean something (P17 anti-freeze is informational blue, never red). Raw fault codes always visible next to plain English. No mascots, no marketing voice.

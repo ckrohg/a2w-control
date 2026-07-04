@@ -1,19 +1,5 @@
-# NARRATIVE — a2w-control
+# NARRATIVE — A2W Control
 
-> How would you describe this to someone in 30 seconds, without jargon, in a way that makes them want to know more?
+> N/A — personal infrastructure project; no external audience. One-liner for reference:
 
-## One-liner
-
-(Single sentence. Says what you do, for whom.)
-
-## Elevator pitch
-
-(2–3 sentences. Problem → solution → why now.)
-
-## Story
-
-(A real anecdote about a person hitting the problem. Not a hypothetical.)
-
-## The shift
-
-(What changes when this exists? Before/after a user adopts it.)
+Remote control and plain-English monitoring for two Arctic air-to-water heat pumps: change the heating setpoint from a phone, see live temps and power, and get told "low water flow — check the circulation pump" instead of "P01" on a basement display.

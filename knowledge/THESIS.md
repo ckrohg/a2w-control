@@ -1,20 +1,5 @@
-# THESIS — a2w-control
+# THESIS — A2W Control
 
-> The bet you're making. Be specific enough to be wrong.
+> N/A — personal infrastructure project, not a venture. See `VISION.md` and `reference/heatpump-bridge-handoff.md`.
 
-## Bet
-
-(In 1–3 sentences: what do you believe that you'd act on, even when it's costly?)
-
-## Why now
-
-(What's true today that wasn't 2 years ago? What unlocks this bet now?)
-
-## Falsifiable predictions
-
-- (If thesis is right, X will happen by Y date.)
-- (If thesis is wrong, you'd see Z.)
-
-## What would change your mind
-
-(Concrete evidence that would make you pivot.)
+The only "bet" worth recording: a right-sized DIY bridge (Pi + SQLite + Cloudflare Tunnel) beats both vendor cloud lock-in and over-engineered home-automation stacks for this two-pump residential install. Falsified if comm error rates on unshielded wire stay high, or if SQLite/single-process polling can't keep up — neither is expected.

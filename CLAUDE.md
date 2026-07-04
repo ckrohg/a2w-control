@@ -24,6 +24,16 @@ Write journal entries AS YOU WORK, not at session end. Each entry needs:
 - Use `/skill` to load domain expertise — don't guess
 
 ## Current Focus
-Building a new product from scratch. Start by filling in knowledge/VISION.md — what are you building and why? Then use /skill startup for stage assessment, /skill brand-architect for identity, /skill spec for technical spec.
 
-Pinned skills: `startup`, `brand-architect`, `spec`. Run `/skill` for more.
+**A2W Control** — custom IoT control bridge for 2× Arctic (Guangdong Macon MAHRW030ZA/BEH2) air-to-water heat pumps in southern NH. Personal infrastructure project, not a startup — ignore GTM/brand framing.
+
+**Read first, in order:**
+1. `knowledge/reference/heatpump-bridge-handoff.md` — complete build spec. Hardware architecture and stack decisions are SETTLED; do not redesign or propose alternatives.
+2. `knowledge/reference/modbus-register-map.md` — distilled register map (source of truth: `A2W Modbus.docx` same folder, from Winnie @ Guangdong Macon)
+3. `knowledge/PRODUCT_SPEC.md` + `knowledge/ROADMAP.md` — working summaries
+
+**Stage:** Phase 0 (simulator-first). Build the `heatpump-bridge/` repo per handoff §6.2 against simulated pumps. No hardware dependency. Phase 1 is gated on Winnie's CN22/pinout reply (emailed 2026-07-04).
+
+**Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
+
+Owner rejects over-engineering — right-sized solutions first (SQLite, single process, Cloudflare Tunnel).
