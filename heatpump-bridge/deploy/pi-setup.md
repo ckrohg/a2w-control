@@ -22,6 +22,26 @@ Any 16 GB+ microSD card. Everything on it will be erased.
 4. **Write**, wait, eject. That's the whole card — nothing else ever goes on it.
 5. Card into the Pi, power on, give it ~2 minutes on first boot.
 
+## 1b. Getting the Pi on the network
+
+The Pi 5 has WiFi and gigabit Ethernet built in — pick one, no extra hardware:
+
+- **WiFi**: nothing to do beyond step 3 above — the credentials you typed into the
+  imager ride in on the SD card and the Pi joins automatically on first boot.
+  If the WiFi password ever changes, the cleanest headless fix is re-flashing the
+  card with new credentials (2 minutes; nothing on the card is precious — the
+  bootstrap script rebuilds everything).
+- **Ethernet**: plug a cable from the router/switch into the Pi. Zero config, works
+  even if WiFi was skipped in the imager. Preferred for an always-on appliance if
+  a jack is practical near where the Pi lives.
+
+Note the Pi mostly needs the **home LAN** (to reach the W610s and be reached by your
+phone); actual internet is only used by the bootstrap/update command (GitHub) and
+later by the Cloudflare Tunnel. Both arrive over the same connection automatically.
+
+Once it's up, set a **DHCP reservation** for the Pi in the router so its address
+never changes — same as the W610s.
+
 ## 2. Everything else — one command
 
 From the Mac:
