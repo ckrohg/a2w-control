@@ -26,6 +26,8 @@
 - Notifications beyond in-UI (push/email) — v1.1, after alert quality is proven
 - Predictive control design — after months of run history exist
 - Shielded cabling — only if logged comm error rates say so
+- **TempIQ integration shape** (decided 2026-07-04 to defer): either TempIQ writes the target temp via our guarded setpoint API, or TempIQ feeds signals and A2W's own logic decides. Both are just API consumers — nothing in Phases 0–3 changes. Leaning toward A2W owning the decision logic (guardrails and pump protection live here), but decide when Phase 4 starts.
+- HBX awareness — Phase 4; borrow read/write patterns from TempIQv2 (reference only, NEVER edit that repo)
 
 ## External dependencies
 

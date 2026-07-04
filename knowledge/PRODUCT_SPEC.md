@@ -45,7 +45,9 @@ Repo layout: `bridge/` (main, config, modbus_client, registers, faults, guardrai
 
 ## Out of scope (v1)
 
-User accounts (Cloudflare Access handles auth), schedules, predictive logic, HBX integration, push/email notifications (fine for v1.1). Phase 4 (weather-predictive / price-optimized control) must arrive as a new API consumer, not a rewrite.
+User accounts (Cloudflare Access handles auth), schedules, predictive logic, HBX integration, TempIQ integration, push/email notifications (fine for v1.1). Phase 4 (weather-predictive / price-optimized control, TempIQ signals) must arrive as a new API consumer, not a rewrite.
+
+**Design seam for future integration:** every setpoint write carries a `source` identifier (e.g. `ui`, later `tempiq`/`scheduler`) in the request and audit log — handoff §6.4 already requires source in the audit; making it explicit in the API means a future machine consumer needs zero schema change.
 
 ## Open questions
 
