@@ -4,6 +4,7 @@
 
 const POLL_MS = 5000;
 const state = {
+  unit: localStorage.getItem("a2w-unit") === "f" ? "f" : "c",
   pumps: [],            // [{id, name}]
   snapshots: {},        // id -> /status payload
   pending: {},          // id -> locally adjusted (unconfirmed) setpoint
@@ -59,6 +60,14 @@ function num(v, digits = 1) {
   return (v === null || v === undefined) ? "—" : Number(v).toFixed(digits);
 }
 
+// Display-only unit conversion. The pump, bridge, and guardrails are Celsius
+// throughout (registers are whole degC); degF is a view preference on this device.
+const unitLabel = () => state.unit === "f" ? "°F" : "°C";
+const toDisplay = (c) => state.unit === "f" ? c * 9 / 5 + 32 : c;
+function temp(v, digits = 1) {
+  return (v === null || v === undefined) ? "—" : toDisplay(Number(v)).toFixed(digits);
+}
+
 function renderDashboard() {
   const wrap = $("#pump-cards");
   wrap.innerHTML = state.pumps.map(p => {
@@ -84,16 +93,16 @@ function renderDashboard() {
         <span class="chip ${stateName}">${stateName}</span>
       </div>
       <div class="temps">
-        <div class="temp"><div class="v">${num(s.outlet_c)}°</div><div class="l">Outlet</div></div>
-        <div class="temp"><div class="v">${num(s.inlet_c)}°</div><div class="l">Inlet</div></div>
-        <div class="temp"><div class="v">${num(s.ambient_c)}°</div><div class="l">Outdoor</div></div>
+        <div class="temp"><div class="v">${temp(s.outlet_c)}°</div><div class="l">Outlet</div></div>
+        <div class="temp"><div class="v">${temp(s.inlet_c)}°</div><div class="l">Inlet</div></div>
+        <div class="temp"><div class="v">${temp(s.ambient_c)}°</div><div class="l">Outdoor</div></div>
       </div>
       <div class="powerline">Power <b>${num(power, 0)} W</b>
         &nbsp;·&nbsp; stage 1: ${num(s.power_sys1, 0)} · stage 2: ${num(s.power_sys2, 0)}</div>
       <div class="setpoint">
         <div>
           <div class="label">Setpoint</div>
-          <div class="val ${dirty ? "pending" : ""}">${num(shown, 0)}°C</div>
+          <div class="val ${dirty ? "pending" : ""}">${temp(shown, 0)}${unitLabel()}</div>
         </div>
         <button class="stepper" data-act="dec" ${s.online ? "" : "disabled"}>−</button>
         <button class="stepper" data-act="inc" ${s.online ? "" : "disabled"}>+</button>
@@ -133,7 +142,7 @@ document.addEventListener("click", async (e) => {
       });
       delete state.pending[id];
       snap.setpoint_c = result.setpoint_c;
-      toast(`✓ ${snap.name}: setpoint ${result.setpoint_c}°C (verified)`);
+      toast(`✓ ${snap.name}: setpoint ${temp(result.setpoint_c, 0)}${unitLabel()} (verified)`);
     } catch (err) {
       toast(err.message, true);
     } finally {
@@ -216,11 +225,13 @@ async function loadHistory() {
   try {
     const rows = await api(`/api/pumps/${state.historyPump}/history?hours=${state.historyHours}`);
     const pick = key => rows.map(r => ({ x: r.ts, y: r[key] }));
+    const pickTemp = key => rows.map(r => ({ x: r.ts, y: r[key] == null ? null : toDisplay(r[key]) }));
+    $("#temps-title").textContent = `Temperatures ${unitLabel()}`;
     $("#chart-temps").innerHTML = svgChart([
-      { color: "#4dabf7", points: pick("outlet_c") },
-      { color: "#63e6be", points: pick("inlet_c") },
-      { color: "#845ef7", points: pick("ambient_c") },
-      { color: "#ffd666", points: pick("setpoint_c"), dash: true },
+      { color: "#4dabf7", points: pickTemp("outlet_c") },
+      { color: "#63e6be", points: pickTemp("inlet_c") },
+      { color: "#845ef7", points: pickTemp("ambient_c") },
+      { color: "#ffd666", points: pickTemp("setpoint_c"), dash: true },
     ]);
     $("#chart-power").innerHTML = svgChart([
       { color: "#ff9f43", points: pick("power_sys1") },
@@ -261,7 +272,21 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => { el.className = ""; }, 3500);
 }
 
+// ---------- unit toggle ----------
+function renderUnitToggle() {
+  document.querySelectorAll("#unit-toggle .seg-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.unit === state.unit));
+}
+document.querySelectorAll("#unit-toggle .seg-btn").forEach(b => b.addEventListener("click", () => {
+  state.unit = b.dataset.unit;
+  localStorage.setItem("a2w-unit", state.unit);
+  renderUnitToggle();
+  renderDashboard();
+  if (state.view === "history") loadHistory();
+}));
+
 // ---------- boot ----------
+renderUnitToggle();
 refresh();
 setInterval(() => {
   refresh();

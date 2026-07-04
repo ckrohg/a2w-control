@@ -13,6 +13,10 @@
   <header>
     <h1>A2W Control</h1>
     <span id="health-dot" class="dot" title="service health"></span>
+    <div class="seg unit-seg" id="unit-toggle">
+      <button class="seg-btn" data-unit="c">°C</button>
+      <button class="seg-btn" data-unit="f">°F</button>
+    </div>
   </header>
 
   <nav id="tabs">
@@ -35,7 +39,7 @@
         </div>
       </div>
       <div class="chart-block">
-        <h3>Temperatures °C</h3>
+        <h3 id="temps-title">Temperatures °C</h3>
         <div id="chart-temps" class="chart"></div>
         <div class="legend">
           <span><i style="background:#4dabf7"></i>Outlet</span>
