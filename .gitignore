@@ -1,0 +1,25 @@
+# Tenet workspace state (local-only, gitignored by convention)
+.tenet/memory.db*
+.tenet/context-hub.pid
+.tenet/context-hub.port
+.tenet/context-hub.token
+.tenet/logs/
+.tenet/sessions/
+.tenet/presence/
+.tenet/telemetry/
+.tenet/map-events.jsonl
+.tenet/service-events.jsonl
+.tenet/training-buffer.jsonl
+.tenet/telemetry-agent-state.json
+
+# Worktrees + temp dirs
+worktrees/
+.tenet/tmp/
+
+# Node / Python deps
+node_modules/
+.venv/
+__pycache__/
+
+# OS cruft
+.DS_Store

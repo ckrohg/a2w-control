@@ -1,0 +1,21 @@
+flows:
+  - name: session-activity-log
+    description: Log tool use activity for session analysis
+    enabled: true
+    trigger:
+      pattern: hook:tool-use
+    actions:
+      - type: log
+        message: "Tool used: {{data.tool_name}} on {{data.file_paths}}"
+
+  - name: session-end-summary
+    description: Emit summary event when session stops
+    enabled: true
+    trigger:
+      pattern: hook:stop
+    actions:
+      - type: emit
+        event_type: session:ended
+        data:
+          source: flow:session-end-summary
+          auto_captured: true
