@@ -72,7 +72,8 @@ class FakePump:
                    2039: 0}
         for addr, val in factory.items():
             await self.set_reg(addr, val)
-        await self.set_reg(R.REG_SWITCH_STATUS, (1 << 4) | (1 << 5))  # AC online + water flow OK
+        # AC online + water flow OK + remote linkage contact closed (HBX calling)
+        await self.set_reg(R.REG_SWITCH_STATUS, (1 << 4) | (1 << 5) | (1 << 6))
         log.info("pump %d: modbus RTU-over-TCP on :%d (device_id=%d)",
                  self.index, self.port, self.device_id)
 

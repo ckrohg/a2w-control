@@ -172,6 +172,7 @@ table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
 .badge.power_write { background: #14324e; color: var(--info); }
 .badge.param_write { background: #3a2a17; color: var(--warning); }
 .badge.schedule_change { background: #26303a; color: var(--dim); }
+.badge.state { background: #1c2f28; color: var(--ok); }
 .badge.comm { background: #26303a; color: var(--dim); }
 .event .code { font-family: ui-monospace, monospace; font-weight: 800; }
 .event .msg { flex: 1; }

@@ -20,6 +20,27 @@ log = logging.getLogger(__name__)
 
 COMM_SNAPSHOT_INTERVAL_S = 900  # heartbeat row; errors also force a row
 
+# Runtime edges worth a discrete event (group, key, code, on-message, off-message).
+# The remote/linkage contact is how the HBX calls for heat — bit mapping to CN33 is a
+# Phase 1 verification item, hence the hedged wording.
+STATE_WATCHES = (
+    ("switches", "emergency_switch", "remote_contact",
+     "Remote linkage contact closed — external call active (HBX?)",
+     "Remote linkage contact opened — external call ended"),
+    ("switches", "ac_online", "ac_linkage",
+     "AC linkage switch closed", "AC linkage switch opened"),
+    ("switches", "water_flow_switch", "flow",
+     "Water flow switch closed — flow OK", "Water flow switch open — no flow"),
+    ("status", "compressor1", "comp1",
+     "Stage 1 compressor started", "Stage 1 compressor stopped"),
+    ("status", "compressor2", "comp2",
+     "Stage 2 compressor started", "Stage 2 compressor stopped"),
+    ("status", "electric_heating", "elec_heat",
+     "Backup electric heater ON", "Backup electric heater off"),
+    ("", "defrosting", "defrost",
+     "Defrost cycle started", "Defrost cycle ended"),
+)
+
 
 class PumpPoller:
     def __init__(self, cfg: PumpConfig, app_cfg: AppConfig, store: Store, guard: SetpointGuard):
@@ -29,6 +50,7 @@ class PumpPoller:
         self.guard = guard
         self.client = PumpClient(cfg.host, cfg.port, cfg.device_id, app_cfg.modbus_timeout_s)
         self.active_faults: dict[str, dict] = {}  # key -> {code,message,severity,since}
+        self._prev_flags: dict[str, bool] | None = None  # runtime edge detection state
         self.snapshot: dict = {"id": cfg.id, "name": cfg.name, "online": False,
                                "write_enabled": cfg.write_enabled}
         self._task: asyncio.Task | None = None
@@ -80,6 +102,7 @@ class PumpPoller:
         decoded = R.decode_snapshot(regs)
         was_online = self.snapshot.get("online", False)
         await self._update_faults(decode_faults(regs))
+        await self._emit_state_events(decoded)
 
         self.snapshot = {
             "id": self.cfg.id,
@@ -144,6 +167,24 @@ class PumpPoller:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
         await self._maybe_comm_row(force=True)
+
+    async def _emit_state_events(self, decoded: dict) -> None:
+        """Log runtime transitions (heat calls, compressor start/stop, electric heat,
+        defrost, flow) as discrete events. First successful poll only seeds the baseline —
+        no event spam at startup."""
+        flags = {}
+        for group, key, code, _, _ in STATE_WATCHES:
+            source = decoded.get(group, {}) if group else decoded
+            flags[code] = bool(source.get(key))
+        if self._prev_flags is not None:
+            for group, key, code, on_msg, off_msg in STATE_WATCHES:
+                if flags[code] != self._prev_flags[code]:
+                    await self.store.add_event(
+                        self.cfg.id, "state",
+                        code=f"{code}_{'on' if flags[code] else 'off'}",
+                        severity="info",
+                        message=on_msg if flags[code] else off_msg)
+        self._prev_flags = flags
 
     @staticmethod
     def _fault_entry(key: str, fdef: FaultDef, since: float) -> dict:

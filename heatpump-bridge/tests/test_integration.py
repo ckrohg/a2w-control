@@ -299,6 +299,35 @@ async def test_scheduler_fires_once_per_day(rig):
     assert await store.list_schedules("p1") == []
 
 
+async def test_runtime_edges_become_events(rig):
+    pump, poller, store = rig
+    await poller.poll_once()   # seeds the baseline — no events yet
+    assert [e for e in await store.get_events("p1", 1) if e["type"] == "state"] == []
+
+    # HBX drops the call: remote linkage contact (bit 6) opens
+    sw = await pump.get_reg(R.REG_SWITCH_STATUS)
+    await pump.set_reg(R.REG_SWITCH_STATUS, sw & ~(1 << 6))
+    # and the backup electric heater kicks on
+    st = await pump.get_reg(R.REG_STATUS)
+    await pump.set_reg(R.REG_STATUS, st | (1 << 11))
+    await poller.poll_once()
+    await poller.poll_once()   # unchanged state: no duplicate events
+
+    events = [e for e in await store.get_events("p1", 1) if e["type"] == "state"]
+    codes = {e["code"] for e in events}
+    assert codes == {"remote_contact_off", "elec_heat_on"}
+    assert len(events) == 2
+    remote = next(e for e in events if e["code"] == "remote_contact_off")
+    assert "call ended" in remote["message"]
+
+    # contact closes again -> one more event
+    await pump.set_reg(R.REG_SWITCH_STATUS, sw | (1 << 6))
+    await poller.poll_once()
+    events = [e for e in await store.get_events("p1", 1) if e["type"] == "state"]
+    assert len(events) == 3
+    assert events[0]["code"] == "remote_contact_on"  # newest first
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

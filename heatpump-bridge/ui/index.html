@@ -59,7 +59,15 @@
     </section>
 
     <section id="view-events" class="view">
-      <div class="controls"><div id="events-pumps" class="seg"></div></div>
+      <div class="controls">
+        <div id="events-pumps" class="seg"></div>
+        <div class="seg" id="event-filter">
+          <button class="seg-btn active" data-filter="all">All</button>
+          <button class="seg-btn" data-filter="faults">Faults</button>
+          <button class="seg-btn" data-filter="writes">Writes</button>
+          <button class="seg-btn" data-filter="runtime">Runtime</button>
+        </div>
+      </div>
       <div id="event-list"></div>
     </section>
   </main>

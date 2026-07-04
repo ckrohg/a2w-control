@@ -16,6 +16,14 @@ const state = {
   historyPump: null,
   historyHours: 24,
   eventsPump: null,
+  eventsFilter: "all",
+};
+
+const EVENT_FILTERS = {
+  all: () => true,
+  faults: e => e.type.startsWith("fault"),
+  writes: e => e.type.endsWith("_write") || e.type === "schedule_change",
+  runtime: e => e.type === "state" || e.type === "comm",
 };
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -533,10 +541,17 @@ async function loadHistory() {
 }
 
 // ---------- events ----------
+document.querySelectorAll("#event-filter .seg-btn").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("#event-filter .seg-btn").forEach(x => x.classList.toggle("active", x === b));
+  state.eventsFilter = b.dataset.filter;
+  loadEvents();
+}));
+
 async function loadEvents() {
   if (!state.eventsPump) return;
   try {
-    const rows = await api(`/api/pumps/${state.eventsPump}/events?days=7`);
+    const rows = (await api(`/api/pumps/${state.eventsPump}/events?days=7`))
+      .filter(EVENT_FILTERS[state.eventsFilter] || EVENT_FILTERS.all);
     $("#event-list").innerHTML = rows.map(e => {
       const t = new Date(e.ts * 1000).toLocaleString([], {
         month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
