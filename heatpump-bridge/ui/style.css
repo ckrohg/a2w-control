@@ -38,8 +38,19 @@ main { padding: 8px 12px 40px; max-width: 980px; margin: 0 auto; }
 .chip.cooling { background: #14324e; color: var(--info); }
 .chip.defrost { background: #123a3f; color: #3bc9db; }
 .chip.idle { background: #26303a; color: var(--dim); }
+.chip.off { background: #26303a; color: #55636f; }
 .chip.offline { background: #3d2a2a; color: var(--critical); }
 .chip.fault { background: #4a2517; color: var(--high); }
+
+.card .head .power { margin-left: auto; margin-right: 8px; width: 30px; height: 30px;
+  border-radius: 8px; border: 1px solid var(--line); background: var(--card2);
+  color: #55636f; font-size: 15px; cursor: pointer; line-height: 1; }
+.card .head .power.on { color: var(--ok); border-color: #2b5240; }
+.card .head .power:disabled { opacity: .4; cursor: default; }
+.modectl { margin-bottom: 10px; width: 100%; }
+.modectl .seg-btn { flex: 1; }
+.modectl .seg-btn.active:first-child { color: var(--high); }
+.modectl .seg-btn.active:last-child { color: var(--info); }
 
 .temps { display: flex; gap: 8px; margin: 10px 0; }
 .temp { flex: 1; background: var(--card2); border-radius: 10px; padding: 8px 4px; text-align: center; }
@@ -131,10 +142,25 @@ table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
 .badge.fault_on { background: #4a2517; color: var(--high); }
 .badge.fault_off { background: #1f3d2b; color: var(--ok); }
 .badge.setpoint_write { background: #14324e; color: var(--info); }
+.badge.mode_write { background: #14324e; color: var(--info); }
+.badge.power_write { background: #14324e; color: var(--info); }
 .badge.comm { background: #26303a; color: var(--dim); }
 .event .code { font-family: ui-monospace, monospace; font-weight: 800; }
 .event .msg { flex: 1; }
 .empty { color: var(--dim); text-align: center; padding: 30px 0; }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(5,8,11,.72); z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 20px; }
+.modal { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  padding: 20px; max-width: 400px; width: 100%; }
+.modal h3 { font-size: 17px; margin-bottom: 8px; }
+.modal p { font-size: 14px; color: var(--dim); line-height: 1.5; }
+.modal-actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+.modal-actions button { padding: 10px 18px; border: 0; border-radius: 10px;
+  font-weight: 700; font-size: 14px; cursor: pointer; }
+.m-cancel { background: var(--card2); color: var(--text); }
+.m-confirm { background: var(--info); color: #08233c; }
+.m-confirm.danger { background: var(--critical); color: #330f0f; }
 
 #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
          background: var(--card2); border: 1px solid var(--line); color: var(--text);

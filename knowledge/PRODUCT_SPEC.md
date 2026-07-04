@@ -38,11 +38,19 @@ Repo layout: `bridge/` (main, config, modbus_client, registers, faults, guardrai
 
 **Mode-aware setpoints (added 2026-07-04):** the units run heating OR cooling (reg 2001),
 and each mode has its own setpoint register with its own valid range — heating → reg 2003
-(clamp 30–55°C), cooling → reg 2002 (clamp 12–25°C), hot water → reg 2004 (writes refused,
+(clamp 30–75°C), cooling → reg 2002 (clamp 12–25°C), hot water → reg 2004 (writes refused,
 409 — wall controller only). The write path re-reads the mode register fresh before every
-write so a stale snapshot can never route a value to the wrong register. Mode is displayed
-in the UI but NOT remotely writable (deliberate: heat/cool switchover involves the HBX and
-buffer plant, not just the pump — revisit at Phase 4).
+write so a stale snapshot can never route a value to the wrong register.
+
+**Control parity principle (owner decision 2026-07-04):** everything the wall controller
+can do (and more) should be possible from the web view. Implemented: setpoint (mode-aware),
+**mode switch heating↔cooling** (reg 2001, only 0/1 ever written, confirmation modal in the
+UI), **unit on/off** (reg 2000, confirmation modal, danger-styled for off). All control
+writes share the guardrail discipline — write_enabled flag, per-control rate limiter
+(mode/power/setpoint each have their own lane), read-back verify, audit event, and an
+immediate re-poll so the UI reflects reality. Deliberately still read-only: installer
+parameters 2010–2039 (manual §2.8 warns against non-professional adjustment) and the
+emergency override (2005) — add later only if a real need appears.
 
 **Layered setpoint MAX (corrected 2026-07-04 against the manual):** the spec table (p.3)
 states max water outlet = **85°C (185°F)**, with rated operation at 75°C down to −12°C

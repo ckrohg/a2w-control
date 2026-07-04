@@ -166,7 +166,15 @@ function renderDashboard() {
     <div class="card" data-pump="${p.id}">
       <div class="head">
         <h2>${esc(s.name || p.name)}</h2>
+        <button class="power ${s.on ? "on" : ""}" data-power="${s.on ? "off" : "on"}"
+          title="${s.on ? "Turn unit off" : "Turn unit on"}" ${s.online ? "" : "disabled"}>⏻</button>
         <span class="chip ${stateName}">${stateName}</span>
+      </div>
+      <div class="modectl seg">
+        <button class="seg-btn ${s.mode_kind === "heating" ? "active" : ""}"
+          data-mode="heating" ${s.online ? "" : "disabled"}>Heat</button>
+        <button class="seg-btn ${s.mode_kind === "cooling" ? "active" : ""}"
+          data-mode="cooling" ${s.online ? "" : "disabled"}>Cool</button>
       </div>
       <div class="temps">
         <div class="temp"><div class="v">${temp(s.outlet_c)}°</div><div class="l">Outlet</div></div>
@@ -196,6 +204,85 @@ function renderDashboard() {
     </div>`;
   }).join("") || `<div class="empty">No pumps configured</div>`;
 }
+
+// ---------- confirmation modal ----------
+function confirmDialog({ title, body, confirmLabel, danger = false }) {
+  return new Promise(resolve => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal">
+        <h3>${esc(title)}</h3>
+        <p>${esc(body)}</p>
+        <div class="modal-actions">
+          <button class="m-cancel">Cancel</button>
+          <button class="m-confirm ${danger ? "danger" : ""}">${esc(confirmLabel)}</button>
+        </div>
+      </div>`;
+    const close = (answer) => { overlay.remove(); resolve(answer); };
+    overlay.querySelector(".m-cancel").onclick = () => close(false);
+    overlay.querySelector(".m-confirm").onclick = () => close(true);
+    overlay.addEventListener("click", e => { if (e.target === overlay) close(false); });
+    document.body.appendChild(overlay);
+    overlay.querySelector(".m-confirm").focus();
+  });
+}
+
+async function guardedPost(path, body, okMessage) {
+  try {
+    await api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, source: "ui" }),
+    });
+    toast(okMessage);
+  } catch (err) {
+    toast(err.message, true);
+  }
+  await refresh();
+}
+
+// mode switch + power toggle (each behind a confirmation step)
+document.addEventListener("click", async (e) => {
+  const modeBtn = e.target.closest("[data-mode]");
+  const powerBtn = e.target.closest("[data-power]");
+  if (!modeBtn && !powerBtn) return;
+  const card = e.target.closest("[data-pump]");
+  if (!card) return;
+  const id = card.dataset.pump;
+  const s = state.snapshots[id] || {};
+  const name = s.name || id;
+
+  if (modeBtn) {
+    const target = modeBtn.dataset.mode;
+    if (target === s.mode_kind) return;  // already there
+    const targetSp = target === "cooling" ? s.setpoint_cooling_c : s.setpoint_heating_c;
+    const ok = await confirmDialog({
+      title: `Switch ${name} to ${target === "cooling" ? "cooling" : "heating"}?`,
+      body: `The unit will stop ${s.mode_kind === "cooling" ? "cooling" : "heating"} and chase ` +
+            `the ${target} setpoint (${temp(targetSp, 0)}${unitLabel()}). ` +
+            `Make sure the rest of the hydronic system expects this.`,
+      confirmLabel: target === "cooling" ? "Switch to cooling" : "Switch to heating",
+    });
+    if (ok) await guardedPost(`/api/pumps/${id}/mode`, { value: target },
+      `✓ ${name}: now in ${target} mode`);
+  }
+
+  if (powerBtn) {
+    const turningOn = powerBtn.dataset.power === "on";
+    const ok = await confirmDialog({
+      title: `Turn ${name} ${turningOn ? "on" : "OFF"}?`,
+      body: turningOn
+        ? "The unit will resume following its setpoint."
+        : "The unit will stop and ignore heating calls until turned back on " +
+          "(here or at the wall controller).",
+      confirmLabel: turningOn ? "Turn on" : "Turn off",
+      danger: !turningOn,
+    });
+    if (ok) await guardedPost(`/api/pumps/${id}/power`, { value: turningOn },
+      `✓ ${name}: turned ${turningOn ? "on" : "off"}`);
+  }
+});
 
 // remember expand/collapse across the 5s re-renders
 document.addEventListener("click", (e) => {

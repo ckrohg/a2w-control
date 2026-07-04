@@ -105,6 +105,8 @@ class PumpPoller:
         non_info = {k: v for k, v in self.active_faults.items() if v["severity"] != Severity.INFO}
         if non_info:
             return "fault"
+        if not decoded["on"]:
+            return "off"
         if decoded.get("defrosting"):
             return "defrost"
         if decoded["running"]:
@@ -245,3 +247,53 @@ class PumpPoller:
                 f"read-back mismatch: wrote {value}°C but unit reports {readback}°C", 502)
         self.snapshot["setpoint_c"] = readback
         return {"setpoint_c": readback, "verified": True, "mode": kind}
+
+    async def _guarded_control_write(self, register: int, raw: int, *, event_type: str,
+                                     describe: str, source: str) -> None:
+        """Shared machinery for mode/power writes: same discipline as setpoints —
+        precondition checks, per-control rate limit, read-back verify, audit — then an
+        immediate re-poll so the snapshot reflects the new reality right away."""
+        rate_key = f"{self.cfg.id}:{event_type}"  # own limiter; doesn't block setpoints
+
+        async def audit(code: str, sev: str, message: str):
+            await self.store.add_event(
+                self.cfg.id, event_type, code=code, severity=sev, message=message,
+                detail={"register": register, "requested": raw, "source": source})
+
+        try:
+            self.guard.validate(rate_key, raw, online=self.online,
+                                write_enabled=self.cfg.write_enabled,
+                                min_c=float("-inf"), max_c=float("inf"))
+        except GuardrailError as exc:
+            await audit("rejected", "warning", str(exc))
+            raise
+        try:
+            readback = await self.client.write_register_verified(register, raw)
+        except ModbusError as exc:
+            await audit("failed", "high", f"write failed: {exc}")
+            raise GuardrailError(f"write failed: {exc}", 502) from exc
+        self.guard.record_write(rate_key)
+        if readback != raw:
+            await audit("verify_mismatch", "high",
+                        f"read-back mismatch on reg {register}: wrote {raw}, got {readback}")
+            raise GuardrailError(
+                f"read-back mismatch: unit did not accept the change", 502)
+        await audit("accepted", "info", f"{describe} ({source})")
+        await self.poll_once()
+
+    async def write_mode(self, kind: str, source: str) -> dict:
+        """Switch heating <-> cooling (reg 2001). Only 0/1 ever written — the protocol
+        doc marks modes 2-5 unstable. UI puts a confirmation step in front of this."""
+        target = {"heating": 1, "cooling": 0}[kind]
+        current = self.snapshot.get("mode_kind", "?")
+        await self._guarded_control_write(
+            R.REG_MODE, target, event_type="mode_write",
+            describe=f"mode {current} -> {kind}", source=source)
+        return {"mode": kind, "verified": True}
+
+    async def write_power(self, on: bool, source: str) -> dict:
+        """Unit on/off (reg 2000) — same as the wall controller's power button."""
+        await self._guarded_control_write(
+            R.REG_ON_OFF, 1 if on else 0, event_type="power_write",
+            describe=f"unit switched {'on' if on else 'off'}", source=source)
+        return {"on": on, "verified": True}

@@ -188,6 +188,58 @@ async def test_hot_water_mode_refuses_remote_setpoint(rig):
     assert exc.value.status_code == 409
 
 
+async def test_mode_switch_guarded_write(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    assert poller.snapshot["mode_kind"] == "heating"
+
+    result = await poller.write_mode("cooling", source="test")
+    assert result == {"mode": "cooling", "verified": True}
+    assert await pump.get_reg(R.REG_MODE) == 0
+    # the immediate re-poll refreshed the snapshot: mode, active setpoint, bounds
+    assert poller.snapshot["mode_kind"] == "cooling"
+    assert poller.snapshot["setpoint_bounds_c"] == [12, 25]
+
+    events = await store.get_events("p1", 1)
+    mode_event = next(e for e in events if e["type"] == "mode_write")
+    assert mode_event["code"] == "accepted"
+    assert mode_event["detail"]["source"] == "test"
+
+
+async def test_power_toggle_guarded_write(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    result = await poller.write_power(False, source="test")
+    assert result == {"on": False, "verified": True}
+    assert await pump.get_reg(R.REG_ON_OFF) == 0
+    assert poller.snapshot["on"] is False
+    assert poller.snapshot["state"] == "off"
+
+    events = await store.get_events("p1", 1)
+    assert any(e["type"] == "power_write" and e["code"] == "accepted" for e in events)
+
+
+async def test_control_writes_have_independent_rate_limits(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    # a mode write must not consume the setpoint limiter, and vice versa
+    await poller.write_mode("cooling", source="test")
+    await poller.write_setpoint(18, source="test")   # allowed immediately after
+    await poller.write_power(False, source="test")   # and power has its own lane
+
+
+async def test_control_writes_refused_when_disabled(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    poller.cfg.write_enabled = False
+    for call in (poller.write_mode("cooling", source="test"),
+                 poller.write_power(False, source="test")):
+        with pytest.raises(GuardrailError) as exc:
+            await call
+        assert exc.value.status_code == 403
+    poller.cfg.write_enabled = True
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

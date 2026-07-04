@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -17,6 +18,16 @@ router = APIRouter(prefix="/api")
 class SetpointRequest(BaseModel):
     value: float
     source: str = Field(default="ui", max_length=32)  # audit trail; future: "tempiq"
+
+
+class ModeRequest(BaseModel):
+    value: Literal["heating", "cooling"]  # modes 2-5 are unstable per protocol doc
+    source: str = Field(default="ui", max_length=32)
+
+
+class PowerRequest(BaseModel):
+    value: bool
+    source: str = Field(default="ui", max_length=32)
 
 
 def _pollers(request: Request) -> dict[str, PumpPoller]:
@@ -69,6 +80,24 @@ async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest):
     poller = _pump(request, pump_id)
     try:
         return await poller.write_setpoint(body.value, body.source)
+    except GuardrailError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@router.post("/pumps/{pump_id}/mode")
+async def write_mode(request: Request, pump_id: str, body: ModeRequest):
+    poller = _pump(request, pump_id)
+    try:
+        return await poller.write_mode(body.value, body.source)
+    except GuardrailError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@router.post("/pumps/{pump_id}/power")
+async def write_power(request: Request, pump_id: str, body: PowerRequest):
+    poller = _pump(request, pump_id)
+    try:
+        return await poller.write_power(body.value, body.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
