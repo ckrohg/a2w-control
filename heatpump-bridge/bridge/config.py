@@ -24,8 +24,10 @@ class PumpConfig(BaseModel):
 
 class GuardrailConfig(BaseModel):
     # heating setpoint clamp; effective max at runtime = min(this, live reg 2027).
-    # 75degC (167degF) is the manual's rated operating point; hardware max is 85degC.
-    # NOTE: reg 2027 (wall param 17) ships at 55 — raise it on the unit to go higher.
+    # 75degC (167degF) is the manual's rated operating point; hardware max outlet is
+    # 85degC and the Arctic installer manual caps the WATER SYSTEM at 80degC (p.15) —
+    # keep this at or below 80. NOTE: reg 2027 (wall param 17) ships at 55 — raise it
+    # on the unit to go higher.
     setpoint_min_c: float = 30.0
     setpoint_max_c: float = 75.0
     # cooling setpoint clamp (reg 2002); register itself only accepts 10-25

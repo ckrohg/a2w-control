@@ -121,7 +121,7 @@ clamp meter during commissioning.
 | 2 | E06 | Sys1 fixed-freq coil sensor error |
 | 3 | E08 | Sys2 fixed-freq coil sensor error |
 | 4 | E10 | Sys1 fixed-freq suction sensor error |
-| 5 | E12 | Sys2 fixed-freq suction sensor error (doc says "System 1" — likely typo) |
+| 5 | E12 | Sys2 fixed-freq suction sensor error (Modbus doc says "System 1" — CONFIRMED typo: Arctic manual error table p.29 lists E12 = System 2 on/off suction) |
 | 6 | E39 | Comms failure fixed-freq board ↔ inverter board 1 |
 | 7 | E40 | Comms failure fixed-freq board ↔ inverter board 2 |
 | 8 | E28 | Fixed-freq system EE error |
@@ -214,6 +214,7 @@ clamp meter during commissioning.
 
 ## Commissioning verification checklist (Phase 1)
 
+- [ ] **FIRST: record the as-found parameters as baseline** — `curl localhost:8000/api/pumps/pump1/status > baseline-pump1.json` (and pump2) before touching anything. Arctic's manual (p.1) says parameters "have been pre-set at the factory — we recommend that you leave these parameters as set"; the baseline is what "as set" means for these specific units.
 - [ ] Register addressing offset: doc addresses (2000+) vs pymodbus 0-based — read 2050–2052 and sanity-check against wall controller display
 - [ ] Temp scaling: ranges are quoted in whole °C (−40…99) suggesting 1 °C resolution, but Macon boards often use ×0.1 — verify
 - [ ] Signedness of temps (need negative ambient to decode correctly — NH winter)
