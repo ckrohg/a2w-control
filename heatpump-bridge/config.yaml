@@ -1,0 +1,30 @@
+# heatpump-bridge configuration
+# This default points at the local simulator (sim/fake_pump.py) for Phase 0.
+# For real hardware, see deploy/config.production.yaml — and leave write_enabled
+# false until Phase 2.
+
+pumps:
+  - id: pump1
+    name: Heat Pump 1
+    host: 127.0.0.1
+    port: 15020        # W610 default is 8899; sim uses 15020/15021
+    device_id: 1       # Modbus slave address (SW2 DIP on the board)
+    poll_interval_s: 5 # sim: fast feedback; use 20-30 on real hardware (2400 baud)
+    write_enabled: true
+  - id: pump2
+    name: Heat Pump 2
+    host: 127.0.0.1
+    port: 15021
+    device_id: 1
+    poll_interval_s: 5
+    write_enabled: true
+
+guardrails:
+  setpoint_min_c: 30
+  setpoint_max_c: 55        # matches reg 2027 factory default; confirm on the units
+  min_write_interval_s: 60
+  offline_after_failed_polls: 3
+
+db_path: bridge.db
+ui_dir: ui
+modbus_timeout_s: 5

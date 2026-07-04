@@ -30,11 +30,10 @@ path exists:
 - HBX's own SensorLinx app "adjusts system parameters" remotely on the ECO-0600 — so a
   write endpoint exists on `mobile.sensorlinx.co`; TempIQ simply never used it
 - HBX also advertises a server-side API for BMS/BACnet integrations
-- Discovery options, in order: (1) **HAR-capture the SensorLinx app** while changing a
-  setpoint — same methodology TempIQ used to reverse the SPAN Cloud API (see their
-  `server/scripts/intercept-span-api.ts` + `SPAN_API_INTERCEPTION.md` as the template);
-  (2) ask HBX for their BMS API docs; (3) check the ECO-0600 manual for a local BMS/RS-485
-  port as a cloud-free alternative (unconfirmed — nothing found in a quick search)
+- Discovery method (settled): **Proxyman capture of the SensorLinx app** while changing a
+  setpoint. The owner already used Proxyman to reverse the read side — same workflow for
+  writes. Fallbacks: HBX's BMS API docs; ECO-0600 manual local BMS/RS-485 port
+  (unconfirmed — nothing found in a quick search)
 - Treat any HBX write with the same guardrail discipline as reg 2003: clamp, read-back
   verify, rate limit, audit with source
 

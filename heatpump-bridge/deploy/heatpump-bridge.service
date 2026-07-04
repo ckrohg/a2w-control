@@ -1,0 +1,19 @@
+# @purpose: systemd unit for the bridge on the Pi 5. Install:
+#   sudo cp deploy/heatpump-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now heatpump-bridge
+[Unit]
+Description=Heat pump Modbus bridge (A2W Control)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/heatpump-bridge
+Environment=BRIDGE_CONFIG=/home/pi/heatpump-bridge/config.yaml
+ExecStart=/home/pi/heatpump-bridge/.venv/bin/uvicorn bridge.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

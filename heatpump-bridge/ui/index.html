@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- @purpose: A2W Control single-page UI. Static, no build step; served by FastAPI at /. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1419">
+  <title>A2W Control</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>♨️</text></svg>">
+</head>
+<body>
+  <header>
+    <h1>A2W Control</h1>
+    <span id="health-dot" class="dot" title="service health"></span>
+  </header>
+
+  <nav id="tabs">
+    <button class="tab active" data-view="dashboard">Dashboard</button>
+    <button class="tab" data-view="history">History</button>
+    <button class="tab" data-view="events">Events</button>
+  </nav>
+
+  <main>
+    <section id="view-dashboard" class="view active">
+      <div id="pump-cards" class="cards"></div>
+    </section>
+
+    <section id="view-history" class="view">
+      <div class="controls">
+        <div id="history-pumps" class="seg"></div>
+        <div class="seg">
+          <button class="seg-btn active" data-hours="24">24h</button>
+          <button class="seg-btn" data-hours="168">7d</button>
+        </div>
+      </div>
+      <div class="chart-block">
+        <h3>Temperatures °C</h3>
+        <div id="chart-temps" class="chart"></div>
+        <div class="legend">
+          <span><i style="background:#4dabf7"></i>Outlet</span>
+          <span><i style="background:#63e6be"></i>Inlet</span>
+          <span><i style="background:#845ef7"></i>Ambient</span>
+          <span><i style="background:#ffd666"></i>Setpoint</span>
+        </div>
+      </div>
+      <div class="chart-block">
+        <h3>Power W</h3>
+        <div id="chart-power" class="chart"></div>
+        <div class="legend">
+          <span><i style="background:#ff9f43"></i>Stage 1</span>
+          <span><i style="background:#ff6b6b"></i>Stage 2</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-events" class="view">
+      <div class="controls"><div id="events-pumps" class="seg"></div></div>
+      <div id="event-list"></div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

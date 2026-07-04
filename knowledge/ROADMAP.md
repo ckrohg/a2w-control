@@ -2,25 +2,26 @@
 
 > Phases are settled (handoff §8). Phase 0 needs no hardware and can start immediately.
 
-## Now — Phase 0: simulator-first build
+## Done — Phase 0: simulator-first build ✅ (2026-07-04)
 
-- [ ] Scaffold `heatpump-bridge/` repo exactly per handoff §6.2
-- [ ] `sim/fake_pump.py` — pymodbus server simulating a MAHRW030ZA (regs 2003, 2050–2052, 2063/2088, 2110–2118, fault-injection knobs)
-- [ ] `registers.py` + `faults.py` + `modbus_client.py` with tests
-- [ ] Guardrails + poller + SQLite store + API
-- [ ] Mobile UI against two simulated pumps
-- [ ] **Exit:** setpoint change from phone UI + injected fault appears/clears as plain-English alert
+- [x] Scaffold `heatpump-bridge/` repo per handoff §6.2
+- [x] `sim/fake_pump.py` — RTU-over-TCP pymodbus servers w/ toy physics + HTTP fault-injection API
+- [x] `registers.py` + `faults.py` + `modbus_client.py` + guardrails + poller + SQLite store + API — 27 tests passing
+- [x] Mobile UI (no build step) against two simulated pumps
+- [x] **Exit verified:** setpoint changed from phone-sized UI with verified read-back; P01/P17/E18 injected → plain-English alerts appeared with correct severities and cleared
 
-## Next — Phases 1–2: first real hardware (gated on Winnie's CN22/pinout reply)
+## Next — W610 prep + Phases 1–2
 
-- [ ] Phase 1: one pump, read-only (write path behind flag). Verify addressing/scaling/signedness/CRC against reality. Watch error rates 48h.
-- [ ] Phase 2: enable guarded writes on pump 1; confirm wall controller reflects the change.
+- [ ] When W610s arrive: bench-configure per `heatpump-bridge/deploy/w610-setup.md` (transparent mode, 2400 8N1, TCP server 8899, DHCP reservations)
+- [ ] Pi provisioning per `heatpump-bridge/deploy/pi-setup.md` (can be done before the heat pump connection exists — bridge will just show pumps offline)
+- [ ] Phase 1 (gated on Winnie's CN22/pinout reply): one pump, read-only (write_enabled: false). Run the commissioning checklist in `reference/modbus-register-map.md` (addressing offset, temp scaling/signedness, CRC, power units — cross-check vs SPAN). Watch error rates 48h.
+- [ ] Phase 2: flip write_enabled on pump 1; confirm wall controller reflects the change.
 
 ## Later — Phases 3–4
 
 - [ ] Phase 3: second pump + Cloudflare Tunnel + systemd hardening (`Restart=always`)
 - [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — as a new consumer of existing API endpoints
-- [ ] Phase 4 (future): **coordinated HP + HBX control** — hard requirement (2026-07-04): A2W must write HBX setpoints so buffer tank and heat pumps work in conjunction. Write path discovery: HAR-capture the SensorLinx app changing a setpoint (TempIQ's SPAN interception methodology is the template), ask HBX for BMS API docs, and check ECO-0600 manual for a local BMS port. Same guardrail discipline as heat pump writes.
+- [ ] Phase 4 (future): **coordinated HP + HBX control** — hard requirement (2026-07-04): A2W must write HBX setpoints so buffer tank and heat pumps work in conjunction. Write path discovery: Proxyman capture of the SensorLinx app changing a setpoint (owner already built the read side this way). Same guardrail discipline as heat pump writes.
 
 ## Decisions deferred
 

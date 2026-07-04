@@ -1,0 +1,152 @@
+# @purpose: SQLite persistence (right-sized by design — no InfluxDB/Postgres): time-series
+# samples, event log (faults + setpoint audit), and periodic comm-stats snapshots. Stdlib
+# sqlite3 run via asyncio.to_thread; WAL mode so API reads never block the poller's writes.
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import time
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY,
+    pump_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    inlet_c REAL, outlet_c REAL, ambient_c REAL, setpoint_c REAL,
+    power_sys1 REAL, power_sys2 REAL,
+    heating INTEGER, status_word INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_samples_pump_ts ON samples(pump_id, ts);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    pump_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    type TEXT NOT NULL,          -- fault_on | fault_off | setpoint_write | comm
+    code TEXT,                   -- raw fault code, or accepted/rejected for writes
+    severity TEXT,
+    message TEXT,
+    detail TEXT                  -- JSON blob (fault key, old/new values, source, ...)
+);
+CREATE INDEX IF NOT EXISTS idx_events_pump_ts ON events(pump_id, ts);
+
+CREATE TABLE IF NOT EXISTS comm_stats (
+    id INTEGER PRIMARY KEY,
+    pump_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    ok_polls INTEGER, error_polls INTEGER, timeouts INTEGER,
+    io_errors INTEGER, exception_responses INTEGER, reconnects INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_comm_pump_ts ON comm_stats(pump_id, ts);
+"""
+
+
+class Store:
+    def __init__(self, path: str):
+        self.path = path
+        self._conn: sqlite3.Connection | None = None
+
+    async def open(self) -> None:
+        def _open():
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(SCHEMA)
+            return conn
+        self._conn = await asyncio.to_thread(_open)
+
+    async def close(self) -> None:
+        if self._conn:
+            await asyncio.to_thread(self._conn.close)
+            self._conn = None
+
+    async def _exec(self, sql: str, params: tuple = ()) -> None:
+        def _run():
+            with self._conn:  # implicit transaction
+                self._conn.execute(sql, params)
+        await asyncio.to_thread(_run)
+
+    async def _query(self, sql: str, params: tuple = ()) -> list[dict]:
+        def _run():
+            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        return await asyncio.to_thread(_run)
+
+    # --- writes ---------------------------------------------------------------
+    async def add_sample(self, pump_id: str, snap: dict) -> None:
+        await self._exec(
+            "INSERT INTO samples (pump_id, ts, inlet_c, outlet_c, ambient_c, setpoint_c,"
+            " power_sys1, power_sys2, heating, status_word)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (pump_id, time.time(), snap["inlet_c"], snap["outlet_c"], snap["ambient_c"],
+             snap["setpoint_c"], snap["power_sys1"], snap["power_sys2"],
+             int(snap["heating"]), snap.get("status_word", 0)),
+        )
+
+    async def add_event(self, pump_id: str, type_: str, *, code: str | None = None,
+                        severity: str | None = None, message: str | None = None,
+                        detail: dict | None = None) -> None:
+        await self._exec(
+            "INSERT INTO events (pump_id, ts, type, code, severity, message, detail)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (pump_id, time.time(), type_, code, severity, message,
+             json.dumps(detail) if detail else None),
+        )
+
+    async def add_comm_snapshot(self, pump_id: str, stats: dict) -> None:
+        await self._exec(
+            "INSERT INTO comm_stats (pump_id, ts, ok_polls, error_polls, timeouts,"
+            " io_errors, exception_responses, reconnects) VALUES (?,?,?,?,?,?,?,?)",
+            (pump_id, time.time(), stats["ok_polls"], stats["error_polls"],
+             stats["timeouts"], stats["io_errors"], stats["exception_responses"],
+             stats["reconnects"]),
+        )
+
+    # --- reads ----------------------------------------------------------------
+    async def get_history(self, pump_id: str, hours: float) -> list[dict]:
+        """Raw samples up to 48h; beyond that, 5-minute bucket averages."""
+        since = time.time() - hours * 3600
+        if hours <= 48:
+            return await self._query(
+                "SELECT ts, inlet_c, outlet_c, ambient_c, setpoint_c, power_sys1,"
+                " power_sys2, heating FROM samples WHERE pump_id=? AND ts>=? ORDER BY ts",
+                (pump_id, since),
+            )
+        return await self._query(
+            "SELECT CAST(ts/300 AS INTEGER)*300 AS ts, AVG(inlet_c) AS inlet_c,"
+            " AVG(outlet_c) AS outlet_c, AVG(ambient_c) AS ambient_c,"
+            " AVG(setpoint_c) AS setpoint_c, AVG(power_sys1) AS power_sys1,"
+            " AVG(power_sys2) AS power_sys2, MAX(heating) AS heating"
+            " FROM samples WHERE pump_id=? AND ts>=? GROUP BY 1 ORDER BY 1",
+            (pump_id, since),
+        )
+
+    async def get_events(self, pump_id: str, days: float) -> list[dict]:
+        since = time.time() - days * 86400
+        rows = await self._query(
+            "SELECT ts, type, code, severity, message, detail FROM events"
+            " WHERE pump_id=? AND ts>=? ORDER BY ts DESC LIMIT 500",
+            (pump_id, since),
+        )
+        for r in rows:
+            r["detail"] = json.loads(r["detail"]) if r["detail"] else None
+        return rows
+
+    async def get_open_faults(self, pump_id: str) -> dict[str, float]:
+        """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —
+        keeps 'active since' honest across bridge restarts."""
+        rows = await self._query(
+            "SELECT ts, type, detail FROM events WHERE pump_id=? AND type IN"
+            " ('fault_on','fault_off') ORDER BY ts", (pump_id,),
+        )
+        open_faults: dict[str, float] = {}
+        for r in rows:
+            detail = json.loads(r["detail"]) if r["detail"] else {}
+            key = detail.get("key")
+            if not key:
+                continue
+            if r["type"] == "fault_on":
+                open_faults.setdefault(key, r["ts"])
+            else:
+                open_faults.pop(key, None)
+        return open_faults
