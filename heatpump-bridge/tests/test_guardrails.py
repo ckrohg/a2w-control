@@ -65,3 +65,23 @@ def test_rate_limit_and_recovery(guard):
 def test_rate_limit_is_per_pump(guard):
     guard.record_write("p1")
     ok(guard, 45, pump="p2")  # p2 unaffected by p1's write
+
+
+def test_explicit_bounds_override_defaults(guard):
+    # cooling-style bounds: 45 is valid for heating but not within 12-25
+    with pytest.raises(GuardrailError) as exc:
+        guard.validate("p1", 45, online=True, write_enabled=True,
+                       min_c=12, max_c=25, context="cooling mode")
+    assert exc.value.status_code == 422
+    assert "cooling mode" in str(exc.value)
+    guard.validate("p1", 20, online=True, write_enabled=True, min_c=12, max_c=25)
+
+
+def test_config_rejects_max_above_hard_ceiling():
+    with pytest.raises(ValueError):
+        GuardrailConfig(setpoint_max_c=70)   # hard ceiling is 65
+    with pytest.raises(ValueError):
+        GuardrailConfig(setpoint_min_c=10)   # register floor is 20
+    with pytest.raises(ValueError):
+        GuardrailConfig(cooling_setpoint_max_c=30)  # register cap is 25
+    GuardrailConfig(setpoint_max_c=65)       # at the ceiling is allowed

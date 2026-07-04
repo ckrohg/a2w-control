@@ -90,6 +90,8 @@ class PumpPoller:
             **decoded,
             "status_word": regs.get(R.REG_STATUS, 0),
             "state": self._derive_state(decoded),
+            "setpoint_bounds_c": self._setpoint_bounds(decoded["mode_kind"],
+                                                       decoded["max_water_temp_c"]),
             "active_faults": list(self.active_faults.values()),
             "comm": self.client.stats.as_dict(),
         }
@@ -103,9 +105,24 @@ class PumpPoller:
         non_info = {k: v for k, v in self.active_faults.items() if v["severity"] != Severity.INFO}
         if non_info:
             return "fault"
-        if decoded["heating"]:
-            return "heating"
+        if decoded.get("defrosting"):
+            return "defrost"
+        if decoded["running"]:
+            return "cooling" if decoded["mode_kind"] == "cooling" else "heating"
         return "idle"
+
+    def _setpoint_bounds(self, mode_kind: str, unit_max_c: float | None) -> list[float] | None:
+        """Effective clamp for the active mode. Heating folds in the unit's own
+        reg 2027 limit; unsupported modes return None (writes refused)."""
+        g = self.app_cfg.guardrails
+        if mode_kind == "heating":
+            max_c = min(g.setpoint_max_c, R.HARD_MAX_SETPOINT_C)
+            if unit_max_c is not None and 20 <= unit_max_c <= 90:
+                max_c = min(max_c, unit_max_c)
+            return [g.setpoint_min_c, max_c]
+        if mode_kind == "cooling":
+            return [g.cooling_setpoint_min_c, g.cooling_setpoint_max_c]
+        return None
 
     async def _handle_poll_failure(self, exc: ModbusError) -> None:
         threshold = self.app_cfg.guardrails.offline_after_failed_polls
@@ -159,27 +176,57 @@ class PumpPoller:
 
     # --- guarded write path ---------------------------------------------------
     async def write_setpoint(self, value: float, source: str) -> dict:
-        """Clamp -> rate limit -> write -> read-back verify -> audit. Raises
-        GuardrailError (mapped to HTTP status) on any refusal or verification failure."""
+        """Mode-aware guarded write: re-read the mode and unit-max registers FRESH
+        (never trust a stale snapshot to pick the target register), clamp to the
+        mode's effective bounds, rate limit, write, read-back verify, audit."""
         old = self.snapshot.get("setpoint_c")
-        try:
-            self.guard.validate(self.cfg.id, value,
-                                online=self.online, write_enabled=self.cfg.write_enabled)
-        except GuardrailError as exc:
+
+        async def audit_reject(exc: GuardrailError | ModbusError, code: str, sev: str):
             await self.store.add_event(
-                self.cfg.id, "setpoint_write", code="rejected", severity="warning",
-                message=str(exc),
-                detail={"old": old, "requested": value, "source": source})
+                self.cfg.id, "setpoint_write", code=code, severity=sev,
+                message=str(exc), detail={"old": old, "requested": value, "source": source})
+
+        # cheap pre-checks before touching the bus
+        try:
+            self.guard.validate(self.cfg.id, value, online=self.online,
+                                write_enabled=self.cfg.write_enabled,
+                                min_c=float("-inf"), max_c=float("inf"))
+        except GuardrailError as exc:
+            await audit_reject(exc, "rejected", "warning")
+            raise
+
+        try:
+            control = await self.client.read_block(R.BLOCK_CONTROL)
+        except ModbusError as exc:
+            await audit_reject(exc, "failed", "high")
+            raise GuardrailError(f"cannot confirm pump mode before writing: {exc}", 502) from exc
+
+        mode = control.get(R.REG_MODE, 1)
+        kind = R.MODE_KIND.get(mode, "unknown")
+        unit_max = R.to_signed(control.get(R.REG_MAX_WATER_TEMP, 0)) * R.TEMP_SCALE
+        bounds = self._setpoint_bounds(kind, unit_max)
+        if bounds is None:
+            exc = GuardrailError(
+                f"unit is in {R.MODE_NAMES.get(mode, mode)} mode — remote setpoint is only "
+                f"supported for heating and cooling; use the wall controller", 409)
+            await audit_reject(exc, "rejected", "warning")
+            raise exc
+        target_register = R.SETPOINT_REGISTER_FOR_KIND[kind]
+
+        try:
+            context = f"{kind} mode" + (f", unit max {unit_max:g}°C" if kind == "heating" else "")
+            self.guard.validate(self.cfg.id, value, online=self.online,
+                                write_enabled=self.cfg.write_enabled,
+                                min_c=bounds[0], max_c=bounds[1], context=context)
+        except GuardrailError as exc:
+            await audit_reject(exc, "rejected", "warning")
             raise
 
         raw = int(round(value / R.TEMP_SCALE))
         try:
-            readback_raw = await self.client.write_register_verified(R.REG_SETPOINT_HEATING, raw)
+            readback_raw = await self.client.write_register_verified(target_register, raw)
         except ModbusError as exc:
-            await self.store.add_event(
-                self.cfg.id, "setpoint_write", code="failed", severity="high",
-                message=f"write failed: {exc}",
-                detail={"old": old, "requested": value, "source": source})
+            await audit_reject(exc, "failed", "high")
             raise GuardrailError(f"write failed: {exc}", 502) from exc
 
         self.guard.record_write(self.cfg.id)
@@ -189,11 +236,12 @@ class PumpPoller:
             self.cfg.id, "setpoint_write",
             code="accepted" if verified else "verify_mismatch",
             severity="info" if verified else "high",
-            message=(f"setpoint {old} -> {value}°C ({source})" if verified else
+            message=(f"{kind} setpoint {old} -> {value}°C ({source})" if verified else
                      f"read-back mismatch: wrote {value}, unit reports {readback}"),
-            detail={"old": old, "requested": value, "readback": readback, "source": source})
+            detail={"old": old, "requested": value, "readback": readback,
+                    "source": source, "mode": kind, "register": target_register})
         if not verified:
             raise GuardrailError(
                 f"read-back mismatch: wrote {value}°C but unit reports {readback}°C", 502)
         self.snapshot["setpoint_c"] = readback
-        return {"setpoint_c": readback, "verified": True}
+        return {"setpoint_c": readback, "verified": True, "mode": kind}

@@ -58,7 +58,9 @@ class FakePump:
         await asyncio.sleep(0.2)
         await self.set_reg(R.REG_ON_OFF, 1)
         await self.set_reg(R.REG_MODE, 1)  # floor heating
+        await self.set_reg(R.REG_SETPOINT_COOLING, 16)
         await self.set_reg(R.REG_SETPOINT_HEATING, 45)
+        await self.set_reg(R.REG_SETPOINT_HOT_WATER, 50)
         await self.set_reg(R.REG_MAX_WATER_TEMP, 55)
         await self.set_reg(R.REG_SWITCH_STATUS, (1 << 4) | (1 << 5))  # AC online + water flow OK
         log.info("pump %d: modbus RTU-over-TCP on :%d (device_id=%d)",
@@ -72,34 +74,51 @@ class FakePump:
         await self.server.context.async_setValues(self.device_id, 3, addr, [value & 0xFFFF])
 
     async def tick(self) -> None:
-        """Advance toy physics one step and write telemetry registers."""
+        """Advance toy physics one step and write telemetry registers. Mode-aware:
+        follows reg 2001 (0 = cooling chases reg 2002, heating chases reg 2003)."""
         self._t += PHYSICS_TICK_S
-        setpoint = await self.get_reg(R.REG_SETPOINT_HEATING)
         on = await self.get_reg(R.REG_ON_OFF)
+        mode = await self.get_reg(R.REG_MODE)
+        cooling = mode == 0
+        setpoint = await self.get_reg(R.REG_SETPOINT_COOLING if cooling
+                                      else R.REG_SETPOINT_HEATING)
 
         # ambient wanders slowly around 5degC with +/-6degC daily-ish swing
         self.ambient = 5.0 + 6.0 * math.sin(self._t / 600) + random.uniform(-0.3, 0.3)
 
-        # thermostat with 2degC hysteresis, like the real control
-        if on and not self.heating and self.tank < setpoint - 2:
-            self.heating = True
-        elif self.heating and (not on or self.tank >= setpoint + 1):
-            self.heating = False
-
-        if self.heating:
-            self.tank += 0.12 * PHYSICS_TICK_S  # heat-up rate
+        # thermostat with 2degC hysteresis on either side, like the real control
+        if cooling:
+            if on and not self.heating and self.tank > setpoint + 2:
+                self.heating = True   # "heating" = compressors running
+            elif self.heating and (not on or self.tank <= setpoint - 1):
+                self.heating = False
         else:
-            self.tank -= 0.008 * PHYSICS_TICK_S * max(0.2, (self.tank - self.ambient) / 30)
+            if on and not self.heating and self.tank < setpoint - 2:
+                self.heating = True
+            elif self.heating and (not on or self.tank >= setpoint + 1):
+                self.heating = False
 
-        outlet = self.tank + (4.5 if self.heating else 0.3) + random.uniform(-0.2, 0.2)
-        inlet = self.tank - (0.5 if self.heating else 0.1) + random.uniform(-0.2, 0.2)
+        drift = 0.008 * PHYSICS_TICK_S * max(0.2, abs(self.tank - self.ambient) / 30)
+        if self.heating:
+            self.tank += (-0.10 if cooling else 0.12) * PHYSICS_TICK_S
+        else:
+            self.tank += drift if cooling and self.tank < 30 else -drift
 
-        # power: two stages; stage 2 (high-temp R134a) joins above 45degC outlet
+        delta = 4.5 if self.heating else 0.3
+        outlet = self.tank + (-delta if cooling else delta) + random.uniform(-0.2, 0.2)
+        inlet = self.tank + (0.5 if cooling else -0.5) * (1 if self.heating else 0.2) \
+            + random.uniform(-0.2, 0.2)
+
+        # power: two stages; in heating, stage 2 (R134a) joins above 45degC outlet
         if self.heating:
             p1 = 2600 + random.uniform(-150, 150)
-            p2 = (1900 + random.uniform(-120, 120)) if outlet > 45 else 0.0
+            p2 = (1900 + random.uniform(-120, 120)) if (not cooling and outlet > 45) else 0.0
         else:
             p1 = p2 = 0.0
+
+        # occasional defrost cycle: in heating, cold ambient, while running
+        defrost = (not cooling and self.heating and self.ambient < 3
+                   and (self._t % 900) < 60)
 
         status = 0
         if on:
@@ -109,6 +128,12 @@ class FakePump:
             status |= 1 << 1                      # compressor 1
             status |= (1 << 2) if p2 else 0       # compressor 2
             status |= 1 << 3                      # fan high
+        if cooling or defrost:
+            status |= 1 << 7                      # four-way valve 1
+            if p2 or cooling:
+                status |= 1 << 8                  # four-way valve 2
+        if not cooling and self.ambient < -15:
+            status |= 1 << 11                     # electric heating assists when frigid
 
         await self.set_reg(R.REG_INLET_TEMP, encode(inlet))
         await self.set_reg(R.REG_OUTLET_TEMP, encode(outlet))
@@ -119,8 +144,41 @@ class FakePump:
         await self.set_reg(R.REG_SYS2_CURRENT, encode(p2 / 240))
         await self.set_reg(R.REG_SYS1_FREQ, 65 if self.heating else 0)
         await self.set_reg(R.REG_SYS2_FREQ, 60 if p2 else 0)
-        await self.set_reg(R.REG_AC_VOLTAGE, 232)
         await self.set_reg(R.REG_STATUS, status)
+
+        # per-stage refrigerant-side detail (what the wall controller shows)
+        run1 = self.heating
+        run2 = bool(p2)
+        await self.set_reg(2055, encode(78 + random.uniform(-3, 3) if run1 else self.tank))
+        await self.set_reg(2056, encode(self.ambient - (6 if run1 else 0)))
+        await self.set_reg(2057, encode(self.ambient - (2 if run1 else 0)))
+        await self.set_reg(2059, 210 if run1 else 0)   # EEV, actual = x2
+        await self.set_reg(2060, encode(self.tank))
+        await self.set_reg(2061, 38)                   # bus V, actual = x10
+        await self.set_reg(2062, encode(52 if run1 else self.ambient + 5))
+        await self.set_reg(2064, 850 if run1 else 0)   # fan rpm
+        await self.set_reg(2065, 26 if run1 else 14)   # high pressure (raw)
+        await self.set_reg(2066, 5 if run1 else 14)    # low pressure (raw)
+        await self.set_reg(2067, 231)
+        await self.set_reg(2080, encode(84 + random.uniform(-3, 3) if run2 else self.tank))
+        await self.set_reg(2081, encode(self.tank + (3 if run2 else 0)))
+        await self.set_reg(2082, encode(self.tank - (4 if run2 else 0)))
+        await self.set_reg(2084, 195 if run2 else 0)
+        await self.set_reg(2085, encode(self.tank))
+        await self.set_reg(2086, 37)
+        await self.set_reg(2087, encode(48 if run2 else self.ambient + 5))
+        await self.set_reg(2089, 0)                    # stage 2 shares the fan
+        await self.set_reg(2090, 28 if run2 else 15)
+        await self.set_reg(2091, 6 if run2 else 15)
+        # fixed-speed compressors idle in this sim: plausible resting temps, no draw
+        for base in (2071, 2096):
+            await self.set_reg(base, encode(self.tank))          # discharge
+            await self.set_reg(base + 1, encode(self.ambient))   # coil
+            await self.set_reg(base + 2, encode(self.ambient))   # suction
+            await self.set_reg(base + 3, 0)                      # current
+            await self.set_reg(base + 4, 0)                      # EEV
+        await self.set_reg(2076, 0)
+        await self.set_reg(R.REG_AC_VOLTAGE, 232)
 
     async def inject_fault(self, code: str, on: bool, bit_index: int = 0) -> dict:
         """Set/clear the bit(s) for a fault code. Codes mapping to multiple bits

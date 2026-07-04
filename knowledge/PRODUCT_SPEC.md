@@ -30,11 +30,31 @@ Repo layout: `bridge/` (main, config, modbus_client, registers, faults, guardrai
 ## Write guardrails (non-negotiable, before any write path is exposed)
 
 1. Clamp setpoint to configured bounds; reject out-of-range with 422 (never silently clamp)
-2. Read-back verification after writing reg 2003
+2. Read-back verification after every setpoint write
 3. Rate limit writes per pump (~60s min interval)
 4. Watchdog: N failed polls → offline; never replay stale writes
 5. Audit log every write attempt
 6. Comm error-rate tracking (CRC/timeout/reconnect) exposed in `/status` — validates the unshielded-wire decision
+
+**Mode-aware setpoints (added 2026-07-04):** the units run heating OR cooling (reg 2001),
+and each mode has its own setpoint register with its own valid range — heating → reg 2003
+(clamp 30–55°C), cooling → reg 2002 (clamp 12–25°C), hot water → reg 2004 (writes refused,
+409 — wall controller only). The write path re-reads the mode register fresh before every
+write so a stale snapshot can never route a value to the wrong register. Mode is displayed
+in the UI but NOT remotely writable (deliberate: heat/cool switchover involves the HBX and
+buffer plant, not just the pump — revisit at Phase 4).
+
+**Layered setpoint MAX:** hardware outlet 85°C > code hard ceiling 65°C (config refuses to
+start above it) > config clamp (55°C) > **live reg 2027** (the unit's own max-water-temp
+parameter, read every poll; effective max = min(config, reg 2027)). Effective bounds are
+in every snapshot (`setpoint_bounds_c`) and shown under the setpoint control in the UI.
+
+**Wall-controller parity (added 2026-07-04):** the UI shows everything the wall controller
+can — mode, defrost indicator (heuristic: heating + running + four-way valve energized —
+verify in Phase 1), what's firing (compressors, fan speed, circulating pump, electric heat,
+crankcase/chassis heaters), per-stage refrigerant detail (discharge/coil/suction temps,
+compressor Hz, current, EEV steps, IPM temp, pressures, bus/AC voltage), and hardware
+switch states (water flow!, HP/LP, emergency) in a collapsible Details panel per pump.
 
 ## Fault alerting rules
 

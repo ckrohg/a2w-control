@@ -3,8 +3,10 @@
 "use strict";
 
 const POLL_MS = 5000;
+const MODE_LABELS = { cooling: "Cooling", heating: "Heating", hot_water: "Hot water" };
 const state = {
   unit: localStorage.getItem("a2w-unit") === "f" ? "f" : "c",
+  detailsOpen: {},      // pump id -> bool, survives re-renders
   pumps: [],            // [{id, name}]
   snapshots: {},        // id -> /status payload
   pending: {},          // id -> locally adjusted (unconfirmed) setpoint
@@ -68,6 +70,67 @@ function temp(v, digits = 1) {
   return (v === null || v === undefined) ? "—" : toDisplay(Number(v)).toFixed(digits);
 }
 
+function pill(label, on, cls = "") {
+  return `<span class="pill ${on ? "on " + cls : ""}">${label}</span>`;
+}
+
+function detailRow(label, vals, fmt = v => v ?? "—") {
+  return `<tr><th>${label}</th>${vals.map(v => `<td>${v == null ? "—" : fmt(v)}</td>`).join("")}</tr>`;
+}
+
+function renderDetails(id, s) {
+  const st = s.status || {};
+  const sw = s.switches || {};
+  const d = s.details || {};
+  const s1 = d.stage1_inverter || {}, f1 = d.stage1_fixed || {};
+  const s2 = d.stage2_inverter || {}, f2 = d.stage2_fixed || {};
+  const fanLabel = s.fan_speed && s.fan_speed !== "off" ? `Fan ${s.fan_speed}` : "Fan";
+
+  const pills = [
+    pill("Comp 1", st.compressor1),
+    pill("Comp 2", st.compressor2),
+    pill(fanLabel, s.fan_speed !== "off"),
+    pill("Pump", st.water_pump),
+    pill("Defrost", s.defrosting, "defrost"),
+    pill("Elec heat", st.electric_heating, "hot"),
+    st.crankcase_heater1 || st.crankcase_heater2
+      ? pill("Crankcase", true) : "",
+    st.chassis_heating ? pill("Chassis heat", true) : "",
+  ].join("");
+
+  const T = v => v == null ? "—" : temp(v, 0) + "°";
+  const cols = [s1, f1, s2, f2];
+  const table = `
+    <div class="detail-scroll"><table class="detail">
+      <tr><th></th><th>S1 inv</th><th>S1 fix</th><th>S2 inv</th><th>S2 fix</th></tr>
+      ${detailRow("Discharge", cols.map(c => c.discharge_c), T)}
+      ${detailRow("Coil", cols.map(c => c.coil_c), T)}
+      ${detailRow("Suction", cols.map(c => c.suction_c), T)}
+      ${detailRow("Comp Hz", [s1.compressor_hz, null, s2.compressor_hz, null])}
+      ${detailRow("Current A", cols.map(c => c.current_a))}
+      ${detailRow("EEV steps", cols.map(c => c.eev_steps))}
+      ${detailRow("IPM temp", [s1.ipm_temp_c, null, s2.ipm_temp_c, null], T)}
+      ${detailRow("Pressure hi/lo", [
+        s1.high_pressure != null ? `${s1.high_pressure}/${s1.low_pressure}` : null, null,
+        s2.high_pressure != null ? `${s2.high_pressure}/${s2.low_pressure}` : null, null])}
+      ${detailRow("Bus V", [s1.bus_voltage_v, null, s2.bus_voltage_v, null])}
+      ${detailRow("Fan rpm", [s1.fan_rpm, null, s2.fan_rpm, null])}
+    </table></div>
+    <div class="switchline">
+      ${pill("Flow " + (sw.water_flow_switch ? "OK" : "LOW"), sw.water_flow_switch, sw.water_flow_switch ? "" : "bad")}
+      ${pill("AC", sw.ac_online)}
+      ${sw.emergency_switch ? pill("Emergency", true, "bad") : ""}
+      <span class="acv">${d.shared?.ac_voltage_v ? d.shared.ac_voltage_v + " VAC" : ""}</span>
+    </div>`;
+
+  return `
+    <div class="pills">${pills}</div>
+    <details class="deep" data-id="${id}" ${state.detailsOpen[id] ? "open" : ""}>
+      <summary>Details</summary>
+      ${table}
+    </details>`;
+}
+
 function renderDashboard() {
   const wrap = $("#pump-cards");
   wrap.innerHTML = state.pumps.map(p => {
@@ -79,6 +142,8 @@ function renderDashboard() {
     const dirty = pending !== undefined && pending !== actual;
     const writing = state.writing[p.id];
     const power = (s.power_sys1 || 0) + (s.power_sys2 || 0);
+    const modeLabel = MODE_LABELS[s.mode_kind] || (s.mode_name || "—");
+    const bounds = s.setpoint_bounds_c;
     const faults = (s.active_faults || []).map(f => `
       <div class="fault ${f.severity}">
         <span class="code">${esc(f.code)}</span>
@@ -101,8 +166,9 @@ function renderDashboard() {
         &nbsp;·&nbsp; stage 1: ${num(s.power_sys1, 0)} · stage 2: ${num(s.power_sys2, 0)}</div>
       <div class="setpoint">
         <div>
-          <div class="label">Setpoint</div>
+          <div class="label">Setpoint · ${esc(modeLabel)}</div>
           <div class="val ${dirty ? "pending" : ""}">${temp(shown, 0)}${unitLabel()}</div>
+          ${bounds ? `<div class="range-hint">${temp(bounds[0], 0)}–${temp(bounds[1], 0)}${unitLabel()}</div>` : ""}
         </div>
         <button class="stepper" data-act="dec" ${s.online ? "" : "disabled"}>−</button>
         <button class="stepper" data-act="inc" ${s.online ? "" : "disabled"}>+</button>
@@ -111,6 +177,7 @@ function renderDashboard() {
           ${writing ? "…" : "Set"}</button>
       </div>
       ${faults ? `<div class="faults">${faults}</div>` : ""}
+      ${s.online ? renderDetails(p.id, s) : ""}
       <div class="comm">
         <span>errors: <span class="${err > 0.05 ? "err-bad" : ""}">${(err * 100).toFixed(1)}%</span></span>
         <span>last poll ${fmtAgo(s.last_poll_ts)}</span>
@@ -118,6 +185,16 @@ function renderDashboard() {
     </div>`;
   }).join("") || `<div class="empty">No pumps configured</div>`;
 }
+
+// remember expand/collapse across the 5s re-renders
+document.addEventListener("click", (e) => {
+  const summary = e.target.closest(".deep summary");
+  if (summary) {
+    const el = summary.parentElement;
+    // native toggle fires after click; record the state it's about to become
+    state.detailsOpen[el.dataset.id] = !el.open;
+  }
+});
 
 document.addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-act]");
@@ -127,9 +204,13 @@ document.addEventListener("click", async (e) => {
   if (!id) return;
   const snap = state.snapshots[id] || {};
   const current = state.pending[id] ?? snap.setpoint_c ?? 40;
+  const clampPending = v => {
+    const b = snap.setpoint_bounds_c;
+    return b ? Math.min(Math.max(v, Math.ceil(b[0])), Math.floor(b[1])) : v;
+  };
 
-  if (btn.dataset.act === "dec") { state.pending[id] = Math.round(current) - 1; renderDashboard(); }
-  if (btn.dataset.act === "inc") { state.pending[id] = Math.round(current) + 1; renderDashboard(); }
+  if (btn.dataset.act === "dec") { state.pending[id] = clampPending(Math.round(current) - 1); renderDashboard(); }
+  if (btn.dataset.act === "inc") { state.pending[id] = clampPending(Math.round(current) + 1); renderDashboard(); }
   if (btn.dataset.act === "set") {
     const value = state.pending[id];
     state.writing[id] = true;

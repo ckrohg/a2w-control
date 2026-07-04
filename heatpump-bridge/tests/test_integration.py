@@ -97,7 +97,7 @@ async def test_guarded_write_with_readback(rig):
     pump, poller, store = rig
     await poller.poll_once()
     result = await poller.write_setpoint(48, source="test")
-    assert result == {"setpoint_c": 48, "verified": True}
+    assert result == {"setpoint_c": 48, "verified": True, "mode": "heating"}
     assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 48
 
     # audit trail: accepted write recorded with old/new/source
@@ -136,6 +136,56 @@ async def test_offline_watchdog_and_write_refusal(rig):
 
     events = await store.get_events("p1", 1)
     assert any(e["type"] == "comm" and e["code"] == "offline" for e in events)
+
+
+async def test_unit_max_reg2027_caps_the_clamp(rig):
+    pump, poller, store = rig
+    await pump.set_reg(R.REG_MAX_WATER_TEMP, 50)  # unit's own limit below config's 55
+    await poller.poll_once()
+    assert poller.snapshot["setpoint_bounds_c"] == [30, 50]
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(52, source="test")  # fine for config, above unit max
+    assert exc.value.status_code == 422
+    assert "unit max 50" in str(exc.value)
+
+
+async def test_cooling_mode_targets_reg_2002_with_cooling_bounds(rig):
+    pump, poller, store = rig
+    await pump.set_reg(R.REG_MODE, 0)  # someone set cooling at the wall controller
+    await pump.tick()
+    await poller.poll_once()
+    snap = poller.snapshot
+    assert snap["mode_kind"] == "cooling"
+    assert snap["setpoint_c"] == 16          # active setpoint is now reg 2002
+    assert snap["setpoint_bounds_c"] == [12, 25]
+
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(45, source="test")  # heating value, cooling mode
+    assert exc.value.status_code == 422
+
+    result = await poller.write_setpoint(18, source="test")
+    assert result["mode"] == "cooling"
+    assert await pump.get_reg(R.REG_SETPOINT_COOLING) == 18
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 45  # untouched
+
+
+async def test_write_rereads_mode_fresh_not_from_snapshot(rig):
+    pump, poller, store = rig
+    await poller.poll_once()                 # snapshot says heating
+    await pump.set_reg(R.REG_MODE, 0)        # mode flips AFTER the poll
+    result = await poller.write_setpoint(18, source="test")
+    assert result["mode"] == "cooling"       # fresh read routed to reg 2002
+    assert await pump.get_reg(R.REG_SETPOINT_COOLING) == 18
+
+
+async def test_hot_water_mode_refuses_remote_setpoint(rig):
+    pump, poller, store = rig
+    await pump.set_reg(R.REG_MODE, 5)
+    await poller.poll_once()
+    assert poller.snapshot["setpoint_bounds_c"] is None
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(45, source="test")
+    assert exc.value.status_code == 409
 
 
 async def test_open_faults_survive_restart(rig):

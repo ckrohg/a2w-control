@@ -21,18 +21,26 @@ class SetpointGuard:
         self._clock = clock
         self._last_write: dict[str, float] = {}
 
-    def validate(self, pump_id: str, value: float, *, online: bool, write_enabled: bool) -> None:
-        """Raise GuardrailError unless this write is allowed right now."""
+    def validate(self, pump_id: str, value: float, *, online: bool, write_enabled: bool,
+                 min_c: float | None = None, max_c: float | None = None,
+                 context: str = "") -> None:
+        """Raise GuardrailError unless this write is allowed right now. min_c/max_c are
+        the mode-aware effective bounds (caller folds in live reg 2027); they default to
+        the configured heating clamp."""
+        if min_c is None:
+            min_c = self.cfg.setpoint_min_c
+        if max_c is None:
+            max_c = self.cfg.setpoint_max_c
         if not write_enabled:
             raise GuardrailError(
                 f"writes are disabled for {pump_id} (write_enabled: false)", 403)
         if not online:
             raise GuardrailError(
                 f"{pump_id} is offline — refusing to queue a stale write", 503)
-        if not (self.cfg.setpoint_min_c <= value <= self.cfg.setpoint_max_c):
+        if not (min_c <= value <= max_c):
+            suffix = f" ({context})" if context else ""
             raise GuardrailError(
-                f"setpoint {value}°C outside allowed range "
-                f"{self.cfg.setpoint_min_c}–{self.cfg.setpoint_max_c}°C", 422)
+                f"setpoint {value}°C outside allowed range {min_c}–{max_c}°C{suffix}", 422)
         last = self._last_write.get(pump_id)
         if last is not None:
             elapsed = self._clock() - last

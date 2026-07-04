@@ -35,6 +35,8 @@ main { padding: 8px 12px 40px; max-width: 980px; margin: 0 auto; }
 
 .chip { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: .5px; }
 .chip.heating { background: #1f3d2b; color: var(--ok); }
+.chip.cooling { background: #14324e; color: var(--info); }
+.chip.defrost { background: #123a3f; color: #3bc9db; }
 .chip.idle { background: #26303a; color: var(--dim); }
 .chip.offline { background: #3d2a2a; color: var(--critical); }
 .chip.fault { background: #4a2517; color: var(--high); }
@@ -71,6 +73,30 @@ main { padding: 8px 12px 40px; max-width: 980px; margin: 0 auto; }
 .fault.high { border-color: var(--high); } .fault.high .code { color: var(--high); }
 .fault.critical { border-color: var(--critical); background: #33201d; }
 .fault.critical .code { color: var(--critical); }
+
+.range-hint { font-size: 11px; color: var(--dim); text-align: center; margin-top: 2px; }
+
+.pills { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+.pill { font-size: 11.5px; font-weight: 650; padding: 3px 9px; border-radius: 999px;
+        background: var(--card2); color: #55636f; }
+.pill.on { background: #1f3d2b; color: var(--ok); }
+.pill.on.defrost { background: #123a3f; color: #3bc9db; }
+.pill.on.hot { background: #4a2517; color: var(--high); }
+.pill.on.bad { background: #33201d; color: var(--critical); }
+
+.deep { margin-bottom: 8px; }
+.deep summary { font-size: 12.5px; color: var(--dim); cursor: pointer;
+                padding: 4px 0; user-select: none; }
+.detail-scroll { overflow-x: auto; }
+table.detail { width: 100%; border-collapse: collapse; font-size: 12.5px;
+               font-variant-numeric: tabular-nums; margin: 4px 0; }
+table.detail th, table.detail td { padding: 3px 6px; text-align: right; white-space: nowrap; }
+table.detail tr th:first-child { text-align: left; color: var(--dim); font-weight: 500; }
+table.detail tr:first-child th { color: var(--dim); font-size: 11px; text-transform: uppercase;
+                                 letter-spacing: .4px; border-bottom: 1px solid var(--line); }
+table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
+.switchline { display: flex; gap: 5px; align-items: center; margin-top: 4px; }
+.switchline .acv { margin-left: auto; font-size: 11.5px; color: var(--dim); }
 
 .comm { color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; }
 .comm .err-bad { color: var(--high); font-weight: 700; }

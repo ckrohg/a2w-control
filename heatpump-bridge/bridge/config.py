@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from .registers import COOLING_REGISTER_RANGE, HARD_MAX_SETPOINT_C, HARD_MIN_SETPOINT_C
 
 
 class PumpConfig(BaseModel):
@@ -21,10 +23,27 @@ class PumpConfig(BaseModel):
 
 
 class GuardrailConfig(BaseModel):
+    # heating setpoint clamp; effective max at runtime = min(this, live reg 2027)
     setpoint_min_c: float = 30.0
     setpoint_max_c: float = 55.0  # matches reg 2027 factory default; confirm on unit
+    # cooling setpoint clamp (reg 2002); register itself only accepts 10-25
+    cooling_setpoint_min_c: float = 12.0
+    cooling_setpoint_max_c: float = 25.0
     min_write_interval_s: float = 60.0
     offline_after_failed_polls: int = 3
+
+    @model_validator(mode="after")
+    def _sane_bounds(self):
+        if not (HARD_MIN_SETPOINT_C <= self.setpoint_min_c < self.setpoint_max_c):
+            raise ValueError("heating setpoint bounds must satisfy "
+                             f"{HARD_MIN_SETPOINT_C} <= min < max")
+        if self.setpoint_max_c > HARD_MAX_SETPOINT_C:
+            raise ValueError(f"setpoint_max_c {self.setpoint_max_c} exceeds the hard "
+                             f"ceiling {HARD_MAX_SETPOINT_C}degC — refusing to start")
+        lo, hi = COOLING_REGISTER_RANGE
+        if not (lo <= self.cooling_setpoint_min_c < self.cooling_setpoint_max_c <= hi):
+            raise ValueError(f"cooling setpoint bounds must be within {lo}-{hi}degC")
+        return self
 
 
 class AppConfig(BaseModel):
