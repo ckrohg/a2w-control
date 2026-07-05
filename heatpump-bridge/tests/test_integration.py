@@ -328,6 +328,31 @@ async def test_runtime_edges_become_events(rig):
     assert events[0]["code"] == "remote_contact_on"  # newest first
 
 
+async def test_external_changes_become_events_but_own_writes_dont(rig):
+    pump, poller, store = rig
+    await poller.poll_once()   # seed baseline
+
+    # installer changes a parameter at the wall controller
+    await pump.set_reg(2010, 8)          # heating restart differential 5 -> 8
+    await pump.set_reg(R.REG_SETPOINT_HEATING, 50)  # and bumps the setpoint
+    await poller.poll_once()
+    await poller.poll_once()   # steady state: no duplicates
+
+    changes = [e for e in await store.get_events("p1", 1)
+               if e["type"] == "state" and e["code"].startswith("changed_")]
+    assert {e["code"] for e in changes} == {"changed_heating_start_diff",
+                                            "changed_setpoint_heating_c"}
+    assert len(changes) == 2
+    assert "changed at the unit" in changes[0]["message"]
+
+    # our own write must NOT produce a changed_* event
+    await poller.write_setpoint(52, source="test")
+    await poller.poll_once()
+    changes = [e for e in await store.get_events("p1", 1)
+               if e["type"] == "state" and e["code"] == "changed_setpoint_heating_c"]
+    assert len(changes) == 1  # still just the external one
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

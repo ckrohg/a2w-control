@@ -51,6 +51,7 @@ class PumpPoller:
         self.client = PumpClient(cfg.host, cfg.port, cfg.device_id, app_cfg.modbus_timeout_s)
         self.active_faults: dict[str, dict] = {}  # key -> {code,message,severity,since}
         self._prev_flags: dict[str, bool] | None = None  # runtime edge detection state
+        self._prev_config: dict[str, int] | None = None  # external-change detection state
         self.snapshot: dict = {"id": cfg.id, "name": cfg.name, "online": False,
                                "write_enabled": cfg.write_enabled}
         self._task: asyncio.Task | None = None
@@ -103,6 +104,7 @@ class PumpPoller:
         was_online = self.snapshot.get("online", False)
         await self._update_faults(decode_faults(regs))
         await self._emit_state_events(decoded)
+        await self._emit_config_change_events(decoded)
 
         self.snapshot = {
             "id": self.cfg.id,
@@ -167,6 +169,43 @@ class PumpPoller:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
         await self._maybe_comm_row(force=True)
+
+    @staticmethod
+    def _config_values(decoded: dict) -> dict[str, tuple[str, int | float]]:
+        """The unit's settings as {key: (label, value)} — anything here that changes
+        without the bridge writing it was changed at the wall controller (or by
+        another master) and deserves an audit event."""
+        mode_label = R.MODE_NAMES.get(decoded.get("mode"), str(decoded.get("mode")))
+        out = {
+            "on": ("Unit power", int(decoded.get("on", 0))),
+            "mode": (f"Mode ({mode_label})", decoded.get("mode", 1)),
+            "setpoint_heating_c": ("Heating setpoint °C", decoded.get("setpoint_heating_c")),
+            "setpoint_cooling_c": ("Cooling setpoint °C", decoded.get("setpoint_cooling_c")),
+            "setpoint_hot_water_c": ("Hot water setpoint °C", decoded.get("setpoint_hot_water_c")),
+        }
+        for p in decoded.get("parameters", []):
+            out[p["key"]] = (p["label"], p["value"])
+        return out
+
+    def note_local_change(self, key: str, value: int | float) -> None:
+        """Called by our own write paths so the next poll doesn't misreport a change
+        we made ourselves as an external one."""
+        if self._prev_config is not None:
+            self._prev_config[key] = value
+
+    async def _emit_config_change_events(self, decoded: dict) -> None:
+        current = self._config_values(decoded)
+        if self._prev_config is not None:
+            for key, (label, value) in current.items():
+                prev = self._prev_config.get(key)
+                if prev is not None and prev != value:
+                    await self.store.add_event(
+                        self.cfg.id, "state", code=f"changed_{key}", severity="info",
+                        message=f"{label} changed {prev} → {value} "
+                                f"(changed at the unit, not via the bridge)")
+                    log.info("[%s] external change: %s %s -> %s",
+                             self.cfg.id, key, prev, value)
+        self._prev_config = {k: v for k, (_, v) in current.items()}
 
     async def _emit_state_events(self, decoded: dict) -> None:
         """Log runtime transitions (heat calls, compressor start/stop, electric heat,
@@ -287,6 +326,7 @@ class PumpPoller:
             raise GuardrailError(
                 f"read-back mismatch: wrote {value}°C but unit reports {readback}°C", 502)
         self.snapshot["setpoint_c"] = readback
+        self.note_local_change(f"setpoint_{kind}_c", readback)
         return {"setpoint_c": readback, "verified": True, "mode": kind}
 
     async def _guarded_control_write(self, register: int, raw: int, *, event_type: str,
@@ -327,6 +367,7 @@ class PumpPoller:
         doc marks modes 2-5 unstable. UI puts a confirmation step in front of this."""
         target = {"heating": 1, "cooling": 0}[kind]
         current = self.snapshot.get("mode_kind", "?")
+        self.note_local_change("mode", target)
         await self._guarded_control_write(
             R.REG_MODE, target, event_type="mode_write",
             describe=f"mode {current} -> {kind}", source=source)
@@ -334,6 +375,7 @@ class PumpPoller:
 
     async def write_power(self, on: bool, source: str) -> dict:
         """Unit on/off (reg 2000) — same as the wall controller's power button."""
+        self.note_local_change("on", 1 if on else 0)
         await self._guarded_control_write(
             R.REG_ON_OFF, 1 if on else 0, event_type="power_write",
             describe=f"unit switched {'on' if on else 'off'}", source=source)
@@ -352,6 +394,7 @@ class PumpPoller:
         raw = int(value) & 0xFFFF  # negatives to two's complement
         old = next((p["value"] for p in self.snapshot.get("parameters", [])
                     if p["key"] == key), None)
+        self.note_local_change(key, int(value))
         await self._guarded_control_write(
             addr, raw, event_type="param_write",
             describe=f"{label}: {old} -> {value}", source=source)
