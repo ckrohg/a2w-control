@@ -475,6 +475,51 @@ async def test_gateway_overrides_persist_and_respect_mac(tmp_path):
     assert no_mac.pumps[0].mac == "d8:b0:4c:12:34:56"
 
 
+async def test_add_and_remove_pump_at_runtime(rig):
+    from types import SimpleNamespace
+    from bridge import api as api_mod
+    from bridge.config import apply_gateway_overrides
+
+    pump, poller, store = rig
+    pump3 = FakePump(3, free_port())
+    await pump3.start()
+    await pump3.tick()
+
+    async def persist(pid, h, p):
+        pass
+    ns = SimpleNamespace(pollers={"p1": poller}, config=poller.app_cfg, store=store,
+                         guard=poller.guard, persist_gateway=persist)
+    request = SimpleNamespace(app=SimpleNamespace(state=ns))
+
+    result = await api_mod.add_pump(request, api_mod.AddPumpRequest(
+        name="Heat Pump 3", host="127.0.0.1", port=pump3.port))
+    new_id = result["id"]
+    assert new_id in ns.pollers
+    new_poller = ns.pollers[new_id]
+    assert new_poller.cfg.write_enabled is False   # Phase 1 rule applies to added pumps
+    await new_poller.poll_once()
+    assert new_poller.online
+
+    # persisted: a fresh config load includes the added pump
+    fresh = AppConfig(pumps=[PumpConfig(id="p1", name="P1", host="127.0.0.1")],
+                      db_path=poller.app_cfg.db_path)
+    apply_gateway_overrides(fresh)
+    assert any(p.id == new_id and p.added for p in fresh.pumps)
+
+    # config-defined pumps cannot be removed via the API
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        await api_mod.remove_pump(request, "p1")
+
+    await api_mod.remove_pump(request, new_id)
+    assert new_id not in ns.pollers
+    fresh2 = AppConfig(pumps=[PumpConfig(id="p1", name="P1", host="127.0.0.1")],
+                       db_path=poller.app_cfg.db_path)
+    apply_gateway_overrides(fresh2)
+    assert not any(p.id == new_id for p in fresh2.pumps)
+    await pump3.server.shutdown()
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

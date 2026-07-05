@@ -46,6 +46,12 @@ class GatewayRequest(BaseModel):
     port: int = 8899
 
 
+class AddPumpRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    host: str
+    port: int = 8899
+
+
 def _pollers(request: Request) -> dict[str, PumpPoller]:
     return request.app.state.pollers
 
@@ -67,9 +73,64 @@ async def list_pumps(request: Request):
             "state": p.snapshot.get("state", "offline"),
             "last_poll_ts": p.snapshot.get("last_poll_ts"),
             "error_rate": p.client.stats.as_dict()["error_rate"],
+            "host": p.cfg.host,
+            "port": p.cfg.port,
+            "mac": p.cfg.mac,
+            "added": p.cfg.added,
+            "write_enabled": p.cfg.write_enabled,
         }
         for p in _pollers(request).values()
     ]
+
+
+@router.post("/pumps")
+async def add_pump(request: Request, body: AddPumpRequest):
+    """Add a heat pump at runtime (Setup tab): point it at a discovered gateway,
+    adopt the MAC, start polling, persist across restarts. Ships write-disabled —
+    same Phase 1 rule as config-defined pumps."""
+    from .config import PumpConfig, save_added_pump
+    from .discovery import get_mac_for_ip
+    from .poller import PumpPoller
+
+    state = request.app.state
+    existing = set(state.pollers.keys())
+    n = 1
+    while f"pump{n}" in existing:
+        n += 1
+    pump_cfg = PumpConfig(
+        id=f"pump{n}", name=body.name, host=body.host, port=body.port,
+        mac=await get_mac_for_ip(body.host), added=True, write_enabled=False)
+    state.config.pumps.append(pump_cfg)
+    poller = PumpPoller(pump_cfg, state.config, state.store, state.guard)
+    poller.on_gateway_change = state.persist_gateway
+    state.pollers[pump_cfg.id] = poller
+    await poller.start()
+    save_added_pump(state.config, pump_cfg)
+    await state.store.add_event(
+        pump_cfg.id, "comm", code="pump_added", severity="info",
+        message=f"{body.name} added via Setup at {body.host}:{body.port}")
+    return {"id": pump_cfg.id, "name": pump_cfg.name, "mac": pump_cfg.mac}
+
+
+@router.delete("/pumps/{pump_id}")
+async def remove_pump(request: Request, pump_id: str):
+    """Remove a UI-added pump (config.yaml-defined pumps are removed by editing the
+    file — the bridge never rewrites the human's config)."""
+    from .config import remove_added_pump
+
+    state = request.app.state
+    poller = _pump(request, pump_id)
+    if not poller.cfg.added:
+        raise HTTPException(
+            409, f"{pump_id} is defined in config.yaml — remove it there, then restart")
+    await poller.stop()
+    del state.pollers[pump_id]
+    state.config.pumps = [p for p in state.config.pumps if p.id != pump_id]
+    remove_added_pump(state.config, pump_id)
+    await state.store.add_event(
+        pump_id, "comm", code="pump_removed", severity="info",
+        message=f"{poller.cfg.name} removed via Setup")
+    return {"removed": pump_id}
 
 
 @router.get("/pumps/{pump_id}/status")

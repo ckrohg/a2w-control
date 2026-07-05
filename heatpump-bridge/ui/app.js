@@ -53,6 +53,7 @@ async function refresh() {
     if (!state.eventsPump && pumps.length) state.eventsPump = pumps[0].id;
     renderDashboard();
     renderPumpSelectors();
+    if (state.view === "setup") renderSetup();
   } catch (err) {
     $("#health-dot").className = "dot bad";
     console.error("refresh failed", err);
@@ -260,18 +261,20 @@ function confirmDialog({ title, body, confirmLabel, danger = false }) {
   });
 }
 
-function promptDialog({ title, body, value, min, max, confirmLabel, danger = false }) {
+function promptDialog({ title, body, value, min, max, confirmLabel, danger = false,
+                        inputType = "number" }) {
   return new Promise(resolve => {
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
+    const inputHtml = inputType === "number"
+      ? `<input type="number" value="${value}" min="${min}" max="${max}" step="1">
+         <span class="range">allowed ${min}–${max}</span>`
+      : `<input type="text" value="${esc(value ?? "")}" maxlength="40" class="wide">`;
     overlay.innerHTML = `
       <div class="modal">
         <h3>${esc(title)}</h3>
         <p>${esc(body)}</p>
-        <div class="modal-input">
-          <input type="number" value="${value}" min="${min}" max="${max}" step="1">
-          <span class="range">allowed ${min}–${max}</span>
-        </div>
+        <div class="modal-input">${inputHtml}</div>
         <div class="modal-actions">
           <button class="m-cancel">Cancel</button>
           <button class="m-confirm ${danger ? "danger" : ""}">${esc(confirmLabel)}</button>
@@ -280,7 +283,8 @@ function promptDialog({ title, body, value, min, max, confirmLabel, danger = fal
     const input = overlay.querySelector("input");
     const close = (answer) => { overlay.remove(); resolve(answer); };
     overlay.querySelector(".m-cancel").onclick = () => close(null);
-    overlay.querySelector(".m-confirm").onclick = () => close(Number(input.value));
+    overlay.querySelector(".m-confirm").onclick = () =>
+      close(inputType === "number" ? Number(input.value) : input.value.trim());
     overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
     document.body.appendChild(overlay);
     input.focus();
@@ -517,7 +521,120 @@ document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", (
     v.classList.toggle("active", v.id === `view-${state.view}`));
   if (state.view === "history") loadHistory();
   if (state.view === "events") loadEvents();
+  if (state.view === "setup") renderSetup();
 }));
+
+// ---------- setup tab ----------
+function renderSetup() {
+  $("#pump-list").innerHTML = state.pumps.map(p => `
+    <div class="pump-row">
+      <div class="pump-row-main">
+        <b>${esc(p.name)}</b>
+        <span class="chip ${p.state}">${p.state}</span>
+      </div>
+      <div class="pump-row-detail">
+        ${esc(p.host)}:${p.port} · ${p.mac ? esc(p.mac) : "MAC not verified"} ·
+        writes ${p.write_enabled ? "enabled" : "disabled"} ·
+        ${p.added ? "added via UI" : "from config.yaml"}
+      </div>
+      ${p.added ? `<button class="timer-del" data-remove-pump="${p.id}" title="Remove">×</button>` : ""}
+    </div>`).join("") || `<div class="empty small">No pumps configured</div>`;
+}
+
+async function assignCandidate(c) {
+  // chooser: existing pumps + "add as new"
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `<div class="modal">
+      <h3>${esc(c.ip)}:${c.port || 8899}</h3>
+      <p>${c.mac ? esc(c.mac) + " · " : ""}${c.probe ? "responds like a heat pump ✓" : "no heat pump reply — assign anyway?"}</p>
+      <div class="gw-list">
+        ${state.pumps.map(p => `<button class="gw-row" data-assign="${p.id}">
+            <b>Assign to ${esc(p.name)}</b><span class="dim">currently ${esc(p.host)}:${p.port}</span>
+          </button>`).join("")}
+        <button class="gw-row" data-assign="__new__"><b>＋ Add as a new heat pump</b></button>
+      </div>
+      <div class="modal-actions"><button class="m-cancel">Cancel</button></div>
+    </div>`;
+  overlay.querySelector(".m-cancel").onclick = () => overlay.remove();
+  overlay.addEventListener("click", ev => { if (ev.target === overlay) overlay.remove(); });
+  overlay.querySelectorAll("[data-assign]").forEach(btn => btn.onclick = async () => {
+    overlay.remove();
+    const target = btn.dataset.assign;
+    try {
+      if (target === "__new__") {
+        const name = await promptDialog({
+          title: "Name the new heat pump",
+          body: `It will be added at ${c.ip}:${c.port || 8899}, polling immediately, with writes disabled (Phase 1 rule).`,
+          value: `Heat Pump ${state.pumps.length + 1}`, inputType: "text",
+          confirmLabel: "Add pump",
+        });
+        if (!name) return;
+        await api("/api/pumps", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, host: c.ip, port: c.port || 8899 }) });
+        toast(`✓ ${name} added`);
+      } else {
+        await api(`/api/pumps/${target}/gateway`, { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ host: c.ip, port: c.port || 8899 }) });
+        toast(`✓ gateway assigned to ${target}`);
+      }
+    } catch (err) { toast(err.message, true); }
+    await refresh();
+    renderSetup();
+  });
+  document.body.appendChild(overlay);
+}
+
+$("#scan-btn").addEventListener("click", async () => {
+  const btn = $("#scan-btn");
+  btn.disabled = true;
+  btn.textContent = "Scanning…";
+  $("#scan-note").textContent = "sweeping the local network (~10s)";
+  try {
+    const candidates = await api("/api/discover?probe=true");
+    $("#scan-results").innerHTML = candidates.map((c, i) => {
+      const badge = c.matches_pump ? `<span class="pill on">MAC of ${esc(c.matches_pump)}</span>`
+        : c.in_use_by ? `<span class="pill">in use by ${esc(c.in_use_by)}</span>` : "";
+      const temps = c.probe
+        ? `heat pump ✓ · out ${temp(c.probe.outlet_c, 0)}° in ${temp(c.probe.inlet_c, 0)}°`
+        : "no heat pump reply";
+      return `<button class="gw-row" data-candidate="${i}">
+          <b>${esc(c.ip)}:${c.port || 8899}</b>
+          <span>${c.mac ? esc(c.mac) : "MAC unknown"}</span>
+          <span class="${c.probe ? "" : "dim"}">${temps}</span>${badge}
+        </button>`;
+    }).join("") || `<div class="empty small">Nothing found. Are the W610s powered, on this WiFi, and not on a guest/IoT network?</div>`;
+    $("#scan-results").querySelectorAll("[data-candidate]").forEach(row =>
+      row.onclick = () => assignCandidate(candidates[Number(row.dataset.candidate)]));
+    $("#scan-note").textContent = `${candidates.length} found`;
+  } catch (err) {
+    toast(`scan failed: ${err.message}`, true);
+    $("#scan-note").textContent = "";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan network";
+  }
+});
+
+document.addEventListener("click", async (e) => {
+  const rm = e.target.closest("[data-remove-pump]");
+  if (!rm) return;
+  const id = rm.dataset.removePump;
+  const p = state.pumps.find(x => x.id === id);
+  const ok = await confirmDialog({
+    title: `Remove ${p?.name || id}?`,
+    body: "Stops polling and removes it from the dashboard. Its history and events stay in the database. The heat pump itself is not affected.",
+    confirmLabel: "Remove", danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/pumps/${id}`, { method: "DELETE" });
+    toast(`removed ${p?.name || id}`);
+  } catch (err) { toast(err.message, true); }
+  await refresh();
+  renderSetup();
+});
 
 function renderPumpSelectors() {
   for (const [elId, key, reload] of [

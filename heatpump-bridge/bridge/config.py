@@ -25,6 +25,8 @@ class PumpConfig(BaseModel):
     # really belongs to THIS physical unit — a swapped/reshuffled IP (pump identity
     # flip-flop) raises a critical alert and blocks all writes to it.
     mac: str | None = None
+    added: bool = False   # True = created via the UI (persisted in bridge state,
+                          # removable via the UI); False = defined in config.yaml
 
 
 class GuardrailConfig(BaseModel):
@@ -72,39 +74,69 @@ def load_config(path: str | os.PathLike | None = None) -> AppConfig:
     return cfg
 
 
-# --- discovered-gateway overrides ---------------------------------------------------
-# When discovery (UI assignment or MAC-following auto-rediscovery) moves a pump to a
-# new address, we persist it here — NOT by rewriting config.yaml (which is the human's
-# file, full of comments). Overrides only apply when the stored MAC still matches the
-# config, so editing config.yaml to a new unit invalidates stale overrides naturally.
+# --- bridge-owned state (gateway overrides + UI-added pumps) ------------------------
+# When discovery moves a pump to a new address, or a pump is added via the UI, we
+# persist it here — NOT by rewriting config.yaml (the human's file, full of comments).
+# Overrides only apply while the stored MAC still matches the config, so editing
+# config.yaml to a new unit invalidates stale overrides naturally.
 
-def _overrides_path(cfg: AppConfig) -> Path:
+def _state_path(cfg: AppConfig) -> Path:
     return Path(cfg.db_path).parent / "gateway-overrides.json"
 
 
-def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) -> None:
-    path = _overrides_path(cfg)
-    data = {}
-    if path.exists():
-        with open(path) as f:
-            data = json.load(f)
-    pump = next((p for p in cfg.pumps if p.id == pump_id), None)
-    data[pump_id] = {"host": host, "port": port, "mac": pump.mac if pump else None}
-    with open(path, "w") as f:
-        json.dump(data, f, indent=1)
-
-
-def apply_gateway_overrides(cfg: AppConfig) -> None:
-    path = _overrides_path(cfg)
+def _read_state(cfg: AppConfig) -> dict:
+    path = _state_path(cfg)
     if not path.exists():
-        return
+        return {"overrides": {}, "added_pumps": []}
     try:
         with open(path) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return {"overrides": {}, "added_pumps": []}
+    if "overrides" not in data and "added_pumps" not in data:
+        data = {"overrides": data}  # legacy flat layout
+    data.setdefault("overrides", {})
+    data.setdefault("added_pumps", [])
+    return data
+
+
+def _write_state(cfg: AppConfig, data: dict) -> None:
+    with open(_state_path(cfg), "w") as f:
+        json.dump(data, f, indent=1)
+
+
+def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) -> None:
+    data = _read_state(cfg)
+    pump = next((p for p in cfg.pumps if p.id == pump_id), None)
+    data["overrides"][pump_id] = {"host": host, "port": port,
+                                  "mac": pump.mac if pump else None}
+    if pump and pump.added:  # keep the added-pump record current too
+        save_added_pump(cfg, pump, _data=data)
         return
+    _write_state(cfg, data)
+
+
+def save_added_pump(cfg: AppConfig, pump: PumpConfig, _data: dict | None = None) -> None:
+    data = _data if _data is not None else _read_state(cfg)
+    data["added_pumps"] = [p for p in data["added_pumps"] if p["id"] != pump.id]
+    data["added_pumps"].append(pump.model_dump())
+    _write_state(cfg, data)
+
+
+def remove_added_pump(cfg: AppConfig, pump_id: str) -> None:
+    data = _read_state(cfg)
+    data["added_pumps"] = [p for p in data["added_pumps"] if p["id"] != pump_id]
+    data["overrides"].pop(pump_id, None)
+    _write_state(cfg, data)
+
+
+def apply_gateway_overrides(cfg: AppConfig) -> None:
+    data = _read_state(cfg)
+    for entry in data["added_pumps"]:
+        if not any(p.id == entry["id"] for p in cfg.pumps):
+            cfg.pumps.append(PumpConfig.model_validate(entry))
     for pump in cfg.pumps:
-        entry = data.get(pump.id)
+        entry = data["overrides"].get(pump.id)
         if not entry:
             continue
         if pump.mac and entry.get("mac") and pump.mac.lower() != entry["mac"].lower():

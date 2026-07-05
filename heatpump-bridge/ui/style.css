@@ -140,7 +140,18 @@ table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
 .modal-input input { background: var(--card2); border: 1px solid var(--line);
   color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 18px;
   width: 110px; font-variant-numeric: tabular-nums; }
+.modal-input input.wide { width: 100%; font-size: 16px; }
 .modal-input .range { color: var(--dim); font-size: 12.5px; }
+
+.setup-h { font-size: 13px; color: var(--dim); text-transform: uppercase;
+           letter-spacing: .5px; margin: 18px 0 8px; }
+#pump-list { display: flex; flex-direction: column; gap: 8px; }
+.pump-row { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+            padding: 10px 14px; position: relative; }
+.pump-row-main { display: flex; align-items: center; gap: 10px; }
+.pump-row-detail { color: var(--dim); font-size: 12.5px; margin-top: 3px;
+                   font-variant-numeric: tabular-nums; }
+.pump-row .timer-del { position: absolute; top: 10px; right: 10px; }
 
 .comm { color: var(--dim); font-size: 12px; display: flex; justify-content: space-between;
         align-items: center; gap: 8px; flex-wrap: wrap; }

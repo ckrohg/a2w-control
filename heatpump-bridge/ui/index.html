@@ -23,6 +23,7 @@
     <button class="tab active" data-view="dashboard">Dashboard</button>
     <button class="tab" data-view="history">History</button>
     <button class="tab" data-view="events">Events</button>
+    <button class="tab" data-view="setup">Setup</button>
   </nav>
 
   <main>
@@ -69,6 +70,16 @@
         </div>
       </div>
       <div id="event-list"></div>
+    </section>
+    <section id="view-setup" class="view">
+      <h3 class="setup-h">Heat pumps</h3>
+      <div id="pump-list"></div>
+      <h3 class="setup-h">Gateways on the network</h3>
+      <div class="controls">
+        <button id="scan-btn" class="t-add">Scan network</button>
+        <span id="scan-note" class="paramnote"></span>
+      </div>
+      <div id="scan-results" class="gw-list"></div>
     </section>
   </main>
 

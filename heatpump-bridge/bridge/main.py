@@ -37,6 +37,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             poller.on_gateway_change = persist_gateway
         app.state.pollers = pollers
         app.state.config = cfg
+        app.state.store = store
+        app.state.guard = guard
+        app.state.persist_gateway = persist_gateway
         for poller in pollers.values():
             await poller.start()
         scheduler = Scheduler(store, pollers)
