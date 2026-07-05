@@ -399,6 +399,82 @@ async def test_w610_identity_check_blocks_writes_on_mac_mismatch(rig):
     assert poller.identity_ok is True
 
 
+async def test_apply_gateway_hot_swaps_the_connection(rig, tmp_path):
+    pump, poller, store = rig
+    await poller.poll_once()
+
+    # a second fake pump = the "real" gateway after a DHCP reshuffle
+    pump2 = FakePump(2, free_port())
+    await pump2.start()
+    await pump2.tick()
+    await pump2.set_reg(R.REG_SETPOINT_HEATING, 52)  # distinguishable from pump 1's 45
+
+    persisted = {}
+    async def on_change(pump_id, host, port):
+        persisted[pump_id] = (host, port)
+    poller.on_gateway_change = on_change
+
+    await poller.apply_gateway("127.0.0.1", pump2.port, source="test")
+    await poller.poll_once()
+    assert poller.snapshot["setpoint_c"] == 52          # now reading the other unit
+    assert persisted == {"p1": ("127.0.0.1", pump2.port)}
+    events = await store.get_events("p1", 1)
+    assert any(e["code"] == "gateway_change" for e in events)
+    await pump2.server.shutdown()
+
+
+async def test_auto_rediscovery_follows_the_mac(rig):
+    pump, poller, store = rig
+    poller.cfg.mac = "d8:b0:4c:12:34:56"
+    await poller.poll_once()
+
+    pump2 = FakePump(2, free_port())
+    await pump2.start()
+    await pump2.tick()
+
+    async def fake_discover(extra_ports=None, probe=True):
+        return [{"ip": "127.0.0.1", "port": pump2.port, "mac": "D8:B0:4C:12:34:56",
+                 "source": "test"}]
+    poller._discoverer = fake_discover
+
+    await pump.server.shutdown()               # original gateway vanishes
+    for _ in range(3):
+        await poller.poll_once()               # hits offline threshold -> rediscovery
+    await poller.poll_once()                   # next poll uses the new address
+    assert poller.cfg.port == pump2.port
+    assert poller.online
+    events = await store.get_events("p1", 1)
+    change = next(e for e in events if e["code"] == "gateway_change")
+    assert "auto-rediscovery" in change["message"]
+    await pump2.server.shutdown()
+
+
+async def test_gateway_overrides_persist_and_respect_mac(tmp_path):
+    from bridge.config import AppConfig, apply_gateway_overrides, save_gateway_override
+
+    def make_cfg(mac):
+        return AppConfig(
+            pumps=[PumpConfig(id="p1", name="P1", host="10.0.0.5", mac=mac)],
+            db_path=str(tmp_path / "bridge.db"))
+
+    cfg = make_cfg("d8:b0:4c:12:34:56")
+    save_gateway_override(cfg, "p1", "10.0.0.99", 8899)
+
+    fresh = make_cfg("d8:b0:4c:12:34:56")
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].host == "10.0.0.99"   # override applied, same physical unit
+
+    replaced = make_cfg("aa:aa:aa:aa:aa:aa")    # config now names a different unit
+    apply_gateway_overrides(replaced)
+    assert replaced.pumps[0].host == "10.0.0.5"  # stale override ignored
+
+    # MAC adopted at assignment time survives restarts even if config has none
+    no_mac = make_cfg(None)
+    apply_gateway_overrides(no_mac)
+    assert no_mac.pumps[0].host == "10.0.0.99"
+    assert no_mac.pumps[0].mac == "d8:b0:4c:12:34:56"
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

@@ -142,8 +142,21 @@ table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
   width: 110px; font-variant-numeric: tabular-nums; }
 .modal-input .range { color: var(--dim); font-size: 12.5px; }
 
-.comm { color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; }
+.comm { color: var(--dim); font-size: 12px; display: flex; justify-content: space-between;
+        align-items: center; gap: 8px; flex-wrap: wrap; }
 .comm .err-bad { color: var(--high); font-weight: 700; }
+.find-gw { padding: 5px 12px; border: 1px solid var(--line); border-radius: 8px;
+           background: var(--card2); color: var(--info); font-weight: 700;
+           font-size: 12px; cursor: pointer; }
+.gw-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px;
+           max-height: 45vh; overflow-y: auto; }
+.gw-row { display: flex; flex-direction: column; gap: 2px; text-align: left;
+          background: var(--card2); border: 1px solid var(--line); border-radius: 10px;
+          padding: 10px 12px; color: var(--text); font-size: 13px; cursor: pointer;
+          font-family: inherit; }
+.gw-row:active { border-color: var(--info); }
+.gw-row b { font-variant-numeric: tabular-nums; }
+.gw-row .dim { color: var(--dim); }
 
 .controls { display: flex; gap: 8px; margin: 10px 0 14px; flex-wrap: wrap; }
 .seg { display: flex; background: var(--card); border: 1px solid var(--line);

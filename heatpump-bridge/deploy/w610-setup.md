@@ -36,17 +36,19 @@ firmware version, but the flow is always the same.
 5. **Same sitting, set the serial + socket settings** (see the tables in this doc):
    transparent mode, RS-485, **2400 8N1**; socket = **TCP Server, port 8899**.
 6. **Change the admin password**, then **Save + Restart** from the web UI.
-7. After restart the `USR-W610-xxxx` network disappears — the unit is now on your
-   home WiFi. Find it in the **router's client list** and give it a **DHCP
-   reservation** (suggested: .61 for pump 1, .62 for pump 2 — must match
-   `~/bridge-data/config.yaml` on the Pi).
-   **Also record its MAC address** (on the unit's label and in the router list) into
-   the pump's `mac:` field in `~/bridge-data/config.yaml`. That turns on the bridge's
-   identity check: if this IP ever answers with a different MAC (lease reshuffle,
-   swapped units), the bridge raises a critical alert and blocks writes — the
-   permanent guarantee that "Heat Pump 1" in the UI is that physical machine.
-8. **Verify from the Mac or Pi**: `nc -vz 192.168.1.61 8899` → "succeeded" means the
-   TCP server is up and the bridge can reach it.
+7. **The easy way from here — let the bridge find it.** Open the dashboard: the
+   offline pump card shows a **Find gateway** button. Tap it — the bridge sweeps the
+   LAN (USR broadcast + Modbus-port scan), lists candidates with IP, MAC, and a live
+   heat-pump probe (it actually reads temps to prove which box is which). Tap the
+   right one and you're done: the bridge connects, **adopts the W610's MAC
+   automatically**, persists the assignment across restarts, and from then on
+   verifies identity every poll AND follows the MAC to a new IP if DHCP ever
+   reshuffles (self-healing, with an audit event).
+8. Still recommended (belt + suspenders): give each W610 a **DHCP reservation** in
+   the router (suggested .61 / .62) so addresses don't move in the first place.
+   Manual alternative to step 7: put IPs + `mac:` values in
+   `~/bridge-data/config.yaml` by hand, and check reachability with
+   `nc -vz 192.168.1.61 8899`.
 
 **If it goes sideways**: hold the W610's **Reload/Reset button ~5 s** → factory
 reset → the `USR-W610-xxxx` setup network comes back and you start over. Nothing

@@ -7,9 +7,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
-import re
-import subprocess
 import time
 
 from . import registers as R
@@ -45,32 +42,9 @@ STATE_WATCHES = (
 )
 
 
-def normalize_mac(mac: str) -> str:
-    """Case/zero-pad tolerant: 'D8:B0:4C:1:2:3' == 'd8:b0:4c:01:02:03'."""
-    return ":".join(part.zfill(2) for part in mac.lower().strip().split(":"))
+from .discovery import discover, get_mac_for_ip, normalize_mac  # noqa: F401 (re-export)
 
-
-async def get_mac_for_ip(host: str) -> str | None:
-    """Best-effort ARP lookup for the MAC behind an IP we have an open TCP
-    connection to. Returns None when unresolvable (localhost/sim, cold ARP cache) —
-    callers must treat None as 'cannot verify', never as a mismatch."""
-    def _lookup() -> str | None:
-        try:
-            if os.path.exists("/proc/net/arp"):  # Linux / the Pi
-                with open("/proc/net/arp") as f:
-                    for line in f.readlines()[1:]:
-                        parts = line.split()
-                        if len(parts) >= 4 and parts[0] == host:
-                            return None if parts[3] == "00:00:00:00:00:00" else parts[3]
-            else:  # macOS dev
-                out = subprocess.run(["arp", "-n", host], capture_output=True,
-                                     text=True, timeout=2)
-                m = re.search(r"(([0-9a-f]{1,2}:){5}[0-9a-f]{1,2})", out.stdout.lower())
-                return m.group(1) if m else None
-        except Exception:
-            return None
-        return None
-    return await asyncio.to_thread(_lookup)
+REDISCOVER_MIN_INTERVAL_S = 300  # at most one MAC-following network sweep per 5 min
 
 
 class PumpPoller:
@@ -85,6 +59,9 @@ class PumpPoller:
         self._prev_config: dict[str, int] | None = None  # external-change detection state
         self.identity_ok: bool = True   # MAC-vs-IP verification (see _check_identity)
         self._mac_resolver = get_mac_for_ip  # injectable for tests
+        self._discoverer = discover          # injectable for tests
+        self._last_rediscover = 0.0
+        self.on_gateway_change = None   # optional async callback(pump_id, host, port)
         self.snapshot: dict = {"id": cfg.id, "name": cfg.name, "online": False,
                                "write_enabled": cfg.write_enabled}
         self._task: asyncio.Task | None = None
@@ -186,11 +163,50 @@ class PumpPoller:
             return [g.cooling_setpoint_min_c, g.cooling_setpoint_max_c]
         return None
 
+    async def apply_gateway(self, host: str, port: int, *, source: str) -> None:
+        """Point this pump at a (new) gateway address: swap the Modbus client live,
+        reset identity state, audit, and notify the persistence callback."""
+        old = f"{self.cfg.host}:{self.cfg.port}"
+        self.client.close()
+        self.cfg.host, self.cfg.port = host, port
+        self.client = PumpClient(host, port, self.cfg.device_id,
+                                 self.app_cfg.modbus_timeout_s)
+        self.identity_ok = True
+        await self.store.add_event(
+            self.cfg.id, "comm", code="gateway_change", severity="info",
+            message=f"gateway address updated {old} -> {host}:{port} ({source})")
+        if self.on_gateway_change:
+            await self.on_gateway_change(self.cfg.id, host, port)
+
+    async def _try_rediscover(self) -> None:
+        """Offline and we know the physical unit's MAC — sweep the LAN and follow it.
+        Makes DHCP reshuffles self-healing instead of an outage."""
+        if not self.cfg.mac:
+            return
+        now = time.monotonic()
+        if now - self._last_rediscover < REDISCOVER_MIN_INTERVAL_S:
+            return
+        self._last_rediscover = now
+        want = normalize_mac(self.cfg.mac)
+        try:
+            candidates = await self._discoverer(extra_ports={self.cfg.port}, probe=False)
+        except Exception:
+            log.exception("[%s] rediscovery sweep failed", self.cfg.id)
+            return
+        match = next((c for c in candidates
+                      if c.get("mac") and normalize_mac(c["mac"]) == want), None)
+        if match and (match["ip"] != self.cfg.host or match.get("port", self.cfg.port) != self.cfg.port):
+            log.info("[%s] found configured MAC at new address %s", self.cfg.id, match["ip"])
+            await self.apply_gateway(match["ip"], match.get("port", self.cfg.port),
+                                     source="auto-rediscovery followed the MAC")
+
     async def _handle_poll_failure(self, exc: ModbusError) -> None:
         threshold = self.app_cfg.guardrails.offline_after_failed_polls
         failures = self.client.stats.consecutive_failures
         log.warning("[%s] poll failed (%s, %d consecutive): %s",
                     self.cfg.id, exc.category, failures, exc)
+        if failures >= threshold:
+            await self._try_rediscover()
         if failures == threshold and self.snapshot.get("online"):
             self.snapshot = {**self.snapshot, "online": False, "state": "offline",
                              "comm": self.client.stats.as_dict()}

@@ -230,6 +230,7 @@ function renderDashboard() {
       <div class="comm">
         <span>errors: <span class="${err > 0.05 ? "err-bad" : ""}">${(err * 100).toFixed(1)}%</span></span>
         ${s.identity_ok === false ? '<span class="err-bad">⚠ W610 identity mismatch — writes blocked</span>' : ""}
+        ${!s.online ? `<button class="find-gw" data-find-gw>Find gateway</button>` : ""}
         <span>last poll ${fmtAgo(s.last_poll_ts)}</span>
       </div>
     </div>`;
@@ -402,6 +403,63 @@ document.addEventListener("click", async (e) => {
       renderDashboard();
     } catch (err) { toast(err.message, true); }
   }
+});
+
+// gateway discovery: scan the LAN, pick the right W610 for an offline pump
+document.addEventListener("click", async (e) => {
+  const findBtn = e.target.closest("[data-find-gw]");
+  if (!findBtn) return;
+  const card = e.target.closest("[data-pump]");
+  const id = card?.dataset.pump;
+  if (!id) return;
+  findBtn.disabled = true;
+  findBtn.textContent = "Scanning…";
+  let candidates = [];
+  try {
+    candidates = await api("/api/discover?probe=true");
+  } catch (err) {
+    toast(`scan failed: ${err.message}`, true);
+    return;
+  }
+  const rows = candidates.map(c => {
+    const badge = c.matches_pump === id
+      ? '<span class="pill on">MAC matches this pump ✓</span>'
+      : c.matches_pump ? `<span class="pill on bad">MAC of ${esc(c.matches_pump)}</span>`
+      : c.in_use_by ? `<span class="pill">in use by ${esc(c.in_use_by)}</span>` : "";
+    const temps = c.probe
+      ? `heat pump ✓ · out ${temp(c.probe.outlet_c, 0)}° in ${temp(c.probe.inlet_c, 0)}°`
+      : "no heat pump reply";
+    return `<button class="gw-row" data-gw-host="${esc(c.ip)}" data-gw-port="${c.port || 8899}">
+        <b>${esc(c.ip)}:${c.port || 8899}</b>
+        <span>${c.mac ? esc(c.mac) : "MAC unknown"}</span>
+        <span class="${c.probe ? "" : "dim"}">${temps}</span>${badge}
+      </button>`;
+  }).join("");
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `<div class="modal">
+      <h3>Assign a gateway to ${esc(state.snapshots[id]?.name || id)}</h3>
+      <p>${candidates.length ? "Gateways found on this network — tap one:"
+                             : "No gateways found. Is the W610 powered and on the WiFi?"}</p>
+      <div class="gw-list">${rows}</div>
+      <div class="modal-actions"><button class="m-cancel">Cancel</button></div>
+    </div>`;
+  overlay.querySelector(".m-cancel").onclick = () => overlay.remove();
+  overlay.addEventListener("click", ev => { if (ev.target === overlay) overlay.remove(); });
+  overlay.querySelectorAll(".gw-row").forEach(row => row.onclick = async () => {
+    overlay.remove();
+    try {
+      const r = await api(`/api/pumps/${id}/gateway`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host: row.dataset.gwHost, port: Number(row.dataset.gwPort) }),
+      });
+      toast(r.online ? `✓ ${id} connected via ${row.dataset.gwHost}` :
+        `assigned ${row.dataset.gwHost} — waiting for first poll`);
+    } catch (err) { toast(err.message, true); }
+    await refresh();
+  });
+  document.body.appendChild(overlay);
 });
 
 // remember expand/collapse across the 5s re-renders

@@ -3,6 +3,7 @@
 # so a freshly configured real pump is read-only until explicitly enabled (Phase 1 rule).
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -66,4 +67,49 @@ def load_config(path: str | os.PathLike | None = None) -> AppConfig:
     cfg_path = Path(path or os.environ.get("BRIDGE_CONFIG", "config.yaml"))
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)
-    return AppConfig.model_validate(raw)
+    cfg = AppConfig.model_validate(raw)
+    apply_gateway_overrides(cfg)
+    return cfg
+
+
+# --- discovered-gateway overrides ---------------------------------------------------
+# When discovery (UI assignment or MAC-following auto-rediscovery) moves a pump to a
+# new address, we persist it here — NOT by rewriting config.yaml (which is the human's
+# file, full of comments). Overrides only apply when the stored MAC still matches the
+# config, so editing config.yaml to a new unit invalidates stale overrides naturally.
+
+def _overrides_path(cfg: AppConfig) -> Path:
+    return Path(cfg.db_path).parent / "gateway-overrides.json"
+
+
+def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) -> None:
+    path = _overrides_path(cfg)
+    data = {}
+    if path.exists():
+        with open(path) as f:
+            data = json.load(f)
+    pump = next((p for p in cfg.pumps if p.id == pump_id), None)
+    data[pump_id] = {"host": host, "port": port, "mac": pump.mac if pump else None}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=1)
+
+
+def apply_gateway_overrides(cfg: AppConfig) -> None:
+    path = _overrides_path(cfg)
+    if not path.exists():
+        return
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    for pump in cfg.pumps:
+        entry = data.get(pump.id)
+        if not entry:
+            continue
+        if pump.mac and entry.get("mac") and pump.mac.lower() != entry["mac"].lower():
+            continue  # config points at a different physical unit now — override stale
+        pump.host = entry["host"]
+        pump.port = entry.get("port", pump.port)
+        if not pump.mac and entry.get("mac"):
+            pump.mac = entry["mac"]  # adopted at assignment time; keep it across restarts

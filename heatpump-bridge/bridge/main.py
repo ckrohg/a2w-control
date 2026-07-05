@@ -28,7 +28,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         await store.open()
         guard = SetpointGuard(cfg.guardrails)
         pollers = {p.id: PumpPoller(p, cfg, store, guard) for p in cfg.pumps}
+
+        async def persist_gateway(pump_id: str, host: str, port: int):
+            from .config import save_gateway_override
+            save_gateway_override(cfg, pump_id, host, port)
+
+        for poller in pollers.values():
+            poller.on_gateway_change = persist_gateway
         app.state.pollers = pollers
+        app.state.config = cfg
         for poller in pollers.values():
             await poller.start()
         scheduler = Scheduler(store, pollers)

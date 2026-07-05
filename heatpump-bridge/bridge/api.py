@@ -41,6 +41,11 @@ class ScheduleRequest(BaseModel):
     action: Literal["on", "off"]
 
 
+class GatewayRequest(BaseModel):
+    host: str
+    port: int = 8899
+
+
 def _pollers(request: Request) -> dict[str, PumpPoller]:
     return request.app.state.pollers
 
@@ -146,6 +151,49 @@ async def delete_schedule(request: Request, pump_id: str, schedule_id: int):
         pump_id, "schedule_change", code="removed", severity="info",
         message=f"timer {schedule_id} removed")
     return await poller.store.list_schedules(pump_id)
+
+
+@router.get("/discover")
+async def discover_gateways(request: Request, probe: bool = True):
+    """Sweep the LAN for W610 gateways (USR broadcast + Modbus-port scan), optionally
+    probing each with a real register read. Marks which candidate matches each
+    configured pump's MAC."""
+    from .discovery import discover, normalize_mac
+
+    pollers = _pollers(request)
+    extra_ports = {p.cfg.port for p in pollers.values()}
+    candidates = await discover(extra_ports=extra_ports, probe=probe)
+    mac_to_pump = {normalize_mac(p.cfg.mac): p.cfg.id
+                   for p in pollers.values() if p.cfg.mac}
+    for c in candidates:
+        c["matches_pump"] = mac_to_pump.get(normalize_mac(c["mac"])) if c.get("mac") else None
+        c["in_use_by"] = next((p.cfg.id for p in pollers.values()
+                               if p.cfg.host == c["ip"] and p.cfg.port == c.get("port")), None)
+    return candidates
+
+
+@router.post("/pumps/{pump_id}/gateway")
+async def set_gateway(request: Request, pump_id: str, body: GatewayRequest):
+    """Assign a discovered gateway to this pump. If the pump has a configured MAC and
+    the target's MAC is resolvable, they must match (409 otherwise) — you cannot
+    accidentally point pump 1 at pump 2's gateway."""
+    from .discovery import get_mac_for_ip, normalize_mac
+
+    poller = _pump(request, pump_id)
+    actual = await get_mac_for_ip(body.host)
+    if poller.cfg.mac:
+        if actual and normalize_mac(actual) != normalize_mac(poller.cfg.mac):
+            raise HTTPException(
+                409, f"{body.host} answers with MAC {actual}, but {pump_id} is "
+                     f"configured as {poller.cfg.mac} — that's a different physical unit")
+    elif actual:
+        # trust-on-first-assignment: adopt the MAC so identity checking + MAC-following
+        # rediscovery are active from here on, without anyone typing a MAC
+        poller.cfg.mac = actual
+    await poller.apply_gateway(body.host, body.port, source="assigned via UI")
+    await poller.poll_once()
+    return {"host": body.host, "port": body.port, "online": poller.online,
+            "mac": poller.cfg.mac}
 
 
 @router.get("/health")
