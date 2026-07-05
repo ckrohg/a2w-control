@@ -10,6 +10,24 @@
 - [x] Mobile UI (no build step) against two simulated pumps
 - [x] **Exit verified:** setpoint changed from phone-sized UI with verified read-back; P01/P17/E18 injected → plain-English alerts appeared with correct severities and cleared
 
+## Pre-hardware checklist (everything doable before the W610s arrive)
+
+- [ ] **Pi dress rehearsal** (if the CanaKit Pi is on hand): flash the SD card, boot,
+      run the one-command bootstrap. Optionally run the simulator ON the Pi
+      (`uv run python sim/fake_pump.py` + point config at localhost) — full dashboard
+      from a phone, exercising the exact production stack end-to-end.
+- [ ] **Cloudflare account + domain** (~$10/yr) for the from-anywhere tunnel — the only
+      remaining purchase decision that isn't hardware. (Alternative: Tailscale, no
+      domain needed, app per device.)
+- [ ] **Router prep**: confirm a 2.4 GHz-capable SSID with no client isolation; plan
+      three DHCP reservations (Pi, W610 ×2).
+- [ ] **Bench kit for W610 day**: any 12 V DC adapter for bench config, labels.
+- [ ] **Decide alert notifications** (v1.1): critical faults (P01 water flow) currently
+      show only in the UI — nobody gets paged. Options: ntfy.sh (free, no account),
+      Pushover (~$5 once), or email. Fully buildable + testable against the sim now.
+- [ ] Winnie: reply pending on BMS port/pinout (sent 2026-07-04); add the
+      forced-defrost-register question when nudging.
+
 ## Next — W610 prep + Phases 1–2
 
 - [ ] When W610s arrive: bench-configure per `heatpump-bridge/deploy/w610-setup.md` (transparent mode, 2400 8N1, TCP server 8899, DHCP reservations)
