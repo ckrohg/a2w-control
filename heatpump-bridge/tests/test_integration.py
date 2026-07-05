@@ -520,6 +520,40 @@ async def test_add_and_remove_pump_at_runtime(rig):
     await pump3.server.shutdown()
 
 
+async def test_nightly_maintenance_backup_and_retention(rig, tmp_path):
+    import time as time_mod
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()  # at least one sample row exists
+
+    # plant an ancient sample that retention must remove
+    await store._exec(
+        "INSERT INTO samples (pump_id, ts, inlet_c, outlet_c, ambient_c, setpoint_c,"
+        " power_sys1, power_sys2, heating, status_word) VALUES (?,?,0,0,0,0,0,0,0,0)",
+        ("p1", time_mod.time() - 400 * 86400))
+
+    sched = Scheduler(store, {"p1": poller})
+    await sched.run_maintenance(datetime(2026, 7, 5, 3, 30))
+
+    backups = Path(store.path).parent / "backups"
+    assert (backups / "bridge-20260705.db").exists()
+    old = await store._query(
+        "SELECT COUNT(*) AS n FROM samples WHERE ts < ?",
+        (time_mod.time() - 365 * 86400,))
+    assert old[0]["n"] == 0          # ancient sample pruned
+    recent = await store._query("SELECT COUNT(*) AS n FROM samples", ())
+    assert recent[0]["n"] >= 1       # today's data intact
+
+    # rotation: fabricate old backups beyond the keep window
+    for i in range(10):
+        (backups / f"bridge-2025010{i}.db").touch()
+    await sched.run_maintenance(datetime(2026, 7, 6, 3, 30))
+    assert len(list(backups.glob("bridge-*.db"))) == 7
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

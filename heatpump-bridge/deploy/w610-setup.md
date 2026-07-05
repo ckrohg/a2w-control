@@ -64,7 +64,7 @@ precious is ever stored on the unit.
 |---|---|
 | WiFi mode | STA |
 | Socket | **TCP Server**, port **8899** (factory default) |
-| Max clients | 1 is fine (the Pi is the only master) |
+| Max clients | 2 if the firmware offers it (lets Setup-tab probes coexist with the live connection); 1 also works — the bridge never probes a gateway it's already using |
 | IP | DHCP + **reservation in the router**. Suggested: .61 for pump 1, .62 for pump 2 |
 
 ## Wiring (per handoff §3 — settled)

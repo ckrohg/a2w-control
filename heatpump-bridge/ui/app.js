@@ -613,7 +613,7 @@ $("#scan-btn").addEventListener("click", async () => {
         : c.in_use_by ? `<span class="pill">in use by ${esc(c.in_use_by)}</span>` : "";
       const temps = c.probe
         ? `heat pump ✓ · out ${temp(c.probe.outlet_c, 0)}° in ${temp(c.probe.inlet_c, 0)}°`
-        : "no heat pump reply";
+        : c.probe_skipped ? esc(c.probe_skipped) : "no heat pump reply";
       return `<button class="gw-row" data-candidate="${i}">
           <b>${esc(c.ip)}:${c.port || 8899}</b>
           <span>${c.mac ? esc(c.mac) : "MAC unknown"}</span>

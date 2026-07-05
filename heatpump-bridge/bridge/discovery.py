@@ -127,8 +127,12 @@ async def probe_heatpump(host: str, port: int, device_id: int = 1,
         client.close()
 
 
-async def discover(extra_ports: set[int] | None = None, probe: bool = True) -> list[dict]:
-    """Full sweep -> [{ip, port, mac, source, probe}]. Modbus port default 8899."""
+async def discover(extra_ports: set[int] | None = None, probe: bool = True,
+                   skip_probe: set[tuple[str, int]] | None = None) -> list[dict]:
+    """Full sweep -> [{ip, port, mac, source, probe}]. Modbus port default 8899.
+    skip_probe: (host, port) pairs NOT to open a Modbus connection to — gateways the
+    bridge is actively using. Transparent-mode W610s may allow a single TCP client;
+    probing a live one could steal the bridge's connection mid-poll."""
     ports = {8899} | (extra_ports or set())
     udp_found = await usr_udp_discover()
     open_ports = await tcp_scan(local_subnet_hosts(), ports)
@@ -145,5 +149,9 @@ async def discover(extra_ports: set[int] | None = None, probe: bool = True) -> l
         if not entry.get("mac"):
             entry["mac"] = await get_mac_for_ip(entry["ip"])
         if probe and entry.get("port"):
-            entry["probe"] = await probe_heatpump(entry["ip"], entry["port"])
+            if skip_probe and (entry["ip"], entry["port"]) in skip_probe:
+                entry["probe"] = None
+                entry["probe_skipped"] = "connected to this bridge"
+            else:
+                entry["probe"] = await probe_heatpump(entry["ip"], entry["port"])
     return sorted(candidates.values(), key=lambda e: e["ip"])

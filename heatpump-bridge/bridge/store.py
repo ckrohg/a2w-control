@@ -167,6 +167,25 @@ class Store:
         await self._exec("UPDATE schedules SET last_fired_date=? WHERE id=?",
                          (today, schedule_id))
 
+    # --- maintenance (run nightly by the scheduler) -----------------------------
+    async def backup(self, dest: str) -> None:
+        """Consistent online backup via SQLite's backup API — survives SD card death
+        as long as yesterday's copy does."""
+        def _run():
+            dst = sqlite3.connect(dest)
+            try:
+                with dst:
+                    self._conn.backup(dst)
+            finally:
+                dst.close()
+        await asyncio.to_thread(_run)
+
+    async def prune(self, *, samples_days: float = 365, comm_days: float = 90) -> None:
+        cutoff = time.time() - samples_days * 86400
+        await self._exec("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        await self._exec("DELETE FROM comm_stats WHERE ts < ?",
+                         (time.time() - comm_days * 86400,))
+
     async def get_open_faults(self, pump_id: str) -> dict[str, float]:
         """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —
         keeps 'active since' honest across bridge restarts."""

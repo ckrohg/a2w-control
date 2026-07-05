@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from .guardrails import GuardrailError
 from .poller import PumpPoller
@@ -14,7 +15,9 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
-CHECK_INTERVAL_S = 20  # < 1 minute so no HH:MM slot is ever skipped
+CHECK_INTERVAL_S = 20      # < 1 minute so no HH:MM slot is ever skipped
+MAINTENANCE_HHMM = "03:30"  # nightly backup + retention pruning
+BACKUPS_KEEP = 7
 
 
 class Scheduler:
@@ -22,6 +25,7 @@ class Scheduler:
         self.store = store
         self.pollers = pollers
         self._task: asyncio.Task | None = None
+        self._last_maintenance_date: str | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="scheduler")
@@ -42,6 +46,10 @@ class Scheduler:
 
     async def check_once(self, now: datetime) -> None:
         """Fire every enabled rule matching this minute (at most once per rule per day)."""
+        if (now.strftime("%H:%M") == MAINTENANCE_HHMM
+                and self._last_maintenance_date != now.strftime("%Y-%m-%d")):
+            self._last_maintenance_date = now.strftime("%Y-%m-%d")
+            await self.run_maintenance(now)
         due = await self.store.due_schedules(now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
         for rule in due:
             # mark first: a failing write must not retry every 20s for the whole minute
@@ -55,3 +63,18 @@ class Scheduler:
             except GuardrailError as exc:
                 # already audited by the write path; nothing else to do
                 log.warning("schedule %s failed: %s", rule["id"], exc)
+
+    async def run_maintenance(self, now: datetime) -> None:
+        """Nightly: consistent DB backup (rotated) + retention pruning. A dead SD card
+        costs at most a day of history plus a bootstrap re-run."""
+        backups = Path(self.store.path).parent / "backups"
+        backups.mkdir(exist_ok=True)
+        dest = backups / f"bridge-{now.strftime('%Y%m%d')}.db"
+        try:
+            await self.store.backup(str(dest))
+            for old in sorted(backups.glob("bridge-*.db"))[:-BACKUPS_KEEP]:
+                old.unlink()
+            await self.store.prune()
+            log.info("maintenance: backup %s written, retention pruned", dest.name)
+        except Exception:
+            log.exception("maintenance failed")

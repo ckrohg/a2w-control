@@ -223,7 +223,8 @@ async def discover_gateways(request: Request, probe: bool = True):
 
     pollers = _pollers(request)
     extra_ports = {p.cfg.port for p in pollers.values()}
-    candidates = await discover(extra_ports=extra_ports, probe=probe)
+    in_use = {(p.cfg.host, p.cfg.port) for p in pollers.values() if p.online}
+    candidates = await discover(extra_ports=extra_ports, probe=probe, skip_probe=in_use)
     mac_to_pump = {normalize_mac(p.cfg.mac): p.cfg.id
                    for p in pollers.values() if p.cfg.mac}
     for c in candidates:
