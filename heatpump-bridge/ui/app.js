@@ -553,6 +553,10 @@ async function assignCandidate(c) {
             <b>Assign to ${esc(p.name)}</b><span class="dim">currently ${esc(p.host)}:${p.port}</span>
           </button>`).join("")}
         <button class="gw-row" data-assign="__new__"><b>＋ Add as a new heat pump</b></button>
+        <button class="gw-row" data-assign="__configure__">
+          <b>⚙ Auto-configure serial</b>
+          <span class="dim">sets 2400 8N1 + transparent mode over the network (experimental)</span>
+        </button>
       </div>
       <div class="modal-actions"><button class="m-cancel">Cancel</button></div>
     </div>`;
@@ -562,6 +566,17 @@ async function assignCandidate(c) {
     overlay.remove();
     const target = btn.dataset.assign;
     try {
+      if (target === "__configure__") {
+        toast("configuring W610…");
+        const r = await api("/api/w610/configure", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ host: c.ip }),
+        });
+        toast(r.ok
+          ? (r.changed.length ? `✓ configured: ${r.changed.join("; ")} — rebooting` : "✓ already configured correctly")
+          : r.error, !r.ok);
+        return;
+      }
       if (target === "__new__") {
         const name = await promptDialog({
           title: "Name the new heat pump",

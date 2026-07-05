@@ -257,6 +257,24 @@ async def set_gateway(request: Request, pump_id: str, body: GatewayRequest):
             "mac": poller.cfg.mac}
 
 
+@router.post("/w610/configure")
+async def configure_w610_endpoint(request: Request, body: GatewayRequest):
+    """EXPERIMENTAL: push the required serial settings (2400 8N1, transparent mode)
+    to a W610 over the vendor UDP channel — the web-console alternative."""
+    from .w610_config import configure_w610
+
+    report = await configure_w610(body.host)
+    for p in _pollers(request).values():
+        if p.cfg.host == body.host:
+            await p.store.add_event(
+                p.cfg.id, "comm", code="w610_configure",
+                severity="info" if report["ok"] else "warning",
+                message=f"W610 auto-configure at {body.host}: "
+                        f"{', '.join(report['changed']) or report.get('error', 'already correct')}")
+            break
+    return report
+
+
 @router.get("/health")
 async def health(request: Request):
     pollers = _pollers(request)
