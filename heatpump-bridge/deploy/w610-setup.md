@@ -33,6 +33,8 @@ firmware version, but the flow is always the same.
    SSID → enter the WiFi password (WPA2). Leave STA IP on **DHCP**.
    ⚠️ The W610 is **2.4 GHz only** — if your WiFi is a mesh with a combined SSID
    that's fine, but a 5 GHz-only network won't work.
+   ⚠️ Use the **same network/SSID as the Pi** — not a guest or "IoT" SSID with
+   client isolation, or the Pi won't be able to discover or reach the gateways.
 5. **Same sitting, set the serial + socket settings** (see the tables in this doc):
    transparent mode, RS-485, **2400 8N1**; socket = **TCP Server, port 8899**.
 6. **Change the admin password**, then **Save + Restart** from the web UI.
