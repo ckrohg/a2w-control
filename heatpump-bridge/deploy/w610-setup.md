@@ -35,8 +35,12 @@ firmware version, but the flow is always the same.
    that's fine, but a 5 GHz-only network won't work.
    ⚠️ Use the **same network/SSID as the Pi** — not a guest or "IoT" SSID with
    client isolation, or the Pi won't be able to discover or reach the gateways.
-5. **Same sitting, set the serial + socket settings** (see the tables in this doc):
-   transparent mode, RS-485, **2400 8N1**; socket = **TCP Server, port 8899**.
+5. **Serial settings — try the automatic way first**: once the unit is on your WiFi,
+   go to the dashboard → **Setup → Scan network** → tap the W610 → **Auto-configure
+   serial**. The bridge pushes 2400 8N1 + transparent mode over the vendor protocol
+   and reboots the unit. (Experimental until verified on unit #1 — if it reports it
+   couldn't, fall back to the web console: transparent mode, RS-485, **2400 8N1**;
+   socket = **TCP Server, port 8899**.)
 6. **Change the admin password**, then **Save + Restart** from the web UI.
 7. **The easy way from here — let the bridge find it.** Open the dashboard: the
    offline pump card shows a **Find gateway** button. Tap it — the bridge sweeps the
