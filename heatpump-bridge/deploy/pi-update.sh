@@ -28,9 +28,20 @@ fi
 
 echo "update: $current -> $target"
 echo "$target" > "$STATE"
-git reset --hard -q "$target"
-(cd "$BRIDGE" && uv sync --no-dev)
-$RESTART_CMD
+
+apply() {  # checkout + deps + restart; any step failing returns nonzero
+  git reset --hard -q "$1" \
+    && (cd "$BRIDGE" && uv sync --no-dev) \
+    && $RESTART_CMD
+}
+
+if ! apply "$target"; then
+  # a mid-apply failure (sync error, restart refusal) must not strand the repo on
+  # $target with a broken venv while the check above reports "up to date" forever
+  echo "APPLY FAILED for $target — rolling back to $current"
+  apply "$current" || echo "rollback apply also failed — manual attention needed"
+  exit 1
+fi
 
 for _ in $(seq 1 30); do
   if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
@@ -42,7 +53,5 @@ for _ in $(seq 1 30); do
 done
 
 echo "HEALTH CHECK FAILED on $target — rolling back to $current"
-git reset --hard -q "$current"
-(cd "$BRIDGE" && uv sync --no-dev)
-$RESTART_CMD
+apply "$current" || echo "rollback apply failed — manual attention needed"
 exit 1

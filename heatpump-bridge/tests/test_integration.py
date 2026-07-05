@@ -271,6 +271,68 @@ async def test_parameter_write_rejects_out_of_doc_range(rig):
     assert exc.value.status_code == 404
 
 
+async def test_concurrent_setpoint_writes_cannot_bypass_rate_limit(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    results = await asyncio.gather(
+        poller.write_setpoint(46, source="test"),
+        poller.write_setpoint(47, source="test"),
+        return_exceptions=True)
+    ok = [r for r in results if isinstance(r, dict)]
+    limited = [r for r in results if isinstance(r, GuardrailError)]
+    assert len(ok) == 1 and len(limited) == 1     # the write lock serializes them
+    assert limited[0].status_code == 429
+
+
+async def test_non_integer_setpoint_rejected_not_rounded(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    before = await pump.get_reg(R.REG_SETPOINT_HEATING)
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(44.5, source="test")
+    assert exc.value.status_code == 422
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == before  # nothing written
+
+
+async def test_rejected_control_write_does_not_fake_external_change(rig):
+    pump, poller, store = rig
+    await poller.poll_once()
+    poller.cfg.write_enabled = False
+    with pytest.raises(GuardrailError):
+        await poller.write_power(False, source="test")
+    poller.cfg.write_enabled = True
+    await poller.poll_once()
+    await poller.poll_once()
+    fabricated = [e for e in await store.get_events("p1", 1)
+                  if e["type"] == "state" and e["code"] == "changed_on"]
+    assert fabricated == []   # the 403 rejection must not poison change detection
+
+
+async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+    await store.add_schedule("p1", "06:00", "on")
+    await store.add_schedule("p1", "09:00", "off")
+    sched = Scheduler(store, {"p1": poller})
+
+    # bridge was down all morning; first tick at 14:23 — net intended state is OFF,
+    # and only ONE write fires (not an on-then-off burst through the rate limiter)
+    await sched.check_once(datetime(2026, 7, 4, 14, 23))
+    assert await pump.get_reg(R.REG_ON_OFF) == 0
+    fired = [e for e in await store.get_events("p1", 1)
+             if e["type"] == "power_write" and e["code"] == "accepted"]
+    assert len(fired) == 1
+
+    await sched.check_once(datetime(2026, 7, 4, 14, 24))  # both marked: no refire
+    fired = [e for e in await store.get_events("p1", 1)
+             if e["type"] == "power_write" and e["code"] == "accepted"]
+    assert len(fired) == 1
+
+
 async def test_scheduler_fires_once_per_day(rig):
     from datetime import datetime
     from bridge.scheduler import Scheduler
@@ -511,8 +573,12 @@ async def test_add_and_remove_pump_at_runtime(rig):
     with pytest.raises(HTTPException):
         await api_mod.remove_pump(request, "p1")
 
+    # a timer on the doomed pump must die with it — ids are recycled, and an
+    # orphaned schedule would silently attach to a future pump
+    await store.add_schedule(new_id, "22:00", "off")
     await api_mod.remove_pump(request, new_id)
     assert new_id not in ns.pollers
+    assert await store.list_schedules(new_id) == []
     fresh2 = AppConfig(pumps=[PumpConfig(id="p1", name="P1", host="127.0.0.1")],
                        db_path=poller.app_cfg.db_path)
     apply_gateway_overrides(fresh2)

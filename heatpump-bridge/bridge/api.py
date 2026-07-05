@@ -93,13 +93,14 @@ async def add_pump(request: Request, body: AddPumpRequest):
     from .poller import PumpPoller
 
     state = request.app.state
-    existing = set(state.pollers.keys())
-    n = 1
+    mac = await get_mac_for_ip(body.host)  # await BEFORE picking the id: no yield
+    existing = set(state.pollers.keys())   # between id choice and registration, so
+    n = 1                                  # concurrent adds can't collide on pump{n}
     while f"pump{n}" in existing:
         n += 1
     pump_cfg = PumpConfig(
         id=f"pump{n}", name=body.name, host=body.host, port=body.port,
-        mac=await get_mac_for_ip(body.host), added=True, write_enabled=False)
+        mac=mac, added=True, write_enabled=False)
     state.config.pumps.append(pump_cfg)
     poller = PumpPoller(pump_cfg, state.config, state.store, state.guard)
     poller.on_gateway_change = state.persist_gateway
@@ -127,9 +128,11 @@ async def remove_pump(request: Request, pump_id: str):
     del state.pollers[pump_id]
     state.config.pumps = [p for p in state.config.pumps if p.id != pump_id]
     remove_added_pump(state.config, pump_id)
+    # pump ids are recycled — orphaned timers would silently attach to a future pump
+    await state.store.delete_schedules_for_pump(pump_id)
     await state.store.add_event(
         pump_id, "comm", code="pump_removed", severity="info",
-        message=f"{poller.cfg.name} removed via Setup")
+        message=f"{poller.cfg.name} removed via Setup (its timers deleted with it)")
     return {"removed": pump_id}
 
 

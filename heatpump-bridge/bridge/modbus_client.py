@@ -83,12 +83,12 @@ class PumpClient:
                 resp = await self._client.read_holding_registers(
                     block.start, count=block.count, device_id=self.device_id,
                 )
-            except asyncio.TimeoutError as exc:
-                self.stats.timeouts += 1
-                raise ModbusError(f"timeout reading {block.start}", "timeout") from exc
             except ModbusException as exc:
-                self.stats.io_errors += 1
-                raise ModbusError(f"io error reading {block.start}: {exc}", "io") from exc
+                # pymodbus 3.13 swallows asyncio timeouts internally and surfaces
+                # them as ModbusIOException — classify by message so stats.timeouts
+                # actually counts them
+                category = self._classify(exc)
+                raise ModbusError(f"{category} reading {block.start}: {exc}", category) from exc
             if resp.isError():
                 self.stats.exception_responses += 1
                 raise ModbusError(f"exception response for {block.start}: {resp}", "exception")
@@ -105,16 +105,21 @@ class PumpClient:
             await self._ensure_connected()
             try:
                 resp = await self._client.write_register(address, value, device_id=self.device_id)
-            except asyncio.TimeoutError as exc:
-                self.stats.timeouts += 1
-                raise ModbusError(f"timeout writing {address}", "timeout") from exc
             except ModbusException as exc:
-                self.stats.io_errors += 1
-                raise ModbusError(f"io error writing {address}: {exc}", "io") from exc
+                category = self._classify(exc)
+                raise ModbusError(f"{category} writing {address}: {exc}", category) from exc
             if resp.isError():
                 self.stats.exception_responses += 1
                 raise ModbusError(f"exception response writing {address}: {resp}", "exception")
         return await self.read_register(address)
+
+    def _classify(self, exc: Exception) -> str:
+        text = str(exc).lower()
+        if "timeout" in text or "timed out" in text or "no response" in text:
+            self.stats.timeouts += 1
+            return "timeout"
+        self.stats.io_errors += 1
+        return "io"
 
     def record_poll(self, ok: bool) -> None:
         if ok:

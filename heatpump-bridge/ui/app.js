@@ -8,6 +8,7 @@ const state = {
   unit: localStorage.getItem("a2w-unit") === "f" ? "f" : "c",
   detailsOpen: {},      // pump id -> bool, survives re-renders
   schedules: {},        // pump id -> timer rules
+  lastMode: {},         // pump id -> mode_kind, to invalidate stale pending setpoints
   pumps: [],            // [{id, name}]
   snapshots: {},        // id -> /status payload
   pending: {},          // id -> locally adjusted (unconfirmed) setpoint
@@ -40,23 +41,40 @@ async function api(path, opts) {
   return res.json();
 }
 
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;   // overlapping cycles would apply older data over newer
+  refreshing = true;
   try {
     const pumps = await api("/api/pumps");
     state.pumps = pumps;
     $("#health-dot").className = "dot " + (pumps.some(p => p.online) ? "ok" : "bad");
+    // per-pump fetch: one failing pump (e.g. removed in another tab) must not
+    // abort the whole cycle
     await Promise.all(pumps.map(async p => {
-      state.snapshots[p.id] = await api(`/api/pumps/${p.id}/status`);
-      state.schedules[p.id] = await api(`/api/pumps/${p.id}/schedules`);
+      try {
+        state.snapshots[p.id] = await api(`/api/pumps/${p.id}/status`);
+        state.schedules[p.id] = await api(`/api/pumps/${p.id}/schedules`);
+      } catch { /* keep last snapshot; next cycle retries */ }
     }));
-    if (!state.historyPump && pumps.length) state.historyPump = pumps[0].id;
-    if (!state.eventsPump && pumps.length) state.eventsPump = pumps[0].id;
+    // drop a pending (unconfirmed) setpoint if the pump's mode changed under it —
+    // it was chosen against the other mode's bounds
+    for (const p of pumps) {
+      const kind = state.snapshots[p.id]?.mode_kind;
+      if (state.lastMode[p.id] && state.lastMode[p.id] !== kind) delete state.pending[p.id];
+      state.lastMode[p.id] = kind;
+    }
+    // selectors must always point at a live pump
+    if (!pumps.find(p => p.id === state.historyPump)) state.historyPump = pumps[0]?.id ?? null;
+    if (!pumps.find(p => p.id === state.eventsPump)) state.eventsPump = pumps[0]?.id ?? null;
     renderDashboard();
     renderPumpSelectors();
     if (state.view === "setup") renderSetup();
   } catch (err) {
     $("#health-dot").className = "dot bad";
     console.error("refresh failed", err);
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -175,6 +193,18 @@ function renderDetails(id, s) {
 
 function renderDashboard() {
   const wrap = $("#pump-cards");
+  // never rebuild under an open modal, and preserve half-typed timer inputs —
+  // the 5s poll must not wipe in-progress interaction
+  if (document.querySelector(".modal-overlay")) return;
+  const keepTimers = {};
+  wrap.querySelectorAll("[data-pump]").forEach(card => {
+    const t = card.querySelector(".t-time");
+    if (t) keepTimers[card.dataset.pump] = {
+      time: t.value, action: card.querySelector(".t-action")?.value,
+      focused: card.contains(document.activeElement),
+    };
+  });
+  if (Object.values(keepTimers).some(k => k.focused)) return;
   wrap.innerHTML = state.pumps.map(p => {
     const s = state.snapshots[p.id] || {};
     const stateName = s.state || "offline";
@@ -236,6 +266,13 @@ function renderDashboard() {
       </div>
     </div>`;
   }).join("") || `<div class="empty">No pumps configured</div>`;
+  for (const [id, kept] of Object.entries(keepTimers)) {
+    const card = wrap.querySelector(`[data-pump="${id}"]`);
+    const t = card?.querySelector(".t-time");
+    if (t && kept.time) t.value = kept.time;
+    const a = card?.querySelector(".t-action");
+    if (a && kept.action) a.value = kept.action;
+  }
 }
 
 // ---------- confirmation modal ----------

@@ -51,13 +51,14 @@ async def get_mac_for_ip(host: str) -> str | None:
 
 def local_subnet_hosts() -> list[str]:
     """The /24 around this machine's primary LAN address."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))  # no packets sent; just resolves the local address
         own = s.getsockname()[0]
-        s.close()
     except OSError:
         return []
+    finally:
+        s.close()
     base = own.rsplit(".", 1)[0]
     return [f"{base}.{i}" for i in range(1, 255)]
 
@@ -81,9 +82,11 @@ async def usr_udp_discover(timeout_s: float = 1.5) -> dict[str, str]:
 
         transport, _ = await loop.create_datagram_endpoint(
             Proto, local_addr=("0.0.0.0", 0), allow_broadcast=True)
-        transport.sendto(USR_DISCOVERY_PAYLOAD, ("255.255.255.255", USR_DISCOVERY_PORT))
-        await asyncio.sleep(timeout_s)
-        transport.close()
+        try:
+            transport.sendto(USR_DISCOVERY_PAYLOAD, ("255.255.255.255", USR_DISCOVERY_PORT))
+            await asyncio.sleep(timeout_s)
+        finally:
+            transport.close()
     except Exception as exc:
         log.debug("usr broadcast discovery unavailable: %s", exc)
     return found

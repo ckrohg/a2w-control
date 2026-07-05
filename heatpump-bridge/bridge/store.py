@@ -55,6 +55,7 @@ class Store:
     def __init__(self, path: str):
         self.path = path
         self._conn: sqlite3.Connection | None = None
+        self._write_lock = asyncio.Lock()
 
     async def open(self) -> None:
         def _open():
@@ -71,10 +72,13 @@ class Store:
             self._conn = None
 
     async def _exec(self, sql: str, params: tuple = ()) -> None:
-        def _run():
-            with self._conn:  # implicit transaction
-                self._conn.execute(sql, params)
-        await asyncio.to_thread(_run)
+        # one writer at a time: `with conn:` manages the CONNECTION-wide transaction,
+        # so concurrent to_thread writers could roll back each other's work
+        async with self._write_lock:
+            def _run():
+                with self._conn:  # implicit transaction
+                    self._conn.execute(sql, params)
+            await asyncio.to_thread(_run)
 
     async def _query(self, sql: str, params: tuple = ()) -> list[dict]:
         def _run():
@@ -157,11 +161,19 @@ class Store:
                          (schedule_id, pump_id))
 
     async def due_schedules(self, hhmm: str, today: str) -> list[dict]:
-        """Enabled rules matching this wall-clock minute that haven't fired today."""
+        """Enabled rules at-or-before this wall-clock time that haven't fired today —
+        <= (not ==) so a restart or a stalled tick spanning the exact minute still
+        fires the rule late instead of silently skipping the whole day."""
         return await self._query(
             "SELECT id, pump_id, time_hhmm, action FROM schedules WHERE enabled=1"
-            " AND time_hhmm=? AND (last_fired_date IS NULL OR last_fired_date<>?)",
+            " AND time_hhmm<=? AND (last_fired_date IS NULL OR last_fired_date<>?)"
+            " ORDER BY time_hhmm",
             (hhmm, today))
+
+    async def delete_schedules_for_pump(self, pump_id: str) -> None:
+        """On pump removal: pump ids are recycled, so orphaned timers would silently
+        attach to a future pump."""
+        await self._exec("DELETE FROM schedules WHERE pump_id=?", (pump_id,))
 
     async def mark_schedule_fired(self, schedule_id: int, today: str) -> None:
         await self._exec("UPDATE schedules SET last_fired_date=? WHERE id=?",
@@ -188,10 +200,12 @@ class Store:
 
     async def get_open_faults(self, pump_id: str) -> dict[str, float]:
         """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —
-        keeps 'active since' honest across bridge restarts."""
+        keeps 'active since' honest across bridge restarts. Bounded to a year so startup
+        cost can't grow without limit."""
         rows = await self._query(
             "SELECT ts, type, detail FROM events WHERE pump_id=? AND type IN"
-            " ('fault_on','fault_off') ORDER BY ts", (pump_id,),
+            " ('fault_on','fault_off') AND ts>=? ORDER BY ts",
+            (pump_id, time.time() - 365 * 86400),
         )
         open_faults: dict[str, float] = {}
         for r in rows:

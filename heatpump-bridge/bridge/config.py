@@ -101,8 +101,15 @@ def _read_state(cfg: AppConfig) -> dict:
 
 
 def _write_state(cfg: AppConfig, data: dict) -> None:
-    with open(_state_path(cfg), "w") as f:
+    # atomic write: this box lives at a site whose defining problem is power outages —
+    # a half-written JSON must not silently discard added pumps / gateway overrides
+    path = _state_path(cfg)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) -> None:

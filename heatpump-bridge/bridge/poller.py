@@ -62,6 +62,12 @@ class PumpPoller:
         self._discoverer = discover          # injectable for tests
         self._last_rediscover = 0.0
         self.on_gateway_change = None   # optional async callback(pump_id, host, port)
+        # _write_lock makes guardrail check-then-act atomic under concurrent requests
+        # (rate limit was bypassable by requests arriving during a slow 2400-baud write);
+        # _poll_lock stops interleaved polls double-emitting edge events / mixing reads
+        # from two gateways when apply_gateway swaps the client mid-poll.
+        self._write_lock = asyncio.Lock()
+        self._poll_lock = asyncio.Lock()
         self.snapshot: dict = {"id": cfg.id, "name": cfg.name, "online": False,
                                "write_enabled": cfg.write_enabled}
         self._task: asyncio.Task | None = None
@@ -99,17 +105,23 @@ class PumpPoller:
             await asyncio.sleep(max(1.0, self.cfg.poll_interval_s - elapsed))
 
     async def poll_once(self) -> None:
-        """One full poll: three batched reads, decode, edge-detect, persist."""
-        try:
-            regs: dict[int, int] = {}
-            for block in R.ALL_BLOCKS:
-                regs.update(await self.client.read_block(block))
-        except ModbusError as exc:
-            self.client.record_poll(ok=False)
-            await self._handle_poll_failure(exc)
-            return
+        """One full poll: three batched reads, decode, edge-detect, persist.
+        Serialized by _poll_lock; all reads go through one client reference so a
+        concurrent apply_gateway can't produce a snapshot mixing two pumps."""
+        async with self._poll_lock:
+            client = self.client
+            try:
+                regs: dict[int, int] = {}
+                for block in R.ALL_BLOCKS:
+                    regs.update(await client.read_block(block))
+            except ModbusError as exc:
+                client.record_poll(ok=False)
+                await self._handle_poll_failure(exc)
+                return
+            await self._poll_decode_and_store(client, regs)
 
-        self.client.record_poll(ok=True)
+    async def _poll_decode_and_store(self, client: PumpClient, regs: dict[int, int]) -> None:
+        client.record_poll(ok=True)
         await self._check_identity()
         decoded = R.decode_snapshot(regs)
         was_online = self.snapshot.get("online", False)
@@ -130,9 +142,9 @@ class PumpPoller:
                                                        decoded["max_water_temp_c"]),
             "active_faults": list(self.active_faults.values()),
             "identity_ok": self.identity_ok,
-            "comm": self.client.stats.as_dict(),
+            "comm": client.stats.as_dict(),
         }
-        if not was_online and self.client.stats.ok_polls > 1:
+        if not was_online and client.stats.ok_polls > 1:
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
         await self.store.add_sample(self.cfg.id, decoded | {"status_word": regs.get(R.REG_STATUS, 0)})
@@ -165,13 +177,23 @@ class PumpPoller:
 
     async def apply_gateway(self, host: str, port: int, *, source: str) -> None:
         """Point this pump at a (new) gateway address: swap the Modbus client live,
-        reset identity state, audit, and notify the persistence callback."""
+        reset identity AND edge-detection state (the device behind the address may be
+        different — stale baselines would fabricate 'changed at the unit' events and
+        misattributed fault edges), audit, and notify the persistence callback."""
         old = f"{self.cfg.host}:{self.cfg.port}"
         self.client.close()
         self.cfg.host, self.cfg.port = host, port
         self.client = PumpClient(host, port, self.cfg.device_id,
                                  self.app_cfg.modbus_timeout_s)
         self.identity_ok = True
+        self._prev_flags = None
+        self._prev_config = None
+        for gone in self.active_faults.values():  # close the ledger for the old device
+            await self.store.add_event(
+                self.cfg.id, "fault_off", code=gone["code"], severity=gone["severity"],
+                message=f"Cleared (gateway reassigned): {gone['message']}",
+                detail={"key": gone["key"]})
+        self.active_faults.clear()
         await self.store.add_event(
             self.cfg.id, "comm", code="gateway_change", severity="info",
             message=f"gateway address updated {old} -> {host}:{port} ({source})")
@@ -343,7 +365,12 @@ class PumpPoller:
     async def write_setpoint(self, value: float, source: str) -> dict:
         """Mode-aware guarded write: re-read the mode and unit-max registers FRESH
         (never trust a stale snapshot to pick the target register), clamp to the
-        mode's effective bounds, rate limit, write, read-back verify, audit."""
+        mode's effective bounds, rate limit, write, read-back verify, audit.
+        Serialized per pump so concurrent requests can't slip past the rate limit."""
+        async with self._write_lock:
+            return await self._write_setpoint_locked(value, source)
+
+    async def _write_setpoint_locked(self, value: float, source: str) -> dict:
         old = self.snapshot.get("setpoint_c")
 
         async def audit_reject(exc: GuardrailError | ModbusError, code: str, sev: str):
@@ -351,9 +378,14 @@ class PumpPoller:
                 self.cfg.id, "setpoint_write", code=code, severity=sev,
                 message=str(exc), detail={"old": old, "requested": value, "source": source})
 
-        # cheap pre-checks before touching the bus
+        # cheap pre-checks before touching the bus. Whole degrees only: the register
+        # is 1degC resolution — rounding silently would violate "never clamp silently".
         try:
             self._require_identity()
+            if float(value) != int(value):
+                raise GuardrailError(
+                    f"setpoint must be a whole number of °C (got {value}) — the pump "
+                    f"register has 1°C resolution", 422)
             self.guard.validate(self.cfg.id, value, online=self.online,
                                 write_enabled=self.cfg.write_enabled,
                                 min_c=float("-inf"), max_c=float("inf"))
@@ -397,7 +429,7 @@ class PumpPoller:
 
         self.guard.record_write(self.cfg.id)
         readback = R.to_signed(readback_raw) * R.TEMP_SCALE
-        verified = readback == value
+        verified = readback_raw == raw  # raw compare: immune to float/scale surprises
         await self.store.add_event(
             self.cfg.id, "setpoint_write",
             code="accepted" if verified else "verify_mismatch",
@@ -414,10 +446,21 @@ class PumpPoller:
         return {"setpoint_c": readback, "verified": True, "mode": kind}
 
     async def _guarded_control_write(self, register: int, raw: int, *, event_type: str,
-                                     describe: str, source: str) -> None:
+                                     describe: str, source: str,
+                                     note: tuple[str, int] | None = None) -> None:
         """Shared machinery for mode/power writes: same discipline as setpoints —
         precondition checks, per-control rate limit, read-back verify, audit — then an
-        immediate re-poll so the snapshot reflects the new reality right away."""
+        immediate re-poll so the snapshot reflects the new reality right away.
+        `note` = (config_key, value) registered as a local change ONLY after the write
+        verifies — a rejected write must not poison external-change detection."""
+        async with self._write_lock:
+            await self._guarded_control_write_locked(
+                register, raw, event_type=event_type, describe=describe,
+                source=source, note=note)
+
+    async def _guarded_control_write_locked(self, register: int, raw: int, *,
+                                            event_type: str, describe: str, source: str,
+                                            note: tuple[str, int] | None) -> None:
         rate_key = f"{self.cfg.id}:{event_type}"  # own limiter; doesn't block setpoints
 
         async def audit(code: str, sev: str, message: str):
@@ -444,6 +487,8 @@ class PumpPoller:
                         f"read-back mismatch on reg {register}: wrote {raw}, got {readback}")
             raise GuardrailError(
                 f"read-back mismatch: unit did not accept the change", 502)
+        if note:
+            self.note_local_change(*note)
         await audit("accepted", "info", f"{describe} ({source})")
         await self.poll_once()
 
@@ -452,18 +497,18 @@ class PumpPoller:
         doc marks modes 2-5 unstable. UI puts a confirmation step in front of this."""
         target = {"heating": 1, "cooling": 0}[kind]
         current = self.snapshot.get("mode_kind", "?")
-        self.note_local_change("mode", target)
         await self._guarded_control_write(
             R.REG_MODE, target, event_type="mode_write",
-            describe=f"mode {current} -> {kind}", source=source)
+            describe=f"mode {current} -> {kind}", source=source,
+            note=("mode", target))
         return {"mode": kind, "verified": True}
 
     async def write_power(self, on: bool, source: str) -> dict:
         """Unit on/off (reg 2000) — same as the wall controller's power button."""
-        self.note_local_change("on", 1 if on else 0)
         await self._guarded_control_write(
             R.REG_ON_OFF, 1 if on else 0, event_type="power_write",
-            describe=f"unit switched {'on' if on else 'off'}", source=source)
+            describe=f"unit switched {'on' if on else 'off'}", source=source,
+            note=("on", 1 if on else 0))
         return {"on": on, "verified": True}
 
     async def write_parameter(self, key: str, value: int, source: str) -> dict:
@@ -479,8 +524,8 @@ class PumpPoller:
         raw = int(value) & 0xFFFF  # negatives to two's complement
         old = next((p["value"] for p in self.snapshot.get("parameters", [])
                     if p["key"] == key), None)
-        self.note_local_change(key, int(value))
         await self._guarded_control_write(
             addr, raw, event_type="param_write",
-            describe=f"{label}: {old} -> {value}", source=source)
+            describe=f"{label}: {old} -> {value}", source=source,
+            note=(key, int(value)))
         return {"key": key, "value": value, "verified": True}

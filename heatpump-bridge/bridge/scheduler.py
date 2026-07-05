@@ -51,15 +51,23 @@ class Scheduler:
             self._last_maintenance_date = now.strftime("%Y-%m-%d")
             await self.run_maintenance(now)
         due = await self.store.due_schedules(now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
+        # catch-up semantics: mark ALL due rules fired, but execute only the LATEST per
+        # pump — after downtime spanning "on at 06:00, off at 09:00", the net state
+        # (off) is what fires, and the power-write rate limiter is never asked to run
+        # a burst of contradictory writes.
+        latest_per_pump: dict[str, dict] = {}
         for rule in due:
             # mark first: a failing write must not retry every 20s for the whole minute
             await self.store.mark_schedule_fired(rule["id"], now.strftime("%Y-%m-%d"))
+            latest_per_pump[rule["pump_id"]] = rule  # due is ordered by time_hhmm
+        for rule in latest_per_pump.values():
             poller = self.pollers.get(rule["pump_id"])
             if not poller:
                 continue
             try:
                 await poller.write_power(rule["action"] == "on", source="schedule")
-                log.info("schedule %s: %s -> %s", rule["id"], rule["pump_id"], rule["action"])
+                log.info("schedule %s: %s -> %s (%s)", rule["id"], rule["pump_id"],
+                         rule["action"], rule["time_hhmm"])
             except GuardrailError as exc:
                 # already audited by the write path; nothing else to do
                 log.warning("schedule %s failed: %s", rule["id"], exc)
