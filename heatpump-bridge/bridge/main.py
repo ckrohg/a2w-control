@@ -16,6 +16,17 @@ from .poller import PumpPoller
 from .scheduler import Scheduler
 from .store import Store
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """Serve the UI with Cache-Control: no-cache so browsers always revalidate.
+    ETags make that a cheap 304 on the LAN — and it means every auto-update's new
+    UI shows up on the next page load instead of after a mystery hard-refresh."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
@@ -55,7 +66,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     ui_dir = Path(cfg.ui_dir)
     if ui_dir.is_dir():
-        app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")
+        app.mount("/", NoCacheStaticFiles(directory=ui_dir, html=True), name="ui")
     return app
 
 
