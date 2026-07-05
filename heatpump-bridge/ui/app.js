@@ -229,6 +229,7 @@ function renderDashboard() {
       ${s.online ? renderDetails(p.id, s) : ""}
       <div class="comm">
         <span>errors: <span class="${err > 0.05 ? "err-bad" : ""}">${(err * 100).toFixed(1)}%</span></span>
+        ${s.identity_ok === false ? '<span class="err-bad">⚠ W610 identity mismatch — writes blocked</span>' : ""}
         <span>last poll ${fmtAgo(s.last_poll_ts)}</span>
       </div>
     </div>`;

@@ -7,6 +7,9 @@ pumps:
   - id: pump1
     name: Heat Pump 1
     host: 192.168.1.61     # W610 #1 — set a DHCP reservation for its MAC
+    # mac: "d8:b0:4c:00:00:00"  # from W610 #1's label — enables identity verification:
+    #                           # if this IP ever answers with a different MAC (DHCP
+    #                           # reshuffle / swapped units), alert + block writes
     port: 8899             # W610 factory default TCP server port
     device_id: 1           # slave address per SW2 DIP (confirm with Winnie's reply)
     poll_interval_s: 20    # 2400 baud: a full poll is ~1.2s of bus time
@@ -14,6 +17,7 @@ pumps:
   - id: pump2
     name: Heat Pump 2
     host: 192.168.1.62     # W610 #2
+    # mac: "d8:b0:4c:00:00:00"  # from W610 #2's label
     port: 8899
     device_id: 1           # separate bus, so same address is fine
     poll_interval_s: 20

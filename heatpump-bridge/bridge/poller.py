@@ -7,6 +7,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import re
+import subprocess
 import time
 
 from . import registers as R
@@ -42,6 +45,34 @@ STATE_WATCHES = (
 )
 
 
+def normalize_mac(mac: str) -> str:
+    """Case/zero-pad tolerant: 'D8:B0:4C:1:2:3' == 'd8:b0:4c:01:02:03'."""
+    return ":".join(part.zfill(2) for part in mac.lower().strip().split(":"))
+
+
+async def get_mac_for_ip(host: str) -> str | None:
+    """Best-effort ARP lookup for the MAC behind an IP we have an open TCP
+    connection to. Returns None when unresolvable (localhost/sim, cold ARP cache) —
+    callers must treat None as 'cannot verify', never as a mismatch."""
+    def _lookup() -> str | None:
+        try:
+            if os.path.exists("/proc/net/arp"):  # Linux / the Pi
+                with open("/proc/net/arp") as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[0] == host:
+                            return None if parts[3] == "00:00:00:00:00:00" else parts[3]
+            else:  # macOS dev
+                out = subprocess.run(["arp", "-n", host], capture_output=True,
+                                     text=True, timeout=2)
+                m = re.search(r"(([0-9a-f]{1,2}:){5}[0-9a-f]{1,2})", out.stdout.lower())
+                return m.group(1) if m else None
+        except Exception:
+            return None
+        return None
+    return await asyncio.to_thread(_lookup)
+
+
 class PumpPoller:
     def __init__(self, cfg: PumpConfig, app_cfg: AppConfig, store: Store, guard: SetpointGuard):
         self.cfg = cfg
@@ -52,6 +83,8 @@ class PumpPoller:
         self.active_faults: dict[str, dict] = {}  # key -> {code,message,severity,since}
         self._prev_flags: dict[str, bool] | None = None  # runtime edge detection state
         self._prev_config: dict[str, int] | None = None  # external-change detection state
+        self.identity_ok: bool = True   # MAC-vs-IP verification (see _check_identity)
+        self._mac_resolver = get_mac_for_ip  # injectable for tests
         self.snapshot: dict = {"id": cfg.id, "name": cfg.name, "online": False,
                                "write_enabled": cfg.write_enabled}
         self._task: asyncio.Task | None = None
@@ -100,6 +133,7 @@ class PumpPoller:
             return
 
         self.client.record_poll(ok=True)
+        await self._check_identity()
         decoded = R.decode_snapshot(regs)
         was_online = self.snapshot.get("online", False)
         await self._update_faults(decode_faults(regs))
@@ -118,6 +152,7 @@ class PumpPoller:
             "setpoint_bounds_c": self._setpoint_bounds(decoded["mode_kind"],
                                                        decoded["max_water_temp_c"]),
             "active_faults": list(self.active_faults.values()),
+            "identity_ok": self.identity_ok,
             "comm": self.client.stats.as_dict(),
         }
         if not was_online and self.client.stats.ok_polls > 1:
@@ -169,6 +204,38 @@ class PumpPoller:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
         await self._maybe_comm_row(force=True)
+
+    async def _check_identity(self) -> None:
+        """Verify the IP still belongs to the configured physical W610 (by MAC).
+        Guards against DHCP reshuffles / swapped units silently flip-flopping which
+        heat pump we're reading — and worse, writing."""
+        if not self.cfg.mac:
+            return
+        actual = await self._mac_resolver(self.cfg.host)
+        if actual is None:
+            return  # can't verify right now — keep last verdict, never false-alarm
+        ok = normalize_mac(actual) == normalize_mac(self.cfg.mac)
+        if ok == self.identity_ok:
+            return
+        self.identity_ok = ok
+        if not ok:
+            await self.store.add_event(
+                self.cfg.id, "comm", code="identity_mismatch", severity="critical",
+                message=f"W610 identity check FAILED: {self.cfg.host} answers with MAC "
+                        f"{actual}, expected {self.cfg.mac} — this may be the OTHER "
+                        f"pump's gateway. All writes blocked. Check DHCP reservations.")
+            log.error("[%s] identity mismatch at %s: %s != %s",
+                      self.cfg.id, self.cfg.host, actual, self.cfg.mac)
+        else:
+            await self.store.add_event(
+                self.cfg.id, "comm", code="identity_ok", severity="info",
+                message="W610 identity verified again — writes re-enabled")
+
+    def _require_identity(self) -> None:
+        if not self.identity_ok:
+            raise GuardrailError(
+                "identity check failed — the device at this IP is not the configured "
+                "W610 (MAC mismatch); refusing to write to what may be the wrong pump", 409)
 
     @staticmethod
     def _config_values(decoded: dict) -> dict[str, tuple[str, int | float]]:
@@ -270,6 +337,7 @@ class PumpPoller:
 
         # cheap pre-checks before touching the bus
         try:
+            self._require_identity()
             self.guard.validate(self.cfg.id, value, online=self.online,
                                 write_enabled=self.cfg.write_enabled,
                                 min_c=float("-inf"), max_c=float("inf"))
@@ -342,6 +410,7 @@ class PumpPoller:
                 detail={"register": register, "requested": raw, "source": source})
 
         try:
+            self._require_identity()
             self.guard.validate(rate_key, raw, online=self.online,
                                 write_enabled=self.cfg.write_enabled,
                                 min_c=float("-inf"), max_c=float("inf"))

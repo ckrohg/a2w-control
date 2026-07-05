@@ -353,6 +353,52 @@ async def test_external_changes_become_events_but_own_writes_dont(rig):
     assert len(changes) == 1  # still just the external one
 
 
+async def test_w610_identity_check_blocks_writes_on_mac_mismatch(rig):
+    from bridge.poller import normalize_mac
+
+    assert normalize_mac("D8:B0:4C:1:2:3") == normalize_mac("d8:b0:4c:01:02:03")
+
+    pump, poller, store = rig
+    poller.cfg.mac = "D8:B0:4C:12:34:56"
+    arp = {"mac": "d8:b0:4c:12:34:56"}
+
+    async def fake_resolver(host):
+        return arp["mac"]
+    poller._mac_resolver = fake_resolver
+
+    await poller.poll_once()
+    assert poller.identity_ok is True
+    assert poller.snapshot["identity_ok"] is True
+
+    arp["mac"] = "aa:bb:cc:dd:ee:ff"     # DHCP reshuffle: another device answers
+    await poller.poll_once()
+    await poller.poll_once()             # no duplicate events
+    assert poller.identity_ok is False
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(45, source="test")
+    assert exc.value.status_code == 409
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_power(False, source="test")
+    assert exc.value.status_code == 409
+
+    events = [e for e in await store.get_events("p1", 1)
+              if e["code"] == "identity_mismatch"]
+    assert len(events) == 1
+    assert events[0]["severity"] == "critical"
+
+    arp["mac"] = "D8:B0:4C:12:34:56"     # reservation fixed
+    await poller.poll_once()
+    assert poller.identity_ok is True
+    await poller.write_setpoint(45, source="test")  # writes work again
+
+    # unresolvable ARP (None) must never flip the verdict
+    async def unresolvable(host):
+        return None
+    poller._mac_resolver = unresolvable
+    await poller.poll_once()
+    assert poller.identity_ok is True
+
+
 async def test_open_faults_survive_restart(rig):
     pump, poller, store = rig
     await pump.inject_fault("E18", on=True)

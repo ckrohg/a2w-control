@@ -40,6 +40,11 @@ firmware version, but the flow is always the same.
    home WiFi. Find it in the **router's client list** and give it a **DHCP
    reservation** (suggested: .61 for pump 1, .62 for pump 2 — must match
    `~/bridge-data/config.yaml` on the Pi).
+   **Also record its MAC address** (on the unit's label and in the router list) into
+   the pump's `mac:` field in `~/bridge-data/config.yaml`. That turns on the bridge's
+   identity check: if this IP ever answers with a different MAC (lease reshuffle,
+   swapped units), the bridge raises a critical alert and blocks writes — the
+   permanent guarantee that "Heat Pump 1" in the UI is that physical machine.
 8. **Verify from the Mac or Pi**: `nc -vz 192.168.1.61 8899` → "succeeded" means the
    TCP server is up and the bridge can reach it.
 

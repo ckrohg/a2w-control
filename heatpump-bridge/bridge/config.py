@@ -20,6 +20,10 @@ class PumpConfig(BaseModel):
     device_id: int = 1            # Modbus slave address (SW2 DIP, default 1 unconfirmed)
     poll_interval_s: float = 20.0
     write_enabled: bool = False   # Phase 1: reads only until flipped deliberately
+    # W610 MAC from its label. When set, the bridge verifies via ARP that the IP
+    # really belongs to THIS physical unit — a swapped/reshuffled IP (pump identity
+    # flip-flop) raises a critical alert and blocks all writes to it.
+    mac: str | None = None
 
 
 class GuardrailConfig(BaseModel):
