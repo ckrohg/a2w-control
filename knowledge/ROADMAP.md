@@ -16,9 +16,10 @@
       run the one-command bootstrap. Optionally run the simulator ON the Pi
       (`uv run python sim/fake_pump.py` + point config at localhost) — full dashboard
       from a phone, exercising the exact production stack end-to-end.
-- [ ] **Cloudflare account + domain** (~$10/yr) for the from-anywhere tunnel — the only
-      remaining purchase decision that isn't hardware. (Alternative: Tailscale, no
-      domain needed, app per device.)
+- [x] **Remote access decided (2026-07-05): Tailscale Funnel** — free, no domain, public
+      HTTPS URL gated by the bridge login. One-command `deploy/setup-remote.sh` on the Pi.
+      Custom domain (Cloudflare, ~$10/yr) is a non-breaking later upgrade for a pretty URL.
+      (Full data-platform / Supabase mirror explicitly deferred — not wanted yet.)
 - [ ] **Router prep**: confirm a 2.4 GHz-capable SSID with no client isolation; plan
       three DHCP reservations (Pi, W610 ×2).
 - [ ] **Bench kit for W610 day**: any 12 V DC adapter for bench config, labels.
