@@ -39,11 +39,17 @@ last work on ANY router. Aim for at least one strong barrier + detection.**
 power/mode changes with no matching dashboard/API write — surfacing a rogue write (or a
 wall-controller change) even if a barrier is later misconfigured.
 
-### UniFi / Ubiquiti (Dream Machine, UDM, or AmpliFi Alien)
-You have the best case for layer B. On a UniFi console: create an **IoT network/VLAN**, put
-the Pi + gateways on it, then add a **firewall rule** allowing only the Pi's IP to reach the
-gateway IPs on 8899 (and block the gateways from initiating to the rest of the LAN). AmpliFi
-Alien is more limited — if its firewall can't scope per-IP, fall back to layer A + C.
+### Ubiquiti routers
+- **UniFi (Dream Machine / UDM):** best case, use layer B — create an **IoT network/VLAN**,
+  put Pi + gateways on it, add a **firewall rule** allowing only the Pi's IP to reach the
+  gateway IPs on 8899 (and block the gateways from initiating to the rest of the LAN).
+- **AmpliFi Alien (consumer mesh — no VLANs, no per-IP firewall rules):** layer B is NOT
+  available. Recommended path: **layer C mini-router** for the strong barrier (the Alien
+  can't scope traffic between LAN clients, so a $30 GL.iNet uplinked to the Alien is the
+  clean isolation), OR **layer A device-lock** (max-clients=1 + admin pw + disable cloud)
+  + layer D detection if you'd rather add no hardware. Don't use the AmpliFi *guest*
+  network for the Pi — it would block your phone (on the main network) from reaching the
+  LAN dashboard, and its client isolation can block the Pi↔gateway path too.
 
 
 
