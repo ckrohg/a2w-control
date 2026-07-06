@@ -15,12 +15,15 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
   - Pick a **dashboard password** (8+ chars) for the browser login.
   - ntfy: pick a **hard-to-guess topic** name, subscribe to it in the ntfy phone app.
   - (Optional) healthchecks.io: create a check, copy its **ping URL** (the dead-man).
-- [ ] 🖥 **Router prep** — the #1 safety item, and you can stage it before the W610s exist:
-  - Confirm a **2.4 GHz-capable SSID** (W610s are 2.4 GHz only), no client isolation for
-    the Pi↔gateway path.
-  - Create the **isolated segment** for the gateways now: a VLAN or a separate SSID where
-    only the Pi can reach them (see `w610-setup.md` §isolation). Plan 3 DHCP reservations
-    (Pi, W610 ×2). Setting this up now means it's proven before it's load-bearing.
+- [ ] 🖥 **Restrict gateway access** — the #1 safety item, layered & router-agnostic (see
+      `w610-setup.md` §Restrict). Pick what your setup allows; stage it before the W610s
+      arrive so it's proven before it's load-bearing:
+  - Confirm a **2.4 GHz-capable SSID** (W610s are 2.4 GHz only). Plan 3 DHCP reservations.
+  - Always: W610 admin password + disable cloud + **max clients = 1** (device-level lock,
+    any router). Detection (rogue power/mode-change alert) is already on.
+  - UniFi: an **IoT VLAN + a firewall rule Pi→gateways only** (your gear does this well).
+  - No capable router: a **~$30 mini-router** for Pi + gateways (bring-your-own isolation).
+  - Bench-investigate **W610 TCP-Client mode** (no LAN-facing port at all) — strongest, any router.
 - [ ] 🖥 **Pi dress rehearsal** (once the CanaKit Pi is on hand — the single best de-risk):
   - Flash the SD card (`pi-setup.md` §1) and boot.
   - Run the bootstrap **with your secrets** so it comes up remote-ready:

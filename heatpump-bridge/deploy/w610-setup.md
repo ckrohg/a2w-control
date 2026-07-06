@@ -1,23 +1,49 @@
 # USR-W610 configuration — per heat pump
 
-## ⚠ REQUIRED security step: network-isolate the gateways (fusion audit, risk #1)
+## ⚠ Restrict who can reach the gateways (fusion audit, risk #1) — layered, router-agnostic
 
-Every software guardrail (auth, clamp, rate-limit, MAC-pin, read-back, write_enabled)
-lives inside the Pi. But each W610 exposes a **raw Modbus TCP port (8899) and a web admin
-page** on the home WiFi. Anything else on that network — a phone, a guest laptop, a
-compromised smart bulb, a stray `nmap` — can open a socket straight to a gateway and write
-Modbus frames directly to a pump, **bypassing every guardrail at once**. A second process
-holding that single socket also starves the Pi's polling. "The Pi is the only Modbus
-master" is only true if the *network* enforces it.
+The problem: each W610 exposes a **raw Modbus TCP port (8899) with NO authentication** and a
+web admin page. On a flat network, anything on the WiFi can open a socket and write Modbus
+frames straight to a pump, bypassing every software guardrail; a second connection can also
+starve the Pi's polling. The software works fine either way — this is *hardening*, and the
+worst case is capped by the untouched manual/HBX chain (heat can't be lost). But close it.
 
-Do at least one of these before go-live (in rough order of strength):
-1. **VLAN / dedicated SSID** for the two W610s + Pi, isolated from the main LAN.
-2. **Router firewall ACL**: allow TCP 8899 + the W610 admin port only from the Pi's IP.
-3. **Client isolation** on an IoT SSID (blocks device-to-device), with the Pi on that SSID.
-4. If the router can't do any of the above, a small dedicated AP for the Pi + gateways.
+**These layers are independent — do the ones your setup allows; the first three and the
+last work on ANY router. Aim for at least one strong barrier + detection.**
 
-Plus, on each W610: **change the admin password** from the default, and **disable its
-cloud / remote-config service** so it isn't reachable or configurable from outside.
+**A. Device-level (works on any router, no network skills):**
+- **Change the W610 admin password** and **disable its cloud / remote-config service**.
+- **Set max TCP clients = 1.** The Pi holds that one connection persistently, so a rogue
+  client is *refused* while the Pi is connected — a real (if imperfect: a reconnect window
+  exists) lock that needs no router support.
+- **Strongest, verify on the bench:** run the W610 in **TCP-Client mode dialing the Pi**
+  instead of TCP-Server. Then the gateway has **no listening port on the LAN at all** — it
+  makes an outbound connection to the Pi, so nothing can connect *to* it. This works on any
+  router and eliminates the exposure entirely. It needs a small Pi-side listener change;
+  test it during Phase 1 (the pymodbus side must accept the W610's connection as its
+  transport). If it works cleanly on your hardware, prefer it.
+
+**B. Network-level (if your router supports it — see the UniFi note below):**
+- **VLAN / separate network** for Pi + gateways, with a firewall rule permitting only the
+  Pi to reach the gateways.
+- **Firewall ACL** on a flat network: block the W610 IPs from everything except the Pi's IP.
+- (Client-isolation on a guest/IoT SSID does NOT work here — it would also block the Pi
+  from reaching the gateways.)
+
+**C. Bring-your-own isolation (works with literally any main router):**
+- A **~$30 dedicated mini-router** (e.g. GL.iNet): put the Pi + both W610s on it, uplink to
+  the main network. Those three are on their own subnet, isolated by default, and the Pi
+  still reaches the internet. Zero dependence on the main router's features.
+
+**D. Detection (always on, any router — already built):** the bridge alerts if a pump's
+power/mode changes with no matching dashboard/API write — surfacing a rogue write (or a
+wall-controller change) even if a barrier is later misconfigured.
+
+### UniFi / Ubiquiti (Dream Machine, UDM, or AmpliFi Alien)
+You have the best case for layer B. On a UniFi console: create an **IoT network/VLAN**, put
+the Pi + gateways on it, then add a **firewall rule** allowing only the Pi's IP to reach the
+gateway IPs on 8899 (and block the gateways from initiating to the rest of the LAN). AmpliFi
+Alien is more limited — if its firewall can't scope per-IP, fall back to layer A + C.
 
 
 
@@ -85,7 +111,7 @@ precious is ever stored on the unit.
 |---|---|
 | WiFi mode | STA |
 | Socket | **TCP Server**, port **8899** (factory default) |
-| Max clients | 2 if the firmware offers it (lets Setup-tab probes coexist with the live connection); 1 also works — the bridge never probes a gateway it's already using |
+| Max clients | **1 (recommended, as a security lock — layer A above)**: only the Pi's persistent connection is accepted, a rogue client is refused. The bridge never probes a gateway it's already using, so 1 is fine operationally. |
 | IP | DHCP + **reservation in the router**. Suggested: .61 for pump 1, .62 for pump 2 |
 
 ## Wiring (per handoff §3 — settled)
