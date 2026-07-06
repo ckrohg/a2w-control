@@ -29,6 +29,21 @@ Architecture/safety audit by Claude Opus+Sonnet, GPT-5.5, judged cross-vendor. F
       cut `git tag release-YYYYMMDD-N && git push --tags` to ship to the Pi.**
       (Deferred sub-item: health check proving both pump sockets poll — needs hardware.)
 
+## Fusion RE-AUDIT of the fixes (2026-07-05, CONVERGENT — high confidence)
+
+Verdict: fixes sound; **read-only Phase 1 OK once isolation is actually verified**;
+write-enabled Phase 1 needed 3 edge-fixes — all now done (release-20260705-2):
+- [x] Blind-deploy: `/api/health` → 503 when a write_enabled pump has no fresh poll (90s).
+- [x] Unattended setpoint FLOOR (`unattended_min_setpoint_c`) — setpoint-only was still heat-removing.
+- [x] Level-based alerting: heartbeat → healthchecks.io `/fail` on active fault/offline.
+- [x] Forward-only tag deploy (no backward deploy from a stray old tag).
+- [x] `verify-isolation.sh` + hard write-enable commissioning gate; unexpected power/mode alert.
+
+**Still the #1 real risk (by design, needs the human at commissioning):** W610 isolation
+must be *verified from a non-Pi host* and the HBX-override bench test run BEFORE any pump's
+`write_enabled: true`. Software can't enforce network isolation; the gate + script make it
+a recorded step. Read-only Phase 1 does not need it live but should verify it early.
+
 ## Pre-hardware checklist (everything doable before the W610s arrive)
 
 - [ ] **Pi dress rehearsal** (if the CanaKit Pi is on hand): flash the SD card, boot,
