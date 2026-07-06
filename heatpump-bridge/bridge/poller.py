@@ -58,6 +58,10 @@ class PumpPoller:
         self.active_faults: dict[str, dict] = {}  # key -> {code,message,severity,since}
         self._prev_flags: dict[str, bool] | None = None  # runtime edge detection state
         self._prev_config: dict[str, int] | None = None  # external-change detection state
+        # remote-optimizer lease (in-memory, so a restart safely discards a stale override
+        # rather than trusting a persisted lease against an unsynced clock)
+        self._lease: dict | None = None   # {until, source, warned}
+        self._reverted = False            # for the recovery alert
         self.identity_ok: bool = True   # MAC-vs-IP verification (see _check_identity)
         self._mac_resolver = get_mac_for_ip  # injectable for tests
         self._discoverer = discover          # injectable for tests
@@ -143,6 +147,8 @@ class PumpPoller:
                                                        decoded["max_water_temp_c"]),
             "active_faults": list(self.active_faults.values()),
             "identity_ok": self.identity_ok,
+            "remote_lease_until": self._lease["until"] if self._lease else None,
+            "remote_lease_source": self._lease["source"] if self._lease else None,
             "comm": client.stats.as_dict(),
         }
         if not was_online and client.stats.ok_polls > 1:
@@ -396,15 +402,27 @@ class PumpPoller:
 
     # --- guarded write path ---------------------------------------------------
     async def write_setpoint(self, value: float, source: str,
-                             unattended: bool = False) -> dict:
+                             unattended: bool = False,
+                             lease_minutes: float | None = None) -> dict:
         """Mode-aware guarded write: re-read the mode and unit-max registers FRESH
         (never trust a stale snapshot to pick the target register), clamp to the
         mode's effective bounds, rate limit, write, read-back verify, audit.
         Serialized per pump so concurrent requests can't slip past the rate limit.
         unattended=True (scheduler / machine token) additionally enforces the winter-safe
-        floor so an automated actor can't command a heat-removing low LWT."""
+        floor. lease_minutes (from a remote optimizer) records a lease the optimizer must
+        renew — see check_lease()."""
         async with self._write_lock:
-            return await self._write_setpoint_locked(value, source, unattended)
+            result = await self._write_setpoint_locked(value, source, unattended)
+        g = self.app_cfg.guardrails
+        if lease_minutes and g.baseline_setpoint_c is not None:
+            until = time.time() + min(lease_minutes, g.lease_max_minutes) * 60
+            self._lease = {"until": until, "source": source, "warned": False}
+            if self._reverted:  # optimizer resumed after we'd reverted to baseline
+                self._reverted = False
+                self._push(title=f"✓ {self.cfg.name}: optimizer resumed",
+                           message=f"{source} is setting the setpoint again.",
+                           priority="low", tags="white_check_mark")
+        return result
 
     async def _write_setpoint_locked(self, value: float, source: str,
                                      unattended: bool = False) -> dict:
@@ -539,6 +557,41 @@ class PumpPoller:
             self.note_local_change(*note)
         await audit("accepted", "info", f"{describe} ({source})")
         await self.poll_once()
+
+    async def check_lease(self, now: float) -> None:
+        """Called each scheduler tick. If the optimizer's setpoint lease is lapsing, warn;
+        if it has lapsed, revert to the warm baseline via the normal guarded path so the
+        house is never stranded at a stale optimizer value. Catches optimizer-death while
+        the Pi itself is alive — the gap the dead-man heartbeat can't see."""
+        g = self.app_cfg.guardrails
+        if not self._lease or g.baseline_setpoint_c is None:
+            return
+        remaining = self._lease["until"] - now
+        if remaining <= 0:
+            # revert FIRST; only clear the lease + alert once the baseline write actually
+            # lands, so a transient rate-limit/offline retries next tick instead of
+            # stranding the house at the stale optimizer value
+            source = self._lease["source"]
+            try:
+                await self.write_setpoint(g.baseline_setpoint_c, source="baseline-revert",
+                                          unattended=True)
+            except GuardrailError as exc:
+                log.warning("[%s] baseline revert pending (will retry): %s", self.cfg.id, exc)
+                return
+            self._lease = None
+            self._reverted = True
+            self._push(
+                title=f"⚠ {self.cfg.name}: optimizer stale — reverted to baseline",
+                message=f"No fresh setpoint from {source} — reverted to the "
+                        f"{g.baseline_setpoint_c:g}°C baseline. House is fine; savings paused.",
+                priority="high", tags="warning")
+        elif remaining <= g.lease_warn_minutes * 60 and not self._lease["warned"]:
+            self._lease["warned"] = True
+            self._push(
+                title=f"{self.cfg.name}: optimizer setpoint expiring",
+                message=f"No renewal from {self._lease['source']} — reverting to baseline "
+                        f"in ~{int(remaining / 60)} min unless it resumes.",
+                priority="default", tags="hourglass")
 
     async def write_mode(self, kind: str, source: str) -> dict:
         """Switch heating <-> cooling (reg 2001). Only 0/1 ever written — the protocol

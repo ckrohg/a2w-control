@@ -358,6 +358,43 @@ async def test_store_concurrent_reads_and_writes_dont_corrupt(rig):
     assert len(await store.list_schedules("p1")) == 1
 
 
+async def test_optimizer_lease_reverts_to_baseline_when_stale(rig):
+    # fusion architecture audit: a remote setpoint is a renewable LEASE; if the optimizer
+    # goes silent, the Pi reverts to a warm baseline on its own — never stranded.
+    import time as time_mod
+    pump, poller, store = rig
+    g = poller.app_cfg.guardrails
+    g.restrict_unattended_writes = True
+    g.setback_setpoint_c = 40
+    g.baseline_setpoint_c = 48       # warm default reverted to
+    g.lease_warn_minutes = 15
+    await poller.poll_once()
+
+    # optimizer sets a low price-optimized setpoint with a 90-min lease
+    await poller.write_setpoint(42, source="optimizer", unattended=True, lease_minutes=90)
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 42
+    assert poller._lease is not None
+
+    now = time_mod.time()
+    await poller.check_lease(now)                    # fresh — nothing happens
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 42
+
+    await poller.check_lease(now + 80 * 60)          # inside warn window (<15 min left)
+    assert poller._lease["warned"] is True
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 42   # still held
+
+    await asyncio.sleep(0.15)                         # let the per-pump rate-limit window pass
+    await poller.check_lease(now + 91 * 60)          # lapsed -> revert to baseline
+    assert poller._lease is None
+    assert poller._reverted is True
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 48   # warm baseline, not stranded at 42
+
+    # optimizer resumes -> new lease, recovery flag cleared
+    await asyncio.sleep(0.15)
+    await poller.write_setpoint(43, source="optimizer", unattended=True, lease_minutes=90)
+    assert poller._reverted is False and poller._lease is not None
+
+
 async def test_unattended_writes_respect_winter_floor(rig):
     # re-audit fix 2: "setpoint-only" is still heat-removing — an unattended actor must not
     # go below the winter-safe floor even within the clamp. Human writes still can.

@@ -39,6 +39,12 @@ guardrails:
   # unattended_min_setpoint_c: 45  # winter-safe FLOOR for scheduler + token setpoint
   #   writes — set from the house's design-day heat requirement before enabling writes
   #   (defaults to setback_setpoint_c). Human UI can still go to setpoint_min_c.
+  # Remote-optimizer lease (platform phase — set baseline to activate): a remote setpoint
+  # is a renewable LEASE; if the optimizer goes silent the Pi reverts to this warm baseline
+  # on its own so the house is never stranded at a stale value.
+  # baseline_setpoint_c: 48       # warm winter default reverted to when a lease lapses
+  # lease_max_minutes: 180
+  # lease_warn_minutes: 15
 
 # Push alerts (ntfy — free, no account) + external dead-man heartbeat.
 notifications:

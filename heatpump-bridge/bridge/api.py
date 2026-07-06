@@ -28,6 +28,7 @@ control = require("control")
 
 class SetpointRequest(BaseModel):
     value: float
+    lease_minutes: float | None = Field(default=None, gt=0)  # remote optimizer: renew before it lapses
 
 
 class ModeRequest(BaseModel):
@@ -176,7 +177,8 @@ async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest,
     poller = _pump(request, pump_id)
     try:
         return await poller.write_setpoint(body.value, principal.source,
-                                           unattended=principal.is_machine)
+                                           unattended=principal.is_machine,
+                                           lease_minutes=body.lease_minutes)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 

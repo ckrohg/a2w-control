@@ -58,6 +58,13 @@ class GuardrailConfig(BaseModel):
     # clamp min (30) sits below the setback (40). Set this from the house's design-day
     # heat requirement, NOT a round number. Defaults to the setback.
     unattended_min_setpoint_c: float | None = None
+    # Remote-optimizer LEASE (fusion architecture audit): a remote setpoint write is a
+    # time-limited lease the optimizer must keep renewing. If it goes silent, the Pi
+    # reverts to `baseline_setpoint_c` (a warm winter default) on its own — never stranded
+    # at a stale optimizer value. Dormant until baseline_setpoint_c is set (platform phase).
+    baseline_setpoint_c: float | None = None   # warm default reverted to when a lease lapses
+    lease_max_minutes: float = 180             # clamp on any single lease
+    lease_warn_minutes: float = 15             # warn this long before a lease would revert
 
     @model_validator(mode="after")
     def _sane_bounds(self):
@@ -75,6 +82,11 @@ class GuardrailConfig(BaseModel):
         if self.unattended_min_setpoint_c is not None and not (
                 self.setpoint_min_c <= self.unattended_min_setpoint_c <= self.setpoint_max_c):
             raise ValueError("unattended_min_setpoint_c must be within the heating clamp")
+        if self.baseline_setpoint_c is not None:
+            floor = self.unattended_min_setpoint_c or self.setback_setpoint_c
+            if not (floor <= self.baseline_setpoint_c <= self.setpoint_max_c):
+                raise ValueError("baseline_setpoint_c must be within [unattended floor, max] "
+                                 "— it's the WARM default the house reverts to")
         if self.comfort_setpoint_c is not None and not (
                 self.setpoint_min_c <= self.comfort_setpoint_c <= self.setpoint_max_c):
             raise ValueError("comfort_setpoint_c must be within the heating clamp")

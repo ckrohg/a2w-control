@@ -108,6 +108,25 @@ if (res.status === 429) { /* back off 60s */ }
 else if (!res.ok) { /* log res.status + (await res.json()).detail */ }
 ```
 
+## 5b. Setpoint LEASES (required for a continuous optimizer)
+
+A remote optimizer must send each setpoint as a **renewable lease**, not a permanent value:
+
+```
+POST /api/pumps/pump1/setpoint  {"value": 45, "lease_minutes": 90}
+```
+
+Then **re-assert every ~15–20 min even when your math says "hold"** (same value, fresh
+lease). If the bridge stops hearing from you (Railway redeploy, tunnel blip, optimizer
+crash), the lease lapses and the Pi reverts to its warm `baseline_setpoint_c` on its own —
+the house is never stranded at a stale, possibly-low, optimizer value. The Pi validates the
+lease against its own clock, so a late/retried command can't fire after its window
+(idempotency for free). `/status` reports `remote_lease_until` / `remote_lease_source` so
+you can confirm your writes are actually holding authority.
+
+Design your optimizer around this: it's a *stateless caller holding a lease*, and the Pi
+owns "what's still valid" — which is why no cloud command-queue is needed.
+
 ## 6. Integration posture
 
 Recommended first step: a **read-only token** (`can_write: false`). Let TempIQ *observe*

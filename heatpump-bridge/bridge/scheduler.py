@@ -58,6 +58,10 @@ class Scheduler:
 
     async def check_once(self, now: datetime) -> None:
         """Fire every enabled rule matching this minute (at most once per rule per day)."""
+        # optimizer-lease watchdog: revert to baseline if a remote setpoint lease lapses
+        ts = now.timestamp()
+        for poller in self.pollers.values():
+            await poller.check_lease(ts)
         if (now.strftime("%H:%M") == MAINTENANCE_HHMM
                 and self._last_maintenance_date != now.strftime("%Y-%m-%d")):
             self._last_maintenance_date = now.strftime("%Y-%m-%d")
