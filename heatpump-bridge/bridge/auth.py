@@ -30,6 +30,7 @@ class Principal:
     source: str          # audit identity; overrides any body-provided source
     can_write: bool
     authenticated: bool   # True if a token/session validated
+    is_machine: bool = False  # True for bearer-token callers (vs human UI session)
 
 
 def load_or_create_ui_secret(data_dir: Path) -> str:
@@ -124,7 +125,8 @@ def resolve_principal(request: Request) -> Principal:
     if presented is not None:
         for t in state.config.auth.tokens:
             if _eq(presented, t.token):
-                return Principal(source=t.source, can_write=t.can_write, authenticated=True)
+                return Principal(source=t.source, can_write=t.can_write,
+                                 authenticated=True, is_machine=True)
         raise HTTPException(401, "invalid API token")
     if valid_session(state.ui_secret, request.cookies.get(UI_COOKIE)):
         return Principal(source="ui", can_write=True, authenticated=True)
@@ -139,15 +141,25 @@ def resolve_principal_safe(request: Request) -> Principal:
 
 
 def require(scope: str):
-    """FastAPI dependency factory. scope: 'read' | 'write'."""
+    """FastAPI dependency factory. scope:
+      'read'    — gated only in protect=all.
+      'write'   — a writable credential (setpoint; machines allowed).
+      'control' — like write, PLUS blocks machine tokens when unattended writes are
+                  restricted (power/mode/parameter/setup are human-only by default —
+                  fusion audit risk 2, cold-latch safety)."""
     def dependency(request: Request) -> Principal:
         principal = resolve_principal(request)
         mode = request.app.state.config.auth.protect
-        if scope == "write":
+        if scope in ("write", "control"):
             if mode in ("writes", "all") and not principal.authenticated:
                 raise HTTPException(401, "authentication required to control the pumps")
             if not principal.can_write:
                 raise HTTPException(403, "this API token is read-only")
+            if scope == "control" and principal.is_machine and \
+                    request.app.state.config.guardrails.restrict_unattended_writes:
+                raise HTTPException(
+                    403, "automated clients are limited to setpoint changes "
+                         "(unattended-write safety — power/mode/parameters are human-only)")
         elif scope == "read":
             if mode == "all" and not principal.authenticated:
                 raise HTTPException(401, "authentication required")

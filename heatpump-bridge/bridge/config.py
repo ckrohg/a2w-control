@@ -43,6 +43,16 @@ class GuardrailConfig(BaseModel):
     cooling_setpoint_max_c: float = 25.0
     min_write_interval_s: float = 60.0
     offline_after_failed_polls: int = 3
+    # Cold-latch safety (fusion audit risk 2): unattended writers (the on-Pi scheduler
+    # and machine API tokens) must not latch a state the manual/HBX fallback can't undo
+    # if connectivity then drops in a cold snap. When true:
+    #   - machine tokens are setpoint-only (no power/mode/parameter/setup writes)
+    #   - scheduler never powers a pump OFF: an "off" timer sets a setback setpoint
+    #     instead (unit keeps running, can't freeze); "on" powers on + comfort setpoint.
+    # The human UI keeps full control (a person tapping "off" is attended).
+    restrict_unattended_writes: bool = True
+    setback_setpoint_c: float = 40.0        # scheduler "off" target under restriction
+    comfort_setpoint_c: float | None = None  # scheduler "on" target (None = leave setpoint)
 
     @model_validator(mode="after")
     def _sane_bounds(self):
@@ -55,6 +65,11 @@ class GuardrailConfig(BaseModel):
         lo, hi = COOLING_REGISTER_RANGE
         if not (lo <= self.cooling_setpoint_min_c < self.cooling_setpoint_max_c <= hi):
             raise ValueError(f"cooling setpoint bounds must be within {lo}-{hi}degC")
+        if not (self.setpoint_min_c <= self.setback_setpoint_c <= self.setpoint_max_c):
+            raise ValueError("setback_setpoint_c must be within the heating clamp")
+        if self.comfort_setpoint_c is not None and not (
+                self.setpoint_min_c <= self.comfort_setpoint_c <= self.setpoint_max_c):
+            raise ValueError("comfort_setpoint_c must be within the heating clamp")
         return self
 
 
@@ -104,13 +119,32 @@ class AuthConfig(BaseModel):
         return self
 
 
+class NotifyConfig(BaseModel):
+    # Push alerts via ntfy (free, no account). Create a hard-to-guess topic and either
+    # subscribe in the ntfy app or point it at your own server.
+    ntfy_topic: str | None = None
+    ntfy_server: str = "https://ntfy.sh"
+    # External dead-man heartbeat (e.g. healthchecks.io): pinged every poll cycle. If the
+    # pings stop (Pi/WiFi/ISP/power dead), THAT service alerts you — silence = alarm, and
+    # it doesn't share fate with the Pi (fusion audit risk 3c).
+    heartbeat_url: str | None = None
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
     auth: AuthConfig = AuthConfig()
+    notifications: NotifyConfig = NotifyConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
+
+    @field_validator("guardrails", "auth", "notifications", mode="before")
+    @classmethod
+    def _empty_section_to_default(cls, v):
+        # a YAML section present but with everything commented out parses to null;
+        # treat it as "use defaults" instead of failing to start
+        return {} if v is None else v
 
 
 def load_config(path: str | os.PathLike | None = None) -> AppConfig:

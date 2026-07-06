@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from . import notify
 from .guardrails import GuardrailError
 from .poller import PumpPoller
 from .store import Store
@@ -21,9 +22,11 @@ BACKUPS_KEEP = 7
 
 
 class Scheduler:
-    def __init__(self, store: Store, pollers: dict[str, PumpPoller]):
+    def __init__(self, store: Store, pollers: dict[str, PumpPoller],
+                 heartbeat_url: str | None = None):
         self.store = store
         self.pollers = pollers
+        self.heartbeat_url = heartbeat_url
         self._task: asyncio.Task | None = None
         self._last_maintenance_date: str | None = None
 
@@ -42,6 +45,8 @@ class Scheduler:
                 await self.check_once(datetime.now())
             except Exception:
                 log.exception("scheduler check failed")
+            # external dead-man: ping every cycle so silence (Pi/WiFi/power dead) alarms
+            await notify.heartbeat(self.heartbeat_url)
             await asyncio.sleep(CHECK_INTERVAL_S)
 
     async def check_once(self, now: datetime) -> None:
@@ -65,12 +70,28 @@ class Scheduler:
             if not poller:
                 continue
             try:
-                await poller.write_power(rule["action"] == "on", source="schedule")
+                await self._fire(poller, rule["action"])
                 log.info("schedule %s: %s -> %s (%s)", rule["id"], rule["pump_id"],
                          rule["action"], rule["time_hhmm"])
             except GuardrailError as exc:
                 # already audited by the write path; nothing else to do
                 log.warning("schedule %s failed: %s", rule["id"], exc)
+
+    async def _fire(self, poller: PumpPoller, action: str) -> None:
+        """Execute a timer. Under unattended-write restriction (default), the scheduler
+        NEVER powers a pump off — an "off" timer sets a setback setpoint (unit keeps
+        running, can't latch a cold state if connectivity then drops); "on" powers on and
+        optionally sets a comfort setpoint. Powering ON is always safe (toward heat)."""
+        g = poller.app_cfg.guardrails
+        if not g.restrict_unattended_writes:
+            await poller.write_power(action == "on", source="schedule")
+            return
+        if action == "on":
+            await poller.write_power(True, source="schedule")
+            if g.comfort_setpoint_c is not None:
+                await poller.write_setpoint(g.comfort_setpoint_c, source="schedule")
+        else:  # "off" becomes a setback, never a shutdown
+            await poller.write_setpoint(g.setback_setpoint_c, source="schedule")
 
     async def run_maintenance(self, now: datetime) -> None:
         """Nightly: consistent DB backup (rotated) + retention pruning. A dead SD card

@@ -31,6 +31,20 @@ guardrails:
                            # Effective max is always min(this, live reg 2027).
   min_write_interval_s: 60
   offline_after_failed_polls: 3
+  # Cold-latch safety (fusion audit): unattended writers (scheduler + machine tokens)
+  # can't leave a pump in a state the manual/HBX fallback can't undo.
+  restrict_unattended_writes: true
+  setback_setpoint_c: 40     # scheduler "off" timers lower to this instead of powering off
+  # comfort_setpoint_c: 50   # optional: scheduler "on" timers restore to this
+
+# Push alerts (ntfy — free, no account) + external dead-man heartbeat.
+notifications:
+  # 1. Pick a hard-to-guess topic and subscribe to it in the ntfy app (or ntfy.sh/<topic>).
+  # ntfy_topic: "a2w-REPLACE-with-something-random"
+  # ntfy_server: "https://ntfy.sh"
+  # 2. Optional: healthchecks.io ping URL — if the Pi stops pinging (power/WiFi/ISP dead),
+  #    THAT service emails you. Silence becomes the alarm.
+  # heartbeat_url: "https://hc-ping.com/your-uuid"
 
 db_path: /home/pi/bridge-data/bridge.db
 ui_dir: /home/pi/a2w-control/heatpump-bridge/ui

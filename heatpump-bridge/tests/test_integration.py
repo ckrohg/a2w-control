@@ -313,6 +313,7 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     from bridge.scheduler import Scheduler
 
     pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
     await poller.poll_once()
     assert poller.snapshot["on"] is True
     await store.add_schedule("p1", "06:00", "on")
@@ -333,11 +334,31 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     assert len(fired) == 1
 
 
+async def test_scheduler_off_becomes_setback_not_shutdown(rig):
+    # fusion audit risk 2: the scheduler must never leave a pump powered off (a cold-latch
+    # the HBX can't undo). Under restriction (default), "off" sets a setback setpoint.
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = True
+    poller.app_cfg.guardrails.setback_setpoint_c = 38
+    await poller.poll_once()
+
+    await store.add_schedule("p1", "23:00", "off")
+    sched = Scheduler(store, {"p1": poller})
+    await sched.check_once(datetime(2026, 7, 4, 23, 0, 5))
+
+    assert await pump.get_reg(R.REG_ON_OFF) == 1                 # still ON (never shut off)
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 38      # lowered to setback
+
+
 async def test_scheduler_fires_once_per_day(rig):
     from datetime import datetime
     from bridge.scheduler import Scheduler
 
     pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
     await poller.poll_once()
     assert poller.snapshot["on"] is True
 

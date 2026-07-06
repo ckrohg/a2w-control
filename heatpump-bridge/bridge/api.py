@@ -19,9 +19,11 @@ from .poller import PumpPoller
 
 router = APIRouter(prefix="/api")
 
-# dependency singletons
+# dependency singletons. write = setpoint (machines allowed); control = power/mode/param/
+# setup (machines blocked under unattended-write safety — humans only).
 read = require("read")
 write = require("write")
+control = require("control")
 
 
 class SetpointRequest(BaseModel):
@@ -94,7 +96,7 @@ async def list_pumps(request: Request, _p: Principal = Depends(read)):
 
 @router.post("/pumps")
 async def add_pump(request: Request, body: AddPumpRequest,
-                   principal: Principal = Depends(write)):
+                   principal: Principal = Depends(control)):
     """Add a heat pump at runtime (Setup tab): point it at a discovered gateway,
     adopt the MAC, start polling, persist across restarts. Ships write-disabled —
     same Phase 1 rule as config-defined pumps."""
@@ -125,7 +127,7 @@ async def add_pump(request: Request, body: AddPumpRequest,
 
 @router.delete("/pumps/{pump_id}")
 async def remove_pump(request: Request, pump_id: str,
-                      principal: Principal = Depends(write)):
+                      principal: Principal = Depends(control)):
     """Remove a UI-added pump (config.yaml-defined pumps are removed by editing the
     file — the bridge never rewrites the human's config)."""
     from .config import remove_added_pump
@@ -180,7 +182,7 @@ async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest,
 
 @router.post("/pumps/{pump_id}/mode")
 async def write_mode(request: Request, pump_id: str, body: ModeRequest,
-                     principal: Principal = Depends(write)):
+                     principal: Principal = Depends(control)):
     poller = _pump(request, pump_id)
     try:
         return await poller.write_mode(body.value, principal.source)
@@ -190,7 +192,7 @@ async def write_mode(request: Request, pump_id: str, body: ModeRequest,
 
 @router.post("/pumps/{pump_id}/power")
 async def write_power(request: Request, pump_id: str, body: PowerRequest,
-                      principal: Principal = Depends(write)):
+                      principal: Principal = Depends(control)):
     poller = _pump(request, pump_id)
     try:
         return await poller.write_power(body.value, principal.source)
@@ -200,7 +202,7 @@ async def write_power(request: Request, pump_id: str, body: PowerRequest,
 
 @router.post("/pumps/{pump_id}/parameter")
 async def write_parameter(request: Request, pump_id: str, body: ParameterRequest,
-                          principal: Principal = Depends(write)):
+                          principal: Principal = Depends(control)):
     poller = _pump(request, pump_id)
     try:
         return await poller.write_parameter(body.key, body.value, principal.source)
@@ -216,7 +218,7 @@ async def list_schedules(request: Request, pump_id: str, _p: Principal = Depends
 
 @router.post("/pumps/{pump_id}/schedules")
 async def add_schedule(request: Request, pump_id: str, body: ScheduleRequest,
-                       principal: Principal = Depends(write)):
+                       principal: Principal = Depends(control)):
     poller = _pump(request, pump_id)
     await poller.store.add_schedule(pump_id, body.time, body.action)
     await poller.store.add_event(
@@ -227,7 +229,7 @@ async def add_schedule(request: Request, pump_id: str, body: ScheduleRequest,
 
 @router.delete("/pumps/{pump_id}/schedules/{schedule_id}")
 async def delete_schedule(request: Request, pump_id: str, schedule_id: int,
-                          principal: Principal = Depends(write)):
+                          principal: Principal = Depends(control)):
     poller = _pump(request, pump_id)
     await poller.store.delete_schedule(pump_id, schedule_id)
     await poller.store.add_event(
@@ -238,7 +240,7 @@ async def delete_schedule(request: Request, pump_id: str, schedule_id: int,
 
 @router.get("/discover")
 async def discover_gateways(request: Request, probe: bool = True,
-                            _p: Principal = Depends(write)):
+                            _p: Principal = Depends(control)):
     """Sweep the LAN for W610 gateways (USR broadcast + Modbus-port scan), optionally
     probing each with a real register read. Marks which candidate matches each
     configured pump's MAC."""
@@ -259,7 +261,7 @@ async def discover_gateways(request: Request, probe: bool = True,
 
 @router.post("/pumps/{pump_id}/gateway")
 async def set_gateway(request: Request, pump_id: str, body: GatewayRequest,
-                      _p: Principal = Depends(write)):
+                      _p: Principal = Depends(control)):
     """Assign a discovered gateway to this pump. If the pump has a configured MAC and
     the target's MAC is resolvable, they must match (409 otherwise) — you cannot
     accidentally point pump 1 at pump 2's gateway."""
@@ -284,7 +286,7 @@ async def set_gateway(request: Request, pump_id: str, body: GatewayRequest,
 
 @router.post("/w610/configure")
 async def configure_w610_endpoint(request: Request, body: GatewayRequest,
-                                  _p: Principal = Depends(write)):
+                                  _p: Principal = Depends(control)):
     """EXPERIMENTAL: push the required serial settings (2400 8N1, transparent mode)
     to a W610 over the vendor UDP channel — the web-console alternative."""
     from .w610_config import configure_w610

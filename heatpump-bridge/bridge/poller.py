@@ -9,6 +9,7 @@ import contextlib
 import logging
 import time
 
+from . import notify
 from . import registers as R
 from .config import AppConfig, PumpConfig
 from .faults import FAULTS, FaultDef, decode_faults, worst_severity, Severity
@@ -147,6 +148,8 @@ class PumpPoller:
         if not was_online and client.stats.ok_polls > 1:
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
+            self._push(title=f"✓ {self.cfg.name} back online",
+                       message="Communication restored.", priority="low", tags="white_check_mark")
         await self.store.add_sample(self.cfg.id, decoded | {"status_word": regs.get(R.REG_STATUS, 0)})
         await self._maybe_comm_row()
 
@@ -236,6 +239,9 @@ class PumpPoller:
                 self.cfg.id, "comm", code="offline", severity="high",
                 message=f"{self.cfg.name} unreachable for {failures} consecutive polls",
                 detail={"category": exc.category})
+            self._push(title=f"⚠ {self.cfg.name} offline",
+                       message=f"No response for {failures} polls ({exc.category}). "
+                               f"Check the gateway / WiFi.", priority="high", tags="warning")
         else:
             self.snapshot = {**self.snapshot, "comm": self.client.stats.as_dict()}
             if failures >= threshold:
@@ -262,6 +268,10 @@ class PumpPoller:
                 message=f"W610 identity check FAILED: {self.cfg.host} answers with MAC "
                         f"{actual}, expected {self.cfg.mac} — this may be the OTHER "
                         f"pump's gateway. All writes blocked. Check DHCP reservations.")
+            self._push(title=f"⚠ {self.cfg.name}: gateway identity mismatch",
+                       message=f"{self.cfg.host} answers with the wrong MAC — writes "
+                               f"blocked. Check DHCP reservations.",
+                       priority="urgent", tags="rotating_light")
             log.error("[%s] identity mismatch at %s: %s != %s",
                       self.cfg.id, self.cfg.host, actual, self.cfg.mac)
         else:
@@ -335,6 +345,12 @@ class PumpPoller:
         return {"key": key, "code": fdef.code, "message": fdef.message,
                 "severity": fdef.severity, "since": since}
 
+    def _push(self, title: str, message: str, priority: str = "default", tags: str = "") -> None:
+        """Fire-and-forget push alert; safe if unconfigured (notify.ntfy no-ops)."""
+        asyncio.create_task(notify.ntfy(
+            self.app_cfg.notifications, title=title, message=message,
+            priority=priority, tags=tags))
+
     async def _update_faults(self, current: dict[str, FaultDef]) -> None:
         """Edge detection: log fault_on for new bits, fault_off for cleared bits."""
         for key, fdef in current.items():
@@ -344,6 +360,13 @@ class PumpPoller:
                     self.cfg.id, "fault_on", code=fdef.code, severity=fdef.severity,
                     message=fdef.message, detail={"key": key})
                 log.info("[%s] fault ON %s %s", self.cfg.id, fdef.code, fdef.message)
+                # push only actionable faults — P17 anti-freeze (info) must never page
+                if fdef.severity in (Severity.CRITICAL, Severity.HIGH):
+                    self._push(
+                        title=f"⚠ {self.cfg.name}: {fdef.code}",
+                        message=fdef.message,
+                        priority="urgent" if fdef.severity == Severity.CRITICAL else "high",
+                        tags="rotating_light" if fdef.severity == Severity.CRITICAL else "warning")
         for key in list(self.active_faults):
             if key not in current:
                 gone = self.active_faults.pop(key)

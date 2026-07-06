@@ -91,11 +91,12 @@ Keep `write_enabled: false` until Phase 2 — Phase 1 is read-only by rule (hand
 
 ## 3b. How updates reach the Pi (hands-off)
 
-Code changes are pushed to GitHub; the Pi checks every 15 minutes
-(`heatpump-bridge-update.timer`) and applies new commits automatically:
-pull → reinstall deps → restart → **health check → automatic rollback** to the
-previous commit if the new code doesn't come up healthy (a failed commit is
-quarantined and never retried; the next good commit supersedes it).
+The Pi checks every 15 minutes (`heatpump-bridge-update.timer`) and deploys **only
+owner-promoted release tags** (`release-*`), never mutable `main` — so a stray push or
+mis-merge can't auto-ship pump-commanding code (fusion audit risk 4). A release is
+deliberate: `git tag release-YYYYMMDD-N && git push --tags`. The Pi then pulls that tag →
+reinstalls deps → restarts → **health check → automatic rollback** if it doesn't come up
+healthy (a failed tag is quarantined; the next good tag supersedes it).
 
 - Apply an update immediately: `sudo systemctl start heatpump-bridge-update.service`
 - Watch update activity: `journalctl -u heatpump-bridge-update -f`

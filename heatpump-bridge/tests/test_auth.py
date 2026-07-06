@@ -76,14 +76,27 @@ def test_health_and_whoami_always_open(tmp_path):
 
 def test_source_attribution_comes_from_token_not_body(tmp_path):
     with TestClient(make_app(tmp_path, "writes", both_tokens())) as c:
-        # even if a caller tries to claim source:"ui" in the body, the token's source wins
-        c.post("/api/pumps/pump1/power", json={"value": False, "source": "ui"},
+        # setpoint is the one thing a machine token may do; source must come from the token
+        c.post("/api/pumps/pump1/setpoint", json={"value": 45, "source": "ui"},
                headers=bearer(CONTROL))
         events = c.get("/api/pumps/pump1/events", headers=bearer(CONTROL)).json()
-        writes = [e for e in events if e["type"] == "power_write"]
-        # the write is offline-rejected, but the audit records source=tempiq (from the
-        # token) — never the body's claimed "ui"
+        writes = [e for e in events if e["type"] == "setpoint_write"]
+        # offline-rejected, but audited with source=tempiq (from the token), never body "ui"
         assert writes and all(e["detail"]["source"] == "tempiq" for e in writes)
+
+
+def test_machine_token_is_setpoint_only_under_restriction(tmp_path):
+    # fusion audit risk 2: automated clients may set setpoints but not power/mode/params
+    with TestClient(make_app(tmp_path, "writes", both_tokens())) as c:
+        assert c.post("/api/pumps/pump1/power", json={"value": False},
+                      headers=bearer(CONTROL)).status_code == 403
+        assert c.post("/api/pumps/pump1/mode", json={"value": "cooling"},
+                      headers=bearer(CONTROL)).status_code == 403
+        assert c.post("/api/pumps/pump1/parameter", json={"key": "max_water_temp_c", "value": 60},
+                      headers=bearer(CONTROL)).status_code == 403
+        # setpoint IS allowed for the machine (reaches the poller, offline-rejected != 403-auth)
+        assert c.post("/api/pumps/pump1/setpoint", json={"value": 45},
+                      headers=bearer(CONTROL)).status_code not in (401, 403)
 
 
 def test_protect_off_auto_mints_browser_session(tmp_path):

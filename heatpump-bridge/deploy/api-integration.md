@@ -60,12 +60,14 @@ GET  /api/health                       always open; reports auth_mode
 GET  /api/whoami                       always open; reports your token's identity/scope
 ```
 
-Writes (need a `can_write` token when `protect` ≠ off):
+Writes for a machine token are **setpoint-only** by default (cold-latch safety —
+`restrict_unattended_writes`). Power, mode, and parameter changes are human-only (403 for
+tokens); express a "setback" as a lower setpoint, never an off.
 ```
-POST /api/pumps/{id}/setpoint  {"value": 45}        whole °C only; mode-aware target
-POST /api/pumps/{id}/mode      {"value":"heating"}  heating|cooling
-POST /api/pumps/{id}/power     {"value": true}      on/off
-POST /api/pumps/{id}/parameter {"key":"max_water_temp_c","value":70}
+POST /api/pumps/{id}/setpoint  {"value": 45}   whole °C only; mode-aware target  ← token OK
+POST /api/pumps/{id}/mode      ...             403 for tokens (human UI only)
+POST /api/pumps/{id}/power     ...             403 for tokens (human UI only)
+POST /api/pumps/{id}/parameter ...             403 for tokens (human UI only)
 ```
 
 Interactive schema: `GET /docs` (OpenAPI).
