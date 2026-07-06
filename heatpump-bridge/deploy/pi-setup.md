@@ -59,11 +59,23 @@ then paste:
 curl -fsSL https://raw.githubusercontent.com/ckrohg/a2w-control/main/heatpump-bridge/deploy/pi-bootstrap.sh | bash
 ```
 
-The script installs git/curl/uv, clones the repo, installs dependencies, creates
+The script installs git/curl/uv/tailscale, clones the repo, installs dependencies, creates
 `~/bridge-data/config.yaml` from the production template (config and database live
 OUTSIDE the repo so updates can never clobber them), installs + starts the systemd
 service and the auto-update timer, and health-checks everything. It is idempotent —
 safe to re-run any time.
+
+**Remote-ready in one shot (optional):** supply a dashboard password and a Tailscale
+auth key (from https://login.tailscale.com/admin/settings/keys) and the Pi boots already
+reachable from anywhere, login-gated — no follow-up steps:
+
+```bash
+A2W_UI_PASSWORD='a-long-passphrase' A2W_TAILSCALE_AUTHKEY='tskey-auth-...' \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/ckrohg/a2w-control/main/heatpump-bridge/deploy/pi-bootstrap.sh)"
+```
+(One-time: enable HTTPS + Funnel for your tailnet in the admin console. Secrets land in
+shell history — `history -c` after, or put them in a file you `source`.) Without these
+vars, Tailscale is still installed; run `deploy/setup-remote.sh` when you're ready.
 
 Then open **http://heatpump-pi.local:8000** from your phone. Both pumps show
 **OFFLINE** until the W610s exist — that's expected and correct.
