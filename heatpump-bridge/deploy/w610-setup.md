@@ -8,48 +8,42 @@ frames straight to a pump, bypassing every software guardrail; a second connecti
 starve the Pi's polling. The software works fine either way — this is *hardening*, and the
 worst case is capped by the untouched manual/HBX chain (heat can't be lost). But close it.
 
-**These layers are independent — do the ones your setup allows; the first three and the
-last work on ANY router. Aim for at least one strong barrier + detection.**
+**Assume the realistic topology: the W610s live on a busy shared IoT network with 100+
+other devices, on a consumer router that can't do per-device firewalling.** So the primary
+defense is DEVICE-LEVEL (independent of the network), not network isolation. Layers A + D
+are the baseline; B/C are optional extras only if you happen to have the gear.
 
-**A. Device-level (works on any router, no network skills):**
+**A. Device-level — the baseline (works on any shared network, no network skills):**
+- **Set max TCP clients = 1.** The Pi holds that one connection persistently, so every one
+  of the 100+ other devices gets *connection refused*. The only gap is a brief window during
+  a Pi/W610 reconnect, and grabbing it needs a device *actively targeting* that IP:8899 with
+  Modbus — not random traffic. This is the main barrier on a shared network.
 - **Change the W610 admin password** and **disable its cloud / remote-config service**.
-- **Set max TCP clients = 1.** The Pi holds that one connection persistently, so a rogue
-  client is *refused* while the Pi is connected — a real (if imperfect: a reconnect window
-  exists) lock that needs no router support.
-- **Strongest, verify on the bench:** run the W610 in **TCP-Client mode dialing the Pi**
-  instead of TCP-Server. Then the gateway has **no listening port on the LAN at all** — it
-  makes an outbound connection to the Pi, so nothing can connect *to* it. This works on any
-  router and eliminates the exposure entirely. It needs a small Pi-side listener change;
-  test it during Phase 1 (the pymodbus side must accept the W610's connection as its
-  transport). If it works cleanly on your hardware, prefer it.
 
-**B. Network-level (if your router supports it — see the UniFi note below):**
-- **VLAN / separate network** for Pi + gateways, with a firewall rule permitting only the
-  Pi to reach the gateways.
-- **Firewall ACL** on a flat network: block the W610 IPs from everything except the Pi's IP.
-- (Client-isolation on a guest/IoT SSID does NOT work here — it would also block the Pi
-  from reaching the gateways.)
+**D. Detection — the other half of the baseline (always on, any network — already built):**
+the bridge alerts if a pump's power/mode changes with no matching dashboard/API write, so a
+rogue write (or a legitimate wall-controller change) surfaces even without a barrier.
 
-**C. Bring-your-own isolation (works with literally any main router):**
-- A **~$30 dedicated mini-router** (e.g. GL.iNet): put the Pi + both W610s on it, uplink to
-  the main network. Those three are on their own subnet, isolated by default, and the Pi
-  still reaches the internet. Zero dependence on the main router's features.
+Baseline residual risk: a *targeted* attacker already on your IoT network, who knows Modbus
++ this pump's register map, connects in a reconnect window, and writes — which then alerts
+you and still can't stop the heat (manual/HBX chain untouched). Acceptable for a home.
 
-**D. Detection (always on, any router — already built):** the bridge alerts if a pump's
-power/mode changes with no matching dashboard/API write — surfacing a rogue write (or a
-wall-controller change) even if a barrier is later misconfigured.
+**E. Airtight upgrade — TCP-Client mode (verify at the bench, Phase 1):** run the W610
+dialing OUT to the Pi instead of listening. Then it has **no listening port at all** — the
+100+ neighbors literally cannot connect to it. This is the true "works on any network" fix
+and the recommended end-state. Not yet built: the Pi needs an accept-side transport, and the
+real W610 may send a registration/heartbeat packet on connect that must be handled — both
+confirmed on the bench, then a contained code change (same RTU data plane).
 
-### Ubiquiti routers
-- **UniFi (Dream Machine / UDM):** best case, use layer B — create an **IoT network/VLAN**,
-  put Pi + gateways on it, add a **firewall rule** allowing only the Pi's IP to reach the
-  gateway IPs on 8899 (and block the gateways from initiating to the rest of the LAN).
-- **AmpliFi Alien (consumer mesh — no VLANs, no per-IP firewall rules):** layer B is NOT
-  available. Recommended path: **layer C mini-router** for the strong barrier (the Alien
-  can't scope traffic between LAN clients, so a $30 GL.iNet uplinked to the Alien is the
-  clean isolation), OR **layer A device-lock** (max-clients=1 + admin pw + disable cloud)
-  + layer D detection if you'd rather add no hardware. Don't use the AmpliFi *guest*
-  network for the Pi — it would block your phone (on the main network) from reaching the
-  LAN dashboard, and its client isolation can block the Pi↔gateway path too.
+**B/C. Only if you already have the gear (most won't):** a VLAN + per-IP firewall rule
+(UniFi-class routers), or a ~$30 mini-router for the Pi + gateways. Not expected here.
+
+### This install: AmpliFi Alien + a shared IoT network (100+ devices)
+The Alien is a consumer mesh router — no VLANs, no per-IP firewall rules — and the gateways
+join the existing busy IoT network. So B/C don't apply. **Plan: layer A (max-clients=1 +
+admin pw + disable cloud) + layer D detection as the baseline, then layer E (TCP-Client
+mode) as the airtight end-state, verified on the bench.** That's a full defense that never
+depends on isolating the gateways from their 100+ neighbors.
 
 
 

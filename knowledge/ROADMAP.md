@@ -68,6 +68,7 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 - [ ] When W610s arrive: bench-configure per `heatpump-bridge/deploy/w610-setup.md` (transparent mode, 2400 8N1, TCP server 8899, DHCP reservations)
 - [ ] Pi provisioning per `heatpump-bridge/deploy/pi-setup.md` (can be done before the heat pump connection exists — bridge will just show pumps offline)
 - [ ] Phase 1 (gated on Winnie's CN22/pinout reply): one pump, read-only (write_enabled: false). Run the commissioning checklist in `reference/modbus-register-map.md` (addressing offset, temp scaling/signedness, CRC, power units — cross-check vs SPAN). Watch error rates 48h.
+- [ ] Phase 1 bench: **W610 TCP-Client mode investigation** (topology: gateways on shared 100+ device IoT network, AmpliFi = no isolation). Confirm the W610 can dial the Pi with no listening port + whether it sends a registration/heartbeat packet on connect. If clean, BUILD the Pi-side accept-transport (identical RTU data plane, just accept-vs-connect + strip any registration bytes) as the airtight defense. Baseline until then = max-clients=1 + detection.
 - [ ] Phase 2: flip write_enabled on pump 1; confirm wall controller reflects the change.
 
 ## Later — Phases 3–4
