@@ -91,10 +91,27 @@ quarantined and never retried; the next good commit supersedes it).
 
 ## 4. Remote access (any network, not just home)
 
-See `cloudflared-notes.md`. Summary: cloudflared tunnel → `https://heat.<your-domain>`
-with Cloudflare Access (email OTP) in front, zero open ports. After the tunnel works,
-edit `/etc/systemd/system/heatpump-bridge.service` to `--host 127.0.0.1` so the tunnel
-is the only way in.
+**Fastest, free, no domain — Tailscale Funnel.** Gives the Pi a fixed public HTTPS URL you
+open from any browser (no app to install), gated by the dashboard login.
+
+1. Set the login in `~/bridge-data/config.yaml` (required before exposing publicly):
+   ```yaml
+   auth:
+     protect: all                       # nothing visible without login
+     ui_password: "a-long-passphrase"
+   ```
+   `sudo systemctl restart heatpump-bridge`
+2. `bash ~/a2w-control/heatpump-bridge/deploy/setup-remote.sh`
+   (installs Tailscale, joins your tailnet via a one-time login link, exposes the URL).
+3. Open the printed `https://heatpump-pi.<tailnet>.ts.net` from anywhere → login page →
+   your password. Bookmark it; it never changes.
+
+**Want a pretty custom URL** (`heat.yourname.com`, ~$10/yr domain)? Use Cloudflare Tunnel
+instead — `cloudflared-notes.md`. The bridge doesn't change; only the front door does, so
+you can start with Funnel and switch later.
+
+**For machine access (TempIQ):** `api-integration.md`. Same URL, a bearer token instead of
+the login.
 
 ## 5. Sanity checklist
 

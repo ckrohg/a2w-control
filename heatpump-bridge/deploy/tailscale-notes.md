@@ -1,8 +1,23 @@
 # Tailscale — remote access (recommended default)
 
-Free, no domain, 10 minutes. Gives you the dashboard from anywhere and (optionally) a
-public HTTPS URL for a machine consumer like TempIQ. This is the primary remote-access
-path; `cloudflared-notes.md` is the alternative if you want a branded URL + email-OTP.
+Free, no domain, ~10 minutes. Two flavors; pick by whether you want a public URL.
+
+## Quickest: Funnel (public URL, no app for viewers)
+
+```bash
+# 1. set auth.protect: all + ui_password in ~/bridge-data/config.yaml, restart the service
+# 2. then:
+bash ~/a2w-control/heatpump-bridge/deploy/setup-remote.sh
+```
+That scripts the whole thing: installs Tailscale, joins your tailnet (one login link),
+and exposes `https://heatpump-pi.<tailnet>.ts.net` publicly over HTTPS. You open that URL
+from any browser on any network — no app — and the bridge's login gates it. The rest of
+this doc is the manual/private alternatives.
+
+---
+
+Gives you the dashboard from anywhere and (optionally) a public HTTPS URL for a machine
+consumer like TempIQ. `cloudflared-notes.md` is the alternative if you want a branded URL.
 
 ## Your phone/laptop → the dashboard (private mesh)
 
