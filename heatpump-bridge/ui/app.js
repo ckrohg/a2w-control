@@ -267,14 +267,20 @@ function renderDashboard() {
         <span class="age">${fmtAgo(f.since)}</span>
       </div>`).join("");
     const err = s.comm?.error_rate ?? 0;
+    // Stale-data guard: if polling stopped, the snapshot keeps serving last-good values.
+    // Mark them loudly so the dashboard never gives false assurance ("running, no faults"
+    // while the pump has actually been unreachable). (fusion audit, risk 3b)
+    const ageS = s.last_poll_ts ? (Date.now() / 1000 - s.last_poll_ts) : Infinity;
+    const stale = !s.online || ageS > 90;
     return `
-    <div class="card" data-pump="${p.id}">
+    <div class="card ${stale ? "stale" : ""}" data-pump="${p.id}">
       <div class="head">
         <h2>${esc(s.name || p.name)}</h2>
         <button class="power ${s.on ? "on" : ""}" data-power="${s.on ? "off" : "on"}"
           title="${s.on ? "Turn unit off" : "Turn unit on"}" ${s.online ? "" : "disabled"}>⏻</button>
         <span class="chip ${stateName}">${stateName}</span>
       </div>
+      ${stale ? `<div class="stale-banner">⚠ No fresh data — last update ${fmtAgo(s.last_poll_ts)}. Values below may be out of date.</div>` : ""}
       <div class="modectl seg">
         <button class="seg-btn ${s.mode_kind === "heating" ? "active" : ""}"
           data-mode="heating" ${s.online ? "" : "disabled"}>Heat</button>

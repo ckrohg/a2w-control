@@ -1,5 +1,26 @@
 # USR-W610 configuration — per heat pump
 
+## ⚠ REQUIRED security step: network-isolate the gateways (fusion audit, risk #1)
+
+Every software guardrail (auth, clamp, rate-limit, MAC-pin, read-back, write_enabled)
+lives inside the Pi. But each W610 exposes a **raw Modbus TCP port (8899) and a web admin
+page** on the home WiFi. Anything else on that network — a phone, a guest laptop, a
+compromised smart bulb, a stray `nmap` — can open a socket straight to a gateway and write
+Modbus frames directly to a pump, **bypassing every guardrail at once**. A second process
+holding that single socket also starves the Pi's polling. "The Pi is the only Modbus
+master" is only true if the *network* enforces it.
+
+Do at least one of these before go-live (in rough order of strength):
+1. **VLAN / dedicated SSID** for the two W610s + Pi, isolated from the main LAN.
+2. **Router firewall ACL**: allow TCP 8899 + the W610 admin port only from the Pi's IP.
+3. **Client isolation** on an IoT SSID (blocks device-to-device), with the Pi on that SSID.
+4. If the router can't do any of the above, a small dedicated AP for the Pi + gateways.
+
+Plus, on each W610: **change the admin password** from the default, and **disable its
+cloud / remote-config service** so it isn't reachable or configurable from outside.
+
+
+
 Each pump gets its own W610 + isolated repeater chain (no shared bus). Configure each
 W610 identically except for its IP/name. Do this on the bench BEFORE wiring to the pumps —
 you can validate the whole chain against the simulator first (see bottom).
