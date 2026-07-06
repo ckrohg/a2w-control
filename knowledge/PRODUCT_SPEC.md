@@ -11,7 +11,8 @@ Full bridge service + UI running against **two simulated pumps** (`sim/fake_pump
 - **Bridge:** Python, FastAPI + pymodbus (async), single process on a Pi 5. One Modbus client per pump.
 - **Framing gotcha:** W610 gateways run transparent mode → the Pi speaks **Modbus RTU framing over a TCP socket** (`AsyncModbusTcpClient` + `FramerType.RTU`), *not* Modbus TCP. This is the #1 likely first-connection bug.
 - **Persistence:** SQLite (samples, events, comm_stats). No InfluxDB/Postgres/Grafana.
-- **Remote access:** Cloudflare Tunnel + Cloudflare Access (email OTP). No custom auth, no open ports.
+- **Remote access:** tunnel (Tailscale recommended / Cloudflare alternative). No open ports. See `deploy/tailscale-notes.md`, `deploy/cloudflared-notes.md`.
+- **API auth (added 2026-07-05):** bearer tokens for machine consumers (TempIQ), each with a `source` audit identity and read-only/control scope; browser UI uses an httponly session cookie. Enforcement is opt-in (`auth.protect: off|writes|all`). This is the seam for cloud integration — cloud as a *consumer* of the API, never in the control path. Full guide: `deploy/api-integration.md`.
 - **UI:** mobile-first SPA served by FastAPI at `/`. Both pumps visible at once.
 
 ## Surface inventory

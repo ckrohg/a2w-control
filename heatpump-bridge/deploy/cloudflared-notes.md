@@ -1,7 +1,11 @@
 # Cloudflare Tunnel + Access — remote UI
 
+> Alternative to Tailscale (`tailscale-notes.md`). Choose this if you want a branded URL
+> and email-OTP for humans. For machine access (TempIQ), see `api-integration.md` — put
+> Cloudflare Access on `/` for humans and leave `/api` public, gated by a bridge token.
+
 Goal: `https://heat.<your-domain>` → Pi's localhost:8000, with email-OTP auth in front.
-No open router ports, no custom auth code (handoff §6.1 — settled).
+No open router ports, no custom human auth (handoff §6.1 — settled).
 
 ## Prereqs
 
