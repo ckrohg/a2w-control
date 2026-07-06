@@ -13,11 +13,11 @@ CONTROL = "c" * 24
 READONLY = "r" * 24
 
 
-def make_app(tmp_path, protect="off", tokens=None):
+def make_app(tmp_path, protect="off", tokens=None, ui_password=None):
     cfg = AppConfig(
         pumps=[PumpConfig(id="pump1", name="P1", host="127.0.0.1", port=59999,
                           write_enabled=True, poll_interval_s=999)],
-        auth=AuthConfig(protect=protect, tokens=tokens or []),
+        auth=AuthConfig(protect=protect, tokens=tokens or [], ui_password=ui_password),
         db_path=str(tmp_path / "b.db"),
         ui_dir="ui",
     )
@@ -69,7 +69,7 @@ def test_health_and_whoami_always_open(tmp_path):
         anon = c.get("/api/whoami").json()
         assert anon["authenticated"] is False
         who = c.get("/api/whoami", headers=bearer(CONTROL)).json()
-        assert who == {"authenticated": True, "source": "tempiq", "can_write": True}
+        assert (who["authenticated"], who["source"], who["can_write"]) == (True, "tempiq", True)
         # a bad token on whoami reports unauthenticated rather than erroring
         assert c.get("/api/whoami", headers=bearer("bad")).json()["authenticated"] is False
 
@@ -86,16 +86,47 @@ def test_source_attribution_comes_from_token_not_body(tmp_path):
         assert writes and all(e["detail"]["source"] == "tempiq" for e in writes)
 
 
-def test_ui_cookie_authorizes_browser_without_a_token(tmp_path):
-    with TestClient(make_app(tmp_path, "all", both_tokens())) as c:
-        # httpx TestClient shares a cookie jar; loading the page mints the session
-        assert c.get("/api/pumps").status_code == 401     # no cookie yet
-        c.get("/")                                        # sets a2w_ui cookie
-        assert "a2w_ui" in c.cookies
-        assert c.get("/api/pumps").status_code == 200     # cookie now carries auth
-        # and the cookie is httponly + samesite
-        setc = TestClient(make_app(tmp_path, "all")).get("/").headers.get("set-cookie", "")
-        assert "httponly" in setc.lower() and "samesite=strict" in setc.lower()
+def test_protect_off_auto_mints_browser_session(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        setc = c.get("/").headers.get("set-cookie", "")
+        assert "a2w_ui" in setc and "httponly" in setc.lower() and "samesite=strict" in setc.lower()
+        # the cookie is a signed token, NOT the raw server secret
+        val = c.cookies.get("a2w_ui")
+        assert "." in val and val != c.app.state.ui_secret
+
+
+def test_loading_page_does_NOT_grant_control_under_protect(tmp_path):
+    # regression for the HIGH finding: a public/LAN caller must not get a free write
+    # session just by loading the page
+    with TestClient(make_app(tmp_path, "writes", ui_password="hunter2pass")) as c:
+        c.get("/")                                        # loads page
+        assert "a2w_ui" not in c.cookies                  # no session handed out
+        assert c.post("/api/pumps/pump1/setpoint",
+                      json={"value": 45}).status_code == 401
+
+
+def test_ui_password_login_flow(tmp_path):
+    with TestClient(make_app(tmp_path, "all", ui_password="hunter2pass")) as c:
+        assert c.get("/api/pumps").status_code == 401     # locked out until login
+        assert c.post("/api/session", json={"password": "wrong"}).status_code == 401
+        assert c.post("/api/session", json={"password": "hunter2pass"}).status_code == 200
+        assert "a2w_ui" in c.cookies                       # session issued
+        assert c.get("/api/pumps").status_code == 200      # now authorized
+        r = c.post("/api/pumps/pump1/setpoint", json={"value": 45})
+        assert r.status_code not in (401, 403)             # control granted
+        c.post("/api/logout")
+        assert c.get("/api/pumps").status_code == 401       # logout clears it
+
+
+def test_login_throttle(tmp_path):
+    import bridge.auth as auth
+    auth._fail_times.clear()
+    with TestClient(make_app(tmp_path, "writes", ui_password="hunter2pass")) as c:
+        for _ in range(11):
+            c.post("/api/session", json={"password": "nope"})
+        # after >10 failures/min, even the correct password is refused briefly
+        assert c.post("/api/session", json={"password": "hunter2pass"}).status_code == 429
+    auth._fail_times.clear()
 
 
 def test_config_rejects_short_and_duplicate_tokens(tmp_path):

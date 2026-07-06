@@ -33,12 +33,53 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<":
 // ---------- data ----------
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  if (res.status === 401) maybeLogin();   // server wants a login — prompt for it
   if (!res.ok) {
     let msg = `${res.status}`;
     try { msg = (await res.json()).detail || msg; } catch { /* keep status */ }
     throw new Error(msg);
   }
   return res.json();
+}
+
+// Show a password prompt when the bridge requires a login (protect mode) and offers one.
+let loginShowing = false;
+async function maybeLogin() {
+  if (loginShowing) return;
+  let info;
+  try { info = await (await fetch("/api/whoami")).json(); } catch { return; }
+  if (info.authenticated || !info.login_available) return;   // nothing to do
+  loginShowing = true;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Sign in</h3>
+      <p>Enter the dashboard password to control the heat pumps.</p>
+      <div class="modal-input"><input type="password" class="wide" autocomplete="current-password"></div>
+      <div class="modal-actions">
+        <button class="m-confirm">Sign in</button>
+      </div>
+      <div class="login-err" style="color:var(--critical);font-size:13px;margin-top:8px;display:none"></div>
+    </div>`;
+  const input = overlay.querySelector("input");
+  const err = overlay.querySelector(".login-err");
+  const submit = async () => {
+    try {
+      const r = await fetch("/api/session", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: input.value }),
+      });
+      if (!r.ok) { err.textContent = (await r.json()).detail || "sign-in failed"; err.style.display = "block"; return; }
+      overlay.remove(); loginShowing = false;
+      toast("✓ signed in");
+      await refresh();
+    } catch { err.textContent = "network error"; err.style.display = "block"; }
+  };
+  overlay.querySelector(".m-confirm").onclick = submit;
+  input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  document.body.appendChild(overlay);
+  input.focus();
 }
 
 let refreshing = false;

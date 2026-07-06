@@ -21,12 +21,17 @@ Mint a token and add it to `~/bridge-data/config.yaml`:
 
 ```yaml
 auth:
-  protect: writes        # require a token for control; reads stay open
+  protect: writes        # require a credential for control; reads stay open
+  ui_password: "a-long-passphrase"   # YOUR browser login (once per device, 30-day session)
   tokens:
     - token: "<openssl rand -hex 24>"
       source: tempiq      # appears in the audit log for every write this token makes
       can_write: true     # false = read-only (observe & recommend); true = full control
 ```
+
+`ui_password` is for the human browser; `tokens` are for machines. Under `protect`, loading
+the dashboard no longer grants control for free — you (browser) log in once with the
+password, TempIQ (machine) presents its bearer token. Neither can act without its credential.
 
 `sudo systemctl restart heatpump-bridge`. Send the token as a bearer header:
 

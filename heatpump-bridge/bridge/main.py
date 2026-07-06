@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from .api import router
-from .auth import UI_COOKIE, load_or_create_ui_secret
+from .auth import UI_COOKIE, cookie_secure, load_or_create_ui_secret, mint_session
 from .config import AppConfig, load_config
 from .guardrails import SetpointGuard
 from .poller import PumpPoller
@@ -71,12 +71,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.middleware("http")
     async def _ui_session_cookie(request, call_next):
         response = await call_next(request)
-        # hand the browser a same-origin session when it loads the page (it only got
-        # here by passing the tunnel's own human auth). httponly + SameSite=strict:
-        # not script-readable, not sent on cross-site requests (CSRF-safe).
-        if request.url.path in ("/", "/index.html") and UI_COOKIE not in request.cookies:
+        # Auto-mint a browser session ONLY when protection is off (LAN-first convenience).
+        # When protect is on, a session must be earned via POST /api/session (password) —
+        # otherwise anyone who can load the page would get control for free. The cookie is
+        # a signed, expiring token, never the raw server secret.
+        if (app.state.config.auth.protect == "off"
+                and request.url.path in ("/", "/index.html")
+                and UI_COOKIE not in request.cookies):
             response.set_cookie(
-                UI_COOKIE, app.state.ui_secret, httponly=True, samesite="strict",
+                UI_COOKIE, mint_session(app.state.ui_secret), httponly=True,
+                samesite="strict", secure=cookie_secure(request),
                 max_age=31536000, path="/")
         return response
 

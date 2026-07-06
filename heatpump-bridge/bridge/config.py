@@ -73,10 +73,21 @@ class ApiToken(BaseModel):
 class AuthConfig(BaseModel):
     # off   = no auth enforced (LAN/tunnel is the only gate; tokens still honored for
     #         attribution + scope if presented). Backward-compatible default.
-    # writes= control endpoints require a valid can_write token or the UI session cookie.
-    # all   = every /api call requires a token or the UI cookie.
+    # writes= control endpoints require a valid can_write token or a UI login session.
+    # all   = every /api call requires a token or a UI login session.
     protect: Literal["off", "writes", "all"] = "off"
     tokens: list[ApiToken] = []
+    # Browser login password used when protect != off. Without it, a browser can still
+    # READ (in writes mode) but cannot obtain a control session — set it before exposing
+    # the dashboard for remote control. Machines use tokens and ignore this.
+    ui_password: str | None = None
+
+    @model_validator(mode="after")
+    def _password_present_for_protection(self):
+        if self.protect in ("writes", "all") and self.ui_password is not None:
+            if len(self.ui_password) < 8:
+                raise ValueError("ui_password must be at least 8 characters")
+        return self
 
     @model_validator(mode="after")
     def _unique_tokens(self):

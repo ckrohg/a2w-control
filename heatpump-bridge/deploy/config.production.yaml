@@ -45,6 +45,10 @@ modbus_timeout_s: 5
 # only for headless callers. See deploy/api-integration.md.
 auth:
   protect: off
+  # ui_password: set this before exposing the dashboard for remote CONTROL — under
+  # protect=writes/all the browser must log in once with it (30-day session). Without
+  # it, a browser can still read but not control. Machines use tokens and ignore this.
+  # ui_password: "a-long-passphrase"
   tokens: []
   #  - token: "REPLACE_WITH_openssl_rand_hex_24"
   #    source: tempiq        # this label is what appears in the audit log for its writes

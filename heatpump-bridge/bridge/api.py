@@ -8,11 +8,12 @@ from __future__ import annotations
 import time
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .auth import Principal, require, resolve_principal_safe
+from .auth import (Principal, UI_COOKIE, cookie_secure, login_locked, mint_session,
+                   register_login_failure, require, resolve_principal_safe, _eq)
 from .guardrails import GuardrailError
 from .poller import PumpPoller
 
@@ -54,6 +55,10 @@ class AddPumpRequest(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     host: str
     port: int = 8899
+
+
+class SessionRequest(BaseModel):
+    password: str
 
 
 def _pollers(request: Request) -> dict[str, PumpPoller]:
@@ -314,6 +319,32 @@ async def health(request: Request):
 @router.get("/whoami")
 async def whoami(request: Request):
     """Open endpoint that reports how the caller is authenticated — lets a machine
-    consumer (TempIQ) verify its token and scope without side effects."""
+    consumer (TempIQ) verify its token, and the browser decide whether to show a login."""
     p = resolve_principal_safe(request)
-    return {"authenticated": p.authenticated, "source": p.source, "can_write": p.can_write}
+    auth = request.app.state.config.auth
+    return {"authenticated": p.authenticated, "source": p.source, "can_write": p.can_write,
+            "protect": auth.protect, "login_available": bool(auth.ui_password)}
+
+
+@router.post("/session")
+async def login(request: Request, body: SessionRequest, response: Response):
+    """Exchange the UI password for a signed browser session cookie (used when
+    protect != off). Machines use bearer tokens and never call this."""
+    auth = request.app.state.config.auth
+    if not auth.ui_password:
+        raise HTTPException(400, "no UI password is configured on the bridge")
+    if login_locked():
+        raise HTTPException(429, "too many failed logins — try again in a minute")
+    if not _eq(body.password, auth.ui_password):
+        register_login_failure()
+        raise HTTPException(401, "incorrect password")
+    response.set_cookie(
+        UI_COOKIE, mint_session(request.app.state.ui_secret), httponly=True,
+        samesite="strict", secure=cookie_secure(request), max_age=30 * 86400, path="/")
+    return {"ok": True}
+
+
+@router.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(UI_COOKIE, path="/")
+    return {"ok": True}
