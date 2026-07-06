@@ -75,6 +75,7 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 
 - [ ] Phase 3: second pump + Cloudflare Tunnel + systemd hardening (`Restart=always`)
 - [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — as a new consumer of existing API endpoints
+- [ ] Phase 4 platform (architecture DECIDED 2026-07-06, `reference/remote-api-architecture.md`): **Cloudflare Tunnel + Access** for the remote optimizer API (direct tunnel, not a cloud relay). Setpoint **lease** primitive already built (release-20260706-1). Defer: cloudflared/DNS/Access wiring, the optimizer itself (start read-only → setpoint-only), any hosted dashboard (pure outbound push, later). Never let the optimizer hold authority without a lease.
 - [ ] Phase 4 (future): **coordinated HP + HBX control** — hard requirement (2026-07-04): A2W must write HBX setpoints so buffer tank and heat pumps work in conjunction. Write path discovery: Proxyman capture of the SensorLinx app changing a setpoint (owner already built the read side this way). Same guardrail discipline as heat pump writes.
 
 ## Decisions deferred
