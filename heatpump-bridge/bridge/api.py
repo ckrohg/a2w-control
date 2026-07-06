@@ -1,39 +1,43 @@
-# @purpose: JSON API surface (handoff §6.3). No auth here by design — Cloudflare Access
-# (email OTP) fronts the tunnel. All reads come from the pollers' in-memory snapshots.
+# @purpose: JSON API surface (handoff §6.3). Machine auth lives in auth.py: Bearer tokens
+# (for consumers like TempIQ) + a UI session cookie for browsers past the tunnel. The
+# authenticated principal's `source` is the audit identity — clients cannot spoof it, so
+# the request bodies no longer carry a source field. All reads come from the pollers'
+# in-memory snapshots.
 from __future__ import annotations
 
 import time
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .auth import Principal, require, resolve_principal_safe
 from .guardrails import GuardrailError
 from .poller import PumpPoller
 
 router = APIRouter(prefix="/api")
 
+# dependency singletons
+read = require("read")
+write = require("write")
+
 
 class SetpointRequest(BaseModel):
     value: float
-    source: str = Field(default="ui", max_length=32)  # audit trail; future: "tempiq"
 
 
 class ModeRequest(BaseModel):
     value: Literal["heating", "cooling"]  # modes 2-5 are unstable per protocol doc
-    source: str = Field(default="ui", max_length=32)
 
 
 class PowerRequest(BaseModel):
     value: bool
-    source: str = Field(default="ui", max_length=32)
 
 
 class ParameterRequest(BaseModel):
     key: str
     value: int
-    source: str = Field(default="ui", max_length=32)
 
 
 class ScheduleRequest(BaseModel):
@@ -64,7 +68,7 @@ def _pump(request: Request, pump_id: str) -> PumpPoller:
 
 
 @router.get("/pumps")
-async def list_pumps(request: Request):
+async def list_pumps(request: Request, _p: Principal = Depends(read)):
     return [
         {
             "id": p.cfg.id,
@@ -84,7 +88,8 @@ async def list_pumps(request: Request):
 
 
 @router.post("/pumps")
-async def add_pump(request: Request, body: AddPumpRequest):
+async def add_pump(request: Request, body: AddPumpRequest,
+                   principal: Principal = Depends(write)):
     """Add a heat pump at runtime (Setup tab): point it at a discovered gateway,
     adopt the MAC, start polling, persist across restarts. Ships write-disabled —
     same Phase 1 rule as config-defined pumps."""
@@ -109,12 +114,13 @@ async def add_pump(request: Request, body: AddPumpRequest):
     save_added_pump(state.config, pump_cfg)
     await state.store.add_event(
         pump_cfg.id, "comm", code="pump_added", severity="info",
-        message=f"{body.name} added via Setup at {body.host}:{body.port}")
+        message=f"{body.name} added at {body.host}:{body.port} ({principal.source})")
     return {"id": pump_cfg.id, "name": pump_cfg.name, "mac": pump_cfg.mac}
 
 
 @router.delete("/pumps/{pump_id}")
-async def remove_pump(request: Request, pump_id: str):
+async def remove_pump(request: Request, pump_id: str,
+                      principal: Principal = Depends(write)):
     """Remove a UI-added pump (config.yaml-defined pumps are removed by editing the
     file — the bridge never rewrites the human's config)."""
     from .config import remove_added_pump
@@ -137,88 +143,97 @@ async def remove_pump(request: Request, pump_id: str):
 
 
 @router.get("/pumps/{pump_id}/status")
-async def pump_status(request: Request, pump_id: str):
+async def pump_status(request: Request, pump_id: str, _p: Principal = Depends(read)):
     return _pump(request, pump_id).snapshot
 
 
 @router.get("/pumps/{pump_id}/history")
-async def pump_history(request: Request, pump_id: str, hours: float = 24):
+async def pump_history(request: Request, pump_id: str, hours: float = 24,
+                       _p: Principal = Depends(read)):
     poller = _pump(request, pump_id)
     hours = min(max(hours, 1), 24 * 90)
     return await poller.store.get_history(pump_id, hours)
 
 
 @router.get("/pumps/{pump_id}/events")
-async def pump_events(request: Request, pump_id: str, days: float = 7):
+async def pump_events(request: Request, pump_id: str, days: float = 7,
+                      _p: Principal = Depends(read)):
     poller = _pump(request, pump_id)
     days = min(max(days, 1), 365)
     return await poller.store.get_events(pump_id, days)
 
 
 @router.post("/pumps/{pump_id}/setpoint")
-async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest):
+async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest,
+                         principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     try:
-        return await poller.write_setpoint(body.value, body.source)
+        return await poller.write_setpoint(body.value, principal.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.post("/pumps/{pump_id}/mode")
-async def write_mode(request: Request, pump_id: str, body: ModeRequest):
+async def write_mode(request: Request, pump_id: str, body: ModeRequest,
+                     principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     try:
-        return await poller.write_mode(body.value, body.source)
+        return await poller.write_mode(body.value, principal.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.post("/pumps/{pump_id}/power")
-async def write_power(request: Request, pump_id: str, body: PowerRequest):
+async def write_power(request: Request, pump_id: str, body: PowerRequest,
+                      principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     try:
-        return await poller.write_power(body.value, body.source)
+        return await poller.write_power(body.value, principal.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.post("/pumps/{pump_id}/parameter")
-async def write_parameter(request: Request, pump_id: str, body: ParameterRequest):
+async def write_parameter(request: Request, pump_id: str, body: ParameterRequest,
+                          principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     try:
-        return await poller.write_parameter(body.key, body.value, body.source)
+        return await poller.write_parameter(body.key, body.value, principal.source)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.get("/pumps/{pump_id}/schedules")
-async def list_schedules(request: Request, pump_id: str):
+async def list_schedules(request: Request, pump_id: str, _p: Principal = Depends(read)):
     poller = _pump(request, pump_id)
     return await poller.store.list_schedules(pump_id)
 
 
 @router.post("/pumps/{pump_id}/schedules")
-async def add_schedule(request: Request, pump_id: str, body: ScheduleRequest):
+async def add_schedule(request: Request, pump_id: str, body: ScheduleRequest,
+                       principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     await poller.store.add_schedule(pump_id, body.time, body.action)
     await poller.store.add_event(
         pump_id, "schedule_change", code="added", severity="info",
-        message=f"timer added: {body.action} at {body.time}")
+        message=f"timer added: {body.action} at {body.time} ({principal.source})")
     return await poller.store.list_schedules(pump_id)
 
 
 @router.delete("/pumps/{pump_id}/schedules/{schedule_id}")
-async def delete_schedule(request: Request, pump_id: str, schedule_id: int):
+async def delete_schedule(request: Request, pump_id: str, schedule_id: int,
+                          principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     await poller.store.delete_schedule(pump_id, schedule_id)
     await poller.store.add_event(
         pump_id, "schedule_change", code="removed", severity="info",
-        message=f"timer {schedule_id} removed")
+        message=f"timer {schedule_id} removed ({principal.source})")
     return await poller.store.list_schedules(pump_id)
 
 
 @router.get("/discover")
-async def discover_gateways(request: Request, probe: bool = True):
+async def discover_gateways(request: Request, probe: bool = True,
+                            _p: Principal = Depends(write)):
     """Sweep the LAN for W610 gateways (USR broadcast + Modbus-port scan), optionally
     probing each with a real register read. Marks which candidate matches each
     configured pump's MAC."""
@@ -238,7 +253,8 @@ async def discover_gateways(request: Request, probe: bool = True):
 
 
 @router.post("/pumps/{pump_id}/gateway")
-async def set_gateway(request: Request, pump_id: str, body: GatewayRequest):
+async def set_gateway(request: Request, pump_id: str, body: GatewayRequest,
+                      _p: Principal = Depends(write)):
     """Assign a discovered gateway to this pump. If the pump has a configured MAC and
     the target's MAC is resolvable, they must match (409 otherwise) — you cannot
     accidentally point pump 1 at pump 2's gateway."""
@@ -262,7 +278,8 @@ async def set_gateway(request: Request, pump_id: str, body: GatewayRequest):
 
 
 @router.post("/w610/configure")
-async def configure_w610_endpoint(request: Request, body: GatewayRequest):
+async def configure_w610_endpoint(request: Request, body: GatewayRequest,
+                                  _p: Principal = Depends(write)):
     """EXPERIMENTAL: push the required serial settings (2400 8N1, transparent mode)
     to a W610 over the vendor UDP channel — the web-console alternative."""
     from .w610_config import configure_w610
@@ -281,6 +298,8 @@ async def configure_w610_endpoint(request: Request, body: GatewayRequest):
 
 @router.get("/health")
 async def health(request: Request):
+    """Open (no auth) so uptime checks and the bootstrap can hit it. Reports auth mode
+    but never leaks token material."""
     pollers = _pollers(request)
     return {
         "service": "heatpump-bridge",
@@ -288,4 +307,13 @@ async def health(request: Request):
         "ts": time.time(),
         "pumps_online": sum(1 for p in pollers.values() if p.online),
         "pumps_total": len(pollers),
+        "auth_mode": request.app.state.config.auth.protect,
     }
+
+
+@router.get("/whoami")
+async def whoami(request: Request):
+    """Open endpoint that reports how the caller is authenticated — lets a machine
+    consumer (TempIQ) verify its token and scope without side effects."""
+    p = resolve_principal_safe(request)
+    return {"authenticated": p.authenticated, "source": p.source, "can_write": p.can_write}

@@ -542,6 +542,8 @@ async def test_add_and_remove_pump_at_runtime(rig):
     from bridge import api as api_mod
     from bridge.config import apply_gateway_overrides
 
+    from bridge.auth import Principal
+
     pump, poller, store = rig
     pump3 = FakePump(3, free_port())
     await pump3.start()
@@ -552,9 +554,10 @@ async def test_add_and_remove_pump_at_runtime(rig):
     ns = SimpleNamespace(pollers={"p1": poller}, config=poller.app_cfg, store=store,
                          guard=poller.guard, persist_gateway=persist)
     request = SimpleNamespace(app=SimpleNamespace(state=ns))
+    principal = Principal(source="test", can_write=True, authenticated=True)
 
     result = await api_mod.add_pump(request, api_mod.AddPumpRequest(
-        name="Heat Pump 3", host="127.0.0.1", port=pump3.port))
+        name="Heat Pump 3", host="127.0.0.1", port=pump3.port), principal=principal)
     new_id = result["id"]
     assert new_id in ns.pollers
     new_poller = ns.pollers[new_id]
@@ -571,12 +574,12 @@ async def test_add_and_remove_pump_at_runtime(rig):
     # config-defined pumps cannot be removed via the API
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
-        await api_mod.remove_pump(request, "p1")
+        await api_mod.remove_pump(request, "p1", principal=principal)
 
     # a timer on the doomed pump must die with it — ids are recycled, and an
     # orphaned schedule would silently attach to a future pump
     await store.add_schedule(new_id, "22:00", "off")
-    await api_mod.remove_pump(request, new_id)
+    await api_mod.remove_pump(request, new_id, principal=principal)
     assert new_id not in ns.pollers
     assert await store.list_schedules(new_id) == []
     fresh2 = AppConfig(pumps=[PumpConfig(id="p1", name="P1", host="127.0.0.1")],

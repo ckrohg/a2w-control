@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from .api import router
+from .auth import UI_COOKIE, load_or_create_ui_secret
 from .config import AppConfig, load_config
 from .guardrails import SetpointGuard
 from .poller import PumpPoller
@@ -62,6 +63,23 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         await store.close()
 
     app = FastAPI(title="heatpump-bridge", lifespan=lifespan)
+    # config + UI secret available before startup so the auth deps and cookie middleware
+    # work for any request (lifespan re-sets config with the poller-wired copy).
+    app.state.config = cfg
+    app.state.ui_secret = load_or_create_ui_secret(Path(cfg.db_path).resolve().parent)
+
+    @app.middleware("http")
+    async def _ui_session_cookie(request, call_next):
+        response = await call_next(request)
+        # hand the browser a same-origin session when it loads the page (it only got
+        # here by passing the tunnel's own human auth). httponly + SameSite=strict:
+        # not script-readable, not sent on cross-site requests (CSRF-safe).
+        if request.url.path in ("/", "/index.html") and UI_COOKIE not in request.cookies:
+            response.set_cookie(
+                UI_COOKIE, app.state.ui_secret, httponly=True, samesite="strict",
+                max_age=31536000, path="/")
+        return response
+
     app.include_router(router)
 
     ui_dir = Path(cfg.ui_dir)

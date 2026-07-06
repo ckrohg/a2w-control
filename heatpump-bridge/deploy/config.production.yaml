@@ -35,3 +35,17 @@ guardrails:
 db_path: /home/pi/bridge-data/bridge.db
 ui_dir: /home/pi/a2w-control/heatpump-bridge/ui
 modbus_timeout_s: 5
+
+# API authentication for machine consumers (e.g. TempIQ) and remote control.
+# protect: off (default — LAN/tunnel is the only gate) | writes | all
+#   writes = control endpoints need a can_write token or the browser UI session
+#   all    = every /api call needs a token or the UI session
+# Generate a token with: openssl rand -hex 24
+# The browser UI keeps working with no login of its own (session cookie); tokens are
+# only for headless callers. See deploy/api-integration.md.
+auth:
+  protect: off
+  tokens: []
+  #  - token: "REPLACE_WITH_openssl_rand_hex_24"
+  #    source: tempiq        # this label is what appears in the audit log for its writes
+  #    can_write: true       # false = read-only (observe/recommend); true = full control

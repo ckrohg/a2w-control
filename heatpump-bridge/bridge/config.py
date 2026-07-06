@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -57,9 +58,38 @@ class GuardrailConfig(BaseModel):
         return self
 
 
+class ApiToken(BaseModel):
+    token: str = Field(min_length=16)   # long random secret; e.g. `openssl rand -hex 24`
+    source: str = "api"                 # audit identity for writes made with this token
+    can_write: bool = False             # read-only by default (safe); True = full control
+
+    @model_validator(mode="after")
+    def _label(self):
+        if not self.source.strip():
+            raise ValueError("token source label must be non-empty")
+        return self
+
+
+class AuthConfig(BaseModel):
+    # off   = no auth enforced (LAN/tunnel is the only gate; tokens still honored for
+    #         attribution + scope if presented). Backward-compatible default.
+    # writes= control endpoints require a valid can_write token or the UI session cookie.
+    # all   = every /api call requires a token or the UI cookie.
+    protect: Literal["off", "writes", "all"] = "off"
+    tokens: list[ApiToken] = []
+
+    @model_validator(mode="after")
+    def _unique_tokens(self):
+        secrets_seen = [t.token for t in self.tokens]
+        if len(secrets_seen) != len(set(secrets_seen)):
+            raise ValueError("duplicate API tokens configured")
+        return self
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
+    auth: AuthConfig = AuthConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
