@@ -212,6 +212,21 @@ clamp meter during commissioning.
    damage — wall controller may briefly log E21 and recovers when you stop. Fully
    reversible; the heating chain is never at risk from this procedure.
 
+## HARD GATE before enabling writes (Phase 2) — from the fusion re-audit
+
+The re-audit's verdict: read-only Phase 1 is fine, but do NOT set `write_enabled: true`
+on any pump until all three are done and recorded:
+1. **Gateway isolation VERIFIED (not just documented):** run `deploy/verify-isolation.sh
+   <gw1-ip> <gw2-ip>` from a **non-Pi laptop** on the home network — every port must be
+   unreachable (a raw Modbus write to an exposed :8899 bypasses every software guardrail).
+   Re-run after any router/firmware/VLAN change.
+2. **HBX-override bench test:** confirm whether a raw Modbus "off" / low-setpoint command
+   can override the HBX dry-contact heat call. If Modbus wins, a rogue write can defeat the
+   manual fallback — this must be understood before writes go live.
+3. **Winter-safe floor set:** set `guardrails.unattended_min_setpoint_c` (and the setback)
+   from the house's design-day heat requirement, not the round default — "pump running" at
+   too-low an LWT is not "pipes safe".
+
 ## Commissioning verification checklist (Phase 1)
 
 - [ ] **FIRST: record the as-found parameters as baseline** — `curl localhost:8000/api/pumps/pump1/status > baseline-pump1.json` (and pump2) before touching anything. Arctic's manual (p.1) says parameters "have been pre-set at the factory — we recommend that you leave these parameters as set"; the baseline is what "as set" means for these specific units.

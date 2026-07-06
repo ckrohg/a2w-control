@@ -45,8 +45,15 @@ class Scheduler:
                 await self.check_once(datetime.now())
             except Exception:
                 log.exception("scheduler check failed")
-            # external dead-man: ping every cycle so silence (Pi/WiFi/power dead) alarms
-            await notify.heartbeat(self.heartbeat_url)
+            # external dead-man: ping every cycle so silence (Pi/WiFi/power dead) alarms;
+            # drive it to /fail while any pump is offline or in a high/critical fault, so
+            # the reliable heartbeat channel doubles as the fault alarm
+            unhealthy = any(
+                (not p.online) or any(
+                    f["severity"] in ("high", "critical")
+                    for f in p.snapshot.get("active_faults", []))
+                for p in self.pollers.values())
+            await notify.heartbeat(self.heartbeat_url, fail=unhealthy)
             await asyncio.sleep(CHECK_INTERVAL_S)
 
     async def check_once(self, now: datetime) -> None:
@@ -89,9 +96,11 @@ class Scheduler:
         if action == "on":
             await poller.write_power(True, source="schedule")
             if g.comfort_setpoint_c is not None:
-                await poller.write_setpoint(g.comfort_setpoint_c, source="schedule")
+                await poller.write_setpoint(g.comfort_setpoint_c, source="schedule",
+                                            unattended=True)
         else:  # "off" becomes a setback, never a shutdown
-            await poller.write_setpoint(g.setback_setpoint_c, source="schedule")
+            await poller.write_setpoint(g.setback_setpoint_c, source="schedule",
+                                        unattended=True)
 
     async def run_maintenance(self, now: datetime) -> None:
         """Nightly: consistent DB backup (rotated) + retention pruning. A dead SD card

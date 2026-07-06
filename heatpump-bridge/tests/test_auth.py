@@ -13,10 +13,10 @@ CONTROL = "c" * 24
 READONLY = "r" * 24
 
 
-def make_app(tmp_path, protect="off", tokens=None, ui_password=None):
+def make_app(tmp_path, protect="off", tokens=None, ui_password=None, write_enabled=True):
     cfg = AppConfig(
         pumps=[PumpConfig(id="pump1", name="P1", host="127.0.0.1", port=59999,
-                          write_enabled=True, poll_interval_s=999)],
+                          write_enabled=write_enabled, poll_interval_s=999)],
         auth=AuthConfig(protect=protect, tokens=tokens or [], ui_password=ui_password),
         db_path=str(tmp_path / "b.db"),
         ui_dir="ui",
@@ -63,7 +63,8 @@ def test_all_mode_gates_reads_too(tmp_path):
 
 
 def test_health_and_whoami_always_open(tmp_path):
-    with TestClient(make_app(tmp_path, "all", both_tokens())) as c:
+    # not write-enabled -> health is 200 even with no hardware; and it's never auth-gated
+    with TestClient(make_app(tmp_path, "all", both_tokens(), write_enabled=False)) as c:
         assert c.get("/api/health").status_code == 200
         assert c.get("/api/health").json()["auth_mode"] == "all"
         anon = c.get("/api/whoami").json()
@@ -140,6 +141,16 @@ def test_login_throttle(tmp_path):
         # after >10 failures/min, even the correct password is refused briefly
         assert c.post("/api/session", json={"password": "hunter2pass"}).status_code == 429
     auth._fail_times.clear()
+
+
+def test_health_503_when_write_enabled_but_blind(tmp_path):
+    # re-audit fix 4b: a write-enabled pump with no fresh poll = blind -> 503, so the
+    # updater rolls back a deploy that can't reach the gateways. Not-controlling -> 200.
+    with TestClient(make_app(tmp_path, write_enabled=True)) as c:  # dead port, never polls
+        r = c.get("/api/health")
+        assert r.status_code == 503 and r.json()["healthy"] is False
+    with TestClient(make_app(tmp_path, write_enabled=False)) as c:
+        assert c.get("/api/health").status_code == 200
 
 
 def test_config_rejects_short_and_duplicate_tokens(tmp_path):

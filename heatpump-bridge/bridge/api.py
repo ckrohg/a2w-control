@@ -175,7 +175,8 @@ async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest,
                          principal: Principal = Depends(write)):
     poller = _pump(request, pump_id)
     try:
-        return await poller.write_setpoint(body.value, principal.source)
+        return await poller.write_setpoint(body.value, principal.source,
+                                           unattended=principal.is_machine)
     except GuardrailError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
@@ -304,16 +305,28 @@ async def configure_w610_endpoint(request: Request, body: GatewayRequest,
 
 
 @router.get("/health")
-async def health(request: Request):
-    """Open (no auth) so uptime checks and the bootstrap can hit it. Reports auth mode
-    but never leaks token material."""
+async def health(request: Request, response: Response):
+    """Open (no auth) so uptime checks and the bootstrap can hit it. Returns 503 when the
+    bridge is 'blind' — a write-enabled pump exists but NOTHING has polled fresh in 90s —
+    so a deploy that comes up but can't reach the gateways fails the updater's health check
+    and rolls back (re-audit fix 4b), and uptime monitors catch a stuck bridge. Read-only /
+    no-hardware phases (no write_enabled pump) always report healthy."""
     pollers = _pollers(request)
+    now = time.time()
+    fresh = sum(1 for p in pollers.values() if p.online
+                and p.snapshot.get("last_poll_ts") and now - p.snapshot["last_poll_ts"] < 90)
+    controlling = any(p.cfg.write_enabled for p in pollers.values())
+    blind = controlling and fresh == 0
+    if blind:
+        response.status_code = 503
     return {
         "service": "heatpump-bridge",
         "version": __version__,
-        "ts": time.time(),
+        "ts": now,
         "pumps_online": sum(1 for p in pollers.values() if p.online),
+        "pumps_fresh": fresh,
         "pumps_total": len(pollers),
+        "healthy": not blind,
         "auth_mode": request.app.state.config.auth.protect,
     }
 

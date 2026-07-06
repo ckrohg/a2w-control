@@ -53,6 +53,11 @@ class GuardrailConfig(BaseModel):
     restrict_unattended_writes: bool = True
     setback_setpoint_c: float = 40.0        # scheduler "off" target under restriction
     comfort_setpoint_c: float | None = None  # scheduler "on" target (None = leave setpoint)
+    # Winter-safe floor for UNATTENDED setpoint writes (scheduler + machine tokens). Even
+    # "setpoint-only" is heat-removing if it can go below a safe LWT — re-audit found the
+    # clamp min (30) sits below the setback (40). Set this from the house's design-day
+    # heat requirement, NOT a round number. Defaults to the setback.
+    unattended_min_setpoint_c: float | None = None
 
     @model_validator(mode="after")
     def _sane_bounds(self):
@@ -67,6 +72,9 @@ class GuardrailConfig(BaseModel):
             raise ValueError(f"cooling setpoint bounds must be within {lo}-{hi}degC")
         if not (self.setpoint_min_c <= self.setback_setpoint_c <= self.setpoint_max_c):
             raise ValueError("setback_setpoint_c must be within the heating clamp")
+        if self.unattended_min_setpoint_c is not None and not (
+                self.setpoint_min_c <= self.unattended_min_setpoint_c <= self.setpoint_max_c):
+            raise ValueError("unattended_min_setpoint_c must be within the heating clamp")
         if self.comfort_setpoint_c is not None and not (
                 self.setpoint_min_c <= self.comfort_setpoint_c <= self.setpoint_max_c):
             raise ValueError("comfort_setpoint_c must be within the heating clamp")

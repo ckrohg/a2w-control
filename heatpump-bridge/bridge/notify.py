@@ -30,14 +30,18 @@ async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
     await asyncio.to_thread(_post)
 
 
-async def heartbeat(url: str | None) -> None:
-    """Ping an external dead-man monitor (healthchecks.io etc). No-op if not configured."""
+async def heartbeat(url: str | None, fail: bool = False) -> None:
+    """Ping an external dead-man monitor (healthchecks.io etc). No-op if not configured.
+    fail=True pings the monitor's /fail endpoint so an ACTIVE fault/offline condition also
+    alarms through the reliable heartbeat channel — not only through best-effort ntfy
+    (re-audit fix 3: level-based, so a single dropped push can't lose a 2am fault)."""
     if not url:
         return
+    target = url.rstrip("/") + "/fail" if fail else url
 
     def _get():
         try:
-            urllib.request.urlopen(url, timeout=8).read()
+            urllib.request.urlopen(target, timeout=8).read()
         except Exception:  # noqa: BLE001
             pass
 

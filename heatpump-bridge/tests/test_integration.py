@@ -334,6 +334,27 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     assert len(fired) == 1
 
 
+async def test_unattended_writes_respect_winter_floor(rig):
+    # re-audit fix 2: "setpoint-only" is still heat-removing — an unattended actor must not
+    # go below the winter-safe floor even within the clamp. Human writes still can.
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = True
+    poller.app_cfg.guardrails.setback_setpoint_c = 40  # floor defaults to the setback
+    await poller.poll_once()
+
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(35, source="tempiq", unattended=True)  # below floor
+    assert exc.value.status_code == 422 and "floor" in str(exc.value)
+
+    # a human (attended) may go down to the clamp min (30)
+    result = await poller.write_setpoint(35, source="ui", unattended=False)
+    assert result["verified"] is True
+    # and an unattended write at/above the floor is fine
+    await asyncio.sleep(0.15)  # rate-limit lane
+    ok = await poller.write_setpoint(42, source="tempiq", unattended=True)
+    assert ok["verified"] is True
+
+
 async def test_scheduler_off_becomes_setback_not_shutdown(rig):
     # fusion audit risk 2: the scheduler must never leave a pump powered off (a cold-latch
     # the HBX can't undo). Under restriction (default), "off" sets a setback setpoint.

@@ -320,6 +320,16 @@ class PumpPoller:
                                 f"(changed at the unit, not via the bridge)")
                     log.info("[%s] external change: %s %s -> %s",
                              self.cfg.id, key, prev, value)
+                    # power/mode changed with no bridge write — the wall controller
+                    # (normal) OR a rogue Modbus write on an un-isolated LAN (re-audit
+                    # fix 1). Can't tell them apart, so surface it rather than auto-lock
+                    # (which would false-fire on every legitimate local change).
+                    if key in ("on", "mode"):
+                        self._push(
+                            title=f"{self.cfg.name}: {label} changed at the unit",
+                            message=f"{label} is now {value} — changed outside the "
+                                    f"dashboard (wall controller, or check gateway isolation).",
+                            tags="eyes")
         self._prev_config = {k: v for k, (_, v) in current.items()}
 
     async def _emit_state_events(self, decoded: dict) -> None:
@@ -385,15 +395,19 @@ class PumpPoller:
             self._last_error_polls = self.client.stats.error_polls
 
     # --- guarded write path ---------------------------------------------------
-    async def write_setpoint(self, value: float, source: str) -> dict:
+    async def write_setpoint(self, value: float, source: str,
+                             unattended: bool = False) -> dict:
         """Mode-aware guarded write: re-read the mode and unit-max registers FRESH
         (never trust a stale snapshot to pick the target register), clamp to the
         mode's effective bounds, rate limit, write, read-back verify, audit.
-        Serialized per pump so concurrent requests can't slip past the rate limit."""
+        Serialized per pump so concurrent requests can't slip past the rate limit.
+        unattended=True (scheduler / machine token) additionally enforces the winter-safe
+        floor so an automated actor can't command a heat-removing low LWT."""
         async with self._write_lock:
-            return await self._write_setpoint_locked(value, source)
+            return await self._write_setpoint_locked(value, source, unattended)
 
-    async def _write_setpoint_locked(self, value: float, source: str) -> dict:
+    async def _write_setpoint_locked(self, value: float, source: str,
+                                     unattended: bool = False) -> dict:
         old = self.snapshot.get("setpoint_c")
 
         async def audit_reject(exc: GuardrailError | ModbusError, code: str, sev: str):
@@ -434,11 +448,22 @@ class PumpPoller:
             raise exc
         target_register = R.SETPOINT_REGISTER_FOR_KIND[kind]
 
+        # unattended actors (scheduler / machine token) can't drop below the winter-safe
+        # floor even within the mode's clamp (re-audit: setpoint-only is still heat-removing)
+        eff_min = bounds[0]
+        if unattended and kind == "heating":
+            g = self.app_cfg.guardrails
+            floor = g.unattended_min_setpoint_c
+            if floor is None:
+                floor = g.setback_setpoint_c
+            eff_min = max(eff_min, floor)
         try:
             context = f"{kind} mode" + (f", unit max {unit_max:g}°C" if kind == "heating" else "")
+            if unattended and eff_min > bounds[0]:
+                context += f", unattended floor {eff_min:g}°C"
             self.guard.validate(self.cfg.id, value, online=self.online,
                                 write_enabled=self.cfg.write_enabled,
-                                min_c=bounds[0], max_c=bounds[1], context=context)
+                                min_c=eff_min, max_c=bounds[1], context=context)
         except GuardrailError as exc:
             await audit_reject(exc, "rejected", "warning")
             raise

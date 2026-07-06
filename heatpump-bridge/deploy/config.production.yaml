@@ -36,6 +36,9 @@ guardrails:
   restrict_unattended_writes: true
   setback_setpoint_c: 40     # scheduler "off" timers lower to this instead of powering off
   # comfort_setpoint_c: 50   # optional: scheduler "on" timers restore to this
+  # unattended_min_setpoint_c: 45  # winter-safe FLOOR for scheduler + token setpoint
+  #   writes — set from the house's design-day heat requirement before enabling writes
+  #   (defaults to setback_setpoint_c). Human UI can still go to setpoint_min_c.
 
 # Push alerts (ntfy — free, no account) + external dead-man heartbeat.
 notifications:

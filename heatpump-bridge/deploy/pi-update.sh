@@ -30,6 +30,12 @@ target=$(git rev-list -n 1 "$latest_tag")
 if [ "$current" = "$target" ]; then
   exit 0
 fi
+# forward-only: never auto-deploy a tag that isn't ahead of the running commit — a stray
+# `release-*` tag on an OLD commit must not trigger a mid-night rollback (re-audit fix 4)
+if ! git merge-base --is-ancestor "$current" "$target"; then
+  echo "release $latest_tag ($target) is not ahead of current $current — refusing backward deploy"
+  exit 0
+fi
 echo "release $latest_tag -> $target"
 if [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$target" ]; then
   echo "skip: $target previously failed its health check — waiting for a newer commit"
