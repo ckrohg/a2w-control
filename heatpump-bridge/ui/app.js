@@ -240,9 +240,12 @@ function renderDashboard() {
   const keepTimers = {};
   wrap.querySelectorAll("[data-pump]").forEach(card => {
     const t = card.querySelector(".t-time");
+    const a = card.querySelector(".t-action");
     if (t) keepTimers[card.dataset.pump] = {
-      time: t.value, action: card.querySelector(".t-action")?.value,
-      focused: card.contains(document.activeElement),
+      time: t.value, action: a?.value,
+      // only bail on re-render if the user is actually in a timer FIELD — not just
+      // because a +/- button they clicked holds focus (that must still re-render)
+      focused: document.activeElement === t || document.activeElement === a,
     };
   });
   if (Object.values(keepTimers).some(k => k.focused)) return;
