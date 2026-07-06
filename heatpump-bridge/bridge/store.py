@@ -55,7 +55,7 @@ class Store:
     def __init__(self, path: str):
         self.path = path
         self._conn: sqlite3.Connection | None = None
-        self._write_lock = asyncio.Lock()
+        self._conn_lock = asyncio.Lock()
 
     async def open(self) -> None:
         def _open():
@@ -74,16 +74,21 @@ class Store:
     async def _exec(self, sql: str, params: tuple = ()) -> None:
         # one writer at a time: `with conn:` manages the CONNECTION-wide transaction,
         # so concurrent to_thread writers could roll back each other's work
-        async with self._write_lock:
+        async with self._conn_lock:
             def _run():
                 with self._conn:  # implicit transaction
                     self._conn.execute(sql, params)
             await asyncio.to_thread(_run)
 
     async def _query(self, sql: str, params: tuple = ()) -> list[dict]:
-        def _run():
-            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
-        return await asyncio.to_thread(_run)
+        # reads MUST share the connection lock with writes — a single sqlite3 connection
+        # is not safe for concurrent use across threads (a read racing a poller's write
+        # raises "bad parameter or other API misuse"). _conn_lock is really the
+        # connection-access lock.
+        async with self._conn_lock:
+            def _run():
+                return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+            return await asyncio.to_thread(_run)
 
     # --- writes ---------------------------------------------------------------
     async def add_sample(self, pump_id: str, snap: dict) -> None:
@@ -182,15 +187,16 @@ class Store:
     # --- maintenance (run nightly by the scheduler) -----------------------------
     async def backup(self, dest: str) -> None:
         """Consistent online backup via SQLite's backup API — survives SD card death
-        as long as yesterday's copy does."""
-        def _run():
-            dst = sqlite3.connect(dest)
-            try:
-                with dst:
-                    self._conn.backup(dst)
-            finally:
-                dst.close()
-        await asyncio.to_thread(_run)
+        as long as yesterday's copy does. Under the connection lock (touches _conn)."""
+        async with self._conn_lock:
+            def _run():
+                dst = sqlite3.connect(dest)
+                try:
+                    with dst:
+                        self._conn.backup(dst)
+                finally:
+                    dst.close()
+            await asyncio.to_thread(_run)
 
     async def prune(self, *, samples_days: float = 365, comm_days: float = 90) -> None:
         cutoff = time.time() - samples_days * 86400

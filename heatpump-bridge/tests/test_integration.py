@@ -334,6 +334,30 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     assert len(fired) == 1
 
 
+async def test_store_concurrent_reads_and_writes_dont_corrupt(rig):
+    # regression: a single sqlite3 connection is not thread-safe for concurrent use — an
+    # API read racing the poller's writes raised "bad parameter or other API misuse" 500s
+    # on every dashboard refresh. All connection access must serialize on _conn_lock.
+    pump, poller, store = rig
+    await store.add_schedule("p1", "06:00", "on")
+
+    async def writer():
+        for _ in range(40):
+            await store.add_event("p1", "state", code="x", message="churn")
+            await store.add_sample("p1", {"inlet_c": 1, "outlet_c": 2, "ambient_c": 3,
+                                          "setpoint_c": 40, "power_sys1": 0, "power_sys2": 0,
+                                          "heating": 0, "status_word": 0})
+
+    async def reader():
+        for _ in range(40):
+            await store.list_schedules("p1")
+            await store.get_events("p1", 1)
+            await store.get_history("p1", 24)
+
+    await asyncio.gather(writer(), reader(), reader())  # no InterfaceError = pass
+    assert len(await store.list_schedules("p1")) == 1
+
+
 async def test_unattended_writes_respect_winter_floor(rig):
     # re-audit fix 2: "setpoint-only" is still heat-removing — an unattended actor must not
     # go below the winter-safe floor even within the clamp. Human writes still can.
