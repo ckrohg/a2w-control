@@ -28,8 +28,14 @@ if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-echo "==> 2. join your tailnet (a login link will print — open it once in any browser)"
-sudo tailscale up
+echo "==> 2. join your tailnet"
+if [ -n "${A2W_TAILSCALE_AUTHKEY:-}" ]; then
+  # non-interactive: an auth key from https://login.tailscale.com/admin/settings/keys
+  sudo tailscale up --authkey="$A2W_TAILSCALE_AUTHKEY" --hostname=heatpump-pi
+else
+  echo "   (a login link will print — open it once in any browser)"
+  sudo tailscale up --hostname=heatpump-pi
+fi
 
 echo "==> 3. expose the dashboard publicly over HTTPS"
 # Funnel must be enabled for your tailnet once in the admin console:

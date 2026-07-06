@@ -44,7 +44,7 @@ modbus_timeout_s: 5
 # The browser UI keeps working with no login of its own (session cookie); tokens are
 # only for headless callers. See deploy/api-integration.md.
 auth:
-  protect: off
+  protect: "off"          # quote it — unquoted `off` is YAML boolean false
   # ui_password: set this before exposing the dashboard for remote CONTROL — under
   # protect=writes/all the browser must log in once with it (30-day session). Without
   # it, a browser can still read but not control. Machines use tokens and ignore this.

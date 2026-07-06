@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .registers import COOLING_REGISTER_RANGE, HARD_MAX_SETPOINT_C, HARD_MIN_SETPOINT_C
 
@@ -77,6 +77,13 @@ class AuthConfig(BaseModel):
     # all   = every /api call requires a token or a UI login session.
     protect: Literal["off", "writes", "all"] = "off"
     tokens: list[ApiToken] = []
+
+    @field_validator("protect", mode="before")
+    @classmethod
+    def _yaml_off_footgun(cls, v):
+        # YAML 1.1 parses unquoted `off` as boolean False — accept it as "off" so a
+        # hand-written `protect: off` doesn't fail the bridge on boot
+        return "off" if v is False else v
     # Browser login password used when protect != off. Without it, a browser can still
     # READ (in writes mode) but cannot obtain a control session — set it before exposing
     # the dashboard for remote control. Machines use tokens and ignore this.

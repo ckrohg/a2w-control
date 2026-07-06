@@ -39,6 +39,26 @@ else
   echo "    ~/bridge-data/config.yaml already exists — leaving it alone"
 fi
 
+# If a dashboard password was supplied (needed to expose a public URL safely), bake
+# protect=all + the password into the live config. Auto-generate one if a Tailscale
+# auth key was given without a password (never expose an unauthenticated dashboard).
+if [ -z "${A2W_UI_PASSWORD:-}" ] && [ -n "${A2W_TAILSCALE_AUTHKEY:-}" ]; then
+  A2W_UI_PASSWORD="$(openssl rand -base64 12 2>/dev/null || head -c 12 /dev/urandom | base64)"
+  echo "    ⚠  no A2W_UI_PASSWORD given — generated one for you (SAVE IT): $A2W_UI_PASSWORD"
+fi
+if [ -n "${A2W_UI_PASSWORD:-}" ]; then
+  uv run python - "$HOME/bridge-data/config.yaml" "$A2W_UI_PASSWORD" <<'PY'
+import sys, yaml
+path, pw = sys.argv[1], sys.argv[2]
+cfg = yaml.safe_load(open(path))
+cfg.setdefault("auth", {})
+cfg["auth"]["protect"] = "all"       # nothing visible without login (safe for a public URL)
+cfg["auth"]["ui_password"] = pw
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
+PY
+  echo "    set auth.protect=all + ui_password (dashboard requires login)"
+fi
+
 echo "==> systemd service"
 sed -e "s|/home/pi|$HOME|g" \
     -e "s|^User=pi|User=$USER|" \
@@ -63,6 +83,21 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 curl -fsS localhost:8000/api/health && echo
+
+echo "==> remote access (Tailscale)"
+# Always install Tailscale so remote access is one step away. If an auth key was
+# supplied, bring it up + expose the dashboard publicly now — the Pi boots remote-ready.
+if ! command -v tailscale >/dev/null 2>&1; then
+  curl -fsSL https://tailscale.com/install.sh | sh
+fi
+if [ -n "${A2W_TAILSCALE_AUTHKEY:-}" ]; then
+  A2W_TAILSCALE_AUTHKEY="$A2W_TAILSCALE_AUTHKEY" \
+    bash "$HOME/a2w-control/heatpump-bridge/deploy/setup-remote.sh" || \
+    echo "  remote-access setup hit an issue — finish manually: deploy/setup-remote.sh"
+else
+  echo "  Tailscale installed. To turn on remote access, run:"
+  echo "    bash ~/a2w-control/heatpump-bridge/deploy/setup-remote.sh"
+fi
 
 echo
 echo "✓ Done. Open http://$(hostname).local:8000 from a phone/laptop on the same network."
