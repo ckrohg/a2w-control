@@ -18,17 +18,16 @@ Architecture/safety audit by Claude Opus+Sonnet, GPT-5.5, judged cross-vendor. F
       + change W610 admin pw + disable cloud). Software guardrails are wire-bypassable without it.
 - [x] **Risk 3b — stale data shown as live** (false assurance). Fixed: UI stale banner +
       dimmed values when offline / last poll >90s (commit 65f22c2).
-- [ ] **Risk 2 — cold-latch: a legal write (off/cool/low setpoint) abandoned when connectivity
-      drops mid-cold-snap, HBX can't override.** DECISION PENDING: recommend restricting the
-      UNATTENDED actors (scheduler timers + TempIQ token) to setpoint-only within a safe band;
-      "off" timers become a setback setpoint, never power-off; human UI keeps full control.
-      Tradeoff vs the control-parity features the owner asked for.
-- [ ] **Risk 3a/3c — alerting: pull-only (2am fault unseen) + no external dead-man.**
-      DECISION PENDING (needs channel): push on fault transitions (ntfy/Pushover/email) +
-      healthchecks.io heartbeat each poll so silence = alarm (survives Pi/WiFi/ISP death).
-- [ ] **Risk 4 — auto-updater pulls mutable `main`** = unattended code-exec on the write-path
-      box. Offer: deploy from an owner-promoted tag/release, pin deps, health check must prove
-      both pump sockets actively polling before accepting a deploy.
+- [x] **Risk 2 — cold-latch.** FIXED (58320b0): `restrict_unattended_writes` (default on) —
+      machine tokens setpoint-only; scheduler "off" → setback setpoint, never power-off;
+      human UI keeps full control.
+- [x] **Risk 3 — alerting.** FIXED (58320b0): ntfy push on high/critical faults, offline,
+      identity-mismatch, recovery (P17 never pages) + healthchecks.io dead-man heartbeat.
+      Owner must set `notifications.ntfy_topic` (+ optional `heartbeat_url`) to activate.
+- [x] **Risk 4 — mutable-main auto-deploy.** FIXED (58320b0): `pi-update.sh` deploys only
+      owner-promoted `release-*` tags. First tag: `release-20260705-1`. **New workflow:
+      cut `git tag release-YYYYMMDD-N && git push --tags` to ship to the Pi.**
+      (Deferred sub-item: health check proving both pump sockets poll — needs hardware.)
 
 ## Pre-hardware checklist (everything doable before the W610s arrive)
 
