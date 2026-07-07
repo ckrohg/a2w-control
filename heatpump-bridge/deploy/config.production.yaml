@@ -58,9 +58,14 @@ notifications:
 # Read-only cloud analytics mirror (optional). The Pi pushes a state snapshot to a Vercel
 # app (analytics-mirror/) every interval_s; that hosts the history dashboard. NOT control —
 # purely outbound; if it's down, nothing here is affected. See analytics-mirror/README.md.
+#
+# LIVE MIRROR (deployed 2026-07-07): https://a2w-analytics-mirror.vercel.app (Neon Postgres attached)
+# EASIEST: pass A2W_ANALYTICS_TOKEN=<INGEST_TOKEN> (+ optional A2W_ANALYTICS_URL) to
+# pi-bootstrap.sh and it writes this block for you, keeping the token out of the repo. To wire
+# it MANUALLY, uncomment below and paste the INGEST_TOKEN set on the Vercel project:
 analytics:
-  # endpoint_url: "https://your-project.vercel.app/api/ingest"
-  # token: "REPLACE_with_the_same_INGEST_TOKEN_set_on_Vercel"
+  # endpoint_url: "https://a2w-analytics-mirror.vercel.app/api/ingest"
+  # token: "PASTE_INGEST_TOKEN_FROM_VERCEL"   # must match INGEST_TOKEN on the Vercel project
   # interval_s: 60
 
 # Railway hub — remote control WITHOUT opening a port on the Pi (optional). The bridge dials

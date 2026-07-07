@@ -76,6 +76,23 @@ PY
   echo "    wired hub: $A2W_HUB_URL (Pi dials OUT to the Railway hub — setpoint-only, leased)"
 fi
 
+# If an analytics ingest token was supplied, wire the read-only cloud mirror: the bridge
+# pushes a state snapshot to the Vercel app every interval_s so the history dashboard fills.
+# Pure OUTBOUND, best-effort — NOT a control path; if it's down nothing here is affected. The
+# token is a SECRET (env-only, never in the repo). URL defaults to the live mirror; override
+# with A2W_ANALYTICS_URL. Inert unless BOTH endpoint_url and token are set.
+if [ -n "${A2W_ANALYTICS_TOKEN:-}" ]; then
+  A2W_ANALYTICS_URL="${A2W_ANALYTICS_URL:-https://a2w-analytics-mirror.vercel.app/api/ingest}"
+  uv run python - "$HOME/bridge-data/config.yaml" "$A2W_ANALYTICS_URL" "$A2W_ANALYTICS_TOKEN" <<'PY'
+import sys, yaml
+path, url, token = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = yaml.safe_load(open(path))
+cfg["analytics"] = {"endpoint_url": url, "token": token, "interval_s": 60}
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
+PY
+  echo "    wired analytics mirror: $A2W_ANALYTICS_URL (best-effort outbound snapshot push)"
+fi
+
 echo "==> systemd service"
 sed -e "s|/home/pi|$HOME|g" \
     -e "s|^User=pi|User=$USER|" \
