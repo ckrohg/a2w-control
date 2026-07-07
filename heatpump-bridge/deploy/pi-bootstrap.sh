@@ -59,6 +59,23 @@ PY
   echo "    set auth.protect=all + ui_password (dashboard requires login)"
 fi
 
+# If a hub token was supplied, wire the Railway hub block into the live config so the Pi
+# dials OUT to the hub on boot — remote setpoint control with no inbound port on the Pi.
+# The token is a SECRET: it lives only here (env at bootstrap time) and on Railway, never
+# in the repo. The URL defaults to the live production hub; override with A2W_HUB_URL. The
+# hub client stays inert until BOTH url and token are set, so plain bootstraps skip it.
+if [ -n "${A2W_HUB_TOKEN:-}" ]; then
+  A2W_HUB_URL="${A2W_HUB_URL:-wss://a2w-hub-production.up.railway.app/pi}"
+  uv run python - "$HOME/bridge-data/config.yaml" "$A2W_HUB_URL" "$A2W_HUB_TOKEN" <<'PY'
+import sys, yaml
+path, url, token = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = yaml.safe_load(open(path))
+cfg["hub"] = {"url": url, "token": token, "state_interval_s": 15}
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
+PY
+  echo "    wired hub: $A2W_HUB_URL (Pi dials OUT to the Railway hub — setpoint-only, leased)"
+fi
+
 echo "==> systemd service"
 sed -e "s|/home/pi|$HOME|g" \
     -e "s|^User=pi|User=$USER|" \

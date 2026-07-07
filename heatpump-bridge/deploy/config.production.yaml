@@ -70,9 +70,15 @@ analytics:
 # mode/parameter changes stay human-only on the LAN/Funnel path. Every relayed command still
 # passes the existing guardrails + lease (silence reverts to baseline_setpoint_c above), so
 # it's safe to leave write_enabled false until Phase 2. See deploy/railway-hub.md.
+#
+# LIVE HUB (deployed 2026-07-06): https://a2w-hub-production.up.railway.app
+# EASIEST: don't hand-edit this — pass A2W_HUB_TOKEN=<HUB_PI_TOKEN> (and optionally
+# A2W_HUB_URL) to pi-bootstrap.sh and it writes this block for you, keeping the token out of
+# the repo. To wire it MANUALLY instead, uncomment below and paste the HUB_PI_TOKEN found on
+# Railway (project a2w-hub → service a2w-hub → Variables → HUB_PI_TOKEN):
 # hub:
-#   url: "wss://your-hub.up.railway.app/pi"   # Railway host, wss:// scheme, /pi path
-#   token: "REPLACE_with_the_HUB_PI_TOKEN_set_on_Railway"   # openssl rand -hex 24
+#   url: "wss://a2w-hub-production.up.railway.app/pi"   # the live hub (wss://, /pi path)
+#   token: "PASTE_HUB_PI_TOKEN_FROM_RAILWAY"            # NOT the client token; the PI token
 #   state_interval_s: 15                       # how often the Pi pushes a state frame
 
 db_path: /home/pi/bridge-data/bridge.db

@@ -105,19 +105,34 @@ The hub source lives in `hub/`. See `hub/README.md` for the build/run detail; th
 
 ## 5. Wire the Pi
 
-Add a `hub:` block to `~/bridge-data/config.yaml` on the Pi (this file lives OUTSIDE the repo,
-so auto-updates never touch it). The hub client is enabled **only when both `url` and `token`
-are set** — omit either and the Pi ignores the hub entirely.
+The hub client is enabled **only when both `url` and `token` are set** — omit either and the
+Pi ignores the hub entirely. The live config lives at `~/bridge-data/config.yaml`, OUTSIDE the
+repo, so auto-updates never touch it. Two ways to wire it:
+
+**Easiest — at bootstrap (recommended).** Pass the token (and optionally the URL) to
+`pi-bootstrap.sh` and it writes the `hub:` block for you; the token stays out of the repo. The
+URL defaults to the live production hub, so usually just:
+
+```bash
+A2W_HUB_TOKEN="<HUB_PI_TOKEN>" bash -c "$(curl -fsSL https://raw.githubusercontent.com/ckrohg/a2w-control/main/heatpump-bridge/deploy/pi-bootstrap.sh)"
+# override the host if the hub ever moves:  A2W_HUB_URL="wss://<hub-host>/pi" A2W_HUB_TOKEN=… bash …
+```
+
+Re-running bootstrap with `A2W_HUB_TOKEN` is also how you add the hub to an already-provisioned
+Pi — it patches the existing config in place.
+
+**Manual — edit the config.** Add the block to `~/bridge-data/config.yaml` by hand:
 
 ```yaml
 hub:
   url: "wss://<hub-host>/pi"        # the Railway host, wss:// scheme, /pi path
-  token: "<HUB_PI_TOKEN>"           # the FIRST token from §3
+  token: "<HUB_PI_TOKEN>"           # the FIRST token from §3 (the PI token, not the client one)
   state_interval_s: 15              # how often the Pi pushes a state frame (default 15)
 ```
 
-`sudo systemctl restart heatpump-bridge`. Within a second or two the Pi dials out; re-run the
-health probe from §4 and it should flip to `"pi_connected":true` with a recent `last_state_ts`.
+Either way, `sudo systemctl restart heatpump-bridge` (bootstrap does this for you). Within a
+second or two the Pi dials out; re-run the health probe from §4 and it should flip to
+`"pi_connected":true` with a recent `last_state_ts`.
 
 The hub client uses the **existing guarded write path** for every command it receives — it does
 not add a second write route. A relayed setpoint is exactly:

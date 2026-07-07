@@ -15,6 +15,10 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
   - Pick a **dashboard password** (8+ chars) for the browser login.
   - ntfy: pick a **hard-to-guess topic** name, subscribe to it in the ntfy phone app.
   - (Optional) healthchecks.io: create a check, copy its **ping URL** (the dead-man).
+  - **Railway hub — DONE (deployed 2026-07-06):** live at
+    `https://a2w-hub-production.up.railway.app`. The Pi token is on Railway
+    (project `a2w-hub` → Variables → **`HUB_PI_TOKEN`**). Pass it to the bootstrap as
+    `A2W_HUB_TOKEN=…` (below) and the Pi dials the hub on boot — nothing to hand-edit.
 - [ ] 🖥 **Restrict gateway access** — the #1 safety item. This install: gateways join the
       existing **shared IoT network (100+ devices)** on an AmpliFi Alien (no VLAN/firewall),
       so the defense is device-level, not isolation (see `w610-setup.md` §Restrict):
@@ -26,8 +30,9 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
     the real device's connect behavior (registration/heartbeat bytes).
 - [ ] 🖥 **Pi dress rehearsal** (once the CanaKit Pi is on hand — the single best de-risk):
   - Flash the SD card (`pi-setup.md` §1) and boot.
-  - Run the bootstrap **with your secrets** so it comes up remote-ready:
-    `A2W_UI_PASSWORD=… A2W_TAILSCALE_AUTHKEY=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
+  - Run the bootstrap **with your secrets** so it comes up remote-ready (add
+    `A2W_HUB_TOKEN` to also wire the Railway hub in the same step):
+    `A2W_UI_PASSWORD=… A2W_TAILSCALE_AUTHKEY=… A2W_HUB_TOKEN=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
   - Run the **simulator on the Pi** (`uv run python sim/fake_pump.py`) and point config at
     localhost — then open the dashboard from your phone over Tailscale. This exercises the
     entire production stack (bootstrap, systemd, auto-update, remote access, login, alerts)
