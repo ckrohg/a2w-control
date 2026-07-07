@@ -9,6 +9,7 @@ dependencies = [
     "pymodbus>=3.9",
     "pydantic-settings>=2.4",
     "pyyaml>=6.0",
+    "websockets>=13",
 ]
 
 [dependency-groups]

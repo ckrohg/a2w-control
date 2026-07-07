@@ -66,6 +66,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
       <header>
         <h1>A2W Analytics</h1>
         <span className="dim">read-only cloud mirror</span>
+        <a className="btn" href="/control" style={{ marginLeft: "auto", textDecoration: "none" }}>Control</a>
         <form action="/api/logout" method="post">
           <button type="submit">Sign out</button>
         </form>

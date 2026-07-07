@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import crypto from "crypto";
 
 export const runtime = "nodejs";
 
@@ -17,7 +18,11 @@ export async function POST(req: Request) {
   } catch {
     /* empty */
   }
-  if (password !== expected) {
+  // Constant-time compare so a timer can't recover the password character by character.
+  const given = Buffer.from(password);
+  const want = Buffer.from(expected);
+  const ok = given.length === want.length && crypto.timingSafeEqual(given, want);
+  if (!ok) {
     return NextResponse.json({ error: "incorrect password" }, { status: 401 });
   }
   const res = NextResponse.json({ ok: true });

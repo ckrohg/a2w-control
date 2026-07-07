@@ -14,6 +14,7 @@ from .auth import UI_COOKIE, cookie_secure, load_or_create_ui_secret, mint_sessi
 from .config import AppConfig, load_config
 from .exporter import Exporter
 from .guardrails import SetpointGuard
+from .hub_client import HubClient
 from .poller import PumpPoller
 from .scheduler import Scheduler
 from .store import Store
@@ -59,7 +60,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         scheduler.start()
         exporter = Exporter(cfg.analytics, pollers)
         exporter.start()
+        hub_client = HubClient(cfg.hub, pollers)
+        hub_client.start()
         yield
+        await hub_client.stop()
         await exporter.stop()
         await scheduler.stop()
         for poller in pollers.values():

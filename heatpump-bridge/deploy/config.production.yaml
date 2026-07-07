@@ -63,6 +63,18 @@ analytics:
   # token: "REPLACE_with_the_same_INGEST_TOKEN_set_on_Vercel"
   # interval_s: 60
 
+# Railway hub — remote control WITHOUT opening a port on the Pi (optional). The bridge dials
+# OUT over a WebSocket to a persistent Railway hub (hub/); the cloud optimizer + the Vercel
+# dashboard drive setpoints via the hub's HTTP API, which relays them down this same WS. The
+# hub client is enabled ONLY when both url and token are set. Setpoint-only by design — power/
+# mode/parameter changes stay human-only on the LAN/Funnel path. Every relayed command still
+# passes the existing guardrails + lease (silence reverts to baseline_setpoint_c above), so
+# it's safe to leave write_enabled false until Phase 2. See deploy/railway-hub.md.
+# hub:
+#   url: "wss://your-hub.up.railway.app/pi"   # Railway host, wss:// scheme, /pi path
+#   token: "REPLACE_with_the_HUB_PI_TOKEN_set_on_Railway"   # openssl rand -hex 24
+#   state_interval_s: 15                       # how often the Pi pushes a state frame
+
 db_path: /home/pi/bridge-data/bridge.db
 ui_dir: /home/pi/a2w-control/heatpump-bridge/ui
 modbus_timeout_s: 5

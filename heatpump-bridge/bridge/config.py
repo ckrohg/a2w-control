@@ -160,17 +160,28 @@ class AnalyticsConfig(BaseModel):
     interval_s: float = 60.0          # cloud doesn't need 20s granularity
 
 
+class HubConfig(BaseModel):
+    # Outbound WebSocket link to the Railway hub (relays the optimizer's setpoint-only
+    # commands + latest state to the Vercel dashboard). Best-effort/additive: the Pi dials
+    # OUT and holds the connection (no inbound port opened); if the hub is down, local LAN
+    # and Funnel control are unaffected. Enabled only when BOTH url and token are set.
+    url: str | None = None            # e.g. wss://a2w-hub.up.railway.app/pi
+    token: str | None = None          # HUB_PI_TOKEN — sent as Authorization: Bearer <token>
+    state_interval_s: float = 15.0    # how often to push a state frame while connected
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
     auth: AuthConfig = AuthConfig()
     notifications: NotifyConfig = NotifyConfig()
     analytics: AnalyticsConfig = AnalyticsConfig()
+    hub: HubConfig = HubConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
 
-    @field_validator("guardrails", "auth", "notifications", "analytics", mode="before")
+    @field_validator("guardrails", "auth", "notifications", "analytics", "hub", mode="before")
     @classmethod
     def _empty_section_to_default(cls, v):
         # a YAML section present but with everything commented out parses to null;

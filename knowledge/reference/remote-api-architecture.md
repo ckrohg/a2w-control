@@ -57,3 +57,21 @@ Two-stage anti-flap: warn at `lease_warn_minutes` before expiry (independent ntf
 expiry via the normal guarded write path, alert on revert AND recovery. Lease is in-memory so
 a reboot discards a stale override rather than trusting it against an unsynced clock. This
 catches optimizer-death-while-the-Pi-is-alive — the gap the dead-man heartbeat can't see.
+
+## Update (2026-07-06): the Railway-hub variant was built
+
+The direct-tunnel decision above still holds as a design, but the path we actually built is a
+**self-owned Railway hub** instead of Cloudflare Tunnel — same "no inbound port on the Pi"
+posture with **no Cloudflare, no domain, and no Tailscale dependency** on the machine path. The
+Pi dials OUT over a WebSocket (`wss://<hub>/pi`, auto-reconnect) to a persistent Railway
+container; the optimizer and the Vercel dashboard call the hub's small HTTP API
+(`/health`, `/api/state`, `/api/command`), which relays a **setpoint-only** command down the Pi's
+WS and awaits the ack. The setpoint **lease** built in the "Build NOW" step carries over
+unchanged — a relayed command goes through the same guarded write path (`unattended=True`,
+`lease_minutes`), so silence still reverts the house to `baseline_setpoint_c`. Power/mode/params
+stay human-only on the direct path. **Tailscale Funnel remains the documented fallback**
+(coexists with the hub; direct-to-Pi human/LAN control if the hub is down). Runbook:
+`heatpump-bridge/deploy/railway-hub.md`; hub source + JSON contract: `hub/README.md`. This trades
+Cloudflare's single-vendor edge auth for owning both ends of a WebSocket — acceptable for the
+same reason the original was: a value-path outage is safe by design (savings pause; house stays
+warm on the on-Pi baseline).

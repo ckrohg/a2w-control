@@ -2,6 +2,14 @@
 
 Free, no domain, ~10 minutes. Two flavors; pick by whether you want a public URL.
 
+> **Funnel is also the documented FALLBACK for the Railway hub.** If you run the
+> Railway-hub remote-control path (`railway-hub.md`), this Funnel path **coexists** with it —
+> both can run at once. The bridge always serves its own local API here regardless of the hub,
+> so Funnel is your direct-to-Pi access when the hub is down, when you're on the LAN, or when
+> you need the full human control surface (power / mode / parameters), which the hub
+> deliberately does not carry (it relays setpoint only). Nothing about the hub disables this
+> path, and the Pi dials out to the hub whether or not Funnel is up.
+
 ## Quickest: Funnel (public URL, no app for viewers)
 
 ```bash
