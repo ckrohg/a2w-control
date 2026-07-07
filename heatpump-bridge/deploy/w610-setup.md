@@ -129,12 +129,31 @@ unit malfunctions without it. Slave address = **1** (no DIP/param change needed)
 
 ## Bench validation against the simulator (no heat pump needed)
 
-The exact framing the bridge will use in production can be tested end-to-end through a
-real W610 before the pumps are touched:
+This proves the exact framing the bridge uses in production (RTU-over-TCP ↔ real RS-485)
+through a real W610 **before any pump is touched** — the #1 first-connection de-risk. The
+Mac plays both ends; they only meet by crossing the physical W610:
 
-1. Run the simulator on the Mac with a serial adapter attached to the W610's RS-485 side
-   (USB-RS485 dongle wired A/B to the W610), or skip hardware and just point the bridge
-   at the sim's TCP ports (`config.yaml` defaults).
-2. Point `config.yaml` at the W610's IP:8899 and confirm polls succeed with 0% error rate.
-3. Watch `error_rate` in the UI comm footer — this is the ongoing validation of the
+```
+bridge (master) ──WiFi/TCP:8899──▶ W610 ──RS-485 A/B──▶ USB-RS485 dongle ──USB──▶ sim (--serial)
+```
+
+1. **Configure the W610** (above): 2400 8N1, transparent, TCP server :8899, on the LAN.
+2. **Wire the dongle** A/B → the W610's RS-485 A/B terminals (A→A, B→B).
+3. **Run the sim on the dongle's serial port** (one pump; the sim's `--serial` mode uses the
+   `pyserial` dev dep). Find the device with `ls /dev/tty.usb*` — usually
+   `/dev/tty.usbserial-XXXX` (or `/dev/tty.wchusbserial*` for CH340 dongles, which may need a
+   driver; FTDI/CP210x are plug-and-play on recent macOS):
+
+   ```bash
+   uv run python sim/fake_pump.py --serial /dev/tty.usbserial-XXXX   # 2400 8N1, device_id 1
+   ```
+4. **Point `config.yaml` at the W610's IP:8899** and confirm polls succeed at **0% error**.
+   Inject a fault through the sim's control API (`curl -X POST localhost:8090/pumps/1/fault/P01`)
+   and confirm it surfaces in the UI — that exercises decoding through the real gateway too.
+5. Watch `error_rate` in the UI comm footer — this is the ongoing validation of the
    unshielded-wire decision. Rising error rate = revisit cabling, not baud rate.
+
+> No dongle yet? Skip hardware and point the bridge at the sim's TCP ports (`config.yaml`
+> defaults) — that's the pure-software path (Phase 0). The `--serial` path was verified
+> end-to-end over a virtual null-modem (read + write round-trip); the dongle just replaces
+> the virtual link with real wire.

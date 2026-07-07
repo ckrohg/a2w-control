@@ -1,10 +1,13 @@
 # @purpose: Simulated MAHRW030ZA heat pumps for Phase 0 development. Each pump is a
-# pymodbus RTU-over-TCP server (imitating a USR-W610 in transparent mode) with toy
-# thermal physics, plus one shared HTTP control API for fault injection:
+# pymodbus RTU server (imitating a USR-W610 in transparent mode) with toy thermal physics,
+# plus one shared HTTP control API for fault injection:
 #   uv run python sim/fake_pump.py                 # 2 pumps on :15020/:15021, control :8090
 #   curl -X POST localhost:8090/pumps/1/fault/P01  # inject water-flow fault on pump 1
 #   curl -X POST 'localhost:8090/pumps/1/fault/P01?on=false'   # clear it
 #   curl -X POST 'localhost:8090/pumps/1/register/2052?value=65516'  # ambient = -20degC
+# BENCH mode — serve ONE pump over a real USB-RS485 dongle (through a W610), same RTU framing
+# the W610 puts on the wire, to prove the gateway + framing on real hardware before a pump:
+#   uv run python sim/fake_pump.py --serial /dev/tty.usbserial-XXXX   # see deploy/w610-setup.md
 from __future__ import annotations
 
 import argparse
@@ -18,7 +21,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pymodbus import FramerType
-from pymodbus.server import ModbusTcpServer
+from pymodbus.server import ModbusSerialServer, ModbusTcpServer
 from pymodbus.simulator import SimData, SimDevice, DataType
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -38,22 +41,32 @@ def encode(value: float) -> int:
 class FakePump:
     """One simulated pump: Modbus server + toy thermal model."""
 
-    def __init__(self, index: int, port: int, device_id: int = 1):
+    def __init__(self, index: int, port: int, device_id: int = 1,
+                 serial_port: str | None = None, baudrate: int = 2400):
         self.index = index
         self.port = port
         self.device_id = device_id
+        # Bench mode: when serial_port is set the pump answers over a real USB-RS485 dongle
+        # (through a W610) instead of localhost TCP. Same RTU framing either way.
+        self.serial_port = serial_port
+        self.baudrate = baudrate
         # thermal state (degC)
         self.ambient = 5.0
         self.tank = 38.0          # buffer water temp; inlet reads slightly below outlet
         self.heating = False
         self._t = random.uniform(0, 1000)  # phase offset so pumps don't move in lockstep
-        self.server: ModbusTcpServer | None = None
+        self.server: ModbusTcpServer | ModbusSerialServer | None = None
 
     async def start(self) -> None:
         space = [SimData(address=2000, count=130, values=0, datatype=DataType.REGISTERS)]
         device = SimDevice(id=self.device_id, simdata=space)
-        self.server = ModbusTcpServer(device, framer=FramerType.RTU,
-                                      address=("127.0.0.1", self.port))
+        if self.serial_port:
+            self.server = ModbusSerialServer(
+                device, framer=FramerType.RTU, port=self.serial_port,
+                baudrate=self.baudrate, bytesize=8, parity="N", stopbits=1)
+        else:
+            self.server = ModbusTcpServer(device, framer=FramerType.RTU,
+                                          address=("127.0.0.1", self.port))
         asyncio.create_task(self.server.serve_forever(), name=f"modbus-{self.index}")
         await asyncio.sleep(0.2)
         await self.set_reg(R.REG_ON_OFF, 1)
@@ -74,8 +87,12 @@ class FakePump:
             await self.set_reg(addr, val)
         # AC online + water flow OK + remote linkage contact closed (HBX calling)
         await self.set_reg(R.REG_SWITCH_STATUS, (1 << 4) | (1 << 5) | (1 << 6))
-        log.info("pump %d: modbus RTU-over-TCP on :%d (device_id=%d)",
-                 self.index, self.port, self.device_id)
+        if self.serial_port:
+            log.info("pump %d: modbus RTU on serial %s @ %d 8N1 (device_id=%d)",
+                     self.index, self.serial_port, self.baudrate, self.device_id)
+        else:
+            log.info("pump %d: modbus RTU-over-TCP on :%d (device_id=%d)",
+                     self.index, self.port, self.device_id)
 
     async def get_reg(self, addr: int) -> int:
         vals = await self.server.context.async_getValues(self.device_id, 3, addr, 1)
@@ -251,10 +268,21 @@ async def main() -> None:
     parser.add_argument("--pumps", type=int, default=2)
     parser.add_argument("--base-port", type=int, default=15020)
     parser.add_argument("--control-port", type=int, default=8090)
+    parser.add_argument("--serial", metavar="DEVICE",
+                        help="bench mode: serve ONE pump over a real serial port "
+                             "(USB-RS485 dongle), e.g. /dev/tty.usbserial-XXXX")
+    parser.add_argument("--baud", type=int, default=2400)
+    parser.add_argument("--device-id", type=int, default=1)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    pumps = {i + 1: FakePump(i + 1, args.base_port + i) for i in range(args.pumps)}
+    if args.serial:
+        # Real bench topology is one W610 <-> one pump <-> one dongle, so serve a single
+        # pump on the serial port. Physics + the fault-injection control API still run.
+        pumps = {1: FakePump(1, args.base_port, device_id=args.device_id,
+                             serial_port=args.serial, baudrate=args.baud)}
+    else:
+        pumps = {i + 1: FakePump(i + 1, args.base_port + i) for i in range(args.pumps)}
     for p in pumps.values():
         await p.start()
 
