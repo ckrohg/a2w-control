@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .api import router
 from .auth import UI_COOKIE, cookie_secure, load_or_create_ui_secret, mint_session
 from .config import AppConfig, load_config
+from .exporter import Exporter
 from .guardrails import SetpointGuard
 from .poller import PumpPoller
 from .scheduler import Scheduler
@@ -56,7 +57,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await poller.start()
         scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url)
         scheduler.start()
+        exporter = Exporter(cfg.analytics, pollers)
+        exporter.start()
         yield
+        await exporter.stop()
         await scheduler.stop()
         for poller in pollers.values():
             await poller.stop()

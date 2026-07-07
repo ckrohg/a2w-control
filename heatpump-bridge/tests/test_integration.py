@@ -334,6 +334,48 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     assert len(fired) == 1
 
 
+async def test_analytics_exporter_pushes_snapshot(rig):
+    # read-only mirror: the Pi POSTs a compact snapshot to a cloud endpoint. Verify the
+    # payload shape + that it's best-effort (a dead endpoint never raises into the bridge).
+    import json as _json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+    from bridge.config import AnalyticsConfig
+    from bridge.exporter import Exporter
+
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            received.append((self.headers.get("Authorization"), _json.loads(body)))
+            self.send_response(200); self.end_headers()
+        def log_message(self, *a): pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    cfg = AnalyticsConfig(endpoint_url=f"http://127.0.0.1:{port}/api/ingest",
+                          token="secret123", interval_s=999)
+    exporter = Exporter(cfg, {"p1": poller})
+    await exporter.push_once()
+
+    assert len(received) == 1
+    auth, payload = received[0]
+    assert auth == "Bearer secret123"
+    assert "ts" in payload and len(payload["pumps"]) == 1
+    p = payload["pumps"][0]
+    assert p["id"] == "p1" and "setpoint_c" in p and "outlet_c" in p and "power_w" in p
+
+    srv.shutdown()
+    # dead endpoint: must not raise
+    cfg2 = AnalyticsConfig(endpoint_url="http://127.0.0.1:59997/x", token="t")
+    await Exporter(cfg2, {"p1": poller}).push_once()   # no exception = pass
+
+
 async def test_store_concurrent_reads_and_writes_dont_corrupt(rig):
     # regression: a single sqlite3 connection is not thread-safe for concurrent use — an
     # API read racing the poller's writes raised "bad parameter or other API misuse" 500s

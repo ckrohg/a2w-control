@@ -150,16 +150,27 @@ class NotifyConfig(BaseModel):
     heartbeat_url: str | None = None
 
 
+class AnalyticsConfig(BaseModel):
+    # Read-only cloud mirror (fusion: keep control on the Funnel path; this is a separate,
+    # out-of-control-loop analytics push). The Pi POSTs a throttled state snapshot to a
+    # Vercel app (see analytics-mirror/); the cloud accumulates the time series. Best-effort:
+    # if the endpoint is down, snapshots are skipped — this never affects control.
+    endpoint_url: str | None = None   # e.g. https://a2w-mirror.vercel.app/api/ingest
+    token: str | None = None          # shared secret sent as Bearer to the ingest endpoint
+    interval_s: float = 60.0          # cloud doesn't need 20s granularity
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
     auth: AuthConfig = AuthConfig()
     notifications: NotifyConfig = NotifyConfig()
+    analytics: AnalyticsConfig = AnalyticsConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
 
-    @field_validator("guardrails", "auth", "notifications", mode="before")
+    @field_validator("guardrails", "auth", "notifications", "analytics", mode="before")
     @classmethod
     def _empty_section_to_default(cls, v):
         # a YAML section present but with everything commented out parses to null;

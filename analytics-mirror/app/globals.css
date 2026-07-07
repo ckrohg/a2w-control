@@ -1,0 +1,47 @@
+:root {
+  --bg: #0f1419; --card: #1a2128; --card2: #212a33; --line: #2c3640;
+  --text: #e6edf3; --dim: #8b98a5; --info: #4dabf7; --ok: #63e6be;
+  --warm: #ff9f43; --crit: #ff6b6b;
+}
+* { box-sizing: border-box; margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: 20px; max-width: 1100px; margin: 0 auto;
+}
+h1 { font-size: 20px; font-weight: 650; }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+header .dim { color: var(--dim); font-size: 13px; }
+header form { margin-left: auto; }
+button, .btn { background: var(--card2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 9px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px; margin-bottom: 18px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+.card h2 { font-size: 15px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.chip { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+  padding: 3px 9px; border-radius: 999px; background: var(--card2); color: var(--dim); }
+.chip.heating { background: #1f3d2b; color: var(--ok); }
+.chip.cooling { background: #14324e; color: var(--info); }
+.chip.offline, .chip.off { background: #3d2a2a; color: var(--crit); }
+.temps { display: flex; gap: 8px; margin: 6px 0; }
+.temp { flex: 1; background: var(--card2); border-radius: 9px; padding: 7px 4px; text-align: center; }
+.temp .v { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.temp .l { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .4px; }
+.meta { color: var(--dim); font-size: 12.5px; margin-top: 6px; }
+.chart-block { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  padding: 14px 16px; margin-bottom: 12px; }
+.chart-block h3 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+.chart svg { width: 100%; height: 200px; display: block; }
+.legend { display: flex; gap: 14px; margin-top: 6px; font-size: 12px; color: var(--dim); flex-wrap: wrap; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+.empty { color: var(--dim); text-align: center; padding: 40px 0; }
+.login { max-width: 320px; margin: 12vh auto; }
+.login input { width: 100%; background: var(--card2); border: 1px solid var(--line);
+  color: var(--text); border-radius: 10px; padding: 11px 12px; font: inherit; margin: 10px 0; }
+.login .err { color: var(--crit); font-size: 13px; min-height: 18px; }
+.controls { display: flex; gap: 8px; margin-bottom: 14px; }
+.controls a { text-decoration: none; }
+.seg { display: inline-flex; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.seg a { padding: 7px 14px; color: var(--dim); font-size: 13px; font-weight: 600; }
+.seg a.active { background: var(--card2); color: var(--text); }

@@ -55,6 +55,14 @@ notifications:
   #    THAT service emails you. Silence becomes the alarm.
   # heartbeat_url: "https://hc-ping.com/your-uuid"
 
+# Read-only cloud analytics mirror (optional). The Pi pushes a state snapshot to a Vercel
+# app (analytics-mirror/) every interval_s; that hosts the history dashboard. NOT control —
+# purely outbound; if it's down, nothing here is affected. See analytics-mirror/README.md.
+analytics:
+  # endpoint_url: "https://your-project.vercel.app/api/ingest"
+  # token: "REPLACE_with_the_same_INGEST_TOKEN_set_on_Vercel"
+  # interval_s: 60
+
 db_path: /home/pi/bridge-data/bridge.db
 ui_dir: /home/pi/a2w-control/heatpump-bridge/ui
 modbus_timeout_s: 5
