@@ -11,7 +11,7 @@ pumps:
     #                           # if this IP ever answers with a different MAC (DHCP
     #                           # reshuffle / swapped units), alert + block writes
     port: 8899             # W610 factory default TCP server port
-    device_id: 1           # slave address per SW2 DIP (confirm with Winnie's reply)
+    device_id: 1           # slave address — default 1 CONFIRMED by Winnie (no DIP change needed)
     poll_interval_s: 20    # 2400 baud: a full poll is ~1.2s of bus time
     write_enabled: false   # Phase 2 flips this — one pump at a time
   - id: pump2

@@ -61,8 +61,11 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
 
 ## Phase D — Wire ONE pump, read-only 🔧 (Phase 1)
 
-- [ ] Panel off. Wire pump 1: board BMS header (**CN22 — pending Winnie**) → JST pigtail →
-      isolated repeater → run → W610 A/B. A→A, B→B.
+- [ ] Panel off. Wire pump 1: board BMS header **CN22** → JST pigtail → isolated repeater →
+      run → W610 A/B. A→A, B→B. **CN22 pins (confirmed by Winnie): 1=12V, 2=GND, 3=A(+),
+      4=B(−) — land pins 2/3/4 only; ⛔ do NOT connect pin 1 (12V).**
+- [ ] ⛔ **Leave the CN23 wall controller connected** — Winnie: the unit malfunctions without
+      it. CN22 is a separate bus, so your tap doesn't touch it. Slave address = **1**.
 - [ ] Leave `write_enabled: false`. Watch the dashboard: pump 1 goes online, live temps.
 - [ ] Run the **commissioning checklist** in `reference/modbus-register-map.md`: verify
       addressing offset, temp scaling/signedness, power-register units, CRC, slave address.

@@ -9,7 +9,8 @@
 
 - Modbus **RTU**, half-duplex, **2400 baud, 8N1** (8 data bits, no parity, 1 stop bit)
 - Master = our bridge (via W610 transparent TCP); **slave = heat pump main control board**
-- Slave address: **1–16, set by SW2 DIP** on the board (default assumed 1 — unconfirmed)
+- Slave address: **1–16, set by SW2 DIP** on the board; **default = 1, CONFIRMED by Winnie
+  2026-07-07** (no DIP change needed for default use — see `winnie-bms-port-reply.md`)
 - Function codes: **0x03** read holding, **0x06** write single, **0x10** write multiple
 - ⚠️ The doc describes the CRC as "CRC-16/X25, X16+X12+X5+1" (the CCITT polynomial),
   which is *not* the standard Modbus CRC-16 (X16+X15+X2+1). Almost certainly a doc
@@ -197,20 +198,28 @@ clamp meter during commissioning.
 | 6 | Emergency switch |
 | 7 | Electric heating overheat switch |
 
-## Safe first-connection procedure (Phase 1, works without Winnie's reply)
+## Safe first-connection procedure (Phase 1)
 
-1. **Power off** → multimeter continuity between CN22 and CN23 data pins.
-   Continuity = shared bus with the wall controller (STOP — CN22 unusable as planned,
-   ask Macon for an alternative). Isolated = dedicated BMS port, proceed.
-2. **Listen before transmitting**: connect only the RS-485 receive path through the
-   isolated repeater and watch for traffic. A dedicated slave port is silent until
-   polled; immediate chatter means it's the wall-controller bus — stop.
-3. Only then send the first read (FC03, regs 2050–2052) and compare against the wall
-   controller display. If no response, swap A/B first, then try slave addresses 1–16
-   (a full scan takes seconds at 2400 baud).
-4. Note: accidental transmission on a shared RS-485 bus causes data collisions, not
-   damage — wall controller may briefly log E21 and recovers when you stop. Fully
-   reversible; the heating chain is never at risk from this procedure.
+**Port confirmed (Winnie 2026-07-07, `winnie-bms-port-reply.md`):** CN22 is the BMS port;
+pins **1=12V, 2=GND, 3=A(+), 4=B(−)**; CN22 is a **separate bus** from the CN23 wall
+controller; slave address **1**; no activation/DIP/param change. So the steps below are now
+*confirmation*, not a go/no-go gate — but still run them, they're cheap insurance.
+
+- ⚠️ Wire pins **2/3/4 only (GND/A/B)**. **Do NOT land pin 1 (12V)** — the W610+repeater are
+  powered from the RS-15-12; 12V into a bus terminal can damage the repeater/board.
+- ⚠️ **Leave the wall controller (CN23) connected** — the unit malfunctions without it.
+
+1. **Power off** → multimeter continuity between CN22 and CN23 data pins. Expect **isolation**
+   (Winnie confirmed separate buses). If you unexpectedly read continuity, STOP and recheck
+   the connector before energizing.
+2. **Listen before transmitting**: connect only the RS-485 receive path through the isolated
+   repeater and watch for traffic. A dedicated slave port is silent until polled.
+3. Send the first read (FC03, regs 2050–2052) at **slave address 1** and compare against the
+   wall controller display. If no response, swap A/B first (then, only if needed, scan 1–16 —
+   a full scan takes seconds at 2400 baud).
+4. Note: accidental transmission on a shared RS-485 bus causes data collisions, not damage,
+   and is fully reversible — but with the buses confirmed separate this shouldn't arise. The
+   heating chain is never at risk from this procedure.
 
 ## HARD GATE before enabling writes (Phase 2) — from the fusion re-audit
 
@@ -235,7 +244,7 @@ on any pump until all three are done and recorded:
 - [ ] Signedness of temps (need negative ambient to decode correctly — NH winter)
 - [ ] Units of 2063/2088 power (W? ×10?) — verify against clamp meter or known draw
 - [ ] CRC: standard Modbus CRC-16 vs the doc's claimed CCITT polynomial
-- [ ] Slave address (SW2 DIP setting per unit)
+- [ ] Slave address per unit (default **1** confirmed; only differs if SW2 DIP was changed)
 - [ ] Setpoint write: reg 2003 respects 20–reg2027 bounds; confirm reg 2027 value (default 55 °C) on the actual units
 - [ ] Bit-13/14/16 codes in 2114–2115 (garbled in doc)
 

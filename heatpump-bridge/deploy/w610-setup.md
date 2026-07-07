@@ -114,11 +114,18 @@ precious is ever stored on the unit.
 | Max clients | **1 (recommended, as a security lock — layer A above)**: only the Pi's persistent connection is accepted, a rogue client is refused. The bridge never probes a gateway it's already using, so 1 is fine operationally. |
 | IP | DHCP + **reservation in the router**. Suggested: .61 for pump 1, .62 for pump 2 |
 
-## Wiring (per handoff §3 — settled)
+## Wiring (per handoff §3 — settled; CN22 CONFIRMED by Winnie 2026-07-07)
 
-Heat pump BMS header (CN22, pending Winnie's confirmation) → JST pigtail →
-isolated repeater → 18/3 or Cat5e run → W610 RS-485 A/B terminals.
-A→A, B→B throughout; if no comms at all, swapping A/B is the first thing to try.
+Heat pump **BMS header CN22** → JST pigtail → isolated repeater → 18/3 or Cat5e run →
+W610 RS-485 A/B terminals. A→A, B→B throughout; if no comms at all, swapping A/B is the
+first thing to try.
+
+**CN22 pinout (confirmed — `knowledge/reference/winnie-bms-port-reply.md`):**
+`pin1 = 12V · pin2 = GND · pin3 = A(+) · pin4 = B(−)`. Land **pins 2/3/4 only**
+(GND→repeater GND, A→A, B→B). ⚠️ **Do NOT connect pin 1 (12V)** — the W610 + repeater are
+powered from the RS-15-12; 12V into a bus terminal can damage the repeater or the board.
+⚠️ CN22 is a **separate bus** from the CN23 wall controller — **leave CN23 connected**, the
+unit malfunctions without it. Slave address = **1** (no DIP/param change needed).
 
 ## Bench validation against the simulator (no heat pump needed)
 

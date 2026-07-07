@@ -19,7 +19,7 @@ class PumpConfig(BaseModel):
     name: str
     host: str
     port: int = 8899              # USR-W610 factory default TCP port
-    device_id: int = 1            # Modbus slave address (SW2 DIP, default 1 unconfirmed)
+    device_id: int = 1            # Modbus slave address (SW2 DIP; default 1 confirmed by Winnie)
     poll_interval_s: float = 20.0
     write_enabled: bool = False   # Phase 1: reads only until flipped deliberately
     # W610 MAC from its label. When set, the bridge verifies via ARP that the IP

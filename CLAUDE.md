@@ -32,7 +32,7 @@ Write journal entries AS YOU WORK, not at session end. Each entry needs:
 2. `knowledge/reference/modbus-register-map.md` — distilled register map (source of truth: `A2W Modbus.docx` same folder, from Winnie @ Guangdong Macon)
 3. `knowledge/PRODUCT_SPEC.md` + `knowledge/ROADMAP.md` — working summaries
 
-**Stage:** Phase 0 COMPLETE (2026-07-04) — `heatpump-bridge/` is built and verified against the simulator (27 tests, UI exit criteria met). Next: W610 bench config + Pi provisioning (`heatpump-bridge/deploy/`), then Phase 1 read-only commissioning, gated on Winnie's CN22/pinout reply (emailed 2026-07-04). Dev quickstart in `heatpump-bridge/README.md`.
+**Stage:** Phase 0 COMPLETE (2026-07-04) — `heatpump-bridge/` is built and verified against the simulator (27 tests, UI exit criteria met). Cloud side deployed + self-wiring (2026-07-07): Railway hub + Vercel dashboard + Neon Postgres all live; `pi-bootstrap.sh` injects hub + analytics from env vars. **Phase 1 is now UNGATED — Winnie confirmed the BMS port 2026-07-07** (`knowledge/reference/winnie-bms-port-reply.md`): CN22, pins 2/3/4=GND/A/B (not pin 1/12V), separate bus from CN23 (keep wall controller connected), no activation, slave address 1. Next: W610 bench config + Pi provisioning (`heatpump-bridge/deploy/`), then Phase 1 read-only commissioning (waits only on hardware). Still owed Winnie: series number (MAHRW030ZA/BEH2) + forced-defrost register question. Dev quickstart in `heatpump-bridge/README.md`.
 
 **Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
 

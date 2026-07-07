@@ -96,5 +96,5 @@ User accounts (Cloudflare Access handles auth), schedules, predictive logic, HBX
 ## Open questions
 
 - Sane setpoint clamp range (hardware max outlet 85 °C; reg 2027 default caps at 55 °C; pick operating bounds with owner)
-- From Winnie (email sent 2026-07-04): CN22 = BMS port? pin order? bus independence? activation param/DIP + default slave address? mating pigtail? — blocks Phase 1, not Phase 0
+- ~~From Winnie: CN22 = BMS port? pin order? bus independence? activation? slave address?~~ **ANSWERED 2026-07-07** (`reference/winnie-bms-port-reply.md`): CN22; 1=12V/2=GND/3=A(+)/4=B(−); separate bus (keep CN23 connected); no activation; slave addr 1. Phase 1 now ungated. Still owed Winnie: series number + forced-defrost register.
 - Commissioning checklist in `reference/modbus-register-map.md` (scaling, signedness, addressing offset, CRC, power units)

@@ -82,12 +82,13 @@ Board connection: JST-style pigtail (pre-crimped, likely JST XH 2.54mm) from the
 
 Verify scaling factors (×0.1 temps are common on Macon boards), signedness, and register offset convention (0-based vs 1-based addressing) against the protocol doc during commissioning — do not assume.
 
-### Open hardware items (blockers for first physical connection, NOT for software build)
-1. **Awaiting confirmation from Winnie** (email sent 2026-07-04): (a) is CN22 the BMS RS-485 port, (b) pin order, (c) independent bus vs shared with wall controller on CN23, (d) activation parameter/DIP switch and default slave address, (e) mating pigtail availability/connector type
-2. Working hypothesis: CN22 is the BMS port (unused 4-pin twin of the wall controller header CN23); field verification plan exists (wall-controller terminal labels → wire colors → CN23 order; continuity check CN22↔CN23; silkscreen)
-3. Default slave address assumed 1 until confirmed; make it configurable
+### Open hardware items — RESOLVED by Winnie 2026-07-07 (see `winnie-bms-port-reply.md`)
+1. **CONFIRMED:** (a) **CN22** is the BMS RS-485 port; (b) pin order **1=12V, 2=GND, 3=A(+), 4=B(−)**; (c) CN22 (Modbus) is a **separate bus** from CN23 (wall controller) — our tap is additive/non-interfering; (d) **no activation / no param / no DIP change**, default **slave address = 1**; (e) mating pigtail = order from a photo.
+2. ⚠️ **The wall controller (CN23) MUST remain connected or the unit malfunctions** (Winnie). We never remove it — now a hard rule.
+3. ⚠️ **Do NOT connect CN22 pin 1 (12V)** — use pins 2/3/4 (GND/A/B) only; the W610+repeater are powered from the RS-15-12.
+4. Default slave address = 1 (confirmed); `device_id` stays configurable.
 
-**None of this blocks software development** — build and test against a simulated Modbus slave first (see Phase 0).
+**None of this blocked software development** — Phase 0 built/tested against a simulated Modbus slave. Phase 1 read-only commissioning is now **ungated** (waits only on hardware).
 
 ---
 
@@ -221,8 +222,8 @@ GET  /api/health                      → service self-check
 **Phase 0 — Simulator-first development (start immediately, no hardware needed):**
 Build `sim/fake_pump.py`, the full bridge service, guardrails, fault decoding, and the UI against two simulated pumps. Exit criteria: change a setpoint from the UI on a phone, inject fault bits in the simulator, watch a plain-English alert appear and clear.
 
-**Phase 1 — First real connection (after Winnie confirms port/pinout):**
-One pump, read-only config (write path disabled by flag). Verify register addressing/scaling against reality, watch error rates for 48h.
+**Phase 1 — First real connection (port/pinout CONFIRMED by Winnie 2026-07-07 → ungated):**
+CN22, pins 2/3/4 = GND/A/B, separate bus, slave address 1, no activation. One pump, read-only config (write path disabled by flag). Verify register addressing/scaling against reality, watch error rates for 48h.
 
 **Phase 2 — Guarded writes on pump 1:** enable setpoint writes, verify wall controller reflects the change (proves the write is real and visible on the existing chain).
 
@@ -237,7 +238,7 @@ One pump, read-only config (write path disabled by flag). Verify register addres
 1. **This document**
 2. **Winnie's Modbus protocol document** (authoritative register map — the tables in §4 are a summary from memory of prior conversations; the doc wins on any conflict)
 3. **Installation manual PDF** (`Manual_for_High_Temp_Heat_Pump__v3_Final.pdf` / `MAHRW030ZA_BEH2_--60HZ.pdf`) — fault tables, controller behavior, specs
-4. Winnie's reply re: CN22/pinout/activation, once received
+4. Winnie's reply re: CN22/pinout/activation — **RECEIVED 2026-07-07, transcribed in `winnie-bms-port-reply.md`**
 5. Photos of the on/off board around CN22/CN23, once the panel is open
 
 ## 10. Suggested First Prompt for the New Session
