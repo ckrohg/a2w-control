@@ -35,13 +35,22 @@ guardrails:
   # can't leave a pump in a state the manual/HBX fallback can't undo.
   restrict_unattended_writes: true
   setback_setpoint_c: 40     # scheduler "off" timers lower to this instead of powering off
+  #   ^ Phase 2: raise to 46 when the floor below is activated — an unattended write is
+  #     clamped by unattended_min_setpoint_c (45), so 40 would just be silently clamped to 45.
   # comfort_setpoint_c: 50   # optional: scheduler "on" timers restore to this
-  # unattended_min_setpoint_c: 45  # winter-safe FLOOR for scheduler + token setpoint
-  #   writes — set from the house's design-day heat requirement before enabling writes
-  #   (defaults to setback_setpoint_c). Human UI can still go to setpoint_min_c.
-  # Remote-optimizer lease (platform phase — set baseline to activate): a remote setpoint
-  # is a renewable LEASE; if the optimizer goes silent the Pi reverts to this warm baseline
-  # on its own so the house is never stranded at a stale value.
+  # --- WINTER-SAFE FLOOR + LEASE (Phase 2 — uncomment when enabling writes) ---
+  # Values VALIDATED 2026-07-07 from the house's TempIQ-learned thermal data + an adversarial
+  # safety-check — full reasoning + commissioning checks in
+  # knowledge/reference/winter-safe-floor-analysis.md. Confidence LOW until the Phase-1
+  # cold-snap checks confirm them. Design day: South Hamilton MA, 99.6% = 5°F.
+  # unattended_min_setpoint_c: 45  # hard freeze FLOOR for scheduler + token/optimizer writes
+  #   (fin-tube baseboard collapses below ~42-43°C; 45 keeps margin). Human UI can still go
+  #   to setpoint_min_c. ⚠️ This clamps the SETPOINT, not the ACHIEVED water temp — between
+  #   ~-15°C and -20°C ambient a de-rated compressor may not REACH 45°C and the unit's own
+  #   backup heater only enables ≤ -20°C (reg 2030). Confirm the HBX 16.5 kW buffer element
+  #   holds the buffer at low ambient before trusting this for freeze safety.
+  # Remote-optimizer lease: a remote setpoint is a renewable LEASE; on optimizer silence the
+  # Pi reverts to this warm baseline so the house is never stranded at a stale value.
   # baseline_setpoint_c: 48       # warm winter default reverted to when a lease lapses
   # lease_max_minutes: 180
   # lease_warn_minutes: 15
