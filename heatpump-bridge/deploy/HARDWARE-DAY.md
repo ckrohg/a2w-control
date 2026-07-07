@@ -51,6 +51,11 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
 - [ ] WiFi + serial config per `w610-setup.md`: join your SSID, set **2400 8N1, transparent,
       TCP server :8899**. Easiest path: dashboard → Setup → Scan → **Auto-configure serial**.
 - [ ] Give each a **DHCP reservation**; record its **MAC** into `~/bridge-data/config.yaml`.
+- [ ] **(Best pre-pump de-risk — kit on hand: USB-RS485 dongle ordered ✓)** End-to-end
+      framing check through a **real W610**: wire the dongle A/B to a configured gateway, run
+      the simulator behind it (`w610-setup.md` §Bench validation), and confirm the bridge
+      polls at **0% error**. This proves the RTU-over-TCP framing (the #1 first-connection
+      trap) on real gateway hardware before any heat pump is touched.
 - [ ] Move both gateways onto the **isolated segment** from Phase A.
 
 ## Phase C — Pi in place 🔧
