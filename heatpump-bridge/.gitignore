@@ -6,3 +6,6 @@ bridge.db*
 .update-state
 ui-session.key
 gateway-overrides.json
+
+# local runtime DB backups (nightly rotation) — never track
+backups/
