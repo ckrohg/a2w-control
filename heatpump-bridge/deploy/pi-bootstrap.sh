@@ -23,6 +23,16 @@ if [ -d "$HOME/a2w-control/.git" ]; then
 else
   git clone https://github.com/ckrohg/a2w-control.git "$HOME/a2w-control"
 fi
+# Boot on the latest promoted release-* tag, NOT mutable main — matches the auto-updater's
+# forward-only policy (same --sort=-creatordate selection + reset --hard, so it's compatible and
+# stays on a branch). First boot then runs exactly the code a normal update would, even if main
+# is mid-change on install day. No release tag yet -> stay on the cloned HEAD.
+git -C "$HOME/a2w-control" fetch -q --tags --force 2>/dev/null || true
+_latest_tag=$(git -C "$HOME/a2w-control" tag -l 'release-*' --sort=-creatordate | head -1)
+if [ -n "$_latest_tag" ]; then
+  git -C "$HOME/a2w-control" reset --hard -q "$_latest_tag"
+  echo "    booting release $_latest_tag (not mutable main)"
+fi
 cd "$HOME/a2w-control/heatpump-bridge"
 
 echo "==> python dependencies"

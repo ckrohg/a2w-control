@@ -6,6 +6,12 @@ they remove all the fiddly account/network steps from the day you're actually wi
 
 Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gate, don't proceed past it
 
+> ⚡ **Electrical safety (read once).** The enclosure is fed by a **120 V AC** tap from the
+> adjacent Taco zone box via MC cable. Before touching that AC side, **kill the breaker feeding
+> it and verify dead.** If you're not comfortable with line-voltage AC, have an electrician do
+> the 120 V tap — everything downstream (RS-15-12 PSU → W610s → Pi) is 12 V/5 V and safe. The
+> heat-pump BMS wiring (CN22) is low-voltage, but still do it with the pump panel powered off.
+
 ---
 
 ## Phase A — Desk work (do NOW, before hardware; no Pi/gateways needed)
@@ -46,18 +52,28 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
     (Each is optional/independent — omit any you're not using; the bridge just skips it. Add
     `A2W_TAILSCALE_AUTHKEY=…` too if you want the direct-to-Pi fallback.)
   - Run the **simulator on the Pi** (`uv run python sim/fake_pump.py`) and point config at
-    localhost — then open the dashboard from your phone over Tailscale. This exercises the
-    entire production stack (bootstrap, systemd, auto-update, remote access, login, alerts)
-    with zero hardware risk. Everything you'd hit on the real day, you hit here first.
-- [ ] 🖥 **BOM check** — confirm all of `handoff §3` is ordered: 2× W610, 2× isolated RS-485
-      repeaters, Mean Well RS-15-12 PSU, Gratury enclosure, JST pigtails, 18/3 or Cat5e,
-      MC cable + connectors, Wago 221s.
+    localhost — then open the dashboard from your phone **over the LAN**
+    (`http://heatpump-pi.local:8000`, or the Pi's IP if `.local` doesn't resolve — see
+    `pi-setup.md`). This exercises the entire production stack (bootstrap, systemd, auto-update,
+    hub link, dashboard, login, alerts) with zero hardware risk. If you set up Tailscale, test
+    the remote path too. Everything you'd hit on the real day, you hit here first.
+- [ ] 🖥 **BOM + tools check** — confirm `handoff §3` is ordered: 2× W610, 2× isolated RS-485
+      repeaters, Mean Well RS-15-12 PSU, Gratury enclosure, 18/3 or Cat5e, MC cable + connectors,
+      Wago 221s. **Plus these, easy to forget:**
+  - **CN22-mating pigtail** — Winnie's "order from a photo": confirm the 4-pin connector actually
+    mates CN22 (not a generic JST). This is the long-lead item that gates wiring pump 1.
+  - **USB-RS485 dongle** (Phase B framing de-risk) — CH340-chip ones may need a macOS driver;
+    FTDI/CP210x are plug-and-play.
+  - **Multimeter/continuity tester** (CN22↔CN23 continuity check, Phase D) + a **clamp meter**
+    (verify the 2063/2088 power-register units at commissioning).
 
 ## Phase B — Bench (gateways, before touching the heat pumps) 🔧
 
 - [ ] Power each W610 on the bench; do them **one at a time**, label each PUMP 1 / PUMP 2.
 - [ ] WiFi + serial config per `w610-setup.md`: join your SSID, set **2400 8N1, transparent,
-      TCP server :8899**. Easiest path: dashboard → Setup → Scan → **Auto-configure serial**.
+      TCP server :8899**. Try dashboard → Setup → Scan → **Auto-configure serial**, but note it's
+      **unproven on real hardware and this is your first unit** — plan to fall back to the W610's
+      own web console (manual steps in `w610-setup.md`), which always works.
 - [ ] Give each a **DHCP reservation**; record its **MAC** into `~/bridge-data/config.yaml`.
 - [ ] **(Best pre-pump de-risk — kit on hand: USB-RS485 dongle ordered ✓)** End-to-end
       framing check through a **real W610**: wire the dongle A/B to a configured gateway, run
@@ -68,7 +84,11 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
 
 ## Phase C — Pi in place 🔧
 
-- [ ] Mount the Pi; confirm it's on the network and the dashboard loads (LAN + Tailscale).
+- [ ] ⛔ Mount the Pi + PSU/W610s in the enclosure. If wiring the **120 V AC** tap, breaker OFF
+      first (safety note up top) — or have an electrician do it.
+- [ ] Confirm the Pi is on the network and the dashboard loads at `http://heatpump-pi.local:8000`.
+      If `.local` doesn't resolve (common on a busy consumer network), find the Pi's IP in your
+      router's DHCP lease list and use that — see `pi-setup.md`.
 - [ ] In the dashboard **Setup** tab, Scan and assign each gateway to its pump (MAC-matched).
       Pumps still show OFFLINE until wired — expected.
 

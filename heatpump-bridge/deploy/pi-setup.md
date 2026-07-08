@@ -53,6 +53,13 @@ From the Mac:
 ssh pi@heatpump-pi.local
 ```
 
+**If `heatpump-pi.local` doesn't resolve** (mDNS/Bonjour is often blocked on busy consumer
+networks like an AmpliFi Alien with 100+ devices — the SSH just hangs, no error), find the Pi's
+IP instead: open your **router's DHCP lease list** and look for hostname `heatpump-pi`, or from
+the Mac run `arp -a | grep -i b8:27:eb` (Raspberry Pi MAC prefix; newer Pis use `d8:3a:dd` or
+`dc:a6:32`) or `ping heatpump-pi.local`. Then `ssh pi@<the-IP>` and use that IP for the dashboard
+too (`http://<the-IP>:8000`). Setting a **DHCP reservation** for the Pi makes the IP stable.
+
 then paste:
 
 ```bash
