@@ -93,6 +93,28 @@ PY
   echo "    wired analytics mirror: $A2W_ANALYTICS_URL (best-effort outbound snapshot push)"
 fi
 
+# Alerting (optional, independent): ntfy push + external dead-man heartbeat. Either or both
+# wire from env — ntfy needs no account (just a hard-to-guess topic you subscribe to in the
+# app); A2W_HEARTBEAT_URL is a healthchecks.io-style ping URL — if the Pi stops pinging
+# (power/WiFi/ISP dead) THAT service alerts you (silence = alarm). Neither is a secret leak
+# risk, but they live only here + on your phone/hc.io, never in the repo.
+if [ -n "${A2W_NTFY_TOPIC:-}" ] || [ -n "${A2W_HEARTBEAT_URL:-}" ]; then
+  uv run python - "$HOME/bridge-data/config.yaml" <<'PY'
+import os, sys, yaml
+path = sys.argv[1]
+cfg = yaml.safe_load(open(path))
+n = cfg.get("notifications") or {}
+if os.environ.get("A2W_NTFY_TOPIC"):
+    n["ntfy_topic"] = os.environ["A2W_NTFY_TOPIC"]
+    n["ntfy_server"] = os.environ.get("A2W_NTFY_SERVER", "https://ntfy.sh")
+if os.environ.get("A2W_HEARTBEAT_URL"):
+    n["heartbeat_url"] = os.environ["A2W_HEARTBEAT_URL"]
+cfg["notifications"] = n
+yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
+PY
+  echo "    wired alerts (ntfy_topic / heartbeat_url from env)"
+fi
+
 echo "==> systemd service"
 sed -e "s|/home/pi|$HOME|g" \
     -e "s|^User=pi|User=$USER|" \

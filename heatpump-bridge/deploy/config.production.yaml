@@ -56,6 +56,8 @@ guardrails:
   # lease_warn_minutes: 15
 
 # Push alerts (ntfy — free, no account) + external dead-man heartbeat.
+# EASIEST: pass A2W_NTFY_TOPIC and/or A2W_HEARTBEAT_URL to pi-bootstrap.sh and it writes this
+# block for you (same as the hub/analytics tokens). To wire it MANUALLY, uncomment below:
 notifications:
   # 1. Pick a hard-to-guess topic and subscribe to it in the ntfy app (or ntfy.sh/<topic>).
   # ntfy_topic: "a2w-REPLACE-with-something-random"

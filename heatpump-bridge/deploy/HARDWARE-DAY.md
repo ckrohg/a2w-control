@@ -34,9 +34,10 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
     the real device's connect behavior (registration/heartbeat bytes).
 - [ ] 🖥 **Pi dress rehearsal** (once the CanaKit Pi is on hand — the single best de-risk):
   - Flash the SD card (`pi-setup.md` §1) and boot.
-  - Run the bootstrap **with your secrets** so it comes up remote-ready (add `A2W_HUB_TOKEN`
-    to wire the Railway hub and `A2W_ANALYTICS_TOKEN` to wire the history push, same step):
-    `A2W_UI_PASSWORD=… A2W_TAILSCALE_AUTHKEY=… A2W_HUB_TOKEN=… A2W_ANALYTICS_TOKEN=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
+  - Run the bootstrap **with your secrets** so it comes up remote-ready. Every secret wires
+    from one command — hub, history push, and alerts included:
+    `A2W_UI_PASSWORD=… A2W_TAILSCALE_AUTHKEY=… A2W_HUB_TOKEN=… A2W_ANALYTICS_TOKEN=… A2W_NTFY_TOPIC=… A2W_HEARTBEAT_URL=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
+    (Each is optional/independent — omit any you're not using; the bridge just skips it.)
   - Run the **simulator on the Pi** (`uv run python sim/fake_pump.py`) and point config at
     localhost — then open the dashboard from your phone over Tailscale. This exercises the
     entire production stack (bootstrap, systemd, auto-update, remote access, login, alerts)
