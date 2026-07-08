@@ -100,6 +100,9 @@ The hub source lives in `hub/`. See `hub/README.md` for the build/run detail; th
    - `HUB_CLIENT_TOKEN` — the second token from §3.
    - `NTFY_TOPIC` — (optional but recommended) the SAME ntfy topic the Pi uses, so the hub's
      dead-man alerts land with your fault alerts. Omit to disable the watchdog.
+   - `RESEND_API_KEY` + `RESEND_TO` — (optional) also email the dead-man alerts via Resend, as a
+     sticky second channel. Without a verified sender domain Resend delivers only to your Resend
+     account email — set `RESEND_TO` to that.
    - `PORT` — Railway injects this; the hub must bind it. Nothing to set unless overriding.
 3. **Deploy.** Railway gives you a public URL, e.g. `https://a2w-hub-production.up.railway.app`.
    The WebSocket endpoint is that host with `wss://` and the `/pi` path; the HTTP API is the same

@@ -67,6 +67,12 @@ notifications:
   #    on the hub to the same topic above). heartbeat_url below is an optional extra channel
   #    (e.g. healthchecks.io) only if you want a second, hub-independent monitor.
   # heartbeat_url: "https://hc-ping.com/your-uuid"
+  # 3. Optional email (Resend) — a sticky second channel for SERIOUS alerts (high/urgent only).
+  #    EASIEST: pass A2W_RESEND_API_KEY + A2W_RESEND_TO to pi-bootstrap.sh. Without a verified
+  #    sender domain Resend delivers only to your own account email — set resend_to to that.
+  # resend_api_key: "re_..."          # from resend.com/api-keys
+  # resend_to: "you@example.com"      # your Resend account email (no domain needed)
+  # resend_from: "A2W Alerts <onboarding@resend.dev>"   # or a verified-domain sender
 
 # Read-only cloud analytics mirror (optional). The Pi pushes a state snapshot to a Vercel
 # app (analytics-mirror/) every interval_s; that hosts the history dashboard. NOT control —

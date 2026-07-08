@@ -146,8 +146,16 @@ class NotifyConfig(BaseModel):
     ntfy_server: str = "https://ntfy.sh"
     # External dead-man heartbeat (e.g. healthchecks.io): pinged every poll cycle. If the
     # pings stop (Pi/WiFi/ISP/power dead), THAT service alerts you — silence = alarm, and
-    # it doesn't share fate with the Pi (fusion audit risk 3c).
+    # it doesn't share fate with the Pi (fusion audit risk 3c). Optional now that the Railway
+    # hub is itself a dead-man.
     heartbeat_url: str | None = None
+    # Email alerts via Resend (resend.com) — a second channel alongside ntfy for the SERIOUS
+    # alerts (high/urgent only; recoveries stay push-only). Needs a Resend API key. Without a
+    # verified sender domain, Resend delivers only to your own account email, which is exactly
+    # right for personal alerts — set resend_to to that address.
+    resend_api_key: str | None = None
+    resend_to: str | None = None
+    resend_from: str = "A2W Alerts <onboarding@resend.dev>"
 
 
 class AnalyticsConfig(BaseModel):

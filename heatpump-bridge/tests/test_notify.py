@@ -49,3 +49,40 @@ async def test_ntfy_noop_without_topic(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     await notify.ntfy(NotifyConfig(), title="x", message="y")   # no topic configured
     assert called is False
+
+
+async def test_resend_email_high_priority_sends_correct_request(monkeypatch):
+    import json
+    captured = {}
+
+    def fake_urlopen(req, timeout=10):
+        captured["url"] = req.full_url
+        captured["auth"] = req.get_header("Authorization")
+        captured["body"] = json.loads(req.data)
+        return _FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    cfg = NotifyConfig(resend_api_key="re_test", resend_to="me@example.com")
+    await notify.email(cfg, subject="⚠ Pump 1 offline", body="down", priority="high")
+
+    assert captured["url"] == "https://api.resend.com/emails"
+    assert captured["auth"] == "Bearer re_test"
+    assert captured["body"]["to"] == ["me@example.com"]
+    assert captured["body"]["subject"] == "⚠ Pump 1 offline"   # emoji fine in JSON subject
+    assert captured["body"]["text"] == "down"
+    assert captured["body"]["from"] == "A2W Alerts <onboarding@resend.dev>"
+
+
+async def test_resend_email_skips_low_priority_and_unconfigured(monkeypatch):
+    calls = 0
+
+    def fake_urlopen(req, timeout=10):
+        nonlocal calls
+        calls += 1
+        return _FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    cfg = NotifyConfig(resend_api_key="re_test", resend_to="me@example.com")
+    await notify.email(cfg, subject="back online", body="ok", priority="low")   # recovery
+    await notify.email(NotifyConfig(), subject="x", body="y", priority="high")  # unconfigured
+    assert calls == 0

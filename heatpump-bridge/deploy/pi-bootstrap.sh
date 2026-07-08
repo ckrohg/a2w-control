@@ -98,7 +98,7 @@ fi
 # app); A2W_HEARTBEAT_URL is a healthchecks.io-style ping URL — if the Pi stops pinging
 # (power/WiFi/ISP dead) THAT service alerts you (silence = alarm). Neither is a secret leak
 # risk, but they live only here + on your phone/hc.io, never in the repo.
-if [ -n "${A2W_NTFY_TOPIC:-}" ] || [ -n "${A2W_HEARTBEAT_URL:-}" ]; then
+if [ -n "${A2W_NTFY_TOPIC:-}" ] || [ -n "${A2W_HEARTBEAT_URL:-}" ] || [ -n "${A2W_RESEND_API_KEY:-}" ]; then
   uv run python - "$HOME/bridge-data/config.yaml" <<'PY'
 import os, sys, yaml
 path = sys.argv[1]
@@ -109,10 +109,15 @@ if os.environ.get("A2W_NTFY_TOPIC"):
     n["ntfy_server"] = os.environ.get("A2W_NTFY_SERVER", "https://ntfy.sh")
 if os.environ.get("A2W_HEARTBEAT_URL"):
     n["heartbeat_url"] = os.environ["A2W_HEARTBEAT_URL"]
+if os.environ.get("A2W_RESEND_API_KEY") and os.environ.get("A2W_RESEND_TO"):
+    n["resend_api_key"] = os.environ["A2W_RESEND_API_KEY"]
+    n["resend_to"] = os.environ["A2W_RESEND_TO"]
+    if os.environ.get("A2W_RESEND_FROM"):
+        n["resend_from"] = os.environ["A2W_RESEND_FROM"]
 cfg["notifications"] = n
 yaml.safe_dump(cfg, open(path, "w"), sort_keys=False)
 PY
-  echo "    wired alerts (ntfy_topic / heartbeat_url from env)"
+  echo "    wired alerts (ntfy / heartbeat / resend email from env)"
 fi
 
 echo "==> systemd service"

@@ -50,6 +50,14 @@ const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
 const PI_SILENCE_ALERT_MS = Number(process.env.PI_SILENCE_ALERT_MS ?? 180_000); // 3 min grace
 const WATCHDOG_INTERVAL_MS = Number(process.env.WATCHDOG_INTERVAL_MS ?? 30_000);
 
+// Optional email second channel (Resend) for the dead-man. RESEND_API_URL is overridable so
+// tests can point it at a local catcher; without a verified sender domain Resend delivers only
+// to your own account email (set RESEND_TO to that).
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const RESEND_TO = process.env.RESEND_TO ?? "";
+const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
+const RESEND_API_URL = process.env.RESEND_API_URL ?? "https://api.resend.com/emails";
+
 // ---------------------------------------------------------------------------
 // Constant-time token comparison
 // ---------------------------------------------------------------------------
@@ -89,6 +97,21 @@ async function notifyNtfy(title: string, message: string,
     });
   } catch (err) {
     console.warn(`[hub] ntfy push failed: ${(err as Error).message}`);
+  }
+}
+
+/** Fire-and-forget email via Resend. No-op when RESEND_API_KEY/RESEND_TO unset; never throws.
+ * Subject/body are JSON (UTF-8), so emoji are fine (unlike the ntfy header title). */
+async function notifyEmail(subject: string, body: string): Promise<void> {
+  if (!RESEND_API_KEY || !RESEND_TO) return;
+  try {
+    await fetch(RESEND_API_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body }),
+    });
+  } catch (err) {
+    console.warn(`[hub] resend email failed: ${(err as Error).message}`);
   }
 }
 
@@ -303,16 +326,17 @@ setInterval(() => {
     piSilenceAlerted = true;
     const mins = Math.max(1, Math.round(silentMs / 60_000));
     // Title/Tags are HTTP headers → ASCII only; the `warning` tag renders as ⚠️ in ntfy.
-    void notifyNtfy(
-      "A2W: heat-pump bridge offline",
-      `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
-        "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.",
-      { priority: "high", tags: "warning" });
+    const title = "A2W: heat-pump bridge offline";
+    const body = `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
+      "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.";
+    void notifyNtfy(title, body, { priority: "high", tags: "warning" });
+    void notifyEmail(title, body);   // dead-man is rare + important → email too
   } else if (!silent && piSilenceAlerted) {
     piSilenceAlerted = false;
-    void notifyNtfy("A2W: heat-pump bridge back online",
-      "The Pi is checking in with the hub again.",
-      { priority: "default", tags: "white_check_mark" });
+    const title = "A2W: heat-pump bridge back online";
+    const body = "The Pi is checking in with the hub again.";
+    void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
+    void notifyEmail(title, body);   // closure for the offline email above
   }
 }, WATCHDOG_INTERVAL_MS);
 

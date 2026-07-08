@@ -5,10 +5,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import urllib.request
 
 log = logging.getLogger(__name__)
+
+# Email fires only for serious alerts (a second, sticky channel); recoveries/info stay
+# push-only so the inbox isn't noisy. ntfy still gets everything.
+_EMAIL_PRIORITIES = {"high", "urgent", "max"}
 
 
 async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
@@ -31,6 +36,34 @@ async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
             urllib.request.urlopen(req, timeout=8).read()
         except Exception as exc:  # noqa: BLE001 — alerting must never break the poller
             log.warning("ntfy push failed: %s", exc)
+
+    await asyncio.to_thread(_post)
+
+
+async def email(cfg, *, subject: str, body: str, priority: str = "default") -> None:
+    """Fire-and-forget email alert via Resend. No-op unless configured AND the alert is
+    serious (high/urgent) — email is the sticky second channel for things that need
+    attention, not every recovery. Subject/body are JSON (UTF-8), so emoji are fine here."""
+    if not cfg or not cfg.resend_api_key or not cfg.resend_to:
+        return
+    if priority not in _EMAIL_PRIORITIES:
+        return
+    payload = json.dumps({
+        "from": cfg.resend_from,
+        "to": [cfg.resend_to],
+        "subject": subject,
+        "text": body,
+    }).encode("utf-8")
+
+    def _post():
+        try:
+            req = urllib.request.Request(
+                "https://api.resend.com/emails", data=payload, method="POST",
+                headers={"Authorization": f"Bearer {cfg.resend_api_key}",
+                         "Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as exc:  # noqa: BLE001 — alerting must never break the poller
+            log.warning("resend email failed: %s", exc)
 
     await asyncio.to_thread(_post)
 

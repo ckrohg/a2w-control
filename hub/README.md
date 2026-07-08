@@ -54,6 +54,8 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
 | `NTFY_SERVER`      | Optional. ntfy base URL (default `https://ntfy.sh`). |
 | `PI_SILENCE_ALERT_MS` | Optional. Grace window before "Pi offline" fires (default `180000` = 3 min). |
+| `RESEND_API_KEY` / `RESEND_TO` | Optional. Also email the dead-man alerts via Resend. No verified domain → delivers only to your Resend account email (set `RESEND_TO` to it). |
+| `RESEND_FROM` | Optional sender (default `A2W Alerts <onboarding@resend.dev>`). |
 
 Tokens are compared constant-time. Generate them with e.g. `openssl rand -hex 32`.
 

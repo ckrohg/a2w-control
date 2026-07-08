@@ -362,10 +362,13 @@ class PumpPoller:
                 "severity": fdef.severity, "since": since}
 
     def _push(self, title: str, message: str, priority: str = "default", tags: str = "") -> None:
-        """Fire-and-forget push alert; safe if unconfigured (notify.ntfy no-ops)."""
+        """Fire-and-forget alert; safe if unconfigured. Fans out to ntfy (all alerts) and,
+        for serious ones, Resend email — each no-ops when not configured."""
         asyncio.create_task(notify.ntfy(
             self.app_cfg.notifications, title=title, message=message,
             priority=priority, tags=tags))
+        asyncio.create_task(notify.email(
+            self.app_cfg.notifications, subject=title, body=message, priority=priority))
 
     async def _update_faults(self, current: dict[str, FaultDef]) -> None:
         """Edge detection: log fault_on for new bits, fault_off for cleared bits."""

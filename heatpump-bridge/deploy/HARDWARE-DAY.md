@@ -42,8 +42,9 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
   - Flash the SD card (`pi-setup.md` §1) and boot.
   - Run the bootstrap **with your secrets** so it comes up remote-ready. Every secret wires
     from one command — hub, history push, and alerts included:
-    `A2W_UI_PASSWORD=… A2W_TAILSCALE_AUTHKEY=… A2W_HUB_TOKEN=… A2W_ANALYTICS_TOKEN=… A2W_NTFY_TOPIC=… A2W_HEARTBEAT_URL=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
-    (Each is optional/independent — omit any you're not using; the bridge just skips it.)
+    `A2W_UI_PASSWORD=… A2W_HUB_TOKEN=… A2W_ANALYTICS_TOKEN=… A2W_NTFY_TOPIC=… A2W_RESEND_API_KEY=… A2W_RESEND_TO=… bash -c "$(curl -fsSL …/pi-bootstrap.sh)"`
+    (Each is optional/independent — omit any you're not using; the bridge just skips it. Add
+    `A2W_TAILSCALE_AUTHKEY=…` too if you want the direct-to-Pi fallback.)
   - Run the **simulator on the Pi** (`uv run python sim/fake_pump.py`) and point config at
     localhost — then open the dashboard from your phone over Tailscale. This exercises the
     entire production stack (bootstrap, systemd, auto-update, remote access, login, alerts)
