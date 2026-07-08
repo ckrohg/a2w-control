@@ -17,12 +17,17 @@ async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
     if not cfg or not cfg.ntfy_topic:
         return
     url = f"{cfg.ntfy_server.rstrip('/')}/{cfg.ntfy_topic}"
+    # HTTP headers are latin-1: an emoji in the title (our alerts prefix ✓/⚠) makes urllib
+    # raise UnicodeEncodeError, which the except below would swallow — so the alert would
+    # SILENTLY never send. Strip the title to latin-1; the emoji is carried by `tags`
+    # (warning -> ⚠️, white_check_mark -> ✓), which ntfy renders anyway. Body stays UTF-8.
+    safe_title = title.encode("latin-1", "ignore").decode("latin-1").strip()
 
     def _post():
         try:
             req = urllib.request.Request(
                 url, data=message.encode("utf-8"), method="POST",
-                headers={"Title": title, "Priority": priority, "Tags": tags})
+                headers={"Title": safe_title, "Priority": priority, "Tags": tags})
             urllib.request.urlopen(req, timeout=8).read()
         except Exception as exc:  # noqa: BLE001 — alerting must never break the poller
             log.warning("ntfy push failed: %s", exc)

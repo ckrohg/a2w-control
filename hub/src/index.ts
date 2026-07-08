@@ -41,6 +41,15 @@ if (!HUB_CLIENT_TOKEN) {
 const PI_PING_INTERVAL_MS = 30_000; // ping the Pi every ~30s
 const COMMAND_ACK_TIMEOUT_MS = 10_000; // await matching ack up to 10s
 
+// Dead-man watchdog: the Pi checks in every ~15s, so if it goes silent past this threshold the
+// hub pushes an ntfy alert. This is the external dead-man (a dead Pi can't alert about itself)
+// running on infra we already own — no healthchecks.io. Fires only after we've seen the Pi at
+// least once, and only on transitions (silent -> alert once, recovered -> notify once).
+const NTFY_TOPIC = process.env.NTFY_TOPIC ?? "";
+const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
+const PI_SILENCE_ALERT_MS = Number(process.env.PI_SILENCE_ALERT_MS ?? 180_000); // 3 min grace
+const WATCHDOG_INTERVAL_MS = Number(process.env.WATCHDOG_INTERVAL_MS ?? 30_000);
+
 // ---------------------------------------------------------------------------
 // Constant-time token comparison
 // ---------------------------------------------------------------------------
@@ -62,6 +71,25 @@ function extractBearer(headerValue: string | undefined): string {
   if (!headerValue) return "";
   const m = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
   return m ? m[1].trim() : "";
+}
+
+/** Fire-and-forget ntfy push. No-op when NTFY_TOPIC is unset; never throws. */
+async function notifyNtfy(title: string, message: string,
+                          opts: { priority?: string; tags?: string } = {}): Promise<void> {
+  if (!NTFY_TOPIC) return;
+  try {
+    // HTTP headers are ByteStrings (Latin-1) — strip anything above U+00FF so a stray emoji in
+    // a title can never throw and silently kill the alert. Emoji belong in `tags`, which ntfy
+    // renders (e.g. warning -> ⚠️); the message body (below) is UTF-8 and takes emoji fine.
+    const headers: Record<string, string> = { Title: title.replace(/[^\x00-\xFF]/g, "").trim() };
+    if (opts.priority) headers.Priority = opts.priority;
+    if (opts.tags) headers.Tags = opts.tags;
+    await fetch(`${NTFY_SERVER.replace(/\/+$/, "")}/${NTFY_TOPIC}`, {
+      method: "POST", headers, body: message,
+    });
+  } catch (err) {
+    console.warn(`[hub] ntfy push failed: ${(err as Error).message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +135,12 @@ let piSocket: WebSocket | null = null;
 
 /** Latest state pushed by the Pi (only the latest is buffered). */
 let lastState: StateMessage | null = null;
+
+/** Dead-man state: when we last heard ANY frame from the Pi (server clock, not the Pi's),
+ * whether we've ever seen it, and whether the silence alert already fired (transition de-dup). */
+let lastPiSeenAt = 0;
+let everSeenPi = false;
+let piSilenceAlerted = false;
 
 interface PendingCommand {
   resolve: (ack: AckMessage) => void;
@@ -254,6 +288,34 @@ const server = app.listen(PORT, () => {
   console.log(`[hub] HTTP + WS listening on :${PORT}`);
 });
 
+if (!NTFY_TOPIC) {
+  console.warn("[hub] NTFY_TOPIC not set — Pi-offline dead-man alerts are disabled.");
+}
+
+// Dead-man watchdog: alert once when the Pi goes silent past the grace window, and once when
+// it returns. Silence is measured from the last frame we heard (lastPiSeenAt), so a brief
+// reconnect (WiFi blip / redeploy) inside the window never fires a false alarm.
+setInterval(() => {
+  if (!everSeenPi || !NTFY_TOPIC) return;
+  const silentMs = Date.now() - lastPiSeenAt;
+  const silent = silentMs > PI_SILENCE_ALERT_MS;
+  if (silent && !piSilenceAlerted) {
+    piSilenceAlerted = true;
+    const mins = Math.max(1, Math.round(silentMs / 60_000));
+    // Title/Tags are HTTP headers → ASCII only; the `warning` tag renders as ⚠️ in ntfy.
+    void notifyNtfy(
+      "A2W: heat-pump bridge offline",
+      `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
+        "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.",
+      { priority: "high", tags: "warning" });
+  } else if (!silent && piSilenceAlerted) {
+    piSilenceAlerted = false;
+    void notifyNtfy("A2W: heat-pump bridge back online",
+      "The Pi is checking in with the hub again.",
+      { priority: "default", tags: "white_check_mark" });
+  }
+}, WATCHDOG_INTERVAL_MS);
+
 // ---------------------------------------------------------------------------
 // WebSocket server (Pi bridge) — path /pi
 // ---------------------------------------------------------------------------
@@ -298,12 +360,15 @@ wss.on("connection", (ws: WebSocket) => {
     }
   }
   piSocket = ws;
+  lastPiSeenAt = Date.now();
+  everSeenPi = true;
   console.log("[hub] Pi connected");
 
   // Liveness: mark alive on pong; drop on a missed ping->pong round.
   let isAlive = true;
   ws.on("pong", () => {
     isAlive = true;
+    lastPiSeenAt = Date.now();
   });
 
   const pingTimer = setInterval(() => {
@@ -324,6 +389,7 @@ wss.on("connection", (ws: WebSocket) => {
   }, PI_PING_INTERVAL_MS);
 
   ws.on("message", (data: RawData) => {
+    lastPiSeenAt = Date.now();
     let msg: unknown;
     try {
       msg = JSON.parse(data.toString());

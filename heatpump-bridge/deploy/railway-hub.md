@@ -30,6 +30,12 @@ control that coexists with the hub and takes over if the hub is down.
   not an error: every guardrail that applies to a human tap applies here.
 - **Best-effort / additive.** If the hub is down the Pi just keeps retrying; local LAN control
   and the optional Funnel path are completely unaffected.
+- **Built-in dead-man.** Because the Pi holds a WebSocket and checks in every ~15 s, the hub
+  *knows* the instant the Pi goes silent. Set `NTFY_TOPIC` on the hub and it pushes an ntfy
+  alert when the Pi drops (power / WiFi / internet / bridge down) and a recovery when it
+  returns — a true external dead-man (a dead Pi can't alert about itself) on infra you already
+  own, replacing an external healthchecks.io ping. Fires only after the Pi has connected once,
+  and only on transitions (no spam). Grace window `PI_SILENCE_ALERT_MS` (default 3 min).
 
 ## 2. Data flow
 
@@ -92,6 +98,8 @@ The hub source lives in `hub/`. See `hub/README.md` for the build/run detail; th
 2. **Set environment variables** (Service → Variables):
    - `HUB_PI_TOKEN` — the first token from §3.
    - `HUB_CLIENT_TOKEN` — the second token from §3.
+   - `NTFY_TOPIC` — (optional but recommended) the SAME ntfy topic the Pi uses, so the hub's
+     dead-man alerts land with your fault alerts. Omit to disable the watchdog.
    - `PORT` — Railway injects this; the hub must bind it. Nothing to set unless overriding.
 3. **Deploy.** Railway gives you a public URL, e.g. `https://a2w-hub-production.up.railway.app`.
    The WebSocket endpoint is that host with `wss://` and the `/pi` path; the HTTP API is the same

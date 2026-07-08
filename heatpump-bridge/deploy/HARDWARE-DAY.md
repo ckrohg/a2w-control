@@ -10,11 +10,17 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
 
 ## Phase A — Desk work (do NOW, before hardware; no Pi/gateways needed)
 
-- [ ] 🖥 **Accounts & secrets** (5 min each, all free):
-  - Tailscale: create account, generate an **auth key** (Settings → Keys). Save it.
-  - Pick a **dashboard password** (8+ chars) for the browser login.
-  - ntfy: pick a **hard-to-guess topic** name, subscribe to it in the ntfy phone app.
-  - (Optional) healthchecks.io: create a check, copy its **ping URL** (the dead-man).
+- [ ] 🖥 **Accounts & secrets** (all free):
+  - ntfy: pick a **hard-to-guess topic**, subscribe in the phone app. One topic for BOTH the
+    Pi (faults/offline) and the hub's dead-man — use the same value for `A2W_NTFY_TOPIC` (Pi)
+    and `NTFY_TOPIC` (hub).
+  - Pick a **Pi dashboard password** for the local/LAN UI. Optional if you only control via the
+    hub + Vercel and don't expose the Pi's own UI.
+  - **Tailscale — OPTIONAL (fallback only).** The hub + Vercel are the primary remote path;
+    Funnel is just the direct-to-Pi backup (full power/mode from away, or if the hub is down).
+    One command to add later — not a bench-day item.
+  - ~~healthchecks.io~~ **not needed** — the Railway hub is the dead-man: it already sees the
+    Pi's ~15 s check-ins and pushes an ntfy alert if the Pi goes silent (set `NTFY_TOPIC` on the hub).
   - **Railway hub — DONE (deployed 2026-07-06):** live at
     `https://a2w-hub-production.up.railway.app`. The Pi token is on Railway
     (project `a2w-hub` → Variables → **`HUB_PI_TOKEN`**). Pass it to the bootstrap as

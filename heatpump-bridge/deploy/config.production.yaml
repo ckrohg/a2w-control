@@ -62,8 +62,10 @@ notifications:
   # 1. Pick a hard-to-guess topic and subscribe to it in the ntfy app (or ntfy.sh/<topic>).
   # ntfy_topic: "a2w-REPLACE-with-something-random"
   # ntfy_server: "https://ntfy.sh"
-  # 2. Optional: healthchecks.io ping URL — if the Pi stops pinging (power/WiFi/ISP dead),
-  #    THAT service emails you. Silence becomes the alarm.
+  # 2. External dead-man. NOT NEEDED if you use the Railway hub — the hub already watches the
+  #    Pi's WebSocket check-ins and pushes an ntfy alert if the Pi goes silent (set NTFY_TOPIC
+  #    on the hub to the same topic above). heartbeat_url below is an optional extra channel
+  #    (e.g. healthchecks.io) only if you want a second, hub-independent monitor.
   # heartbeat_url: "https://hc-ping.com/your-uuid"
 
 # Read-only cloud analytics mirror (optional). The Pi pushes a state snapshot to a Vercel
