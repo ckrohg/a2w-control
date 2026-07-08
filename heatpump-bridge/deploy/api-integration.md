@@ -127,6 +127,11 @@ you can confirm your writes are actually holding authority.
 Design your optimizer around this: it's a *stateless caller holding a lease*, and the Pi
 owns "what's still valid" — which is why no cloud command-queue is needed.
 
+**Renewals are free.** If the value you send already matches the pump's current setpoint, the
+bridge refreshes the lease **without** touching the register (no Modbus write, no EEPROM wear,
+no rate-limit slot consumed, no audit-log entry) — the response includes `"unchanged": true`.
+So re-asserting every ~15 min to hold your lease costs nothing; only a real change writes.
+
 ## 6. Integration posture
 
 Recommended first step: a **read-only token** (`can_write: false`). Let TempIQ *observe*

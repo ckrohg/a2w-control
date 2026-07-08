@@ -97,7 +97,7 @@ async def test_guarded_write_with_readback(rig):
     pump, poller, store = rig
     await poller.poll_once()
     result = await poller.write_setpoint(48, source="test")
-    assert result == {"setpoint_c": 48, "verified": True, "mode": "heating"}
+    assert result == {"setpoint_c": 48, "verified": True, "mode": "heating", "unchanged": False}
     assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 48
 
     # audit trail: accepted write recorded with old/new/source
@@ -106,6 +106,38 @@ async def test_guarded_write_with_readback(rig):
     assert write["code"] == "accepted"
     assert write["detail"]["source"] == "test"
     assert write["detail"]["requested"] == 48
+
+
+async def test_same_value_setpoint_renews_without_rewriting(rig):
+    """A lease renewal at the unchanged value must NOT hit the pump register again (EEPROM /
+    event-log protection) and must NOT consume a rate-limit slot — but must still refresh the
+    optimizer's lease. This is what makes a 15-min renewal loop cheap."""
+    pump, poller, store = rig
+    g = poller.app_cfg.guardrails
+    g.min_write_interval_s = 0        # isolate the no-op behaviour from rate limiting
+    g.baseline_setpoint_c = 48        # activates the lease regime
+    g.unattended_min_setpoint_c = 45  # floor below 48 so the renewal is allowed
+    await poller.poll_once()
+
+    r1 = await poller.write_setpoint(48, source="optimizer", unattended=True, lease_minutes=90)
+    assert r1 == {"setpoint_c": 48, "verified": True, "mode": "heating", "unchanged": False}
+    assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 48
+    lease_until_1 = poller._lease["until"]
+    rate_slot_1 = poller.guard._last_write.get("p1")
+    writes_1 = len([e for e in await store.get_events("p1", 1) if e["type"] == "setpoint_write"])
+
+    # renew at the SAME value: no physical write, no new audit event, no rate-limit slot used,
+    # but the lease timer still moves forward
+    r2 = await poller.write_setpoint(48, source="optimizer", unattended=True, lease_minutes=90)
+    assert r2 == {"setpoint_c": 48, "verified": True, "mode": "heating", "unchanged": True}
+    writes_2 = len([e for e in await store.get_events("p1", 1) if e["type"] == "setpoint_write"])
+    assert writes_2 == writes_1                                   # no new setpoint_write event
+    assert poller.guard._last_write.get("p1") == rate_slot_1      # record_write skipped
+    assert poller._lease["until"] >= lease_until_1                # lease still refreshed
+
+    # a genuine change still writes through normally
+    r3 = await poller.write_setpoint(47, source="optimizer", unattended=True, lease_minutes=90)
+    assert r3["unchanged"] is False and await pump.get_reg(R.REG_SETPOINT_HEATING) == 47
 
 
 async def test_write_rejections_are_audited(rig):

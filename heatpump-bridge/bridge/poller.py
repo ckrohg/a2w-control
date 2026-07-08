@@ -487,6 +487,18 @@ class PumpPoller:
             raise
 
         raw = int(round(value / R.TEMP_SCALE))
+        # Renew-without-rewrite: if the target register already holds this exact value, skip the
+        # physical write, the rate-limit slot (record_write), and the audit event. A remote
+        # optimizer renews its lease every ~15 min even when the setpoint is unchanged; those
+        # renewals must not churn the pump's EEPROM or spam the event log. Bounds + the winter
+        # floor were already validated above, so a same-value renewal that violates them is still
+        # rejected — this only short-circuits a genuine write that's already satisfied. The lease
+        # timer still refreshes in write_setpoint(), so the optimizer keeps its authority. Compare
+        # raw register values (like the read-back verify) so it's immune to float/scale surprises.
+        if control.get(target_register) == raw:
+            readback = R.to_signed(raw) * R.TEMP_SCALE
+            self.snapshot["setpoint_c"] = readback
+            return {"setpoint_c": readback, "verified": True, "mode": kind, "unchanged": True}
         try:
             readback_raw = await self.client.write_register_verified(target_register, raw)
         except ModbusError as exc:
@@ -509,7 +521,7 @@ class PumpPoller:
                 f"read-back mismatch: wrote {value}°C but unit reports {readback}°C", 502)
         self.snapshot["setpoint_c"] = readback
         self.note_local_change(f"setpoint_{kind}_c", readback)
-        return {"setpoint_c": readback, "verified": True, "mode": kind}
+        return {"setpoint_c": readback, "verified": True, "mode": kind, "unchanged": False}
 
     async def _guarded_control_write(self, register: int, raw: int, *, event_type: str,
                                      describe: str, source: str,

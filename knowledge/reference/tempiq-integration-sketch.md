@@ -91,12 +91,13 @@ Either unlocks the deeper setback. Start static/conservative; pick (a) or (b) at
 
 ## 5. Open items this sketch surfaces
 
-1. **Lease-renew-without-rewrite (small A2W refinement, do before Phase B):** `write_setpoint`
-   physically writes the register every call (`poller.py:491`) then sets the lease. A 15-min
-   renewal loop therefore writes the register 96×/day even when unchanged — and the rate limit
-   exists to "protect the pump's EEPROM." Fix: if the requested value already equals the verified
-   `snapshot["setpoint_c"]`, refresh the lease timer but **skip** the physical write. Cheap, and it
-   protects EEPROM regardless of whether the unit commits setpoints to EEPROM.
+1. **Lease-renew-without-rewrite — ✅ BUILT 2026-07-07 (`poller.py`, release-20260707-7).**
+   `write_setpoint` now short-circuits when the target register already holds the requested
+   value: it skips the physical write, skips `record_write` (so a renewal doesn't burn a
+   rate-limit slot), and emits no audit event — but the lease timer still refreshes. So the
+   15-min renewal loop is free (no EEPROM churn, no event-log spam). Bounds + floor are still
+   validated first, so a same-value renewal that violates the floor is still rejected. Returns
+   `{..., "unchanged": true}` on the no-op path.
 2. **Emitter curve is assumed, not measured** (`emitterConductance_z`): TempIQ currently ASSUMES
    supply temps by emitter type (baseboard 140 °F, radiant 95 °F). Measure actual output-vs-water-temp
    per zone at commissioning to make the mapping accurate (else keep the conservative assumed curve).
@@ -110,6 +111,6 @@ Either unlocks the deeper setback. Start static/conservative; pick (a) or (b) at
 ## Phased rollout
 
 - **A — shadow:** `can_write:false`; TempIQ logs would-be targets; validate a few weeks.
-- **B — active, conservative:** `can_write:true`; operate in [static floor 45, cap 55]; lease loop;
-  ship the §5.1 renew-without-rewrite refinement first.
+- **B — active, conservative:** `can_write:true`; operate in [static floor 45, cap 55]; lease loop
+  (renew-without-rewrite already shipped, §5.1).
 - **C — unlock savings:** weather-compensated (or lowered/validated) floor → deeper mild-day setback.
