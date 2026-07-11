@@ -92,8 +92,11 @@ async def usr_udp_discover(timeout_s: float = 1.5) -> dict[str, str]:
     return found
 
 
-async def tcp_scan(hosts: list[str], ports: set[int], timeout_s: float = 0.4) -> list[tuple[str, int]]:
-    """Which (host, port) pairs accept a TCP connection. ~2s for a /24."""
+async def tcp_scan(hosts: list[str], ports: set[int], timeout_s: float = 0.4,
+                   exclude: set[tuple[str, int]] | None = None) -> list[tuple[str, int]]:
+    """Which (host, port) pairs accept a TCP connection. ~2s for a /24.
+    exclude: pairs never to touch — with max-clients=1 on a W610, even this plain
+    connect can kick/collide with the bridge's live polling connection."""
     sem = asyncio.Semaphore(64)
 
     async def check(host: str, port: int):
@@ -106,7 +109,8 @@ async def tcp_scan(hosts: list[str], ports: set[int], timeout_s: float = 0.4) ->
             except Exception:
                 return None
 
-    tasks = [check(h, p) for h in hosts for p in sorted(ports)]
+    tasks = [check(h, p) for h in hosts for p in sorted(ports)
+             if not (exclude and (h, p) in exclude)]
     return [r for r in await asyncio.gather(*tasks) if r]
 
 
@@ -133,12 +137,16 @@ async def probe_heatpump(host: str, port: int, device_id: int = 1,
 async def discover(extra_ports: set[int] | None = None, probe: bool = True,
                    skip_probe: set[tuple[str, int]] | None = None) -> list[dict]:
     """Full sweep -> [{ip, port, mac, source, probe}]. Modbus port default 8899.
-    skip_probe: (host, port) pairs NOT to open a Modbus connection to — gateways the
-    bridge is actively using. Transparent-mode W610s may allow a single TCP client;
-    probing a live one could steal the bridge's connection mid-poll."""
+    skip_probe: (host, port) pairs NOT to open ANY connection to — gateways this bridge
+    is actively using. With max-clients=1 on the W610, even the plain TCP-connect of the
+    port scan (not just the Modbus probe) can kick or collide with the bridge's live
+    polling connection, so these pairs are excluded from the scan entirely. The UDP
+    broadcast still covers them (it never touches :8899), so they stay discoverable."""
     ports = {8899} | (extra_ports or set())
     udp_found = await usr_udp_discover()
-    open_ports = await tcp_scan(local_subnet_hosts(), ports)
+    open_ports = await tcp_scan(local_subnet_hosts(), ports, exclude=skip_probe)
+    # skipped pairs are open by definition — the bridge holds a live connection to them
+    open_ports += list(skip_probe or ())
 
     candidates: dict[str, dict] = {}
     for ip, mac in udp_found.items():

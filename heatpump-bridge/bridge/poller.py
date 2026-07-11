@@ -78,6 +78,10 @@ class PumpPoller:
         self._task: asyncio.Task | None = None
         self._last_comm_row = 0.0
         self._last_error_polls = 0
+        # Offline alerting is edge-tracked explicitly, NOT inferred from the previous
+        # snapshot: a pump that has NEVER been online (fresh boot into a dead gateway —
+        # exactly the first-bench-day case) must still alert, and must alert only once.
+        self._offline_alerted = False
 
     @property
     def online(self) -> bool:
@@ -117,16 +121,22 @@ class PumpPoller:
             client = self.client
             try:
                 regs: dict[int, int] = {}
-                for block in R.ALL_BLOCKS:
+                for block in R.all_blocks():   # live: honors the SPLIT_RESERVED_HOLE fallback
                     regs.update(await client.read_block(block))
             except ModbusError as exc:
                 client.record_poll(ok=False)
                 await self._handle_poll_failure(exc)
                 return
-            await self._poll_decode_and_store(client, regs)
+            try:
+                await self._poll_decode_and_store(client, regs)
+            except Exception as exc:  # noqa: BLE001 — a decode/store bug must never leave a
+                # stale "online" zombie: count it as a FAILED poll so the offline watchdog,
+                # the health endpoint, and the dead-man all see the truth.
+                log.exception("[%s] decode/store failed", self.cfg.id)
+                client.record_poll(ok=False)
+                await self._handle_poll_failure(ModbusError(f"decode/store failed: {exc!r}", "decode"))
 
     async def _poll_decode_and_store(self, client: PumpClient, regs: dict[int, int]) -> None:
-        client.record_poll(ok=True)
         await self._check_identity()
         decoded = R.decode_snapshot(regs)
         was_online = self.snapshot.get("online", False)
@@ -151,13 +161,19 @@ class PumpPoller:
             "remote_lease_source": self._lease["source"] if self._lease else None,
             "comm": client.stats.as_dict(),
         }
-        if not was_online and client.stats.ok_polls > 1:
+        # ok_polls here counts PRIOR successes (record_poll runs at the END of this method,
+        # so a decode crash above counts the poll as failed). Also close the loop for a pump
+        # that alerted offline without ever having been online (fresh boot, dead gateway).
+        if not was_online and (client.stats.ok_polls >= 1 or self._offline_alerted):
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
             self._push(title=f"✓ {self.cfg.name} back online",
                        message="Communication restored.", priority="low", tags="white_check_mark")
+        self._offline_alerted = False
         await self.store.add_sample(self.cfg.id, decoded | {"status_word": regs.get(R.REG_STATUS, 0)})
         await self._maybe_comm_row()
+        client.record_poll(ok=True)
+        self.snapshot["comm"] = client.stats.as_dict()  # refresh post-record (0 consecutive)
 
     def _derive_state(self, decoded: dict) -> str:
         non_info = {k: v for k, v in self.active_faults.items() if v["severity"] != Severity.INFO}
@@ -183,6 +199,14 @@ class PumpPoller:
         if mode_kind == "cooling":
             return [g.cooling_setpoint_min_c, g.cooling_setpoint_max_c]
         return None
+
+    async def _read_control(self) -> dict[int, int]:
+        """Fresh control-register read for the write path — honors the same
+        SPLIT_RESERVED_HOLE fallback as the poll loop (one spanning read, or two)."""
+        regs: dict[int, int] = {}
+        for block in R.control_blocks():
+            regs.update(await self.client.read_block(block))
+        return regs
 
     async def apply_gateway(self, host: str, port: int, *, source: str) -> None:
         """Point this pump at a (new) gateway address: swap the Modbus client live,
@@ -219,8 +243,14 @@ class PumpPoller:
             return
         self._last_rediscover = now
         want = normalize_mac(self.cfg.mac)
+        # Never TCP-touch any configured pump's gateway during the sweep: with
+        # max-clients=1 a bare connect can kick the HEALTHY pump's live connection.
+        # (This pump's own stale address is excluded too — harmless: the UDP broadcast
+        # and ARP still find its MAC at whatever NEW address it moved to.)
+        in_use = {(p.host, p.port) for p in self.app_cfg.pumps}
         try:
-            candidates = await self._discoverer(extra_ports={self.cfg.port}, probe=False)
+            candidates = await self._discoverer(extra_ports={self.cfg.port}, probe=False,
+                                                skip_probe=in_use)
         except Exception:
             log.exception("[%s] rediscovery sweep failed", self.cfg.id)
             return
@@ -238,13 +268,21 @@ class PumpPoller:
                     self.cfg.id, exc.category, failures, exc)
         if failures >= threshold:
             await self._try_rediscover()
-        if failures == threshold and self.snapshot.get("online"):
+        # Alert on the explicit edge flag, not on the previous snapshot's online state — a
+        # pump that has NEVER been online (boot into a dead/miswired gateway: the bench-day
+        # case) must alert too, exactly once, with a message that points at the triage table.
+        if failures >= threshold and not self._offline_alerted:
+            self._offline_alerted = True
+            never_online = self.client.stats.ok_polls == 0
             self.snapshot = {**self.snapshot, "online": False, "state": "offline",
                              "comm": self.client.stats.as_dict()}
+            message = (f"{self.cfg.name} has never responded ({exc.category}) — see the "
+                       f"first-hour triage table in deploy/HARDWARE-DAY.md"
+                       if never_online else
+                       f"{self.cfg.name} unreachable for {failures} consecutive polls")
             await self.store.add_event(
                 self.cfg.id, "comm", code="offline", severity="high",
-                message=f"{self.cfg.name} unreachable for {failures} consecutive polls",
-                detail={"category": exc.category})
+                message=message, detail={"category": exc.category})
             self._push(title=f"⚠ {self.cfg.name} offline",
                        message=f"No response for {failures} polls ({exc.category}). "
                                f"Check the gateway / WiFi.", priority="high", tags="warning")
@@ -452,7 +490,7 @@ class PumpPoller:
             raise
 
         try:
-            control = await self.client.read_block(R.BLOCK_CONTROL)
+            control = await self._read_control()
         except ModbusError as exc:
             await audit_reject(exc, "failed", "high")
             raise GuardrailError(f"cannot confirm pump mode before writing: {exc}", 502) from exc

@@ -671,7 +671,10 @@ async def test_auto_rediscovery_follows_the_mac(rig):
     await pump2.start()
     await pump2.tick()
 
-    async def fake_discover(extra_ports=None, probe=True):
+    async def fake_discover(extra_ports=None, probe=True, skip_probe=None):
+        # rediscovery must exclude every configured gateway from the TCP sweep — with
+        # max-clients=1 a bare connect can kick the healthy pump's live connection
+        assert skip_probe and (poller.cfg.host, poller.cfg.port) in skip_probe
         return [{"ip": "127.0.0.1", "port": pump2.port, "mac": "D8:B0:4C:12:34:56",
                  "source": "test"}]
     poller._discoverer = fake_discover

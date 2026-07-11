@@ -100,6 +100,18 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
 - [ ] ⛔ **Leave the CN23 wall controller connected** — Winnie: the unit malfunctions without
       it. CN22 is a separate bus, so your tap doesn't touch it. Slave address = **1**.
 - [ ] Leave `write_enabled: false`. Watch the dashboard: pump 1 goes online, live temps.
+- [ ] **If it does NOT come online — the first-hour triage table.** The comm footer on the
+      pump card shows a failure breakdown (`connect / timeout / io / nak`); read the symptom,
+      not the tea leaves:
+
+  | Symptom (comm footer / journalctl) | Likely cause, in order |
+  |---|---|
+  | `connect` failures | wrong IP/port · W610 off WiFi · its single client slot already taken (another tool connected? stale socket — see TCP-timeout setting) · W610 accidentally in a Modbus-TCP mode (listening on 502, not 8899) |
+  | `timeout` (silence) | **RS-485 not selected on the W610 (check first!)** · repeater doesn't do 2400 baud · A/B swapped · wrong baud on the W610 · wrong slave address · CN22 not seated · CRC-polynomial quirk (run `deploy/crc-probe.py` — it splits CRC-vs-wiring in one shot; stop the bridge first) |
+  | `nak` (exception responses) | the pump is ALIVE but refusing a register — almost certainly the reserved-hole read: flip `SPLIT_RESERVED_HOLE = True` in `bridge/registers.py` (prepared fallback; poll + write paths both follow it) |
+  | `io` (mismatched/garbage frames) | noise on the bus (bias/termination on the repeater) · WiFi stalls (the bridge discards stale frames and reconnects on its own — watch whether it recovers) |
+  | polls fine, temps look ×10 too big/small | scaling — set `TEMP_SCALE = 0.1` in `bridge/registers.py` (commissioning item, verify vs the wall controller) |
+
 - [ ] Run the **commissioning checklist** in `reference/modbus-register-map.md`: verify
       addressing offset, temp scaling/signedness, power-register units, CRC, slave address.
       Cross-check temps against the wall controller. Watch the error rate for 48 h.

@@ -12,7 +12,10 @@ log = logging.getLogger(__name__)
 
 SEARCH_KEYWORD = b"www.usr.cn"
 DESIRED_UART = "2400,8,1,NONE,NFC"   # baud, data bits, stop bits, parity, flow control
-DESIRED_TMODE = "THROUGHPUT"         # a.k.a. transparent mode
+# Transparent mode's name varies by firmware: some report "throughput", W610 manuals show
+# "Through". Accept either as already-correct; SET with the manual's spelling.
+TMODE_OK = {"THROUGH", "THROUGHPUT"}
+TMODE_SET = "Through"
 
 
 class _UdpSession(asyncio.DatagramProtocol):
@@ -58,10 +61,16 @@ async def configure_w610(host: str, *, port: int = 48899) -> dict:
         await asyncio.sleep(0.3)
 
         async def at(cmd: str) -> str | None:
+            """One AT round-trip. Returns the payload, or None on no-reply OR an +ERR
+            reply — a rejected set command must read as FAILURE, not success (real
+            firmware answers '+ERR=...' to commands it doesn't accept)."""
             reply = await session.request(f"{cmd}\r\n".encode())
             if reply is None:
                 return None
             text = reply.decode(errors="ignore").strip()
+            if text.upper().startswith("+ERR"):
+                log.warning("W610 %s rejected %r: %s", host, cmd, text)
+                return None
             return text.removeprefix("+ok=").removeprefix("+ok").strip(" \r\n=")
 
         # 2. read current settings (report even if we change nothing)
@@ -78,14 +87,14 @@ async def configure_w610(host: str, *, port: int = 48899) -> dict:
         #    report-only, never touched.
         if uart is not None and uart.upper().replace(" ", "") != DESIRED_UART:
             if (await at(f"AT+UART={DESIRED_UART}")) is None:
-                report["error"] = f"AT+UART set command got no reply (was {uart})"
+                report["error"] = f"AT+UART set command failed or was rejected (was {uart})"
                 return report
             report["changed"].append(f"uart {uart} -> {DESIRED_UART}")
-        if tmode is not None and tmode.upper() != DESIRED_TMODE:
-            if (await at("AT+TMODE=throughput")) is None:
-                report["error"] = f"AT+TMODE set command got no reply (was {tmode})"
+        if tmode is not None and tmode.upper().strip() not in TMODE_OK:
+            if (await at(f"AT+TMODE={TMODE_SET}")) is None:
+                report["error"] = f"AT+TMODE set command failed or was rejected (was {tmode})"
                 return report
-            report["changed"].append(f"tmode {tmode} -> throughput")
+            report["changed"].append(f"tmode {tmode} -> {TMODE_SET}")
 
         # 4. restart to apply (no reply expected; brief grace so the datagram lands
         #    before we close the socket)

@@ -110,7 +110,30 @@ class ReadBlock:
 BLOCK_CONTROL = ReadBlock(2000, 40)     # on/off, mode, setpoints, wire params incl 2027
 BLOCK_TELEMETRY = ReadBlock(2050, 51)   # temps + per-stage telemetry through 2100
 BLOCK_STATUS = ReadBlock(2110, 9)       # status word + all fault bitfields + switches
-ALL_BLOCKS = (BLOCK_CONTROL, BLOCK_TELEMETRY, BLOCK_STATUS)
+
+# BENCH FALLBACK: BLOCK_CONTROL spans the doc's reserved hole 2006-2009. The sim serves it
+# happily, but a strictly spec-compliant pump may NAK any read touching unimplemented
+# addresses (symptom: exception_responses climbing + pump never online, while a one-off
+# read of 2050-2052 works). If unit #1 does that, flip this to True — the poll AND write
+# paths both follow it (they call control_blocks()/all_blocks(), evaluated per call).
+# Costs one extra transaction (~0.5 s at 2400 baud), well within the poll budget.
+SPLIT_RESERVED_HOLE = False
+_BLOCK_CONTROL_A = ReadBlock(2000, 6)    # 2000-2005: on/off, mode, setpoints
+_BLOCK_CONTROL_B = ReadBlock(2010, 30)   # 2010-2039: wire-controller params incl 2027
+
+
+def control_blocks() -> tuple[ReadBlock, ...]:
+    """The control-register read(s) — one spanning block, or two skipping the hole."""
+    if SPLIT_RESERVED_HOLE:
+        return (_BLOCK_CONTROL_A, _BLOCK_CONTROL_B)
+    return (BLOCK_CONTROL,)
+
+
+def all_blocks() -> tuple[ReadBlock, ...]:
+    return (*control_blocks(), BLOCK_TELEMETRY, BLOCK_STATUS)
+
+
+ALL_BLOCKS = all_blocks()  # snapshot at import for callers that don't need the live flag
 
 # --- Scaling (commissioning items — verify against wall controller / clamp meter) ----
 TEMP_SCALE = 1.0    # doc quotes whole degC ranges; Macon boards sometimes use x0.1

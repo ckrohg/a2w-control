@@ -144,6 +144,21 @@ function pill(label, on, cls = "") {
   return `<span class="pill ${on ? "on " + cls : ""}">${label}</span>`;
 }
 
+// Failure breakdown for the comm footer — first-connection triage depends on WHICH kind
+// of failure it is (connect = IP/port/WiFi/max-clients; timeout = wiring/baud/address/CRC;
+// exception = pump alive but NAKing a register). Hidden while everything is clean.
+function renderCommBreakdown(c) {
+  if (!c) return "";
+  const parts = [];
+  if (c.connect_failures) parts.push(`connect ${c.connect_failures}`);
+  if (c.timeouts) parts.push(`timeout ${c.timeouts}`);
+  if (c.io_errors) parts.push(`io ${c.io_errors}`);
+  if (c.exception_responses) parts.push(`nak ${c.exception_responses}`);
+  if (c.reconnects) parts.push(`reconnects ${c.reconnects}`);
+  if (c.consecutive_failures) parts.push(`${c.consecutive_failures} in a row`);
+  return parts.length ? `<span class="err-bad">${parts.join(" · ")}</span>` : "";
+}
+
 function detailRow(label, vals, fmt = v => v ?? "—") {
   return `<tr><th>${label}</th>${vals.map(v => `<td>${v == null ? "—" : fmt(v)}</td>`).join("")}</tr>`;
 }
@@ -310,6 +325,7 @@ function renderDashboard() {
       ${s.online ? renderDetails(p.id, s) : ""}
       <div class="comm">
         <span>errors: <span class="${err > 0.05 ? "err-bad" : ""}">${(err * 100).toFixed(1)}%</span></span>
+        ${renderCommBreakdown(s.comm)}
         ${s.identity_ok === false ? '<span class="err-bad">⚠ W610 identity mismatch — writes blocked</span>' : ""}
         ${!s.online ? `<button class="find-gw" data-find-gw>Find gateway</button>` : ""}
         <span>last poll ${fmtAgo(s.last_poll_ts)}</span>

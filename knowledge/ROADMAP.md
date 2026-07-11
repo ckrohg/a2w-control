@@ -71,6 +71,15 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 - [ ] Pi provisioning per `heatpump-bridge/deploy/pi-setup.md` (can be done before the heat pump connection exists — bridge will just show pumps offline)
 - [ ] Phase 1 (**ungated 2026-07-07** — Winnie confirmed CN22/pinout/bus/addr): one pump, read-only (write_enabled: false). Wire CN22 pins 2/3/4 (GND/A/B) — **not** pin 1 (12V); leave CN23 wall controller connected. Run the commissioning checklist in `reference/modbus-register-map.md` (addressing offset, temp scaling/signedness, CRC, power units — cross-check vs SPAN). Watch error rates 48h.
 - [ ] Phase 1 bench: **W610 TCP-Client mode investigation** (topology: gateways on shared 100+ device IoT network, AmpliFi = no isolation). Confirm the W610 can dial the Pi with no listening port + whether it sends a registration/heartbeat packet on connect. If clean, BUILD the Pi-side accept-transport (identical RTU data plane, just accept-vs-connect + strip any registration bytes) as the airtight defense. Baseline until then = max-clients=1 + detection.
+- [ ] Phase 2 **code refinements to land BEFORE flipping write_enabled** (from the 2026-07-11
+      hardware-readiness review; deliberately not churned the night before install since Phase 1
+      is read-only): (a) read-back verify gets ONE retry after ~1-2 s before declaring
+      verify_mismatch (pump may commit async; measure actual commit latency at the bench first);
+      (b) `note_local_change` registers the pending value BEFORE the physical write so an
+      in-flight poll can't misreport our own write as "changed at the unit"; (c) a timed-out
+      write re-reads the target register once after reconnect — audit `accepted_after_timeout`
+      if it landed, `unconfirmed` if unknowable, never a bare `failed` for a write that may
+      have applied.
 - [ ] Phase 2: flip write_enabled on pump 1; confirm wall controller reflects the change.
 
 ## Later — Phases 3–4

@@ -70,7 +70,7 @@ async def test_configures_factory_fresh_unit():
     assert any("uart" in c for c in report["changed"])
     assert any("tmode" in c for c in report["changed"])
     assert fake.uart == "2400,8,1,NONE,NFC"
-    assert fake.tmode == "throughput"
+    assert fake.tmode == "Through"   # the manual's spelling — real firmware rejects 'throughput'
     assert fake.restarted is True
 
 
@@ -81,6 +81,35 @@ async def test_already_configured_changes_nothing():
     assert report["changed"] == []
     assert fake.restarted is False
     assert not any(c.startswith("AT+UART=") for c in fake.commands)
+
+
+async def test_real_firmware_dialect_through_is_accepted_as_transparent():
+    # real W610 firmware reports 'Through', not 'throughput' — that IS transparent mode
+    # and must not trigger a set command (whose rejection used to read as success)
+    fake, port = await start_fake(uart="2400,8,1,NONE,NFC", tmode="Through")
+    report = await configure_w610("127.0.0.1", port=port)
+    assert report["ok"] is True
+    assert report["changed"] == []
+    assert not any(c.startswith("AT+TMODE=") for c in fake.commands)
+
+
+async def test_err_reply_to_set_command_is_a_failure_not_success():
+    fake, port = await start_fake()  # needs both uart + tmode changed
+
+    orig = FakeW610.datagram_received
+    def rejecting(self, data, addr):
+        text = data.decode(errors="ignore").strip()
+        if text.startswith("AT+UART="):
+            self.commands.append(text)
+            self.transport.sendto(b"+ERR=-4\r\n", addr)   # real firmware rejection
+            return
+        orig(self, data, addr)
+    fake.datagram_received = rejecting.__get__(fake)
+
+    report = await configure_w610("127.0.0.1", port=port)
+    assert report["ok"] is False
+    assert "rejected" in report["error"] or "failed" in report["error"]
+    assert fake.restarted is False                          # never restart after a rejection
 
 
 async def test_no_device_reports_cleanly():

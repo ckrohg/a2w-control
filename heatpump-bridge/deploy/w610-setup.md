@@ -56,12 +56,13 @@ you can validate the whole chain against the simulator first (see bottom).
 | Setting | Value |
 |---|---|
 | Work mode | **Transparent mode** (transmission mode) |
-| RS-485/RS-232 | RS-485 |
+| RS-485/RS-232 | **RS-485** — ⚠️ CHECK EXPLICITLY: a unit left on RS-232 passes every other check but its A/B terminals are dead. First item in the no-comms triage, before A/B swap. |
 | Baud rate | **2400** |
 | Data bits | 8 |
 | Parity | None |
 | Stop bits | 1 |
 | Flow control | None (RS-485 direction is automatic) |
+| Serial package / auto-frame (UARTF) | **OFF (factory default — do not enable).** Packing that merges/splits frames confuses RTU framing; default pass-through is exactly right at 2400 baud. |
 
 ## Network side — joining the home WiFi, step by step
 
@@ -111,8 +112,15 @@ precious is ever stored on the unit.
 |---|---|
 | WiFi mode | STA |
 | Socket | **TCP Server**, port **8899** (factory default) |
-| Max clients | **1 (recommended, as a security lock — layer A above)**: only the Pi's persistent connection is accepted, a rogue client is refused. The bridge never probes a gateway it's already using, so 1 is fine operationally. |
+| Max clients | **1 (recommended, as a security lock — layer A above)**: only the Pi's persistent connection is accepted, a rogue client is refused. NOT the factory default (ships allowing many, AT+MAXSK) — set it in the web console's socket settings or via `AT+MAXSK=1`. The bridge never TCP-touches a gateway it's already using (scan + probe both skip it), so 1 is fine operationally. |
+| TCP timeout (AT+TCPTO) | **60 s** — ⚠️ factory default is 0 = a dead client connection is held FOREVER. With max clients = 1, a Pi WiFi blip that dies without a clean close would then lock the Pi out of its own gateway. 60 s: the 20 s poll keeps a healthy socket alive; a dead one frees in ≤ 60 s. |
 | IP | DHCP + **reservation in the router**. Suggested: .61 for pump 1, .62 for pump 2 |
+
+**Verify the client-lock behavior (2 min, per unit):** (1) open TWO simultaneous
+`nc <gw-ip> 8899` sessions from a laptop — the second must fail/refuse. (2) The stale-socket
+recovery test: while the bridge is polling at 0% error, kill it uncleanly
+(`sudo systemctl kill heatpump-bridge`), restart it, and time how long until polls succeed
+again — should be ≤ the TCP timeout you set above. Record both results here.
 
 ## Wiring (per handoff §3 — settled; CN22 CONFIRMED by Winnie 2026-07-07)
 
@@ -126,6 +134,13 @@ first thing to try.
 powered from the RS-15-12; 12V into a bus terminal can damage the repeater or the board.
 ⚠️ CN22 is a **separate bus** from the CN23 wall controller — **leave CN23 connected**, the
 unit malfunctions without it. Slave address = **1** (no DIP/param change needed).
+
+**The isolated repeater at 2400 baud:** check its manual for baud DIP switches or a minimum
+supported rate — set 2400 explicitly if it has switches (some "auto-baud" repeaters don't go
+that low). Prove it BEFORE the pump: put the repeater INTO the dongle bench chain
+(dongle → repeater → W610 → sim poll at 0% error). A repeater that can't do 2400 looks
+exactly like an A/B swap on the real bus. If comms work but `error_rate` is nonzero, enable
+the repeater's bias/termination options before blaming the cable.
 
 ## Bench validation against the simulator (no heat pump needed)
 
