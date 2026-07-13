@@ -9,4 +9,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=pi
+# oneshot default (~90s) can kill an apply mid `uv sync`, stranding new files under the
+# old process (seen live 2026-07-13; pi-update.sh's deploy-marker now self-heals that,
+# but give the apply room to finish in one pass). Installed units need a manual refresh
+# + daemon-reload to pick this up — new bootstraps get it automatically.
+TimeoutStartSec=600
 ExecStart=/home/pi/a2w-control/heatpump-bridge/deploy/pi-update.sh

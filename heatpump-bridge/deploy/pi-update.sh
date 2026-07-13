@@ -11,6 +11,7 @@ set -euo pipefail
 REPO="${A2W_REPO:-$HOME/a2w-control}"
 BRIDGE="$REPO/heatpump-bridge"
 STATE="$BRIDGE/.update-state"   # holds the ref of a target that failed health check
+DEPLOYED="$BRIDGE/.deployed"    # ref of the last apply that PASSED its health check
 HEALTH_URL="${A2W_HEALTH_URL:-http://localhost:8000/api/health}"
 RESTART_CMD="${A2W_RESTART_CMD:-sudo systemctl restart heatpump-bridge}"
 TAG_GLOB="${A2W_TAG_GLOB:-release-*}"
@@ -28,7 +29,20 @@ fi
 target=$(git rev-list -n 1 "$latest_tag")
 
 if [ "$current" = "$target" ]; then
-  exit 0
+  # repo at target is NOT proof the service was restarted onto it: an apply interrupted
+  # between git-reset and restart (e.g. systemd oneshot timeout mid `uv sync`) leaves new
+  # files with the OLD process running — and without this check that state is permanent.
+  # Only trust it when the deploy marker (written after a PASSED health check) agrees.
+  if [ -f "$DEPLOYED" ] && [ "$(cat "$DEPLOYED")" = "$target" ]; then
+    exit 0
+  fi
+  echo "repo already at $target but no completed-deploy marker — finishing the interrupted apply"
+  # the interrupted run wrote $STATE before its health check ever ran — that's not a
+  # failed-health verdict, so clear it or the skip-guard below would block the resume.
+  # (Trade-off: a rollback-failed target also retries each tick instead of parking —
+  # acceptable, since rollback-failure is already "manual attention" territory and the
+  # retry is idempotent.)
+  rm -f "$STATE"
 fi
 # forward-only: never auto-deploy a tag that isn't ahead of the running commit — a stray
 # `release-*` tag on an OLD commit must not trigger a mid-night rollback (re-audit fix 4)
@@ -62,6 +76,7 @@ fi
 for _ in $(seq 1 30); do
   if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
     echo "healthy on $target"
+    echo "$target" > "$DEPLOYED"
     rm -f "$STATE"
     exit 0
   fi
