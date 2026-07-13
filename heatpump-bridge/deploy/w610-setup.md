@@ -56,8 +56,8 @@ you can validate the whole chain against the simulator first (see bottom).
 | Setting | Value |
 |---|---|
 | Work mode | **Transparent mode** (transmission mode) |
-| RS-485/RS-232 | **RS-485** — ⚠️ CHECK EXPLICITLY: a unit left on RS-232 passes every other check but its A/B terminals are dead. First item in the no-comms triage, before A/B swap. |
-| Baud rate | **2400** |
+| RS-485/RS-232 | **RS-485** ("485 mode: Enable") — ⚠️ CHECK EXPLICITLY: a unit left on RS-232 passes every other check but its A/B terminals are dead. First item in the no-comms triage, before A/B swap. ⚠️ **Web-UI-only**: `AT+UART` can't see or set this flag, so remote verification misses it — re-check it in the web console **after every Apply** (the UI loads stale forms with first-option defaults, and Apply writes ALL fields). |
+| Baud rate | **2400** — ⚠️ units ship at 57600; a wrong baud reads as pure SILENCE, not garbage (verified on both real units) |
 | Data bits | 8 |
 | Parity | None |
 | Stop bits | 1 |
@@ -137,6 +137,10 @@ first thing to try.
 `pin1 = 12V · pin2 = GND · pin3 = A(+) · pin4 = B(−)`. Land **pins 2/3/4 only**
 (GND→repeater GND, A→A, B→B). ⚠️ **Do NOT connect pin 1 (12V)** — the W610 + repeater are
 powered from the RS-15-12; 12V into a bus terminal can damage the repeater or the board.
+⚠️ **Pin 2 (GND) is REQUIRED, not optional** — A/B-only hookups read as a dead pump
+(verified 2026-07-13: same unit, silent without GND, streams with it). The W610 itself has
+**no GND terminal**: with no repeater in the run, land pin 2 on the **Mean Well V−** that
+powers the W610 (its RS-485 signal ground = its supply negative).
 ⚠️ CN22 is a **separate bus** from the CN23 wall controller — **leave CN23 connected**, the
 unit malfunctions without it. Slave address = **1** (no DIP/param change needed).
 

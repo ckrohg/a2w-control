@@ -112,6 +112,27 @@ Legend: 🖥 = at your desk · 🔧 = at the enclosure/panel · ⛔ = a hard gat
   | `io` (mismatched/garbage frames) | noise on the bus (bias/termination on the repeater) · WiFi stalls (the bridge discards stale frames and reconnects on its own — watch whether it recovers) |
   | polls fine, temps look ×10 too big/small | scaling — set `TEMP_SCALE = 0.1` in `bridge/registers.py` (commissioning item, verify vs the wall controller) |
 
+  **Field lessons from the 2026-07-12/13 commissioning (both real gateways + pumps):**
+  - **Wrong baud = pure SILENCE, not garbage.** Both W610s shipped at 57600; read back +
+    fix in one shot with `bridge.w610_config.configure_w610(host)` (vendor UDP :48899).
+  - **The RS-485/232 selector is WEB-UI-ONLY** — `AT+UART` cannot see or set it, so remote
+    config verification misses it. Re-check "485 mode: Enable" in the web console **after
+    every Apply**: the UI loads stale forms with default dropdowns (300 baud / 5 data bits)
+    and an Apply then writes those defaults.
+  - **3-wire or silence: signal GND is required.** A/B-only hookups read as a dead pump.
+    The W610 has **no GND terminal** — land CN22 pin 2 on the **Mean Well V−** that powers
+    the W610 (or the isolated repeater's GND once installed).
+  - **A parallel stub silences everything.** A shorted spare run left landed on the CN22
+    pigtail flattens the pair and perfectly impersonates a dead pump port. For any "direct"
+    test, physically disconnect EVERY other wire from the pins. (Symptom: healthy port
+    reads ~3 V bias bare on the driving side, collapses to 0 V when the stub connects.)
+  - **The pump answers only while POWERED** (obvious, but it cost hours) — and its first
+    1–2 polls after power-on return boot garbage (all temps 0, then all −39). The bridge
+    now skips those frames automatically (`is_boot_frame`).
+  - **The definitive pump-side splitter:** `deploy/cn22-direct-probe.py` — FTDI dongle
+    straight on CN22 pins 2/3/4, sweeps every dialect with zero intermediaries. A healthy
+    pump streams at 2400 8N1 · addr 1 · standard CRC (confirmed on real hardware).
+
 - [ ] Run the **commissioning checklist** in `reference/modbus-register-map.md`: verify
       addressing offset, temp scaling/signedness, power-register units, CRC, slave address.
       Cross-check temps against the wall controller. Watch the error rate for 48 h.

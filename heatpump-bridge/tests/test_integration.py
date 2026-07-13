@@ -208,6 +208,45 @@ async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
     assert poller._link_status()[0] == "unknown"
 
 
+async def test_boot_sentinel_frames_are_skipped_not_stored(rig):
+    """Real MAHRW030ZA boards answer the first couple of polls after power-on with
+    garbage: inlet/outlet/ambient all 0, then all -39 (sensor-init sentinel), before
+    real values appear (observed live, HP1 commissioning 2026-07-13). Those frames are
+    valid Modbus and must count as comm-OK, but store nothing and flip nothing."""
+    pump, poller, store = rig
+
+    # boot phase 1: all-zero temps
+    for reg in (R.REG_INLET_TEMP, R.REG_OUTLET_TEMP, R.REG_AMBIENT_TEMP):
+        await pump.set_reg(reg, 0)
+    await poller.poll_once()
+    assert not poller.online                      # no snapshot from a boot frame
+    assert poller.client.stats.ok_polls == 1      # but comms counted as fine
+    assert poller.client.stats.consecutive_failures == 0
+
+    # boot phase 2: -39 sensor sentinels (two's complement on the wire)
+    for reg in (R.REG_INLET_TEMP, R.REG_OUTLET_TEMP, R.REG_AMBIENT_TEMP):
+        await pump.set_reg(reg, (-39) & 0xFFFF)
+    await poller.poll_once()
+    assert not poller.online
+    assert await store.get_history("p1", 1) == []  # nothing persisted from boot frames
+
+    # real values arrive -> normal poll, pump online, sample stored
+    await pump.set_reg(R.REG_INLET_TEMP, 43)
+    await pump.set_reg(R.REG_OUTLET_TEMP, 46)
+    await pump.set_reg(R.REG_AMBIENT_TEMP, 36)
+    await poller.poll_once()
+    assert poller.online
+    assert poller.snapshot["inlet_c"] == 43
+    assert len(await store.get_history("p1", 1)) == 1
+
+    # sanity: ordinary running data that happens to share ONE sentinel value is NOT
+    # a boot frame (all three must be equal)
+    await pump.set_reg(R.REG_AMBIENT_TEMP, 0)      # 0°C outdoors, water temps real
+    await poller.poll_once()
+    assert poller.online
+    assert poller.snapshot["ambient_c"] == 0
+
+
 async def test_unit_max_reg2027_caps_the_clamp(rig):
     pump, poller, store = rig
     await pump.set_reg(R.REG_MAX_WATER_TEMP, 50)  # unit's own limit below config's 55

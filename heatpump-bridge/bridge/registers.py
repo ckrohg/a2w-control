@@ -146,6 +146,22 @@ def to_signed(raw: int) -> int:
     return raw - 0x10000 if raw > 0x7FFF else raw
 
 
+BOOT_SENTINEL_C = -39  # sensor-init sentinel observed on real hardware
+
+
+def is_boot_frame(regs: dict[int, int]) -> bool:
+    """True when the core temps carry the power-on boot signature seen on the real
+    MAHRW030ZA (HP1 commissioning, 2026-07-13): for the first couple of polls after
+    the pump powers on, inlet/outlet/ambient all read 0, then all read -39 (sensor
+    init), before real values appear. Such frames are valid Modbus but garbage data —
+    the poller stores nothing and emits nothing for them. All-three-equal at exactly
+    0 or -39 is physically implausible as real data, so a false positive costs at
+    most one skipped sample."""
+    vals = [to_signed(regs[a]) for a in
+            (REG_INLET_TEMP, REG_OUTLET_TEMP, REG_AMBIENT_TEMP) if a in regs]
+    return len(vals) == 3 and vals[0] == vals[1] == vals[2] and vals[0] in (0, BOOT_SENTINEL_C)
+
+
 def block_dict(block: ReadBlock, values: list[int]) -> dict[int, int]:
     """Map a block read result to {address: raw_value}."""
     return {block.start + i: v for i, v in enumerate(values)}

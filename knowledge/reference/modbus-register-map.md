@@ -12,10 +12,14 @@
 - Slave address: **1–16, set by SW2 DIP** on the board; **default = 1, CONFIRMED by Winnie
   2026-07-07** (no DIP change needed for default use — see `winnie-bms-port-reply.md`)
 - Function codes: **0x03** read holding, **0x06** write single, **0x10** write multiple
-- ⚠️ The doc describes the CRC as "CRC-16/X25, X16+X12+X5+1" (the CCITT polynomial),
-  which is *not* the standard Modbus CRC-16 (X16+X15+X2+1). Almost certainly a doc
-  error — try standard pymodbus RTU framing first; if CRC errors on every frame, this
-  is the first thing to suspect.
+- ✅ **CRC SETTLED on real hardware (2026-07-13, HP1 direct-dongle test):** the pump
+  answers **standard Modbus CRC-16**; X25/CCITT variants were all ignored. The doc's
+  "CRC-16/X25" claim was a doc error, as suspected. Confirmed at exactly 2400 8N1,
+  address 1, FC03 — and reg 2050 returned 44 (= 44 °C inlet), confirming **whole-degree
+  scaling** (no ×10).
+  ⚠️ **3-wire rule (same session's hard lesson):** probes with A/B only (no signal
+  ground) got pure silence from the same unit that answers with **CN22 pin 2 (GND)
+  landed**. Always wire the BMS link 3-wire: A, B, and GND.
 
 ## Holding registers — R/W (0x03/0x06/0x10)
 

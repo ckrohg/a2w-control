@@ -133,6 +133,16 @@ class PumpPoller:
                 self._recent_outcomes.append(exc.category)
                 await self._handle_poll_failure(exc)
                 return
+            if R.is_boot_frame(regs):
+                # Power-on boot signature (all core temps 0, then -39 sensor sentinels —
+                # observed on the real unit): valid Modbus, garbage data. Comms are fine,
+                # so count the poll OK, but store/emit NOTHING — no samples, no fault or
+                # state edges, no snapshot. Real values follow within a poll or two.
+                log.info("[%s] boot-sentinel frame — pump just powered on; skipping store",
+                         self.cfg.id)
+                client.record_poll(ok=True)
+                self._recent_outcomes.append("ok")
+                return
             try:
                 await self._poll_decode_and_store(client, regs)
                 self._recent_outcomes.append("ok")
