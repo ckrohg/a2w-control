@@ -100,9 +100,14 @@ firmware version, but the flow is always the same.
    reshuffles (self-healing, with an audit event).
 8. Still recommended (belt + suspenders): give each W610 a **DHCP reservation** in
    the router (suggested .61 / .62) so addresses don't move in the first place.
-   Manual alternative to step 7: put IPs + `mac:` values in
-   `~/bridge-data/config.yaml` by hand, and check reachability with
-   `nc -vz 192.168.1.61 8899`.
+   Manual alternative to step 7: put IPs in `~/bridge-data/config.yaml` by hand and
+   check reachability with `nc -vz 192.168.1.61 8899`. **Leave `mac:` blank** and let
+   assignment auto-adopt it — ⚠️ do NOT copy the MAC off the W610's label or the scan
+   list. Real W610s report their **base MAC** on the USR broadcast/label but use
+   **base+1** on the WiFi station interface (verified on unit #1, 2026-07-12); the
+   per-poll identity check compares the *station* MAC (via ARP), so a hand-entered
+   label MAC fails every poll and **blocks writes**. If you must set it manually, use
+   the station MAC from `arp -n <ip>`, never the label.
 
 **If it goes sideways**: hold the W610's **Reload/Reset button ~5 s** → factory
 reset → the `USR-W610-xxxx` setup network comes back and you start over. Nothing

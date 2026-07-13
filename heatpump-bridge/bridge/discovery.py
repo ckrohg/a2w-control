@@ -157,8 +157,20 @@ async def discover(extra_ports: set[int] | None = None, probe: bool = True,
         entry.setdefault("source", "port-scan")
 
     for entry in candidates.values():
-        if not entry.get("mac"):
-            entry["mac"] = await get_mac_for_ip(entry["ip"])
+        # Canonicalize identity on the ARP MAC — the WiFi station-interface MAC, which
+        # is exactly what the poller adopts (set_gateway) and verifies every poll
+        # (_check_identity). Real W610s report their BASE MAC on the USR broadcast but
+        # use base+1 on the station interface, so keying rediscovery/identity off the
+        # broadcast MAC would never match the adopted ARP MAC (found on real hardware
+        # 2026-07-12). tcp_scan already connected to each reachable IP, so the ARP cache
+        # is warm here. Keep the broadcast MAC as broadcast_mac when it differs (so the
+        # discrepancy stays visible), and fall back to it only when ARP can't resolve
+        # (sim/localhost, cold cache).
+        arp_mac = await get_mac_for_ip(entry["ip"])
+        if arp_mac:
+            if entry.get("mac") and normalize_mac(entry["mac"]) != normalize_mac(arp_mac):
+                entry["broadcast_mac"] = entry["mac"]
+            entry["mac"] = arp_mac
         if probe and entry.get("port"):
             if skip_probe and (entry["ip"], entry["port"]) in skip_probe:
                 entry["probe"] = None

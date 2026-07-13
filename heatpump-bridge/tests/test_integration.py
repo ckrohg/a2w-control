@@ -691,6 +691,44 @@ async def test_auto_rediscovery_follows_the_mac(rig):
     await pump2.server.shutdown()
 
 
+async def test_discover_canonicalizes_mac_on_arp_not_broadcast(monkeypatch):
+    """Real W610s report their BASE MAC on the USR broadcast/label but use base+1 on the
+    WiFi station interface — what ARP sees, and what the poller adopts (set_gateway) and
+    verifies every poll (_check_identity). discover() must return the ARP MAC as the
+    canonical `mac`, or rediscovery + identity (which key off it) never match the adopted
+    MAC. Regression for the 2026-07-12 bench finding."""
+    import bridge.discovery as disc
+
+    async def fake_udp():
+        return {"192.168.1.61": "d4:ad:20:e3:67:e4",   # broadcast: base MAC
+                "192.168.1.62": "d4:ad:20:e3:67:f0"}   # broadcast-only, ARP unresolvable
+
+    async def fake_scan(hosts, ports, **kw):
+        return [("192.168.1.61", 8899)]
+
+    async def fake_arp(host):
+        return "d4:ad:20:e3:67:e5" if host == "192.168.1.61" else None  # station = base+1
+
+    async def fake_probe(host, port, **kw):
+        return {"inlet_c": 38, "outlet_c": 43, "ambient_c": 11}
+
+    monkeypatch.setattr(disc, "usr_udp_discover", fake_udp)
+    monkeypatch.setattr(disc, "tcp_scan", fake_scan)
+    monkeypatch.setattr(disc, "get_mac_for_ip", fake_arp)
+    monkeypatch.setattr(disc, "probe_heatpump", fake_probe)
+    monkeypatch.setattr(disc, "local_subnet_hosts", lambda: ["192.168.1.61", "192.168.1.62"])
+
+    by_ip = {c["ip"]: c for c in await disc.discover()}
+
+    # ARP resolved: canonical MAC is the station MAC (matches what set_gateway adopts),
+    # and the broadcast/base MAC is kept for visibility.
+    assert by_ip["192.168.1.61"]["mac"] == "d4:ad:20:e3:67:e5"
+    assert by_ip["192.168.1.61"]["broadcast_mac"] == "d4:ad:20:e3:67:e4"
+    # ARP unresolvable: fall back to the broadcast MAC (nothing better available).
+    assert by_ip["192.168.1.62"]["mac"] == "d4:ad:20:e3:67:f0"
+    assert "broadcast_mac" not in by_ip["192.168.1.62"]
+
+
 async def test_gateway_overrides_persist_and_respect_mac(tmp_path):
     from bridge.config import AppConfig, apply_gateway_overrides, save_gateway_override
 

@@ -7,9 +7,15 @@ pumps:
   - id: pump1
     name: Heat Pump 1
     host: 192.168.1.61     # W610 #1 — set a DHCP reservation for its MAC
-    # mac: "d8:b0:4c:00:00:00"  # from W610 #1's label — enables identity verification:
-    #                           # if this IP ever answers with a different MAC (DHCP
-    #                           # reshuffle / swapped units), alert + block writes
+    # mac: leave BLANK — let the bridge auto-adopt it when you assign the gateway in the
+    #   dashboard. It adopts the ARP (WiFi station-interface) MAC, which is what the
+    #   per-poll identity check compares against. ⚠️ Do NOT copy the MAC off the W610's
+    #   label or the scan list here: real W610s report their BASE MAC there but use
+    #   base+1 on the station interface (verified 2026-07-12), so a hand-entered label
+    #   MAC would fail identity every poll and BLOCK WRITES. If you must set it manually,
+    #   use `arp -n <ip>` (the station MAC), never the label. Once adopted, identity
+    #   verification is active: a different MAC at this IP (DHCP reshuffle / swapped
+    #   units) alerts + blocks writes.
     port: 8899             # W610 factory default TCP server port
     device_id: 1           # slave address — default 1 CONFIRMED by Winnie (no DIP change needed)
     poll_interval_s: 20    # 2400 baud: a full poll is ~1.2s of bus time
@@ -17,7 +23,7 @@ pumps:
   - id: pump2
     name: Heat Pump 2
     host: 192.168.1.62     # W610 #2
-    # mac: "d8:b0:4c:00:00:00"  # from W610 #2's label
+    # mac: leave BLANK — auto-adopted on assignment (see pump1 note above; never the label MAC)
     port: 8899
     device_id: 1           # separate bus, so same address is fine
     poll_interval_s: 20
