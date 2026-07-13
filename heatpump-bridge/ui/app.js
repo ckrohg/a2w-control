@@ -345,6 +345,10 @@ function renderDashboard() {
         ${renderCommBreakdown(s.comm)}
         ${s.identity_ok === false ? '<span class="err-bad">⚠ W610 identity mismatch — writes blocked</span>' : ""}
         ${!s.online ? `<button class="find-gw" data-find-gw>Find gateway</button>` : ""}
+        <button class="write-toggle ${s.write_enabled ? "unlocked" : ""}" data-write-toggle
+          title="${s.write_enabled ? "Remote control is ON — tap to return to read-only"
+                                   : "Read-only — tap to enable remote control"}">
+          ${s.write_enabled ? "🔓 control on" : "🔒 read-only"}</button>
         <span>last poll ${fmtAgo(s.last_poll_ts)}</span>
       </div>
     </div>`;
@@ -530,6 +534,40 @@ document.addEventListener("click", async (e) => {
 });
 
 // gateway discovery: scan the LAN, pick the right W610 for an offline pump
+// write-enable toggle — the runtime alternative to editing config.yaml. Enabling is a
+// deliberate, confirmed act (danger modal); disabling is instant (the safe direction).
+// The server audits the change and pushes an alert on enable.
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-write-toggle]");
+  if (!btn) return;
+  const card = e.target.closest("[data-pump]");
+  const id = card?.dataset.pump;
+  if (!id) return;
+  const s = state.snapshots[id] || {};
+  const enabling = !s.write_enabled;
+  if (enabling) {
+    const ok = await confirmDialog({
+      title: `Enable remote control for ${s.name || id}?`,
+      body: "The dashboard and API will be able to change setpoints, mode, and power " +
+            "on this pump. Guardrails stay active (bounds clamp, rate limit, read-back " +
+            "verify), and the wall controller keeps working exactly as before.",
+      confirmLabel: "Enable writes", danger: true,
+    });
+    if (!ok) return;
+  }
+  try {
+    await api(`/api/pumps/${id}/write-enable`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: enabling }),
+    });
+    toast(enabling ? `⚠ remote control ENABLED for ${esc(s.name || id)}`
+                   : `✓ ${esc(s.name || id)} back to read-only`);
+    await refresh();
+  } catch (err) {
+    toast(`✗ ${err.message}`, true);
+  }
+});
+
 document.addEventListener("click", async (e) => {
   const findBtn = e.target.closest("[data-find-gw]");
   if (!findBtn) return;
@@ -646,11 +684,18 @@ document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", (
 
 // ---------- setup tab ----------
 function renderSetup() {
+  // Same layer-diagnosis labels as the dashboard chips: a bare "offline" hides the one
+  // fact that decides the next move at the bench — scan for the gateway (gateway_down)
+  // vs check RS-485/pump power (pump_silent, where a network scan is the wrong tool).
+  const linkChip = p =>
+    p.state === "offline" && p.link === "gateway_down" ? "gateway offline"
+    : p.state === "offline" && p.link === "pump_silent" ? "no pump reply"
+    : p.state;
   $("#pump-list").innerHTML = state.pumps.map(p => `
     <div class="pump-row">
       <div class="pump-row-main">
         <b>${esc(p.name)}</b>
-        <span class="chip ${p.state}">${p.state}</span>
+        <span class="chip ${p.state}" title="${esc(p.link_detail || "")}">${linkChip(p)}</span>
       </div>
       <div class="pump-row-detail">
         ${esc(p.host)}:${p.port} · ${p.mac ? esc(p.mac) : "MAC not verified"} ·

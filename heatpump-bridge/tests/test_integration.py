@@ -208,6 +208,66 @@ async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
     assert poller._link_status()[0] == "unknown"
 
 
+async def test_write_enable_toggle_persists_and_composes_with_gateway_overrides(tmp_path):
+    """The UI write-enable toggle persists in the bridge-owned state file and survives
+    restarts; a later gateway reassignment must NOT clobber it, and a write_enabled-only
+    override must not touch host/port. Same MAC-staleness rule as gateway overrides."""
+    from bridge.config import (AppConfig, apply_gateway_overrides, save_gateway_override,
+                               save_write_enabled)
+
+    def make_cfg():
+        return AppConfig(
+            pumps=[PumpConfig(id="p1", name="P1", host="10.0.0.5",
+                              mac="d8:b0:4c:12:34:56", write_enabled=False)],
+            db_path=str(tmp_path / "bridge.db"))
+
+    cfg = make_cfg()
+    save_write_enabled(cfg, "p1", True)
+
+    fresh = make_cfg()
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].write_enabled is True      # toggle survived the "restart"
+    assert fresh.pumps[0].host == "10.0.0.5"         # write-only override left host alone
+
+    save_gateway_override(cfg, "p1", "10.0.0.99", 8899)   # DHCP move / reassignment
+    fresh = make_cfg()
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].host == "10.0.0.99"
+    assert fresh.pumps[0].write_enabled is True      # reassignment kept the toggle
+
+    save_write_enabled(cfg, "p1", False)             # back to read-only
+    fresh = make_cfg()
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].write_enabled is False
+
+    # different physical unit at this id -> whole override (incl. toggle) is stale
+    save_write_enabled(cfg, "p1", True)
+    replaced = AppConfig(
+        pumps=[PumpConfig(id="p1", name="P1", host="10.0.0.5",
+                          mac="aa:aa:aa:aa:aa:aa", write_enabled=False)],
+        db_path=str(tmp_path / "bridge.db"))
+    apply_gateway_overrides(replaced)
+    assert replaced.pumps[0].write_enabled is False
+
+
+async def test_write_enable_endpoint_flips_the_guard_at_runtime(rig):
+    """POST /pumps/{id}/write-enable must take effect immediately on the live poller:
+    disabled -> guarded writes refuse with 403; re-enabled -> they run again."""
+    pump, poller, store = rig
+    await poller.poll_once()
+    await poller.write_setpoint(45, source="test")   # baseline: writes work
+
+    poller.cfg.write_enabled = False                 # what the endpoint does at runtime
+    poller.snapshot["write_enabled"] = False
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(46, source="test")
+    assert exc.value.status_code == 403
+
+    poller.cfg.write_enabled = True
+    result = await poller.write_setpoint(46, source="test")
+    assert result["verified"] is True
+
+
 async def test_boot_sentinel_frames_are_skipped_not_stored(rig):
     """Real MAHRW030ZA boards answer the first couple of polls after power-on with
     garbage: inlet/outlet/ambient all 0, then all -39 (sensor-init sentinel), before

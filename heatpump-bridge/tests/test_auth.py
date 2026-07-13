@@ -153,6 +153,34 @@ def test_health_503_when_write_enabled_but_blind(tmp_path):
         assert c.get("/api/health").status_code == 200
 
 
+def test_write_enable_toggle_is_human_only_and_flips_the_flag(tmp_path):
+    """The write-enable toggle is a CONTROL action: anonymous callers are rejected in
+    writes mode, read-only tokens are refused, and even a WRITABLE machine token is
+    blocked (human-only, same cold-latch rule as power/mode). A human (UI principal)
+    flips the flag live and /pumps + the setpoint guard reflect it immediately."""
+    with TestClient(make_app(tmp_path, "writes", both_tokens(), write_enabled=False)) as c:
+        assert c.post("/api/pumps/pump1/write-enable",
+                      json={"enabled": True}).status_code == 401       # anonymous
+        assert c.post("/api/pumps/pump1/write-enable", json={"enabled": True},
+                      headers=bearer(READONLY)).status_code == 403     # read-only token
+        assert c.post("/api/pumps/pump1/write-enable", json={"enabled": True},
+                      headers=bearer(CONTROL)).status_code == 403      # machine: human-only
+
+    # open mode (trusted LAN): the UI principal is human -> toggle works end to end
+    with TestClient(make_app(tmp_path, write_enabled=False)) as c:
+        r = c.post("/api/pumps/pump1/write-enable", json={"enabled": True})
+        assert r.status_code == 200 and r.json()["write_enabled"] is True
+        assert c.get("/api/pumps").json()[0]["write_enabled"] is True
+        # setpoint now passes the write_enabled guard (fails later on offline, not 403)
+        assert c.post("/api/pumps/pump1/setpoint",
+                      json={"value": 45}).status_code not in (401, 403)
+        # and back to read-only: the guard refuses again
+        r = c.post("/api/pumps/pump1/write-enable", json={"enabled": False})
+        assert r.status_code == 200 and r.json()["write_enabled"] is False
+        assert c.post("/api/pumps/pump1/setpoint",
+                      json={"value": 45}).status_code == 403
+
+
 def test_config_rejects_short_and_duplicate_tokens(tmp_path):
     with pytest.raises(Exception):
         AuthConfig(tokens=[ApiToken(token="tooshort", source="x", can_write=True)])

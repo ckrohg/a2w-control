@@ -60,6 +60,10 @@ class AddPumpRequest(BaseModel):
     port: int = 8899
 
 
+class WriteEnableRequest(BaseModel):
+    enabled: bool
+
+
 class SessionRequest(BaseModel):
     password: str
 
@@ -287,6 +291,35 @@ async def set_gateway(request: Request, pump_id: str, body: GatewayRequest,
     await poller.poll_once()
     return {"host": body.host, "port": body.port, "online": poller.online,
             "mac": poller.cfg.mac}
+
+
+@router.post("/pumps/{pump_id}/write-enable")
+async def set_write_enabled(request: Request, pump_id: str, body: WriteEnableRequest,
+                            principal: Principal = Depends(control)):
+    """Enable/disable the write path for one pump from the UI — the runtime alternative
+    to editing config.yaml. Deliberately LOUD: audited, and push-notified on enable.
+    Every write still runs the full guardrail stack (clamp, rate limit, identity check,
+    read-back verify) regardless of this flag; disabling always wins instantly."""
+    from .config import save_write_enabled
+
+    poller = _pump(request, pump_id)
+    was = poller.cfg.write_enabled
+    poller.cfg.write_enabled = body.enabled
+    poller.snapshot["write_enabled"] = body.enabled
+    save_write_enabled(request.app.state.config, pump_id, body.enabled)
+    if body.enabled != was:
+        await poller.store.add_event(
+            pump_id, "config", code="write_enabled" if body.enabled else "write_disabled",
+            severity="warning" if body.enabled else "info",
+            message=f"remote control {'ENABLED' if body.enabled else 'disabled'} "
+                    f"for {poller.cfg.name} ({principal.source})")
+        if body.enabled:
+            poller._push(
+                title=f"⚠ {poller.cfg.name}: remote control enabled",
+                message=f"Writes are now allowed ({principal.source}). Guardrails "
+                        f"(clamp, rate limit, read-back verify) remain active.",
+                priority="high", tags="warning")
+    return {"id": pump_id, "write_enabled": body.enabled}
 
 
 @router.post("/w610/configure")

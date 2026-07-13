@@ -169,6 +169,11 @@ table.detail tr:nth-child(even) { background: rgba(255,255,255,.02); }
 .find-gw { padding: 5px 12px; border: 1px solid var(--line); border-radius: 8px;
            background: var(--card2); color: var(--info); font-weight: 700;
            font-size: 12px; cursor: pointer; }
+/* write-enable toggle: quiet lock pill when read-only, amber when control is live */
+.write-toggle { padding: 5px 12px; border: 1px solid var(--line); border-radius: 8px;
+                background: var(--card2); color: var(--dim); font-weight: 700;
+                font-size: 12px; cursor: pointer; }
+.write-toggle.unlocked { color: #e0b050; border-color: #d99a2b; }
 .gw-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px;
            max-height: 45vh; overflow-y: auto; }
 .gw-row { display: flex; flex-direction: column; gap: 2px; text-align: left;

@@ -247,9 +247,29 @@ def _write_state(cfg: AppConfig, data: dict) -> None:
 def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) -> None:
     data = _read_state(cfg)
     pump = next((p for p in cfg.pumps if p.id == pump_id), None)
+    prior = data["overrides"].get(pump_id, {})
     data["overrides"][pump_id] = {"host": host, "port": port,
                                   "mac": pump.mac if pump else None}
+    if "write_enabled" in prior:  # a gateway reassignment must not clobber the toggle
+        data["overrides"][pump_id]["write_enabled"] = prior["write_enabled"]
     if pump and pump.added:  # keep the added-pump record current too
+        save_added_pump(cfg, pump, _data=data)
+        return
+    _write_state(cfg, data)
+
+
+def save_write_enabled(cfg: AppConfig, pump_id: str, enabled: bool) -> None:
+    """Persist the UI-toggled write flag so it survives restarts. Lives in the same
+    bridge-owned state file as gateway overrides — config.yaml stays owner-edited and
+    its write_enabled value becomes the default that this override sits on top of."""
+    data = _read_state(cfg)
+    pump = next((p for p in cfg.pumps if p.id == pump_id), None)
+    entry = data["overrides"].setdefault(pump_id, {})
+    entry["write_enabled"] = enabled
+    if pump and pump.mac and not entry.get("mac"):
+        entry["mac"] = pump.mac  # same staleness guard as gateway overrides
+    if pump and pump.added:
+        pump.write_enabled = enabled
         save_added_pump(cfg, pump, _data=data)
         return
     _write_state(cfg, data)
@@ -280,7 +300,10 @@ def apply_gateway_overrides(cfg: AppConfig) -> None:
             continue
         if pump.mac and entry.get("mac") and pump.mac.lower() != entry["mac"].lower():
             continue  # config points at a different physical unit now — override stale
-        pump.host = entry["host"]
-        pump.port = entry.get("port", pump.port)
+        if "host" in entry:  # entry may be write_enabled-only (no gateway override yet)
+            pump.host = entry["host"]
+            pump.port = entry.get("port", pump.port)
+        if "write_enabled" in entry:
+            pump.write_enabled = bool(entry["write_enabled"])
         if not pump.mac and entry.get("mac"):
             pump.mac = entry["mac"]  # adopted at assignment time; keep it across restarts
