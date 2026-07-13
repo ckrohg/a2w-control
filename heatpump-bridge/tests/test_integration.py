@@ -171,29 +171,40 @@ async def test_offline_watchdog_and_write_refusal(rig):
 
 
 async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
-    """A card going OFFLINE must say WHICH layer is down: a dead W610 gateway (TCP connect
-    fails) vs a live gateway with a silent pump (timeout/io/nak). Regression for the
-    commissioning-clarity ask (2026-07-12)."""
+    """A card going OFFLINE must say WHICH layer is down: a dead/flapping W610 gateway (TCP
+    connect fails) vs a live gateway with a silent pump (timeout/io/nak). Decided over a
+    window of recent polls so a flapping gateway can't flip-flop the banner or contradict the
+    scan. Regression for the commissioning-clarity ask + the flapping mislabel (2026-07-12/13)."""
     pump, poller, store = rig
     await poller.poll_once()
     assert poller.online
     assert poller.snapshot["link"] == "online"
 
-    # Gateway unreachable: kill the "W610" so TCP connects fail -> "connect" category.
+    # Gateway unreachable: kill the "W610" so TCP connects fail -> "connect" outcomes.
     await pump.server.shutdown()
     for _ in range(3):
         await poller.poll_once()
     assert not poller.online
-    assert poller.client.stats.last_error_category == "connect"
     assert poller.snapshot["link"] == "gateway_down"
     assert "gateway" in poller.snapshot["link_detail"].lower()
 
-    # Live gateway, silent/garbled/NAKing pump -> pump_silent (all three downstream kinds).
+    # Live gateway, silent/garbled/NAKing pump -> pump_silent (a clean window of read fails).
     for cat in ("timeout", "io", "exception"):
-        poller.client.stats.last_error_category = cat
+        poller._recent_outcomes.clear()
+        poller._recent_outcomes.extend([cat, cat, cat])
         assert poller._link_status()[0] == "pump_silent"
-    # A clean/unknown category must never mislabel either way.
-    poller.client.stats.last_error_category = ""
+
+    # FLAPPING (the bug the two screens exposed): a gateway that drops on/off — connect
+    # failures MIXED with pump timeouts — must read as gateway_down, not "pump not
+    # responding", and say so, because the unstable link is what to fix first.
+    poller._recent_outcomes.clear()
+    poller._recent_outcomes.extend(["connect", "timeout", "connect", "timeout"])
+    link, detail = poller._link_status()
+    assert link == "gateway_down"
+    assert "intermittent" in detail.lower()
+
+    # Empty window -> unknown; never mislabels with no evidence.
+    poller._recent_outcomes.clear()
     assert poller._link_status()[0] == "unknown"
 
 

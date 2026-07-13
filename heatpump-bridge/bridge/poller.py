@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections import deque
 
 from . import notify
 from . import registers as R
@@ -82,6 +83,10 @@ class PumpPoller:
         # snapshot: a pump that has NEVER been online (fresh boot into a dead gateway —
         # exactly the first-bench-day case) must still alert, and must alert only once.
         self._offline_alerted = False
+        # rolling window of recent poll outcomes ("ok" | connect | timeout | io | exception
+        # | decode) so the gateway-vs-pump diagnosis is stable on a FLAPPING link — a single
+        # most-recent failure is noise when a gateway drops on/off WiFi (see _link_status).
+        self._recent_outcomes: deque[str] = deque(maxlen=6)
 
     @property
     def online(self) -> bool:
@@ -125,15 +130,18 @@ class PumpPoller:
                     regs.update(await client.read_block(block))
             except ModbusError as exc:
                 client.record_poll(ok=False)
+                self._recent_outcomes.append(exc.category)
                 await self._handle_poll_failure(exc)
                 return
             try:
                 await self._poll_decode_and_store(client, regs)
+                self._recent_outcomes.append("ok")
             except Exception as exc:  # noqa: BLE001 — a decode/store bug must never leave a
                 # stale "online" zombie: count it as a FAILED poll so the offline watchdog,
                 # the health endpoint, and the dead-man all see the truth.
                 log.exception("[%s] decode/store failed", self.cfg.id)
                 client.record_poll(ok=False)
+                self._recent_outcomes.append("decode")
                 await self._handle_poll_failure(ModbusError(f"decode/store failed: {exc!r}", "decode"))
 
     async def _poll_decode_and_store(self, client: PumpClient, regs: dict[int, int]) -> None:
@@ -300,17 +308,23 @@ class PumpPoller:
         await self._maybe_comm_row(force=True)
 
     def _link_status(self) -> tuple[str, str]:
-        """Which layer is down, in plain language — the single question a bench/commission
-        operator asks when a card goes OFFLINE. A failed TCP connect means the W610 GATEWAY
-        is unreachable (its power/WiFi/IP); a timeout/garbled/NAK means the gateway answered
-        but the HEAT PUMP behind it didn't (RS-485 wiring/pump power/slave address). Wholly
-        different fixes — the triage table in deploy/HARDWARE-DAY.md splits on exactly this."""
-        cat = self.client.stats.last_error_category
-        if cat == "connect":
+        """Which layer is down, in plain language — the question a commissioning operator asks
+        when a card goes OFFLINE. A failed TCP connect means the W610 GATEWAY is unreachable
+        (power/WiFi/IP); a timeout/garble/NAK means the gateway answered but the HEAT PUMP
+        behind it didn't (RS-485 wiring/pump power/slave address). Decided over a WINDOW of
+        recent polls, NOT the single last failure, so a flapping gateway (drops on and off
+        WiFi) can't flip-flop the banner or contradict the Setup network scan: ANY recent
+        connect failure means the gateway link isn't solid — the thing to fix first — so only
+        a clean run of connects with the pump still silent reads as pump_silent."""
+        recent = self._recent_outcomes
+        gateway_trouble = any(o == "connect" for o in recent)
+        pump_trouble = any(o in ("timeout", "io", "exception", "decode") for o in recent)
+        if gateway_trouble:
+            intermittent = " (connecting only intermittently)" if pump_trouble else ""
             return ("gateway_down",
-                    f"Can't reach the W610 gateway at {self.cfg.host} — "
-                    f"check its power, Wi-Fi, and IP.")
-        if cat in ("timeout", "io", "exception"):
+                    f"Can't reliably reach the W610 gateway at {self.cfg.host}{intermittent} — "
+                    f"check its power, Wi-Fi signal, and IP.")
+        if pump_trouble:
             return ("pump_silent",
                     "The W610 gateway responds, but the heat pump isn't answering — "
                     "check the RS-485 wiring, pump power, and slave address.")
