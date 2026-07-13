@@ -54,6 +54,11 @@ main { padding: 8px 12px 40px; max-width: 980px; margin: 0 auto; }
 
 .stale-banner { background: #3d2a2a; color: var(--high); border-radius: 9px;
   padding: 7px 11px; font-size: 12.5px; font-weight: 600; margin-bottom: 10px; }
+/* Offline diagnosis: gateway-down (network, red) vs pump-not-responding (RS-485 side,
+   amber) — a left accent + tint so the two failure classes read apart at a glance. */
+.link-banner { border-left: 4px solid transparent; }
+.link-banner.link-gateway { background: #3d2323; border-left-color: var(--critical); color: var(--critical); }
+.link-banner.link-pump { background: #3a3320; border-left-color: #d99a2b; color: #e0b050; }
 .card.stale .temps, .card.stale .powerline, .card.stale .pills,
 .card.stale .setpoint { opacity: .4; }
 

@@ -90,6 +90,8 @@ async def list_pumps(request: Request, _p: Principal = Depends(read)):
             "mac": p.cfg.mac,
             "added": p.cfg.added,
             "write_enabled": p.cfg.write_enabled,
+            "link": p.snapshot.get("link", "online" if p.online else "unknown"),
+            "link_detail": p.snapshot.get("link_detail", ""),
         }
         for p in _pollers(request).values()
     ]

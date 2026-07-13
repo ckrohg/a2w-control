@@ -148,6 +148,8 @@ class PumpPoller:
             "id": self.cfg.id,
             "name": self.cfg.name,
             "online": True,
+            "link": "online",
+            "link_detail": "",
             "last_poll_ts": time.time(),
             "write_enabled": self.cfg.write_enabled,
             **decoded,
@@ -291,7 +293,28 @@ class PumpPoller:
             if failures >= threshold:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
+        if not self.snapshot.get("online"):
+            link, detail = self._link_status()
+            self.snapshot["link"] = link
+            self.snapshot["link_detail"] = detail
         await self._maybe_comm_row(force=True)
+
+    def _link_status(self) -> tuple[str, str]:
+        """Which layer is down, in plain language — the single question a bench/commission
+        operator asks when a card goes OFFLINE. A failed TCP connect means the W610 GATEWAY
+        is unreachable (its power/WiFi/IP); a timeout/garbled/NAK means the gateway answered
+        but the HEAT PUMP behind it didn't (RS-485 wiring/pump power/slave address). Wholly
+        different fixes — the triage table in deploy/HARDWARE-DAY.md splits on exactly this."""
+        cat = self.client.stats.last_error_category
+        if cat == "connect":
+            return ("gateway_down",
+                    f"Can't reach the W610 gateway at {self.cfg.host} — "
+                    f"check its power, Wi-Fi, and IP.")
+        if cat in ("timeout", "io", "exception"):
+            return ("pump_silent",
+                    "The W610 gateway responds, but the heat pump isn't answering — "
+                    "check the RS-485 wiring, pump power, and slave address.")
+        return ("unknown", "")
 
     async def _check_identity(self) -> None:
         """Verify the IP still belongs to the configured physical W610 (by MAC).

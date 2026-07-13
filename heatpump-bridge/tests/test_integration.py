@@ -170,6 +170,33 @@ async def test_offline_watchdog_and_write_refusal(rig):
     assert any(e["type"] == "comm" and e["code"] == "offline" for e in events)
 
 
+async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
+    """A card going OFFLINE must say WHICH layer is down: a dead W610 gateway (TCP connect
+    fails) vs a live gateway with a silent pump (timeout/io/nak). Regression for the
+    commissioning-clarity ask (2026-07-12)."""
+    pump, poller, store = rig
+    await poller.poll_once()
+    assert poller.online
+    assert poller.snapshot["link"] == "online"
+
+    # Gateway unreachable: kill the "W610" so TCP connects fail -> "connect" category.
+    await pump.server.shutdown()
+    for _ in range(3):
+        await poller.poll_once()
+    assert not poller.online
+    assert poller.client.stats.last_error_category == "connect"
+    assert poller.snapshot["link"] == "gateway_down"
+    assert "gateway" in poller.snapshot["link_detail"].lower()
+
+    # Live gateway, silent/garbled/NAKing pump -> pump_silent (all three downstream kinds).
+    for cat in ("timeout", "io", "exception"):
+        poller.client.stats.last_error_category = cat
+        assert poller._link_status()[0] == "pump_silent"
+    # A clean/unknown category must never mislabel either way.
+    poller.client.stats.last_error_category = ""
+    assert poller._link_status()[0] == "unknown"
+
+
 async def test_unit_max_reg2027_caps_the_clamp(rig):
     pump, poller, store = rig
     await pump.set_reg(R.REG_MAX_WATER_TEMP, 50)  # unit's own limit below config's 55

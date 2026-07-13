@@ -27,6 +27,10 @@ class CommStats:
     reconnects: int = 0
     consecutive_failures: int = 0
     last_ok_ts: float | None = None  # unix time of last fully successful poll
+    # most recent failure kind, so the UI can say WHICH layer is down: "connect" = the
+    # W610 gateway is unreachable (TCP failed); timeout/io/exception = gateway answered
+    # but the pump behind it didn't. Empty while healthy.
+    last_error_category: str = ""
 
     def as_dict(self) -> dict:
         total = self.ok_polls + self.error_polls
@@ -40,6 +44,7 @@ class CommStats:
             "reconnects": self.reconnects,
             "consecutive_failures": self.consecutive_failures,
             "last_ok_ts": self.last_ok_ts,
+            "last_error_category": self.last_error_category,
             "error_rate": round(self.error_polls / total, 4) if total else 0.0,
         }
 
@@ -78,6 +83,7 @@ class PumpClient:
         ok = await self._client.connect()
         if not ok:
             self.stats.connect_failures += 1
+            self.stats.last_error_category = "connect"
             raise ModbusError(f"cannot connect to {self.host}:{self.port}", "connect")
         if self._was_connected:
             self.stats.reconnects += 1
@@ -108,6 +114,7 @@ class PumpClient:
                 raise ModbusError(f"{category} reading {block.start}: {exc}", category) from exc
             if resp.isError():
                 self.stats.exception_responses += 1
+                self.stats.last_error_category = "exception"
                 raise ModbusError(f"exception response for {block.start}: {resp}", "exception")
             # Shape check: pymodbus matches replies to requests ONLY by device id (RTU has
             # no transaction ids), so a delayed response can be accepted as the answer to a
@@ -118,6 +125,7 @@ class PumpClient:
             regs = getattr(resp, "registers", None)
             if regs is None or len(regs) != block.count:
                 self.stats.io_errors += 1
+                self.stats.last_error_category = "io"
                 self._flush_socket("io")
                 got = "no registers" if regs is None else f"{len(regs)} registers"
                 raise ModbusError(
@@ -142,6 +150,7 @@ class PumpClient:
                 raise ModbusError(f"{category} writing {address}: {exc}", category) from exc
             if resp.isError():
                 self.stats.exception_responses += 1
+                self.stats.last_error_category = "exception"
                 raise ModbusError(f"exception response writing {address}: {resp}", "exception")
         return await self.read_register(address)
 
@@ -149,8 +158,10 @@ class PumpClient:
         text = str(exc).lower()
         if "timeout" in text or "timed out" in text or "no response" in text:
             self.stats.timeouts += 1
+            self.stats.last_error_category = "timeout"
             return "timeout"
         self.stats.io_errors += 1
+        self.stats.last_error_category = "io"
         return "io"
 
     def record_poll(self, ok: bool) -> None:

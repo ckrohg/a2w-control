@@ -159,6 +159,19 @@ function renderCommBreakdown(c) {
   return parts.length ? `<span class="err-bad">${parts.join(" · ")}</span>` : "";
 }
 
+// Offline diagnosis banner — answers the one commissioning question at a glance: is the
+// W610 GATEWAY down, or is the gateway fine and the HEAT PUMP not responding? Derived
+// from the most-recent failure category (connect vs timeout/io/nak) by the poller.
+function renderLinkBanner(s) {
+  const titles = { gateway_down: "W610 gateway unreachable",
+                   pump_silent: "Heat pump not responding" };
+  const clsMap = { gateway_down: "link-gateway", pump_silent: "link-pump" };
+  const title = titles[s.link] || "Offline";
+  const hint = s.link_detail || `No fresh data — last update ${fmtAgo(s.last_poll_ts)}.`;
+  return `<div class="stale-banner link-banner ${clsMap[s.link] || ""}">`
+    + `<b>⚠ ${esc(title)}</b> — ${esc(hint)}</div>`;
+}
+
 function detailRow(label, vals, fmt = v => v ?? "—") {
   return `<tr><th>${label}</th>${vals.map(v => `<td>${v == null ? "—" : fmt(v)}</td>`).join("")}</tr>`;
 }
@@ -293,9 +306,13 @@ function renderDashboard() {
         <h2>${esc(s.name || p.name)}</h2>
         <button class="power ${s.on ? "on" : ""}" data-power="${s.on ? "off" : "on"}"
           title="${s.on ? "Turn unit off" : "Turn unit on"}" ${s.online ? "" : "disabled"}>⏻</button>
-        <span class="chip ${stateName}">${stateName}</span>
+        <span class="chip ${stateName}" title="${!s.online ? esc(s.link_detail || "") : ""}">${
+          !s.online && s.link === "gateway_down" ? "gateway offline"
+          : !s.online && s.link === "pump_silent" ? "no pump reply"
+          : stateName}</span>
       </div>
-      ${stale ? `<div class="stale-banner">⚠ No fresh data — last update ${fmtAgo(s.last_poll_ts)}. Values below may be out of date.</div>` : ""}
+      ${!s.online ? renderLinkBanner(s)
+        : (stale ? `<div class="stale-banner">⚠ No fresh data — last update ${fmtAgo(s.last_poll_ts)}. Values below may be out of date.</div>` : "")}
       <div class="modectl seg">
         <button class="seg-btn ${s.mode_kind === "heating" ? "active" : ""}"
           data-mode="heating" ${s.online ? "" : "disabled"}>Heat</button>
