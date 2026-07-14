@@ -38,9 +38,10 @@ Stored in Neon `baseline_model` (row 1). Sanity: predicts ~100 kWh for the 11 °
 3. TempIQ#1470 automates the ledger pull; until then the fit is reproducible from
    `span_circuit_aggregations` with the query in the session journal (2026-07-14).
 
-## Register/config half
+## Register/config half — ✅ CAPTURED (2026-07-14, via release-20260714-1's snapshot feed)
 
 - HBX as-found: `hbx-config-asfound-20260713.json` (curve 165/5 ↔ 145/125, diff 4).
-- HP as-found: pump1 75 °C, pump2 71 °C (live-confirmed during A-4); reg 2027 + full
-  parameter set land in Neon `pump_snapshots` automatically once the Pi applies
-  `release-20260714-1`.
+- HP as-found (Neon `pump_snapshots`, 31 wire parameters each): **reg 2027 = 75 °C on
+  BOTH units** (installer-raised from the 55 °C factory default — owner's "75 °C at all
+  times" confirmed at the register; Phase B's 75 °C cap is exact). Setpoints as-found:
+  pump1 **75 °C**, pump2 **71 °C**. write_enabled at capture: pump1 false, pump2 true.
