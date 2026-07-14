@@ -265,9 +265,22 @@ Secrets live where they run: Railway service variables (hub, planner), Vercel en
   analysis, unchanged). All planner writes live in [floor, min(config clamp, reg 2027)].
 - **I3 — DHW floor:** buffer ≥ DHW-comfort floor during learned/declared draw windows
   (initial: 120 °F / 49 °C during 06:00–09:00 and 17:00–22:00; §6.3 makes it learned).
-- **I4 — bounded HBX band:** the HBX adapter refuses tank targets outside an owner-set
-  band (e.g. 95–130 °F) and refuses to touch any parameter other than the tank target /
-  curve endpoints it was explicitly scoped to.
+- **I4 — bounded HBX band (REVISED 2026-07-14, owner direction: outdoor-relative, not
+  seasonal):** the adapter clamps tank targets to an **envelope between two
+  outdoor-indexed lines**, not a static range:
+  - *Upper line* = the as-found HBX curve + 3 °F — never command hotter than the
+    behavior the hardware has tolerated for years; only cooler. Rises with cold
+    automatically.
+  - *Lower line* = the binding-zone minimum: 95 °F tank at ≥55 °F outdoor, rising
+    linearly to 135 °F at 5 °F outdoor (Dining baseboard design-day need, TempIQ zone
+    model). Endpoints tighten as A-4/winter data land.
+  - *Strict cap 135 °F until Phase B is live* — a stale winter write above that against
+    a lease-lapsed baseline pump recreates the deadlock (I7). The cap lifts when Phase B
+    actively holds HP setpoints above the commanded target.
+  - **Heating demand lives in the planner, not the clamp**: zone calls / solar-gain /
+    float inform the *choice* within the envelope; the clamp stays a pure function of
+    outdoor temp — dumb, auditable, reconstructible from one number.
+  The adapter still refuses every parameter it wasn't explicitly scoped to.
 - **I5 — lease/watchdog symmetry:** HP writes keep the existing lease. HBX writes are
   persistent, so the equivalents are: a dead-man heartbeat (healthchecks.io — the existing
   pattern) that pages when the planner goes quiet; baseline-curve restore on planner
@@ -276,6 +289,14 @@ Secrets live where they run: Railway service variables (hub, planner), Vercel en
   never stuck.
 - **I6 — hands off staging:** never bias HBX rotation/staging dynamically. One deliberate,
   static exception while HP2's port is dead: §5.4.
+- **I8 — thermal hygiene (added 2026-07-14; owner concern, and it corrects §6.5):**
+  within every rolling 24 h the tank spends **≥60 min at ≥131 °F (55 °C)** — the daily
+  sanitize boost, scheduled in the warmest feasible hour (hygiene at the day's best COP).
+  Why: the potable water *inside the DHW coil and first hot piping* sits at tank
+  temperature between draws; a low-idle optimized tank (~110 °F) would park that slug at
+  the legionella growth *optimum* — a regime the as-found 150 °F+ operation never
+  entered. Monitored from `slx_readings`; alert if 26 h passes without a qualifying
+  excursion; the mixing valve keeps delivery tempered regardless.
 - **I7 — fail-safe ordering (checked at planner startup):**
   `I4 band top + ½·diff + margin ≤ baseline_setpoint_c ≤ min(clamp, reg 2027)`.
   Guarantees that if the planner dies the instant after its highest allowed HBX write and
@@ -501,17 +522,21 @@ in one place — and (2) from the hub's pump-state feed.
 ### 6.5 DHW & legionella — the honest picture
 
 A coil-in-buffer (reverse-indirect) stores **heating water, not potable water**; potable
-passes through the coil once, on demand. Legionella risk lives in *stored, warm, stagnant
-potable* water — which this topology doesn't have. Instantaneous/flow-through heaters are
-the standard low-risk case, and the mixing valve already tempers delivery. So:
+passes through the coil on demand, and the mixing valve tempers delivery.
 
-- **No sanitize cycle is required** — and note the ECO-0600 has no such feature anyway.
-- The DHW constraint is **comfort**: tank ≥ (desired delivery + coil approach ≈ 5–8 °F)
-  during draw windows. That's invariant I3, and it's what caps how deep mild-day setbacks
-  can go around mornings/evenings.
-- **Commissioning check:** visually confirm there is no downstream potable storage tank
-  (if one ever appears, add a weekly 140 °F/60 °C thermal window to the plan — a one-line
-  planner rule, deliberately not built until needed).
+**CORRECTION (2026-07-14, owner pushback — the original conclusion was regime-dependent):**
+the potable water *inside the coil and the first hot piping* sits at tank temperature
+**between draws**, and a large coil holds real gallons. At the as-found 150 °F+ this is
+harmless (no growth above ~122 °F) — but the optimizer's low idle targets (~110 °F) would
+park that slug at the legionella growth **optimum** for hours a day. So sanitation IS a
+constraint of the optimized regime, handled by **invariant I8**: a daily ≥60-min excursion
+to ≥131 °F (55 °C), scheduled at the day's warmest hour (best COP), monitored and alerted.
+
+- The DHW *comfort* constraint stands separately: tank ≥ (desired delivery + coil
+  approach ≈ 5–8 °F) during draw windows — invariant I3.
+- **Commissioning checks:** confirm no downstream potable storage tank (if one ever
+  appears, the excursion becomes weekly 140 °F/60 °C as well); measure the coil volume
+  (bigger slug = stricter I8 posture).
 
 ### 6.6 Owner interface — how you control it and check on it
 

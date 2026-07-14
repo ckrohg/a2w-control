@@ -29,9 +29,9 @@ export interface ShadowOpts {
   i1MarginF: number;
   hpMinF: number; // unattended winter floor, 45 °C
   hpMaxF: number; // reg-2027 cap, 55 °C
-  bandMinF: number; // I4 band
-  bandMaxF: number;
   winterGuardF: number;
+  sanitizeF: number; // I8: daily thermal-hygiene excursion target (≥131 °F = 55 °C)
+  strictCapF: number; // I4: hard ceiling until Phase B actively manages HP setpoints
 }
 
 export const DEFAULT_OPTS: ShadowOpts = {
@@ -42,10 +42,29 @@ export const DEFAULT_OPTS: ShadowOpts = {
   i1MarginF: 8,
   hpMinF: 113,
   hpMaxF: 131,
-  bandMinF: 95,
-  bandMaxF: 130,
   winterGuardF: 50,
+  sanitizeF: 131,
+  strictCapF: 135,
 };
+
+/**
+ * I4 envelope (plan §5.1, revised 2026-07-14): outdoor-indexed, not seasonal.
+ * Lower line = binding-zone minimum: 95 °F tank at ≥55 °F outdoor rising linearly to
+ * 135 °F at 5 °F outdoor. Upper line = as-found HBX curve + 3 °F (never hotter than the
+ * regime the hardware already tolerated), strict-capped until Phase B holds HP setpoints
+ * above commanded targets. Pure function of outdoor temp — intelligence stays in the plan.
+ */
+export function bandFor(
+  outdoorF: number,
+  hbxConfig: Record<string, any> | null,
+  strictCapF: number,
+): { lo: number; hi: number } {
+  const t = Math.min(Math.max(outdoorF, 5), 55);
+  const lo = 95 + ((55 - t) / 50) * 40; // 55°F→95, 5°F→135
+  const curve = hbxConfig ? curveTargetF(hbxConfig, outdoorF) : null;
+  const hi = Math.min(curve != null ? curve + 3 : strictCapF, strictCapF);
+  return { lo, hi: Math.max(hi, lo) };
+}
 
 /** Target the ECO-0600's own linear reset curve would compute at this outdoor temp. */
 export function curveTargetF(cfg: Record<string, any>, outdoorF: number): number | null {
@@ -86,6 +105,23 @@ export function computeShadowPlan(
     warmest.reason = `pre-charge for ${String(start).padStart(2, "0")}:00 window (warmest lead hour, ${warmest.f.outdoorF.toFixed(0)}°F)`;
   }
 
+  // I8 daily thermal hygiene: one block per local day boosted to sanitizeF, in that
+  // day's warmest hour — the coil's potable slug must never sit lukewarm for a full day,
+  // and the warmest hour is the cheapest place to buy the excursion.
+  const byDay = new Map<string, Draft[]>();
+  for (const d of draft) {
+    const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day)!.push(d);
+  }
+  for (const [, ds] of byDay) {
+    if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
+    if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
+    const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
+    warmest.target = opts.sanitizeF;
+    warmest.reason = `daily sanitize boost to ${opts.sanitizeF}°F (I8 thermal hygiene, warmest hour)`;
+  }
+
   return draft.map((d) => {
     let target = d.target;
     let reason = d.reason;
@@ -96,7 +132,8 @@ export function computeShadowPlan(
         reason = "winter guard: mimic HBX curve (winter solver not built yet)";
       }
     }
-    target = clamp(target, opts.bandMinF, opts.bandMaxF);
+    const band = bandFor(d.f.outdoorF, hbxConfig, opts.strictCapF);
+    target = clamp(target, band.lo, band.hi);
     const hp1 = clamp(target + opts.i1MarginF, opts.hpMinF, opts.hpMaxF);
     return {
       ts: d.f.ts.toISOString(),
