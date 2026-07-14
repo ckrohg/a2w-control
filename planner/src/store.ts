@@ -67,7 +67,49 @@ export class Store {
         gap_f            real,
         plan_computed_at timestamptz
       );
+      CREATE TABLE IF NOT EXISTS hbx_writes (
+        id         serial PRIMARY KEY,
+        ts         timestamptz NOT NULL DEFAULT now(),
+        source     text NOT NULL,
+        action     text NOT NULL,
+        requested  jsonb,
+        result     text NOT NULL,
+        detail     text
+      );
     `);
+  }
+
+  /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */
+  async insertHbxWrite(w: {
+    source: string; action: string; requested: unknown; result: string; detail: string;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO hbx_writes (source, action, requested, result, detail) VALUES ($1,$2,$3,$4,$5)`,
+      [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail],
+    );
+  }
+
+  /** Latest SensorLinx reading (for the envelope's outdoor input + current target). */
+  async getLatestSlx(): Promise<{ ts: Date; tankF: number | null; targetF: number | null; outdoorF: number | null } | null> {
+    const res = await this.pool.query(
+      `SELECT ts, tank_f, tank_target_f, outdoor_f FROM slx_readings ORDER BY ts DESC LIMIT 1`,
+    );
+    if (!res.rowCount) return null;
+    const r = res.rows[0];
+    return {
+      ts: new Date(r.ts),
+      tankF: r.tank_f == null ? null : Number(r.tank_f),
+      targetF: r.tank_target_f == null ? null : Number(r.tank_target_f),
+      outdoorF: r.outdoor_f == null ? null : Number(r.outdoor_f),
+    };
+  }
+
+  /** The as-found baseline = the seed config version (row 1, committed 2026-07-13). */
+  async baselineConfig(): Promise<HbxConfig | null> {
+    const res = await this.pool.query(
+      `SELECT config FROM hbx_config_versions ORDER BY id ASC LIMIT 1`,
+    );
+    return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
   }
 
   async insertShadowPlan(plan: unknown, meta: unknown): Promise<void> {

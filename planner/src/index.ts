@@ -10,9 +10,11 @@ import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
+import crypto from "node:crypto";
 import { HubClient } from "./hub";
 import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 import { learnDhwWindows } from "./dhw";
+import { HbxWriter, WriteError } from "./writes";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -40,10 +42,13 @@ const LAT = process.env.LAT ?? "42.63";
 const LON = process.env.LON ?? "-70.87";
 const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
 
+const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
+
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
 const store = new Store(DATABASE_URL);
 const hub = HUB_URL && HUB_CLIENT_TOKEN ? new HubClient(HUB_URL, HUB_CLIENT_TOKEN) : null;
 if (!hub) console.warn("HUB_URL/HUB_CLIENT_TOKEN not set — I1 monitor disabled");
+if (!PLANNER_API_TOKEN) console.warn("PLANNER_API_TOKEN not set — write API disabled");
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
@@ -250,20 +255,55 @@ async function main(): Promise<void> {
     return;
   }
 
+  const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy);
+  const authed = (req: http.IncomingMessage): boolean => {
+    if (!PLANNER_API_TOKEN) return false;
+    const got = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    const a = Buffer.from(got), b = Buffer.from(PLANNER_API_TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+  const json = (res: http.ServerResponse, status: number, body: unknown) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  const readBody = (req: http.IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let s = "";
+      req.on("data", (c) => { s += c; if (s.length > 4096) reject(new Error("body too large")); });
+      req.on("end", () => resolve(s));
+      req.on("error", reject);
+    });
+
   http
-    .createServer((req, res) => {
-      if (req.url === "/health") {
-        const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
-        res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
-          i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
-        }));
-      } else {
+    .createServer(async (req, res) => {
+      try {
+        if (req.url === "/health") {
+          const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
+          return json(res, ok ? 200 : 503, {
+            ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+            i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
+          });
+        }
+        if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore") {
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          if (req.url === "/api/hbx/target" && req.method === "GET") {
+            return json(res, 200, await writer.status());
+          }
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          if (req.url === "/api/hbx/restore") {
+            return json(res, 200, await writer.restore("dashboard"));
+          }
+          const body = JSON.parse((await readBody(req)) || "{}");
+          return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard"));
+        }
         res.writeHead(404).end();
+      } catch (e) {
+        if (e instanceof WriteError) return json(res, e.status, { error: e.message });
+        console.error("api error:", e);
+        return json(res, 500, { error: "internal error" });
       }
     })
-    .listen(PORT, () => console.log(`a2w-planner (A-2 reader + A-5 shadow + I1 monitor) health on :${PORT}, polling every ${POLL_SECONDS}s`));
+    .listen(PORT, () => console.log(`a2w-planner (A-2 reader + A-5 shadow + I1 monitor + write API) on :${PORT}, polling every ${POLL_SECONDS}s`));
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);

@@ -244,6 +244,119 @@ export default function ControlClient() {
           })}
         </div>
       )}
+
+      <HbxTargetCard />
     </>
+  );
+}
+
+type HbxStatus = {
+  tank_f: number | null; target_f: number | null; outdoor_f: number | null;
+  band: { lo: number; hi: number } | null;
+  curve_overridden: boolean; baseline: { dbt: number; mbt: number } | null;
+  last_write_at: string | null; i1_margin_f: number;
+  error?: string;
+};
+
+/** HBX tank-target control — human-only writes through the planner's guarded API
+ *  (I4 outdoor-indexed envelope, I1 cross-check, rate limit, audit all enforced
+ *  planner-side; this card just asks and reports). */
+function HbxTargetCard() {
+  const [st, setSt] = useState<HbxStatus | null>(null);
+  const [target, setTarget] = useState<number | null>(null);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch("/api/planner/target", { cache: "no-store" });
+      const body: HbxStatus = await res.json().catch(() => ({} as HbxStatus));
+      if (res.ok) {
+        setSt(body);
+        setTarget((t) => t ?? (body.target_f != null ? Math.round(body.target_f) : null));
+      } else {
+        setSt(null);
+        setMsg(body.error || `Planner error (${res.status}).`);
+      }
+    } catch {
+      setMsg("Could not reach the dashboard server.");
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  async function act(path: string, body?: unknown, confirmText?: string) {
+    if (confirmText && !window.confirm(confirmText)) return;
+    setBusy(true);
+    setMsg("");
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const out: { ok?: boolean; detail?: string; error?: string } = await res.json().catch(() => ({}));
+      setMsg(res.ok ? `${out.detail || "Done"} ✓` : `Rejected: ${out.error || out.detail || res.status}`);
+    } catch {
+      setMsg("Network error — try again.");
+    } finally {
+      setBusy(false);
+      load();
+    }
+  }
+
+  if (!st) return null;
+  const band = st.band;
+  return (
+    <div className="cards" style={{ marginTop: 4 }}>
+      <div className="card">
+        <h2>
+          HBX tank target
+          <span className={`chip ${st.curve_overridden ? "warn" : "ok"}`}>
+            {st.curve_overridden ? "curve overridden" : "as-found curve"}
+          </span>
+        </h2>
+        <div className="temps">
+          <div className="temp"><div className="v">{st.target_f == null ? "—" : st.target_f.toFixed(1)}°</div><div className="l">Live target</div></div>
+          <div className="temp"><div className="v">{st.tank_f == null ? "—" : st.tank_f.toFixed(1)}°</div><div className="l">Tank</div></div>
+          <div className="temp"><div className="v">{band ? `${band.lo}–${band.hi}` : "—"}</div><div className="l">Allowed °F (I4)</div></div>
+        </div>
+        <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
+          <button type="button" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) - 1)} style={{ flex: "0 0 auto" }}>−</button>
+          <div className="temp" style={{ flex: 1 }}>
+            <div className="v">{target ?? "—"}°</div>
+            <div className="l">New target °F</div>
+          </div>
+          <button type="button" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) + 1)} style={{ flex: "0 0 auto" }}>+</button>
+          <button
+            type="button"
+            disabled={busy || target == null}
+            onClick={() => act("/api/planner/target", { target_f: target },
+              `Set the HBX tank target to ${target}°F? This flattens the reset curve until you restore it. Pump setpoints must stay ${st.i1_margin_f}°F above it (checked).`)}
+            style={{ flex: "0 0 auto" }}
+          >
+            {busy ? "…" : "Set"}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => act("/api/planner/restore", undefined,
+              `Restore the as-found curve (${st.baseline ? `${st.baseline.dbt}/${st.baseline.mbt}°F` : "baseline"})?`)}
+            style={{ flex: "0 0 auto" }}
+          >
+            Restore curve
+          </button>
+        </div>
+        <div className="meta">
+          Writes go through the planner&apos;s guardrails: outdoor-indexed envelope, I1 check vs live pump
+          setpoints, 15-min rate limit, read-back, audit. Restore is never rate-limited.
+          {msg ? (<><br /><span style={{ color: "var(--text)" }}>{msg}</span></>) : null}
+        </div>
+      </div>
+    </div>
   );
 }
