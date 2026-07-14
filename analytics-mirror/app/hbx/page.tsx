@@ -108,6 +108,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let shadowAt: number | null = null;
   let shadowMeta: ShadowMeta | null = null;
   let gap: { avg: number; n: number } | null = null;
+  let scored: { t: number; s: number }[] = [];
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -123,6 +124,9 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
       SELECT id, EXTRACT(EPOCH FROM observed_at)::float8 AS t, changed_fields
       FROM hbx_config_versions ORDER BY id DESC LIMIT 12`).rows;
     try {
+      scored = (await sql`
+        SELECT EXTRACT(EPOCH FROM hour_ts)::float8 AS t, shadow_target_f::float8 AS s
+        FROM plan_scores WHERE hour_ts >= ${since}::timestamptz ORDER BY hour_ts ASC`).rows as { t: number; s: number }[];
       const sp = await sql`SELECT plan, meta, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
       if (sp.rowCount) {
         shadow = sp.rows[0].plan as ShadowBlock[];
@@ -214,6 +218,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                 { color: "#4dabf7", points: pick("tank_f") },
                 { color: "#ffd666", points: pick("tank_target_f"), dash: true },
                 { color: "#ff6b6b", points: i1Line, dash: true, width: 1.2 },
+                { color: "#e599f7", points: scored.flatMap((r) => [{ x: r.t, y: r.s }, { x: r.t + 3599, y: r.s }]), dash: true, width: 1.3 },
                 ...pumpSeries.map((s, i) => ({ color: i === 0 ? "#63e6be" : "#f783ac", points: s.points })),
                 { color: "#845ef7", points: pick("outdoor_f") },
               ]} />
@@ -222,6 +227,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               <span><i style={{ background: "#4dabf7" }} />Tank</span>
               <span><i style={{ background: "#ffd666" }} />Target</span>
               <span><i style={{ background: "#ff6b6b" }} />Target + {I1_MARGIN_F}°F (I1)</span>
+              <span><i style={{ background: "#e599f7" }} />Planner wanted (shadow)</span>
               {pumpSeries.map((s, i) => (
                 <span key={s.id}><i style={{ background: i === 0 ? "#63e6be" : "#f783ac" }} />{s.id} setpoint</span>
               ))}
