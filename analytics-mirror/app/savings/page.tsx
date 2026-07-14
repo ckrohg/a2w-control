@@ -5,6 +5,7 @@
 // typical figure for these water temps and is exactly what the A-4 test calibrates.
 // Rate: ELECTRIC_RATE_USD_KWH env (default 0.30) until TempIQ#1470 supplies the real tariff.
 import { sql } from "@vercel/postgres";
+import { fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
@@ -153,7 +154,7 @@ export default async function SavingsPage() {
               <div className="meta">None yet.</div>
             ) : writes.map((w, i) => (
               <div className="meta" key={i}>
-                {new Date(w.ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} ·
+                {fmtDateTime(w.ts)} ·
                 {" "}<b style={{ color: w.result === "accepted" ? "var(--ok)" : "var(--warm)" }}>{w.result}</b> · {w.detail}
               </div>
             ))}

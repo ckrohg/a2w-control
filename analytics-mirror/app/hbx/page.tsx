@@ -4,6 +4,7 @@
 // target+margin vs HP setpoints vs outdoor — crossing lines = the deadlock), the reset
 // curve card (configured line vs observed scatter), and the config-drift version history.
 import { sql } from "@vercel/postgres";
+import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
@@ -29,9 +30,7 @@ function LineChart({ series, hours }: { series: Series[]; hours: number }) {
   const X = (x: number) => pad.l + ((x - x0) / Math.max(1, x1 - x0)) * (W - pad.l - pad.r);
   const Y = (y: number) => pad.t + (1 - (y - y0) / (y1 - y0)) * (H - pad.t - pad.b);
   const grid = [y0, (y0 + y1) / 2, y1];
-  const lab = (d: Date) => hours > 48
-    ? d.toLocaleDateString([], { month: "short", day: "numeric" })
-    : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const lab = (d: Date) => (hours > 48 ? fmtDay(d) : fmtTime(d));
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
       {grid.map((g, i) => (
@@ -197,7 +196,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               <div className="meta">
                 Stages called: {stagesTxt} · Backup: {last.backup_called ? "CALLED" : "off"} ·
                 HBX {last.connected ? "online" : "OFFLINE"} ·
-                {" "}last poll {new Date(last.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                {" "}last poll {fmtTime(last.ts)}
               </div>
               {curveCfg && (
                 <div className="meta">
@@ -242,7 +241,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
           {shadow && shadow.length > 0 && (
             <div className="chart-block">
               <h3>Shadow plan — next 24h <span className="dim">
-                (what the planner WOULD command; nothing is written · computed {shadowAt ? new Date(shadowAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"})
+                (what the planner WOULD command; nothing is written · computed {shadowAt ? fmtTime(shadowAt) : "—"})
               </span></h3>
               <div className="chart">
                 <LineChart hours={24} series={[
@@ -271,7 +270,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               </div>
               {shadow.filter((b) => !b.reason.startsWith("idle")).slice(0, 8).map((b, i) => (
                 <div className="meta" key={i}>
-                  {new Date(b.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → {b.tank_target_f}°F · {b.reason}
+                  {fmtTime(new Date(b.ts))} → {b.tank_target_f}°F · {b.reason}
                 </div>
               ))}
             </div>
@@ -281,7 +280,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
             <h3>Config versions <span className="dim">(append-only; every row after #1 is a detected edit)</span></h3>
             {versions.map((v) => (
               <div className="meta" key={v.id}>
-                #{v.id} · {new Date(v.t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} ·
+                #{v.id} · {fmtDateTime(v.t)} ·
                 {" "}{v.changed_fields
                   ? Object.entries(v.changed_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")
                   : "initial snapshot (as-found baseline)"}

@@ -3,6 +3,7 @@
 // Read-only. Until the Pi ships the exporter change (release-* tag), this page shows an
 // explanatory empty state — the Pi UI over LAN/Funnel remains the break-glass full view.
 import { sql } from "@vercel/postgres";
+import { fmtTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
@@ -83,7 +84,7 @@ export default async function AdvancedPage() {
                     {stale ? "stale" : s.state ?? "?"}
                   </span>
                   <span className="dim" style={{ marginLeft: 8 }}>
-                    as of {new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    as of {fmtTime(ts)}
                   </span>
                 </h3>
                 <div className="meta">

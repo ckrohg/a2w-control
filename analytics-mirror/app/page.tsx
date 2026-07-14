@@ -4,6 +4,7 @@
 // Deep views: /hbx (tank, curve, plan detail), /control (setpoint writes).
 import { sql } from "@vercel/postgres";
 import { ensureSchema, recentReadings, type Reading } from "@/lib/db";
+import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
 
 export const runtime = "nodejs";
@@ -32,9 +33,7 @@ function Chart({ series, hours }: { series: Series[]; hours: number }) {
   const Y = (y: number) => pad.t + (1 - (y - y0) / (y1 - y0)) * (H - pad.t - pad.b);
   const grid = [y0, (y0 + y1) / 2, y1];
   const t0 = new Date(x0 * 1000), t1 = new Date(x1 * 1000);
-  const lab = (d: Date) => hours > 48
-    ? d.toLocaleDateString([], { month: "short", day: "numeric" })
-    : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const lab = (d: Date) => (hours > 48 ? fmtDay(d) : fmtTime(d));
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
       {grid.map((g, i) => (
@@ -106,7 +105,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   }
   if (slxStale) chips.push({ cls: "offline", text: "HBX reader stale" });
   if (slx?.backup_called) chips.push({ cls: "offline", text: "16.5 kW backup CALLED" });
-  if (driftAt) chips.push({ cls: "warn", text: `HBX config changed ${new Date(driftAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` });
+  if (driftAt) chips.push({ cls: "warn", text: `HBX config changed ${fmtDateTime(driftAt)}` });
   if (!chips.length) chips.push({ cls: "ok", text: "all systems normal" });
 
   // current + next interesting shadow block
@@ -156,7 +155,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                   </div>
                   <div className="meta">
                     {fmt(last.power_w, 0)} W · {last.active_faults ? `${last.active_faults} fault(s) · ` : ""}
-                    last {new Date(last.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    last {fmtTime(last.ts)}
                   </div>
                 </div>
               );
@@ -192,7 +191,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                   </div>
                   {nextAction && (
                     <div className="meta">
-                      Next move it would make: {new Date(nextAction.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → {nextAction.tank_target_f}°F ({nextAction.reason}).
+                      Next move it would make: {fmtTime(new Date(nextAction.ts))} → {nextAction.tank_target_f}°F ({nextAction.reason}).
                       {" "}<a href="/savings" style={{ color: "#4dabf7" }}>what that&apos;s worth →</a>
                     </div>
                   )}
