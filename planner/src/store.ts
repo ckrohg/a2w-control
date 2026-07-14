@@ -53,7 +53,16 @@ export class Store {
         changed_fields jsonb,
         config         jsonb NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS shadow_plans (
+        id          serial PRIMARY KEY,
+        computed_at timestamptz NOT NULL DEFAULT now(),
+        plan        jsonb NOT NULL
+      );
     `);
+  }
+
+  async insertShadowPlan(plan: unknown): Promise<void> {
+    await this.pool.query(`INSERT INTO shadow_plans (plan) VALUES ($1)`, [JSON.stringify(plan)]);
   }
 
   async insertReading(r: SlxReading): Promise<void> {

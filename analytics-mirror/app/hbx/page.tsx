@@ -91,6 +91,7 @@ type SlxRow = {
 };
 type PumpRow = { ts: number; pump_id: string; setpoint_c: number | null };
 type VersionRow = { id: number; t: number; changed_fields: Record<string, { old: unknown; new: unknown }> | null };
+type ShadowBlock = { ts: string; outdoor_f: number; tank_target_f: number; hp1_setpoint_f: number; reason: string };
 
 export default async function HbxPage({ searchParams }: { searchParams: { hours?: string } }) {
   const hours = searchParams.hours === "168" ? 168 : 24;
@@ -101,6 +102,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let pumps: PumpRow[] = [];
   let cfg: Record<string, any> | null = null;
   let versions: VersionRow[] = [];
+  let shadow: ShadowBlock[] | null = null;
+  let shadowAt: number | null = null;
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -115,6 +118,10 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
     versions = (await sql<VersionRow>`
       SELECT id, EXTRACT(EPOCH FROM observed_at)::float8 AS t, changed_fields
       FROM hbx_config_versions ORDER BY id DESC LIMIT 12`).rows;
+    try {
+      const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
+      if (sp.rowCount) { shadow = sp.rows[0].plan as ShadowBlock[]; shadowAt = sp.rows[0].t as number; }
+    } catch { /* table appears with the first planner deploy that computes a plan */ }
   } catch {
     dbError = true;
   }
@@ -217,6 +224,37 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               <span><i style={{ background: "#4dabf7" }} />Observed (outdoor, target)</span>
             </div>
           </div>
+
+          {shadow && shadow.length > 0 && (
+            <div className="chart-block">
+              <h3>Shadow plan — next 24h <span className="dim">
+                (what the planner WOULD command; nothing is written · computed {shadowAt ? new Date(shadowAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"})
+              </span></h3>
+              <div className="chart">
+                <LineChart hours={24} series={[
+                  { color: "#ffd666", points: shadow.flatMap((b) => {
+                    const t = new Date(b.ts).getTime() / 1000;
+                    return [{ x: t, y: b.tank_target_f }, { x: t + 3599, y: b.tank_target_f }];
+                  }), dash: true },
+                  { color: "#63e6be", points: shadow.flatMap((b) => {
+                    const t = new Date(b.ts).getTime() / 1000;
+                    return [{ x: t, y: b.hp1_setpoint_f }, { x: t + 3599, y: b.hp1_setpoint_f }];
+                  }) },
+                  { color: "#845ef7", points: shadow.map((b) => ({ x: new Date(b.ts).getTime() / 1000, y: b.outdoor_f })) },
+                ]} />
+              </div>
+              <div className="legend">
+                <span><i style={{ background: "#ffd666" }} />Shadow tank target</span>
+                <span><i style={{ background: "#63e6be" }} />Shadow HP1 setpoint</span>
+                <span><i style={{ background: "#845ef7" }} />Forecast outdoor</span>
+              </div>
+              {shadow.filter((b) => !b.reason.startsWith("idle")).slice(0, 8).map((b, i) => (
+                <div className="meta" key={i}>
+                  {new Date(b.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → {b.tank_target_f}°F · {b.reason}
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="chart-block">
             <h3>Config versions <span className="dim">(append-only; every row after #1 is a detected edit)</span></h3>

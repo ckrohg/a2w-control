@@ -10,6 +10,8 @@ import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
+import { HubClient } from "./hub";
+import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -31,13 +33,26 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
 const OFFLINE_AFTER_FAILURES = 5;
 
+const HUB_URL = process.env.HUB_URL;
+const HUB_CLIENT_TOKEN = process.env.HUB_CLIENT_TOKEN;
+const LAT = process.env.LAT ?? "42.63";
+const LON = process.env.LON ?? "-70.87";
+const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
+
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
 const store = new Store(DATABASE_URL);
+const hub = HUB_URL && HUB_CLIENT_TOKEN ? new HubClient(HUB_URL, HUB_CLIENT_TOKEN) : null;
+if (!hub) console.warn("HUB_URL/HUB_CLIENT_TOKEN not set — I1 monitor disabled");
+
+const cToF = (c: number) => (c * 9) / 5 + 32;
 
 let lastPollAt: string | null = null;
 let lastDriftAt: string | null = null;
+let lastShadowAt: string | null = null;
 let consecutiveFailures = 0;
 let offlineAlerted = false;
+let i1Violated = false;
+let i1Detail: string | null = null;
 
 async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
   if (!NTFY_TOPIC) return;
@@ -75,9 +90,59 @@ function toReading(dev: Record<string, any>): SlxReading {
   };
 }
 
+/**
+ * I1 (plan §3): every online pump's setpoint must sit above tank target + margin, or the
+ * tank sensor can't terminate calls (the calls-forever deadlock → bkLag → 16.5 kW element).
+ * Edge-triggered: one high-priority alert on entry, one notice on clear.
+ */
+async function checkI1(tankTargetF: number | null): Promise<void> {
+  if (!hub || tankTargetF == null) return;
+  let state;
+  try {
+    state = await hub.getState();
+  } catch (e) {
+    console.warn("I1 check skipped — hub unreachable:", (e as Error).message);
+    return;
+  }
+  const required = tankTargetF + DEFAULT_OPTS.i1MarginF;
+  const offenders = state.pumps
+    .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
+    .map((p) => `${p.id} setpoint ${cToF(p.setpoint_c as number).toFixed(1)}°F < required ${required.toFixed(1)}°F`);
+  if (offenders.length && !i1Violated) {
+    i1Violated = true;
+    i1Detail = offenders.join("; ");
+    console.warn(`I1 VIOLATION: ${i1Detail}`);
+    await ntfy(
+      "I1 violation: HP setpoint below HBX target + margin",
+      `Tank target ${tankTargetF.toFixed(1)}°F.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
+      "high",
+    );
+  } else if (!offenders.length && i1Violated) {
+    i1Violated = false;
+    i1Detail = null;
+    await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`);
+  }
+}
+
+async function shadowOnce(): Promise<void> {
+  const forecast = await fetchForecast(LAT, LON);
+  const cfg = await store.latestConfig();
+  const plan = computeShadowPlan(forecast, cfg);
+  if (!plan.length) throw new Error("empty forecast");
+  await store.insertShadowPlan(plan);
+  lastShadowAt = new Date().toISOString();
+  const targets = plan.map((b) => b.tank_target_f);
+  console.log(
+    `shadow plan: ${plan.length} blocks, targets ${Math.min(...targets)}–${Math.max(...targets)}°F ` +
+    `(vs live HBX curve ~153°F) — first: ${plan[0].reason}`,
+  );
+}
+
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
-  await store.insertReading(toReading(dev));
+  const reading = toReading(dev);
+  await store.insertReading(reading);
+  await checkI1(reading.tankTargetF);
 
   const config = extractConfig(dev);
   const prev = await store.latestConfig();
@@ -126,6 +191,7 @@ async function main(): Promise<void> {
 
   if (process.env.POLL_ONCE === "1") {
     await pollOnce();
+    await shadowOnce();
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -136,15 +202,21 @@ async function main(): Promise<void> {
       if (req.url === "/health") {
         const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
         res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok, lastPollAt, lastDriftAt, consecutiveFailures }));
+        res.end(JSON.stringify({
+          ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+          i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
+        }));
       } else {
         res.writeHead(404).end();
       }
     })
-    .listen(PORT, () => console.log(`a2w-planner (A-2 reader) health on :${PORT}, polling every ${POLL_SECONDS}s`));
+    .listen(PORT, () => console.log(`a2w-planner (A-2 reader + A-5 shadow + I1 monitor) health on :${PORT}, polling every ${POLL_SECONDS}s`));
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);
+  const shadowLoop = () => shadowOnce().catch((e) => console.error("shadow plan failed:", (e as Error).message));
+  await shadowLoop();
+  setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
 }
 
 main().catch((e) => {

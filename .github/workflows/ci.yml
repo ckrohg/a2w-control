@@ -1,0 +1,43 @@
+# @purpose CI gate for the auto-deploying services: bridge control-path tests (pytest) +
+# build/typecheck for hub, planner, and mirror. Runs on pushes/PRs that touch code
+# (knowledge/docs commits are ignored) and on release-* tags (the Pi deploy gate).
+# Public repo → free standard runners; swap runs-on for Blacksmith later if CI ever grows.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["release-*"]
+    paths-ignore: ["knowledge/**", ".tenet/**", "**.md"]
+  pull_request:
+    paths-ignore: ["knowledge/**", ".tenet/**", "**.md"]
+
+jobs:
+  bridge-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: heatpump-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run pytest -q
+
+  node-builds:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dir: [hub, planner, analytics-mirror]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ matrix.dir }}/package-lock.json
+      - run: npm ci
+      - run: npm run build
