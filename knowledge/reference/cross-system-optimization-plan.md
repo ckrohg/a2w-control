@@ -538,7 +538,47 @@ to ≥131 °F (55 °C), scheduled at the day's warmest hour (best COP), monitore
   appears, the excursion becomes weekly 140 °F/60 °C as well); measure the coil volume
   (bigger slug = stricter I8 posture).
 
-### 6.6 Owner interface — how you control it and check on it
+### 6.6 Demand anticipation & capacity staging (added 2026-07-14, owner insight during A-4)
+
+The 2026-07-14 tub test exposed the two-lever reality: the tank fell 25 °F+ *with a pump
+running*, so pre-stored energy alone cannot cover a big draw — you need **energy**
+(pre-boost) *and* **power** (parallel compressors during the draw). They live in
+different systems:
+
+- **Anticipation = the planner's job** (it has the forecast, learned draw windows, COP
+  curve): pre-boost the tank toward the envelope ceiling in the best-COP hour before a
+  learned big-draw window. Synergy: schedule the I8 sanitize boost immediately before the
+  evening draw window — hygiene, pre-boost, and COP timing become one charge.
+- **Reaction = HBX's job** (only it is fast enough), and it's currently tuned against us:
+  `lagT` = 60 min means the second pump joins a tub crisis an hour late. **Proposed
+  experiment (owner applies in the app, reversible):** `lagT` 60 → ~15 min. Measure over
+  two weeks: draw-recovery time, dual-compressor start counts, and part-load vs full-load
+  energy per delivered °F (SPAN per circuit) — two part-load inverters may beat one
+  flat-out compressor, or not; the data decides. Short calls (< lagT) stay single-stage.
+  The phantom slot 3 stays harmless in fixed order (it "joins" as a no-op after stage 2).
+- **Recovery quirk (measured today):** a Modbus power cycle during an active call resumes
+  automatically but only after the compressor's anti-short-cycle delay (~minutes). And a
+  Modbus "off" DOES override an active HBX call — the Phase-E hard-gate answer; power
+  stays human-only.
+
+### 6.7 The tank's behavioral model — TempIQ-first (owner direction 2026-07-14)
+
+Nameplate gallons is the wrong question. The planner's tank node is
+`C_eff·dT/dt = P_hp − Q_dhw(t) − Q_zones(t) − UA_tank·(T − T_basement)`, and the
+parameters come from behavior, not the label:
+
+- **TempIQ already learns most of this** (hydronic-system-learner): effective thermal
+  mass, DHW-vs-standby-loss decomposition of hydronic overhead, per-zone loads. These
+  outputs are now in scope for the TempIQv2#1470 insights API — the planner consumes,
+  never re-derives.
+- **The planner self-learns C_eff continuously** from its own 5-min data: every charge is
+  a known-input slope (SPAN kW in ÷ °F/h rise), every idle overnight a decay fit, and
+  events like the 2026-07-14 tub (pump off + full draw = pure discharge slope, then a
+  clean recovery ramp) are free step-response experiments worth auto-detecting.
+- Standby loss falls out of the same fits (idle decay at known tank-vs-basement ΔT), and
+  it shrinks quadratically as targets drop — part of the savings, tracked not assumed.
+
+### 6.8 Owner interface — how you control it and check on it
 
 Everything lands on the surfaces you already use: the **Vercel dashboard** (remote,
 phone-first) gets a Planner page; the **Pi dashboard** keeps working on the LAN as the
@@ -603,7 +643,7 @@ threshold, planner dead-man. Same discipline as ever: P17-class noise never page
   TypeScript, mirrors `hub/`'s Railway pattern). Polls `api.sensorlinx.co` (the new host)
   every 5 min → `slx_readings` in Neon (tank/target/outdoor, demand, per-stage calls,
   backup call, relays) + `hbx_config_versions` (append-only drift history with
-  old→new per field — the §6.6 curve-version tracker) + ntfy on drift/offline +
+  old→new per field — the §6.8 curve-version tracker) + ntfy on drift/offline +
   `/health`. End-to-end verified against live SensorLinx and the real Neon DB.
   **Remaining: owner deploys to Railway** (root dir `planner`, 3 env vars —
   `planner/README.md`). The A-3 test nudges were also reverted via the live API with
