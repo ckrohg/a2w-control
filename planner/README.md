@@ -61,3 +61,9 @@ Write API (Phase C, not used here): `knowledge/reference/hbx-write-api.md`.
 Deliberate omissions for now: gap backfill via the minute-history endpoint
 (`POST .../history/minutes`) and the socket.io push channel — add if 5-min polling ever
 proves insufficient.
+
+## Deploys
+
+Git-linked (2026-07-14): pushes to `main` touching `planner/**` auto-deploy this service
+on Railway. The hub only redeploys on `hub/**` changes; the Vercel mirror only rebuilds
+when `analytics-mirror/` changes. The Pi keeps its deliberate `release-*` tag flow.
