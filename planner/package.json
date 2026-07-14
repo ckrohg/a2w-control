@@ -1,0 +1,23 @@
+{
+  "name": "a2w-planner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A2W planner service — Phase A-2: SensorLinx reader (api.sensorlinx.co) storing HBX readings + config-drift versions in Neon.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.6",
+    "typescript": "^5.5.0"
+  }
+}
