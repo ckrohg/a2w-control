@@ -36,4 +36,27 @@ export class HubClient {
       pumps: Array.isArray(body.pumps) ? body.pumps : [],
     };
   }
+
+  /** Leased setpoint relay (Phase B). The Pi's guardrails (floor, bounds, rate limit,
+   *  read-back) decide; a nack is a normal outcome and is returned, never thrown. */
+  async sendSetpoint(
+    pumpId: string,
+    valueC: number,
+    leaseMinutes: number,
+    source: string,
+  ): Promise<{ ok: boolean; detail: string }> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/command`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ pump_id: pumpId, value_c: valueC, lease_minutes: leaseMinutes, source }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string };
+      if (res.ok && body.ok) return { ok: true, detail: `acked ${valueC}°C` };
+      return { ok: false, detail: body.detail || `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, detail: (e as Error).message };
+    }
+  }
 }

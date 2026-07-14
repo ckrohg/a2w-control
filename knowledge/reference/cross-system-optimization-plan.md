@@ -682,8 +682,13 @@ threshold, planner dead-man. Same discipline as ever: P17-class noise never page
   baseline frozen (A-6); shadow plans that would have violated no invariant.
 
 ### Phase B — Track (HP-side only; kills the mismatch problem)
-- Planner writes **HP1 setpoint = live HBX target + margin** (clamped to [45 °C, cap])
-  through the existing guarded/leased path, `source=planner`. HP2 set static per §5.4.
+- **BUILT FLAG-OFF 2026-07-14** (`planner/src/phaseb.ts`, dry-run-verified live: would
+  send 69 °C vs as-found 75/71 at the current 151.3 °F target — an immediate gain on
+  day one). Both pumps enrolled (HP2 is writable; §5.4 void). Leased 90 min, renewed
+  every 5-min poll; rollback = unset the flag → baseline. Dry-run caught a real bug:
+  a 55 °C factory-default cap would have manufactured the deadlock — planner cap is 75 °C
+  with the Pi's live bounds authoritative. **Enable after the ~Jul 27 gate: set
+  `PHASE_B_ENABLED=1` on the Railway planner service.**
 - Alert rule: HBX target (+½ diff) above the achievable HP setpoint → the exact
   "tank can never hit target" condition, now detected instead of silently burning.
 - **Exit:** ≥2 weeks autonomous tracking; zero invariant violations; measured COP

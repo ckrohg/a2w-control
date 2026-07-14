@@ -15,6 +15,7 @@ import { HubClient } from "./hub";
 import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
+import { PhaseB } from "./phaseb";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -49,6 +50,15 @@ const store = new Store(DATABASE_URL);
 const hub = HUB_URL && HUB_CLIENT_TOKEN ? new HubClient(HUB_URL, HUB_CLIENT_TOKEN) : null;
 if (!hub) console.warn("HUB_URL/HUB_CLIENT_TOKEN not set — I1 monitor disabled");
 if (!PLANNER_API_TOKEN) console.warn("PLANNER_API_TOKEN not set — write API disabled");
+
+const PHASE_B_ENABLED = process.env.PHASE_B_ENABLED === "1";
+const PHASE_B_DRY_RUN = process.env.PHASE_B_DRY_RUN === "1";
+const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
+const phaseB = PHASE_B_ENABLED && hub
+  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
+  : null;
+if (PHASE_B_ENABLED && !hub) console.warn("PHASE_B_ENABLED but no hub configured — tracking disabled");
+if (phaseB) console.log(`PHASE B ${PHASE_B_DRY_RUN ? "DRY-RUN" : "ACTIVE"} for ${PHASE_B_PUMPS.join(", ")} (target + ${5}°F, leased)`);
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
@@ -200,6 +210,7 @@ async function pollOnce(): Promise<void> {
   const reading = toReading(dev);
   await store.insertReading(reading);
   await checkI1(reading.tankTargetF);
+  if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
 
   const config = extractConfig(dev);
   const prev = await store.latestConfig();
@@ -282,6 +293,9 @@ async function main(): Promise<void> {
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
+            phase_b: phaseB
+              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
+              : "disabled",
           });
         }
         if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore") {

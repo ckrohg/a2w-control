@@ -67,3 +67,20 @@ proves insufficient.
 Git-linked (2026-07-14): pushes to `main` touching `planner/**` auto-deploy this service
 on Railway. The hub only redeploys on `hub/**` changes; the Vercel mirror only rebuilds
 when `analytics-mirror/` changes. The Pi keeps its deliberate `release-*` tag flow.
+
+## Phase B — the tracking loop (FLAG-OFF)
+
+Built 2026-07-14, dry-run-verified against live data. Every poll cycle, each enrolled
+pump's setpoint is driven to (live HBX tank target + 5°F I1 margin), rounded to whole °C,
+**leased 90 min** through the hub — a dead planner lapses to the Pi's baseline within the
+lease, never a stale value. Renewals are free on the Pi (renew-without-rewrite).
+
+| Env | Meaning |
+|---|---|
+| `PHASE_B_ENABLED=1` | turn tracking on (default off) |
+| `PHASE_B_DRY_RUN=1` | compute + log, send nothing |
+| `PHASE_B_PUMPS` | default `pump1,pump2` |
+| `PHASE_B_CAP_C` | planner-side cap, default 75 (bridge config clamp — NOT the reg-2027 factory 55; the Pi's live bounds stay authoritative) |
+
+Rollback = unset `PHASE_B_ENABLED` → leases lapse → Pi reverts to `baseline_setpoint_c`.
+Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow record.
