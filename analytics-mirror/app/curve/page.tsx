@@ -18,7 +18,10 @@ type Daily = {
   kwh: Partial<Record<"aw1" | "aw2" | "element" | "circ" | "glycol", number>>;
   cop_af: number; cop_cur: number; cop_pot: number; tgt_cur: number; tgt_pot: number;
 };
-type ReceiptRow = { o: number; measured?: number; n?: number; af?: number; cur?: number; pot?: number };
+type ReceiptRow = {
+  o: number; measured_v1?: number; n_v1?: number; measured_v3?: number; n_v3?: number;
+  af?: number; cur?: number; pot?: number;
+};
 type CurveHistory = {
   meta: {
     extracted_at: string; era: { from: string; to: string }; hours: number;
@@ -31,11 +34,13 @@ type CurveHistory = {
     opts: { dhwWindows: number[][]; dhwFloorF: number; idleF: number; i1MarginF: number; winterGuardF: number; sanitizeF: number; strictCapF: number };
     totals_kwh: Record<string, number>;
     estimates: { hp_kwh_measured: number; cur_kwh_saved: number; pot_kwh_saved: number; cur_usd_saved: number; pot_usd_saved: number };
-    cop_measured_avg: number | null; notes: string[];
+    cop: { v1_n: number; v1_median: number | null; v3_n: number; v3_median_mild: number | null; v3_median_warm: number | null };
+    mfr_ratings_w75: { o: number; cop: number }[];
+    notes: string[];
   };
   bins_tank: number[][]; bins_target: number[][];
   daily: Daily[];
-  cop_points: { o: number | null; cop: number; sink: number | null }[];
+  cop_points: { o: number | null; cop: number; sink: number | null; v: number | null }[];
   receipt: ReceiptRow[];
 };
 const history = historyJson as unknown as CurveHistory;
@@ -199,16 +204,22 @@ function CurveField({
 }
 
 // ---- COP receipt ----------------------------------------------------------------------
-function ReceiptChart({ points, receipt }: { points: { o: number; cop: number }[]; receipt: ReceiptRow[] }) {
+function ReceiptChart({ points, receipt, mfr }: {
+  points: { o: number; cop: number; v: number | null }[];
+  receipt: ReceiptRow[];
+  mfr: { o: number; cop: number }[];
+}) {
   const W = 900, H = 280, pad = { l: 44, r: 14, t: 12, b: 28 };
   const y0 = 1, y1 = 6; // top = the model's own validity clamp (TempIQ MAX_VALID_COP)
   const X = (o: number) => pad.l + ((o - HX.min) / (HX.max - HX.min)) * (W - pad.l - pad.r);
   const Y = (c: number) => pad.t + (1 - (Math.min(c, y1) - y0) / (y1 - y0)) * (H - pad.t - pad.b);
-  const line = (key: "measured" | "af" | "cur" | "pot", minN = 0) => {
+  const line = (key: "measured_v1" | "measured_v3" | "af" | "cur" | "pot") => {
     // model lines stop at 65°F out — beyond that lift is tiny, the surface saturates
     // at its validity clamp, and there is no heating load to save on anyway
     const pts = receipt.filter((r) => r[key] != null &&
-      (key === "measured" ? (r.n ?? 0) >= minN : r.o <= 65));
+      (key === "measured_v1" ? (r.n_v1 ?? 0) >= 3
+        : key === "measured_v3" ? (r.n_v3 ?? 0) >= 3
+        : r.o <= 65));
     return pts.map((r, j) => `${j ? "L" : "M"}${X(r.o).toFixed(1)},${Y(r[key] as number).toFixed(1)}`).join("");
   };
   return (
@@ -223,12 +234,23 @@ function ReceiptChart({ points, receipt }: { points: { o: number; cop: number }[
         <text key={o} x={X(o)} y={H - 8} fill="#8b98a5" fontSize={12} textAnchor="middle">{o}°F out</text>
       ))}
       {points.map((p, i) => (
-        <circle key={i} cx={X(p.o)} cy={Y(p.cop)} r={2} fill="#4dabf7" fillOpacity={0.28} />
+        <circle key={i} cx={X(p.o)} cy={Y(p.cop)} r={2}
+          fill={(p.v ?? 0) >= 3 ? "#4dabf7" : "#8b98a5"} fillOpacity={(p.v ?? 0) >= 3 ? 0.32 : 0.22} />
       ))}
       <path d={line("af")} fill="none" stroke="#8b98a5" strokeWidth={1.5} strokeDasharray="5 4" />
-      <path d={line("measured", 3)} fill="none" stroke="#4dabf7" strokeWidth={2.6} />
+      <path d={line("measured_v1")} fill="none" stroke="#ff6b6b" strokeWidth={1.6} strokeDasharray="2 4" />
+      <path d={line("measured_v3")} fill="none" stroke="#4dabf7" strokeWidth={2.6} />
       <path d={line("cur")} fill="none" stroke="#e599f7" strokeWidth={2.2} />
       <path d={line("pot")} fill="none" stroke="#e599f7" strokeWidth={1.5} strokeDasharray="5 4" />
+      {/* manufacturer rated points at W75 — the machine's own ceiling at hot water */}
+      {mfr.map((m, i) => (
+        <g key={`m${i}`}>
+          <path d={`M${X(m.o)},${Y(m.cop) - 6}L${X(m.o) + 6},${Y(m.cop)}L${X(m.o)},${Y(m.cop) + 6}L${X(m.o) - 6},${Y(m.cop)}Z`}
+            fill="#ffd666" stroke="#0f1419" strokeWidth={1} />
+          <text x={X(m.o) + 9} y={Y(m.cop) - 6} fill="#ffd666" fontSize={11.5} fontWeight={600}
+            paintOrder="stroke" stroke="#0f1419" strokeWidth={3}>spec {m.cop} @ W75</text>
+        </g>
+      ))}
     </svg>
   );
 }
@@ -362,7 +384,8 @@ export default async function CurvePage() {
   const m = history.meta;
   const est = m.estimates;
   const era = `${new Date(m.era.from + "T12:00:00").toLocaleString("en-US", { month: "short", day: "numeric" })} → ${new Date(m.era.to + "T12:00:00").toLocaleString("en-US", { month: "short", day: "numeric" })}`;
-  const copPts = history.cop_points.filter((p) => p.o != null) as { o: number; cop: number }[];
+  const copPts = history.cop_points.filter((p) => p.o != null) as { o: number; cop: number; v: number | null }[];
+  const cop = history.meta.cop;
 
   return (
     <>
@@ -387,11 +410,12 @@ export default async function CurvePage() {
           </div>
         </div>
         <div className="card">
-          <h2>The receipt <span className="chip warn">measured</span></h2>
-          <div className="temps"><div className="temp"><div className="v">COP {m.cop_measured_avg}</div><div className="l">flat vs outdoor</div></div></div>
+          <h2>The receipt <span className="chip warn">measured · corrected</span></h2>
+          <div className="temps"><div className="temp"><div className="v">COP {cop.v3_median_mild} → {cop.v3_median_warm}</div><div className="l">mild → warm, auditable data</div></div></div>
           <div className="meta">
-            {copPts.length} tank-calorimetry measurements. COP never improved in mild weather — condensing stayed hot
-            no matter the temperature outside. That flatness is the money left on the table.
+            The earlier &ldquo;flat 2.33&rdquo; was a measurement artifact — two calculators glued across seasons, and the
+            winter one reads above the machine&apos;s own 1.96 spec ceiling at W75. The auditable measurements rise with
+            outdoor temp like physics demands, but still sit 1–2 COP below what these pumps do at planner-cool tank temps.
           </div>
         </div>
         <div className="card">
@@ -429,28 +453,31 @@ export default async function CurvePage() {
         <div className="meta">
           Lower is cheaper: each dotted arc is a line of constant modeled COP, so a tank run 20–40° cooler in mild
           weather lands on a much better arc. For eight months every hour sat in the blue cloud — 150–165° water
-          whether it was 10° or 90° outside (COP ~2–2.5). The purple band is where the planner commands the same
-          service instead (COP 3–4+). The white trail is still riding the old curve — Phase B isn&apos;t enabled yet.
+          whether it was 10° or 90° outside. The purple band is where the planner commands the same service instead
+          (COP 3–4+ in mild weather). The white trail is still riding the old curve — Phase B isn&apos;t enabled yet.
         </div>
       </div>
 
       <div className="chart-block">
-        <h3>The COP receipt — measured vs. the same model at planner targets <span className="dim">(by outdoor °F)</span></h3>
+        <h3>The COP receipt — measured (two instruments) vs. the model <span className="dim">(by outdoor °F · yellow diamonds = the machine&apos;s own rating)</span></h3>
         <div className="chart">
-          <ReceiptChart points={copPts} receipt={history.receipt} />
+          <ReceiptChart points={copPts} receipt={history.receipt} mfr={m.mfr_ratings_w75} />
         </div>
         <div className="legend">
-          <span><i style={{ background: "#4dabf7" }} />measured, median per 5°F bin ({copPts.length} charges)</span>
-          <span><i style={{ background: "#8b98a5" }} />model at as-found tank temps (validation — should track blue)</span>
-          <span><i style={{ background: "#e599f7" }} />model at planner targets (as built)</span>
-          <span><i style={{ background: "#e599f7", opacity: 0.55 }} />model at envelope potential</span>
+          <span><i style={{ background: "#4dabf7" }} />measured, session calculator ({cop.v3_n} charges, Mar→Jul)</span>
+          <span><i style={{ background: "#ff6b6b" }} />legacy winter calculator ({cop.v1_n} rows) — inflated, beats the spec diamonds</span>
+          <span><i style={{ background: "#8b98a5" }} />model at as-found tank temps</span>
+          <span><i style={{ background: "#e599f7" }} />model at planner targets (solid = as built, dashed = potential)</span>
+          <span><i style={{ background: "#ffd666" }} />manufacturer rating at 75°C water</span>
         </div>
         <div className="meta">
-          The gray dashed line is the model evaluated where the system actually ran — its agreement with the blue
-          measured line is what makes the purple lines credible. The wedge between blue and purple is the claim,
-          in COP units. Absolute measured COP carries tank-volume uncertainty (A-4); the flatness is the load-bearing fact.
-          Model lines stop at 65°F out (no heating load beyond it, and the model runs optimistic where standby losses
-          dominate) — read the purple lines as upper bounds; the $ math uses only the day-by-day ratio.
+          Forensics (2026-07-14): the old &ldquo;flat COP&rdquo; line blended these two instruments across seasons. The red
+          dotted winter series reads <em>above</em> the yellow spec diamonds — physically impossible, so it&apos;s discarded
+          as inflated (unlearned standby credit + survivorship). The blue auditable series rises with outdoor temp as
+          physics demands, and is itself a <em>lower bound</em>: 36–67% of warm-weather charge windows had hot water
+          running mid-charge (charges are draw-triggered), which understates thermal. The wedge up to the purple lines
+          is the claim; model lines stop at 65°F out. The $ math never used this curve — it scales measured kWh by
+          model ratios only.
         </div>
       </div>
 

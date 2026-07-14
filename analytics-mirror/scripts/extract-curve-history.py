@@ -91,6 +91,20 @@ def in_window(h):
     return any(a <= h < b for a, b in OPTS["dhwWindows"])
 
 
+def cop_summary(pts):
+    """Per-calc-version summary — the versions must never be blended (the blend is
+    what produced the bogus 'flat 2.33'). v3 = auditable session calculator."""
+    def med(vs):
+        vs = sorted(vs)
+        return round(vs[len(vs) // 2], 2) if vs else None
+    v1 = [p["cop"] for p in pts if (p["v"] or 0) < 3]
+    v3 = [p["cop"] for p in pts if (p["v"] or 0) >= 3]
+    v3_mild = [p["cop"] for p in pts if (p["v"] or 0) >= 3 and p["o"] < 65]
+    v3_warm = [p["cop"] for p in pts if (p["v"] or 0) >= 3 and p["o"] >= 65]
+    return {"v1_n": len(v1), "v1_median": med(v1), "v3_n": len(v3),
+            "v3_median_mild": med(v3_mild), "v3_median_warm": med(v3_warm)}
+
+
 def counterfactual_targets(hours_by_day):
     """Mirror shadow.ts: DHW floors + daily sanitize in warmest hour + optional winter
     guard, clamped to the I4 band. Returns {hour_key: (cur, pot)} — 'cur' = planner as
@@ -143,10 +157,14 @@ def main():
         GROUP BY 1, 2 ORDER BY 1""")
 
     print("querying cop_measurements …", file=sys.stderr)
+    # calc_version matters: v1 (Nov 25–Mar 26, winter-only, unauditable, inflated —
+    # beats the machine's 1.96 spec ceiling at A-12C/W75C) vs v3 (Mar–Jul, session-based,
+    # auditable). Mixing them across seasons is what manufactured the flat-COP artifact
+    # (2026-07-14 forensics). Keep both, tagged, and never blend their medians.
     cop_rows = q(db, f"""
         SELECT to_char(date_trunc('hour', timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'),
                        'YYYY-MM-DD"T"HH24:00') AS h,
-               outdoor_temp_f, cop, sink_temp_f
+               outdoor_temp_f, cop, sink_temp_f, calc_version
         FROM cop_measurements
         WHERE system_id = '{COP_SYSTEM}' AND cop BETWEEN 0.8 AND 8
         ORDER BY timestamp""")
@@ -223,6 +241,7 @@ def main():
             "o": round(float(r["outdoor_temp_f"]), 1) if r["outdoor_temp_f"] else None,
             "cop": round(float(r["cop"]), 2),
             "sink": round(sink, 1) if sink else None,
+            "v": int(r["calc_version"]) if r["calc_version"] else None,
         })
     cop_pts = [p for p in cop_pts if p["o"] is not None]
 
@@ -231,9 +250,10 @@ def main():
         vs = sorted(vs); n = len(vs)
         return vs[n // 2] if n % 2 else (vs[n // 2 - 1] + vs[n // 2]) / 2
 
-    meas_bins = defaultdict(list)
+    meas_v1 = defaultdict(list)   # legacy winter calculator — inflated, keep separate
+    meas_v3 = defaultdict(list)   # session-based, auditable
     for p in cop_pts:
-        meas_bins[5 * round(p["o"] / 5)].append(p["cop"])
+        (meas_v1 if (p["v"] or 0) < 3 else meas_v3)[5 * round(p["o"] / 5)].append(p["cop"])
     model_bins = defaultdict(lambda: {"af": [], "cur": [], "pot": []})
     for r in rows:
         b = model_bins[5 * round(r["out"] / 5)]
@@ -241,11 +261,14 @@ def main():
         b["cur"].append(cop_surface(r["out"], cf[r["h"]][0]))
         b["pot"].append(cop_surface(r["out"], cf[r["h"]][1]))
     receipt = []
-    for o in sorted(set(meas_bins) | set(model_bins)):
+    for o in sorted(set(meas_v1) | set(meas_v3) | set(model_bins)):
         e = {"o": o}
-        if o in meas_bins:
-            e["measured"] = round(median(meas_bins[o]), 2)
-            e["n"] = len(meas_bins[o])
+        if o in meas_v1:
+            e["measured_v1"] = round(median(meas_v1[o]), 2)
+            e["n_v1"] = len(meas_v1[o])
+        if o in meas_v3:
+            e["measured_v3"] = round(median(meas_v3[o]), 2)
+            e["n_v3"] = len(meas_v3[o])
         if o in model_bins:
             for k in ("af", "cur", "pot"):
                 e[k] = round(median(model_bins[o][k]), 2)
@@ -274,11 +297,15 @@ def main():
                 "cur_usd_saved": round(est["cur_kwh_saved"] * RATE_USD_KWH),
                 "pot_usd_saved": round(est["pot_kwh_saved"] * RATE_USD_KWH),
             },
-            "cop_measured_avg": round(sum(p["cop"] for p in cop_pts) / len(cop_pts), 2) if cop_pts else None,
+            "cop": cop_summary(cop_pts),
+            "mfr_ratings_w75": [  # spec PDF section II.1, water outlet 75°C
+                {"o": 10.4, "cop": 1.96}, {"o": 44.6, "cop": 2.43},
+            ],
             "notes": [
                 "before-era only (pre A-6 freeze 2026-07-14); winter conflated with HP2 degradation + disabled element",
                 "COP surface + counterfactuals are MODEL numbers; SPAN kWh + cop_measurements are measured",
                 "counterfactual scales HP circuits only; element shown as measured, never scaled",
+                "the old 'flat COP 2.33' was a calc-version artifact (v1 winter rows inflated + v3 summer draw-contaminated); 2026-07-14 forensics",
             ],
         },
         "bins_tank": bins_tank,
