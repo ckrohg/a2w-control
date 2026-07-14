@@ -739,6 +739,26 @@ gamed by a bad baseline fit — and (b) optionally, one mid-season **baseline we
 paused, as-found settings restored for 7 days) recalibrates the model against reality.
 Cheap insurance for a number you'll actually believe.
 
+**Net-accounting doctrine (added 2026-07-14, owner challenge: "make sure it's TRULY
+more efficient"): the meter is the ledger; models are diagnostics.**
+The only claim-grade savings number is **whole-system daily kWh vs the weather-normalized
+baseline with service held constant**. Specifically:
+- **The ledger set** = SPAN circuits: Air-Water 1 + 2, the 16.5 kW element, *and the
+  hydronic circulators* ("Hydronic Zone Pumps & Control", "Glycol Feeder") — lower targets
+  mean more cycles and more circulator hours, and those must not hide. Mini-split circuits
+  are *watched*: comfort shifting onto them is load-shifting, not saving.
+- **Daily-total accounting internalizes every subtlety automatically** — cycling/start
+  losses, tail overshoot (measured +7 °F at min-modulation), standby-loss reduction,
+  circulator runtime: all land in the meter. Nothing per-charge can be gamed into a claim.
+- **Service constancy is part of the claim**: DHW comfort (tank ≥ floor in draw windows,
+  no owner complaints), room temps in band — verified from tank/draw/zone data, else the
+  "saving" is a service cut.
+- **Per-charge Wh/°F-of-tank-rise** (A-4: 102 Wh/°F at 68 °C, 87 °F ambient) is the
+  diagnostic currency — mass-independent, so setpoint A/Bs are valid even before C_eff is
+  pinned — but it never headlines. TempIQ's COP 2.69 absolute level is unreliable (assumed
+  ~50 gal effective mass; A-4 shows the C_eff/COP pair is unresolved); only its *flatness*
+  was load-bearing, and that survives any mass rescaling.
+
 **Capacity-outage mask (added after the SPAN check):** the historical record is
 contaminated by HP2's failure-to-start period — SPAN shows it healthy Nov–Dec, degraded
 Jan–Feb (~60 %/55 % of HP1's energy), and essentially dead Apr–Jul (52/104/61/6 kWh vs
