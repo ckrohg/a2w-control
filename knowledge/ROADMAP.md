@@ -84,6 +84,16 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 
 ## Later — Phases 3–4
 
+- [ ] **Phase 4 design WRITTEN (2026-07-13): `reference/cross-system-optimization-plan.md`** —
+      full A2W × TempIQ × HBX coordination/optimization architecture (grounded in the
+      ECO-0600 manual + TempIQ internals research). Settles the deferred "TempIQ integration
+      shape": **A2W owns the planner** (new `planner` service on the Pi); TempIQ stays a
+      generic insights provider via its surface-token API; HBX keeps demand/staging/backup
+      and later receives bounded tank targets. Key insight: the HP setpoint sets charge-time
+      water temp (→ COP); the HBX tank target only terminates calls — Phase B (HP1 setpoint
+      tracks HBX target + margin, no HBX writes needed) captures most savings and fixes the
+      tank-target-above-HP-setpoint failure mode. Supersedes `tempiq-integration-sketch.md`
+      §3 framing; lease mechanics carry over.
 - [ ] Phase 3: second pump + Cloudflare Tunnel + systemd hardening (`Restart=always`)
 - [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — as a new consumer of existing API endpoints
 - [ ] Phase 4 platform (architecture DECIDED 2026-07-06, `reference/remote-api-architecture.md`): **Cloudflare Tunnel + Access** for the remote optimizer API (direct tunnel, not a cloud relay). Setpoint **lease** primitive already built (release-20260706-1). Defer: cloudflared/DNS/Access wiring, the optimizer itself (start read-only → setpoint-only), any hosted dashboard (pure outbound push, later). Never let the optimizer hold authority without a lease.

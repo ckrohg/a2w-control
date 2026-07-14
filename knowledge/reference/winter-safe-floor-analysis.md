@@ -35,6 +35,11 @@ These happen to match the placeholders already in `config.production.yaml` — t
 - **Independent freeze backstops (not counted in the floor):** the buffer tank's **16.5 kW
   resistive element** + **3 ductless mini-splits**. Whole-house winter peak ~48 kW (= the 200 A
   service ceiling).
+  ⚠️ **CORRECTION 2026-07-13:** the element is currently **disabled at its SPAN circuit**
+  (owner cost mitigation against false HBX backup calls — see the optimization plan §5.5).
+  Until it is re-enabled post-Phase-B, the only independent backstop is the mini-splits;
+  do not count the element in any freeze-safety argument. HP2 also had a failure-to-start
+  condition for much of winter 2025-26 (SPAN-confirmed, since fixed).
 
 ## Why 45 °C
 

@@ -1,0 +1,400 @@
+{
+  "_baseline_note": "As-found 2026-07-13 via Proxyman capture (A-1/A-3). mbt and bkLag were briefly nudged (144/231) during the write-discovery test and are recorded here at their as-found values (145/230); owner reverts in-app. Live/transient fields (temps, relStat, stgRun, connectedAt, runtimes) reflect capture time and are not configuration.",
+  "aBut": 0,
+  "aButEnabled": true,
+  "aButText": "App Button",
+  "alerts": [],
+  "appButton": {
+    "activated": false,
+    "enabled": false,
+    "text": "App Button"
+  },
+  "autoTm": 1,
+  "auxDif": 8,
+  "backup": {
+    "activated": false,
+    "enabled": true,
+    "runTime": "969:00",
+    "title": "Backup"
+  },
+  "bkDif": 90,
+  "bkLag": 230,
+  "bkOd": -22,
+  "bkRun": "969:00",
+  "bkTemp": 90,
+  "bkTk": 32,
+  "boot": 0,
+  "building": "673e25ab8db6198c521700ed",
+  "category": {
+    "family": "geothermal",
+    "group": "control",
+    "key": "control.geothermal",
+    "pluralName": "Geothermal Controls",
+    "singularName": "Geothermal Control"
+  },
+  "categoryKey": "control.geothermal",
+  "cdot": -41,
+  "changeSource": "server",
+  "clDif": 8,
+  "connected": true,
+  "connectedAt": "2026-07-14T02:28:29.125Z",
+  "createdAt": "2024-03-21T15:01:53.808Z",
+  "cwsd": 60,
+  "dbt": 165,
+  "demands": [
+    {
+      "activated": true,
+      "enabled": true,
+      "name": "hd",
+      "title": "Heat"
+    },
+    {
+      "activated": false,
+      "enabled": true,
+      "name": "cd",
+      "title": "Cool"
+    },
+    {
+      "activated": false,
+      "enabled": false,
+      "name": "dhw",
+      "title": "DHW"
+    }
+  ],
+  "devID": 36,
+  "deviceType": "ECO",
+  "dhwOn": 0,
+  "dhwT": 123,
+  "dmd": 1,
+  "dot": 5,
+  "dst": 60,
+  "ecoCl": 0,
+  "ecoInfo": [],
+  "exTm": 24,
+  "fieldFirmwareCheck": false,
+  "firmVer": 2.08,
+  "hpStg": 1,
+  "hpSw": 30,
+  "htDif": 4,
+  "id": "65fc4be11eccbe1413b8d43f",
+  "lagOff": 30,
+  "lagT": 60,
+  "loLo": 0,
+  "mbt": 145,
+  "modRun": [],
+  "modStat": [],
+  "mst": 40,
+  "name": "AECO-2036",
+  "numStg": 3,
+  "p1PP": 60,
+  "p2PP": 60,
+  "pTest": 0,
+  "permCD": 0,
+  "permHD": 1,
+  "pgm": 0,
+  "pmp1Set": 0,
+  "pmp2Set": 5,
+  "prior": 0,
+  "production": {
+    "pin": "NH5EQ",
+    "productionDate": "2024-03-15T12:55:20.782Z"
+  },
+  "pumps": [
+    {
+      "activated": true,
+      "enabled": true,
+      "key": "pump1",
+      "title": "System",
+      "value": 0
+    },
+    {
+      "activated": false,
+      "enabled": true,
+      "key": "pump2",
+      "title": "None",
+      "value": 5
+    }
+  ],
+  "relStat": [
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "relays": [
+    false,
+    false,
+    false,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  ],
+  "reversingValve": {
+    "activated": false,
+    "title": "Reversing Valve"
+  },
+  "rotCy": 0,
+  "rotTi": 1,
+  "sDel1": 0,
+  "sDel2": 0,
+  "showPri": 0,
+  "stages": [
+    {
+      "activated": false,
+      "device": "AECO-2036",
+      "enabled": true,
+      "index": 1,
+      "runTime": "3170:00",
+      "title": "Stage 1"
+    },
+    {
+      "activated": false,
+      "device": "AECO-2036",
+      "enabled": true,
+      "index": 1,
+      "runTime": "3169:28",
+      "title": "Stage 2"
+    },
+    {
+      "activated": false,
+      "device": "AECO-2036",
+      "enabled": true,
+      "index": 1,
+      "runTime": "3172:00",
+      "title": "Stage 3"
+    }
+  ],
+  "stgRun": [
+    "3170:00",
+    "3169:28",
+    "3172:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00",
+    "0:00"
+  ],
+  "stgSeq": 0,
+  "syncCode": "AECO-2036",
+  "tB1": [
+    "TANK",
+    155.5,
+    152.6,
+    1
+  ],
+  "tB2": [
+    null,
+    null,
+    null,
+    0
+  ],
+  "tB3": [
+    "OUTDOOR",
+    78.1,
+    null,
+    0
+  ],
+  "tB4": [
+    null,
+    null,
+    null,
+    0
+  ],
+  "temperatures": [
+    {
+      "activated": true,
+      "activatedColor": "green",
+      "activatedState": "satisfied",
+      "current": 155.5,
+      "enabled": true,
+      "priority": {
+        "enabled": true,
+        "title": "Heating",
+        "type": "hot"
+      },
+      "target": 152.6,
+      "title": "Tank",
+      "type": "single"
+    },
+    {
+      "activated": false,
+      "activatedColor": null,
+      "activatedState": null,
+      "current": null,
+      "enabled": false,
+      "priority": {
+        "enabled": false,
+        "title": "Heating",
+        "type": "hot"
+      },
+      "target": null,
+      "title": null,
+      "type": null
+    },
+    {
+      "activated": false,
+      "activatedColor": null,
+      "activatedState": null,
+      "current": 78.1,
+      "enabled": true,
+      "priority": {
+        "enabled": false,
+        "title": "Heating",
+        "type": "hot"
+      },
+      "target": null,
+      "title": "Outdoor",
+      "type": "outdoor"
+    },
+    {
+      "activated": false,
+      "activatedColor": null,
+      "activatedState": null,
+      "current": null,
+      "enabled": false,
+      "priority": {
+        "enabled": false,
+        "title": "Heating",
+        "type": "hot"
+      },
+      "target": null,
+      "title": null,
+      "type": null
+    }
+  ],
+  "temps": {
+    "temp1": {
+      "actual": 155.5,
+      "color": 1,
+      "status": 1,
+      "target": 152.6,
+      "title": "TANK"
+    },
+    "temp2": {
+      "actual": null,
+      "color": null,
+      "status": null,
+      "target": null,
+      "title": null
+    },
+    "temp3": {
+      "actual": 78.1,
+      "color": null,
+      "status": null,
+      "target": null,
+      "title": "OUTDOOR"
+    },
+    "temp4": {
+      "actual": null,
+      "color": null,
+      "status": null,
+      "target": null,
+      "title": null
+    }
+  },
+  "tkPmp": 0,
+  "triggers": {
+    "fields": [
+      {
+        "label": "Tank",
+        "max": 250,
+        "measurement": "temperature",
+        "min": -99,
+        "operators": [
+          {
+            "label": "Exceeds",
+            "value": "greaterThan"
+          },
+          {
+            "label": "Drops below",
+            "value": "lessThan"
+          }
+        ],
+        "path": "temps.temp1.actual",
+        "type": "number"
+      },
+      {
+        "label": "Outdoor",
+        "max": 250,
+        "measurement": "temperature",
+        "min": -99,
+        "operators": [
+          {
+            "label": "Exceeds",
+            "value": "greaterThan"
+          },
+          {
+            "label": "Drops below",
+            "value": "lessThan"
+          }
+        ],
+        "path": "temps.temp3.actual",
+        "type": "number"
+      }
+    ]
+  },
+  "twoS": 0,
+  "units": 44,
+  "updatedAt": "2026-07-14T02:28:29.397Z",
+  "wPDif": 0,
+  "wVer": null,
+  "webOut": 0,
+  "wkd1B": 0,
+  "wkd1T": 10,
+  "wkd2B": 0,
+  "wkd2T": 20,
+  "wkd3B": 0,
+  "wkd3T": 60,
+  "wkd4B": 0,
+  "wkd4T": 80,
+  "wke1B": 0,
+  "wke1T": 10,
+  "wke2B": 0,
+  "wke2T": 20,
+  "wke3B": 0,
+  "wke3T": 60,
+  "wke4B": 0,
+  "wke4T": 80,
+  "wsd": {
+    "cwsd": {
+      "activated": false,
+      "title": "CWSD"
+    },
+    "wwsd": {
+      "activated": false,
+      "title": "WWSD"
+    }
+  },
+  "wwTime": 0,
+  "wwsd": 125
+}
