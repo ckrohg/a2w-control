@@ -83,39 +83,35 @@ function CurveField({
   const xs: number[] = [];
   for (let o = HX.min; o <= HX.max; o += 3) xs.push(o);
 
-  // iso-COP bands (fill between adjacent contours) + labeled contour lines
-  const levels = [1.7, 2, 2.5, 3, 3.5, 4, 5, 6.5];
-  const bands = levels.slice(0, -1).map((c1, i) => {
-    const c2 = levels[i + 1];
-    const top = xs.map((o) => `${X(o).toFixed(1)},${Y(clampY(isoW(c1, o))).toFixed(1)}`);
-    const bot = xs.slice().reverse().map((o) => `${X(o).toFixed(1)},${Y(clampY(isoW(c2, o))).toFixed(1)}`);
-    return { d: `M${top.join("L")}L${bot.join("L")}Z`, hue: copHue((c1 + c2) / 2) };
-  });
-  const contours = [2, 2.5, 3, 3.5, 4, 5].map((c) => {
+  // three iso-COP arcs, labeled ON the arc (rotated to its slope) so they can't be
+  // misread as gridlines or column headers
+  const contours = [
+    { c: 2, labelAt: 12 },
+    { c: 3, labelAt: 40 },
+    { c: 4, labelAt: 62 },
+  ].map(({ c, labelAt }) => {
     const pts = xs.map((o) => ({ o, w: isoW(c, o) })).filter((p) => p.w > HY.min + 1 && p.w < HY.max - 1);
-    return pts.length > 1 ? { c, pts } : null;
-  }).filter(Boolean) as { c: number; pts: { o: number; w: number }[] }[];
+    const w0 = isoW(c, labelAt - 3), w1 = isoW(c, labelAt + 3);
+    const angle = (Math.atan2(Y(w1) - Y(w0), X(labelAt + 3) - X(labelAt - 3)) * 180) / Math.PI;
+    return { c, pts, lx: X(labelAt), ly: Y(isoW(c, labelAt)), angle };
+  }).filter((c) => c.pts.length > 1);
 
   const maxN = Math.max(...bins.map((b) => b[2]));
   const envTop = xs.map((o) => `${X(o).toFixed(1)},${Y(hiF(o)).toFixed(1)}`);
   const envBot = xs.slice().reverse().map((o) => `${X(o).toFixed(1)},${Y(loF(o)).toFixed(1)}`);
 
+  // on-chart annotation with a dark halo so it stays readable over any layer
+  const Note = ({ x, y, anchor = "start", color = "#cfd8e3", size = 13, weight = 650, children }: {
+    x: number; y: number; anchor?: "start" | "middle" | "end"; color?: string; size?: number; weight?: number; children: React.ReactNode;
+  }) => (
+    <text x={x} y={y} textAnchor={anchor} fill={color} fontSize={size} fontWeight={weight}
+      paintOrder="stroke" stroke="#0f1419" strokeWidth={4} strokeLinejoin="round">{children}</text>
+  );
+
+  const hp1 = history.meta.asfound.hp1_setpoint_f, hp2 = history.meta.asfound.hp2_setpoint_f;
+
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: "auto", aspectRatio: "900/430" }}>
-      {bands.map((b, i) => (
-        <path key={`b${i}`} d={b.d} fill={`hsl(${b.hue} 65% 50%)`} fillOpacity={0.055} />
-      ))}
-      {contours.map(({ c, pts }) => (
-        <g key={`c${c}`}>
-          <path
-            d={pts.map((p, j) => `${j ? "L" : "M"}${X(p.o).toFixed(1)},${Y(p.w).toFixed(1)}`).join("")}
-            fill="none" stroke="#4a5866" strokeWidth={1} strokeDasharray="2 4"
-          />
-          <text x={X(pts[pts.length - 1].o) - 4} y={Y(pts[pts.length - 1].w) - 4}
-            fill="#5d6c7b" fontSize={12} textAnchor="end">COP {c}</text>
-        </g>
-      ))}
-
       {/* axes */}
       {[90, 110, 130, 150, 170].map((t) => (
         <g key={`y${t}`}>
@@ -126,38 +122,51 @@ function CurveField({
       {[0, 20, 40, 60, 80, 100].map((o) => (
         <text key={`x${o}`} x={X(o)} y={H - 8} fill="#8b98a5" fontSize={12} textAnchor="middle">{o}°F out</text>
       ))}
-      <line x1={X(5)} x2={X(5)} y1={pad.t} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.4} strokeDasharray="3 5" />
-      <text x={X(5) + 4} y={pad.t + 12} fill="#8b7355" fontSize={11}>design day 5°F</text>
+      <line x1={X(5)} x2={X(5)} y1={pad.t + 6} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.4} strokeDasharray="3 5" />
+      <Note x={X(5) + 5} y={Y(91)} color="#8b7355" size={11} weight={500}>design day 5°F</Note>
 
-      {/* before-era density cloud: hourly (outdoor, tank), 2°F bins */}
+      {/* iso-COP arcs */}
+      {contours.map(({ c, pts, lx, ly, angle }) => (
+        <g key={`c${c}`}>
+          <path
+            d={pts.map((p, j) => `${j ? "L" : "M"}${X(p.o).toFixed(1)},${Y(p.w).toFixed(1)}`).join("")}
+            fill="none" stroke="#5d6c7b" strokeWidth={1.2} strokeDasharray="2 5"
+          />
+          <text x={lx} y={ly - 5} fill="#8b98a5" fontSize={12} fontWeight={600} textAnchor="middle"
+            transform={`rotate(${angle.toFixed(1)} ${lx.toFixed(1)} ${(ly - 5).toFixed(1)})`}
+            paintOrder="stroke" stroke="#0f1419" strokeWidth={4} strokeLinejoin="round">COP {c} →</text>
+        </g>
+      ))}
+
+      {/* BEFORE: density cloud of hourly (outdoor, tank), 2°F bins */}
       {bins.filter((b) => b[1] >= HY.min && b[1] <= HY.max).map(([o, t, n], i) => (
         <rect key={`d${i}`} x={X(o - 1)} y={Y(t + 1)} width={X(o + 1) - X(o - 1)} height={Y(t - 1) - Y(t + 1)}
           fill="#4dabf7" fillOpacity={0.1 + 0.5 * (Math.log(n + 1) / Math.log(maxN + 1))} rx={1} />
       ))}
 
-      {/* as-found regime */}
+      {/* as-found regime: HBX target curve + parked HP setpoints */}
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(curveF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" />
-      <line x1={X(HX.min)} x2={X(HX.max)} y1={Y(history.meta.asfound.hp1_setpoint_f)} y2={Y(history.meta.asfound.hp1_setpoint_f)}
-        stroke="#63e6be" strokeWidth={1.3} strokeDasharray="2 3" />
-      <line x1={X(HX.min)} x2={X(HX.max)} y1={Y(history.meta.asfound.hp2_setpoint_f)} y2={Y(history.meta.asfound.hp2_setpoint_f)}
-        stroke="#f783ac" strokeWidth={1.3} strokeDasharray="2 3" />
+      {[hp1, hp2].map((sp) => (
+        <line key={sp} x1={X(HX.min)} x2={X(HX.max)} y1={Y(sp)} y2={Y(sp)}
+          stroke="#8b98a5" strokeWidth={1.1} strokeDasharray="2 4" />
+      ))}
 
-      {/* optimizer envelope */}
-      <path d={`M${envTop.join("L")}L${envBot.join("L")}Z`} fill="#e599f7" fillOpacity={0.13} />
+      {/* AFTER: optimizer envelope */}
+      <path d={`M${envTop.join("L")}L${envBot.join("L")}Z`} fill="#e599f7" fillOpacity={0.12} />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(hiF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#e599f7" strokeWidth={1.6} />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(loF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#e599f7" strokeWidth={1.6} />
 
-      {/* live: last 48 h of actual (outdoor, tank) + current point */}
+      {/* live: hourly means, last 24 h + current point */}
       {live.map((p, i) => (
-        <circle key={`l${i}`} cx={X(p.x)} cy={Y(clampY(p.y))} r={2.1} fill="#e6edf3" fillOpacity={0.85} />
+        <circle key={`l${i}`} cx={X(p.x)} cy={Y(clampY(p.y))} r={2.4} fill="#e6edf3" fillOpacity={0.8} />
       ))}
       {now && (
         <g>
           <circle cx={X(now.o)} cy={Y(clampY(now.t))} r={7} fill="none" stroke="#e6edf3" strokeWidth={1.6} />
-          <text x={X(now.o) + 11} y={Y(clampY(now.t)) + 4} fill="#e6edf3" fontSize={12.5} fontWeight={650}>now</text>
+          <Note x={X(now.o) + 11} y={Y(clampY(now.t)) + 4} color="#e6edf3">live now</Note>
         </g>
       )}
 
@@ -168,6 +177,23 @@ function CurveField({
           <title>{`${fmtTime(new Date(b.ts))} → ${b.tank_target_f}°F · ${b.reason} · modeled COP ${copAt(b.outdoor_f, b.tank_target_f).toFixed(2)}`}</title>
         </circle>
       ))}
+
+      {/* direct labels — read the chart without the legend */}
+      <Note x={X(34)} y={Y(171)} anchor="middle" color="#7cc0f5" size={13.5}>
+        BEFORE — tank held 150–165° in every season
+      </Note>
+      <Note x={X(104)} y={Y(hp2) + 15} anchor="end" color="#98a5b3" size={12} weight={550}>
+        HP setpoints parked 167° / 160°, 24/7
+      </Note>
+      <Note x={X(104)} y={Y(curveF(104)) - 8} anchor="end" color="#ffd666" size={12} weight={550}>
+        HBX target curve (as-found)
+      </Note>
+      <Note x={X(27)} y={Y(114)} anchor="middle" color="#eeb7fb" size={13.5}>
+        AFTER — the planner’s band: 95–135° by outdoor
+      </Note>
+      <Note x={X(84)} y={Y(106)} anchor="middle" color="#eeb7fb" size={12} weight={550}>
+        today’s plan, hour by hour
+      </Note>
     </svg>
   );
 }
@@ -179,7 +205,10 @@ function ReceiptChart({ points, receipt }: { points: { o: number; cop: number }[
   const X = (o: number) => pad.l + ((o - HX.min) / (HX.max - HX.min)) * (W - pad.l - pad.r);
   const Y = (c: number) => pad.t + (1 - (Math.min(c, y1) - y0) / (y1 - y0)) * (H - pad.t - pad.b);
   const line = (key: "measured" | "af" | "cur" | "pot", minN = 0) => {
-    const pts = receipt.filter((r) => r[key] != null && (key !== "measured" || (r.n ?? 0) >= minN));
+    // model lines stop at 65°F out — beyond that lift is tiny, the surface saturates
+    // at its validity clamp, and there is no heating load to save on anyway
+    const pts = receipt.filter((r) => r[key] != null &&
+      (key === "measured" ? (r.n ?? 0) >= minN : r.o <= 65));
     return pts.map((r, j) => `${j ? "L" : "M"}${X(r.o).toFixed(1)},${Y(r[key] as number).toFixed(1)}`).join("");
   };
   return (
@@ -313,10 +342,17 @@ export default async function CurvePage() {
   try {
     const slx = (await sql<SlxRow>`
       SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, tank_f, outdoor_f
-      FROM slx_readings WHERE ts >= now() - interval '48 hours' ORDER BY ts ASC`).rows;
+      FROM slx_readings WHERE ts >= now() - interval '24 hours' ORDER BY ts ASC`).rows;
     const pts = slx.filter((r) => r.outdoor_f != null && r.tank_f != null);
-    const step = Math.max(1, Math.floor(pts.length / 200));
-    live = pts.filter((_, i) => i % step === 0).map((r) => ({ x: r.outdoor_f as number, y: r.tank_f as number }));
+    // hourly means — a short readable trail instead of a 5-min scribble
+    const byHour = new Map<number, { sx: number; sy: number; n: number }>();
+    for (const r of pts) {
+      const h = Math.floor(r.ts / 3600);
+      const a = byHour.get(h) ?? { sx: 0, sy: 0, n: 0 };
+      a.sx += r.outdoor_f as number; a.sy += r.tank_f as number; a.n++;
+      byHour.set(h, a);
+    }
+    live = [...byHour.values()].map((a) => ({ x: a.sx / a.n, y: a.sy / a.n }));
     const last = pts[pts.length - 1];
     if (last && Date.now() / 1000 - last.ts < 1200) now = { o: last.outdoor_f as number, t: last.tank_f as number };
     const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
@@ -379,26 +415,22 @@ export default async function CurvePage() {
 
       <div className="chart-block">
         <h3>
-          Where the tank lives — outdoor °F × tank °F
-          <span className="dim"> (blue cloud = 8 months as-found · purple band = where the planner operates · dotted arcs = modeled COP)</span>
+          Where the tank lives — blue = the old regime, purple = the planner
+          <span className="dim"> (outdoor °F across, tank °F up)</span>
         </h3>
         <div className="chart">
           <CurveField bins={history.bins_tank} live={live} blocks={blocks} now={now} />
         </div>
         <div className="legend">
-          <span><i style={{ background: "#4dabf7", opacity: 0.6 }} />tank, hourly {era} (density)</span>
-          <span><i style={{ background: "#ffd666" }} />as-found HBX target curve</span>
-          <span><i style={{ background: "#63e6be" }} />HP1 setpoint 167°F (24/7)</span>
-          <span><i style={{ background: "#f783ac" }} />HP2 setpoint 160°F (24/7)</span>
-          <span><i style={{ background: "#e599f7" }} />I4 envelope + today&apos;s plan blocks{shadowAt ? ` (computed ${fmtTime(shadowAt)})` : ""}</span>
-          <span><i style={{ background: "#e6edf3" }} />live, last 48 h</span>
+          <span><i style={{ background: "#4dabf7", opacity: 0.6 }} />each blue square = hours spent there, {era}</span>
+          <span><i style={{ background: "#e599f7" }} />purple dots = today&apos;s plan{shadowAt ? ` (computed ${fmtTime(shadowAt)})` : ""} — hover for the why</span>
+          <span><i style={{ background: "#e6edf3" }} />white = live, last 24 h</span>
         </div>
         <div className="meta">
-          How to read it: height above an iso-COP arc is wasted lift — heat pumped hotter than anything needed it.
-          The old regime held the top-left of the chart in every season (the target scatter sits on the yellow line
-          with σ {m.asfound.mined_fit.sigma}°F); the planner’s band hugs the arcs where COP is 3–4+. At the cold end
-          the yellow curve meets the pumps’ ceiling — the deadlock where calls couldn’t terminate. Hover a purple dot
-          for the hour’s reason and modeled COP.
+          Lower is cheaper: each dotted arc is a line of constant modeled COP, so a tank run 20–40° cooler in mild
+          weather lands on a much better arc. For eight months every hour sat in the blue cloud — 150–165° water
+          whether it was 10° or 90° outside (COP ~2–2.5). The purple band is where the planner commands the same
+          service instead (COP 3–4+). The white trail is still riding the old curve — Phase B isn&apos;t enabled yet.
         </div>
       </div>
 
@@ -417,9 +449,8 @@ export default async function CurvePage() {
           The gray dashed line is the model evaluated where the system actually ran — its agreement with the blue
           measured line is what makes the purple lines credible. The wedge between blue and purple is the claim,
           in COP units. Absolute measured COP carries tank-volume uncertainty (A-4); the flatness is the load-bearing fact.
-          Above ~50°F outdoor the model runs optimistic (standby losses dominate measured mild-weather charges) and
-          saturates at its validity clamp of 6 — read the purple lines as upper bounds; the $ math uses only the
-          day-by-day ratio, not the absolute level.
+          Model lines stop at 65°F out (no heating load beyond it, and the model runs optimistic where standby losses
+          dominate) — read the purple lines as upper bounds; the $ math uses only the day-by-day ratio.
         </div>
       </div>
 
