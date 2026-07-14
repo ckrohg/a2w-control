@@ -128,9 +128,11 @@
   `baseline_setpoint_c` = 48 °C, lease primitive with baseline revert, renew-without-rewrite.
 - Reg 2027 (unit max-water param) ships at 55 °C and caps reg 2003/2004.
 - Railway hub (Pi dials out over WS) + Vercel dashboard; Tailscale Funnel fallback.
-- ⚠️ **HP2's CN22 BMS port is non-functional at the board** (controlled A/B comparison,
-  2026-07-13). Until repaired, dynamic setpoint control exists for **HP1 only** — §5.4
-  turns this from a blocker into a lead/lag configuration decision.
+- ⚠️ HP2's CN22 BMS port was called non-functional after a controlled A/B comparison
+  (2026-07-13) — **owner correction 2026-07-14: CN22 is in active use and nothing is
+  dead; treat that verdict as superseded** (HP2 also had a failure-to-start issue in the
+  same period, since fixed, which muddied diagnosis). Verify HP2 polls on the bridge at
+  the next check; §5.4 stands only as the phantom-slot note until then.
 
 ### 2.4 Owner-confirmed facts (2026-07-13)
 
@@ -321,8 +323,11 @@ Mitigation that preserves most of the savings:
   HP2 joins as stage 2 mainly in cold weather, when high water temps are needed anyway and
   the COP penalty of its static setpoint is smallest. Trade-off to accept knowingly:
   asymmetric compressor run-hours.
-- Pursue the board-repair question with Winnie in the already-owed reply (series number +
-  forced-defrost register + now the CN22-dead-port question).
+- **Winnie thread CLOSED (owner, 2026-07-14):** the serial number was already sent, she
+  answered everything needed, and CN22 comms are in active production use — nothing is
+  owed and no repair thread is open. Standing check: confirm HP2 polls on the bridge
+  dashboard at the next hardware session; once it does, this section's constraint is void
+  and rotation-off remains purely the phantom-slot mitigation (§5.5).
 
 ### 5.5 The 16.5 kW element — rules of engagement (added 2026-07-13 after A-1)
 
@@ -363,11 +368,12 @@ operational truth; HBX counters are only useful for call-pattern analysis.
   circuit + `bkRun` counter + relay state) and alerts while the planner is active —
   element runtime on a genuinely design-cold day is legitimate; any other firing is a
   planner bug to post-mortem.
-- **R4 — leave the HBX triggers as the safety net.** One recommended app-side tightening
-  for the owner to consider: `bkTemp` 90 → ~15–20 °F (element only *permitted* when it's
-  genuinely cold). Trade-off to weigh: with `bkTemp` low, a pump failure on a 40 °F day
-  won't get element rescue — acceptable only because A2W's alerting now notices a dead
-  pump the same day and the mini-splits exist. Owner's call; reversible in the app.
+- **R4 — HBX triggers stay exactly as-found (owner decision 2026-07-14).** `bkTemp`
+  stays 90 °F deliberately: the element must remain a true year-round backup — (a) rescue
+  if both HPs fail, and (b) surge capacity when demand outruns the compressors (the
+  huge-bathtub case: a lot of piping-hot water needed fast). False-trigger protection is
+  the planner's job via R1–R3 — reachable targets keep the 230-min lag timer from ever
+  expiring falsely — not the HBX gates' job.
 
 **The phantom slot 3 (damaged HBX, replacement in a few months):**
 - **Keep `numStg`=3 until the new HBX** — dropping to 2 would relocate the backup onto
@@ -587,7 +593,12 @@ threshold, planner dead-man. Same discipline as ever: P17-class noise never page
   toward the tank target + margin and watch reg 2051/2063: confirms LWT follows setpoint,
   measures the COP delta that funds this whole plan, and calibrates the I1 margin.
 - A-5: **Shadow planner** — compute the day plan, write it nowhere, log it, chart
-  "planned vs actual" on the dashboard.
+  "planned vs actual" on the dashboard. Summer version (DHW-only loads) needs no TempIQ
+  data; the winter version's binding-zone math depends on A-7.
+- A-7: **TempIQ insights seam — FILED as [ckrohg-org/TempIQv2#1470](https://github.com/ckrohg-org/TempIQv2/issues/1470)**
+  (2026-07-14): generic token-scoped read-only insights API (zone UA/thermal mass, COP
+  points with `sinkTempF`, zone-energy). A TempIQ agent builds it in that repo; **circle
+  back here before heating season** to wire the planner as its first consumer.
 - A-6: **Freeze the baseline** (gate for Phase B — nothing may change before this):
   record the as-found operating point — HP setpoints (owner: 75 °C at all times; the
   register snapshot confirms, including reg 2027, whose factory default of 55 °C would

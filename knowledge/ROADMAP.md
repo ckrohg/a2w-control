@@ -61,9 +61,9 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
       show only in the UI — nobody gets paged. Options: ntfy.sh (free, no account),
       Pushover (~$5 once), or email. Fully buildable + testable against the sim now.
 - [x] Winnie: BMS port/pinout **ANSWERED 2026-07-07** — CN22, pins 2/3/4=GND/A/B, separate
-      bus, slave addr 1, no activation (`reference/winnie-bms-port-reply.md`). ⚠️ Still owed
-      her: **reply with the series/model number (MAHRW030ZA/BEH2)** she requested — and add
-      the forced-defrost-register question in that same reply.
+      bus, slave addr 1, no activation (`reference/winnie-bms-port-reply.md`).
+      **THREAD CLOSED 2026-07-14 (owner):** serial number was sent, everything needed is
+      answered, CN22 in active production use — nothing further owed either direction.
 
 ## Next — W610 prep + Phases 1–2
 
@@ -109,7 +109,12 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 
 ## External dependencies
 
-- Winnie @ Guangdong Macon (emailed 2026-07-04, **REPLIED 2026-07-07** → `reference/winnie-bms-port-reply.md`):
-  - **ANSWERED:** CN22 = BMS RS-485 port; pinout 1=12V/2=GND/3=A(+)/4=B(−); CN22 separate bus from CN23 (wall controller must stay connected); no activation/DIP/param; default slave address = 1.
-  - **⚠️ Owed back to her:** the **series/model number (MAHRW030ZA/BEH2)** she asked for so she can confirm against the exact board revision. Bundle the still-open **forced-defrost register** question with it (manual §2.6 — the one true control gap).
-  - Non-blocking extras still worth asking in that reply: units of 2063/2088 power regs, temp scaling (1 vs 0.1 °C/bit), what reg 2092 really is (current vs voltage).
+- Winnie @ Guangdong Macon — **THREAD CLOSED 2026-07-14 (owner):** serial number sent,
+  everything needed answered (CN22 = BMS port, pinout, separate bus, no activation, slave
+  addr 1 → `reference/winnie-bms-port-reply.md`), CN22 in active production use. Any
+  remaining register curiosities (2092 meaning, forced-defrost) resolve at commissioning
+  by observation, not by email.
+- TempIQ insights API — **FILED 2026-07-14 as [ckrohg-org/TempIQv2#1470](https://github.com/ckrohg-org/TempIQv2/issues/1470)**
+  (generic token-scoped read-only learned-metrics/COP API; a TempIQ agent builds it).
+  **Circle back before heating season** — the winter shadow planner consumes it
+  (optimization plan §7 A-7).
