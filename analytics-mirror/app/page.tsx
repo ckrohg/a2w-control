@@ -179,23 +179,26 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
             </div>
 
             <div className="card">
-              <h2>Plan<span className="chip">shadow</span></h2>
+              <h2>Planner (practice mode)<span className="chip">not in control</span></h2>
               {nowBlock ? (
                 <>
                   <div className="temps">
-                    <div className="temp"><div className="v">{nowBlock.tank_target_f}°</div><div className="l">Would target</div></div>
-                    <div className="temp"><div className="v">{nowBlock.hp1_setpoint_f}°</div><div className="l">Would set HP1</div></div>
-                    <div className="temp"><div className="v">{fmt(slx?.tank_target_f, 0)}°</div><div className="l">HBX actual</div></div>
+                    <div className="temp"><div className="v">{fmt(slx?.tank_target_f, 0)}°</div><div className="l">Running now</div></div>
+                    <div className="temp"><div className="v">{nowBlock.tank_target_f}°</div><div className="l">Plan says enough</div></div>
                   </div>
-                  <div className="meta">now: {nowBlock.reason}</div>
+                  <div className="meta">
+                    The planner is rehearsing, not steering: right now it would run the tank at
+                    {" "}{nowBlock.tank_target_f}°F ({nowBlock.reason}).
+                  </div>
                   {nextAction && (
                     <div className="meta">
-                      next: {new Date(nextAction.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → {nextAction.tank_target_f}°F · {nextAction.reason}
+                      Next move it would make: {new Date(nextAction.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} → {nextAction.tank_target_f}°F ({nextAction.reason}).
+                      {" "}<a href="/savings" style={{ color: "#4dabf7" }}>what that&apos;s worth →</a>
                     </div>
                   )}
                 </>
               ) : (
-                <div className="meta">No shadow plan yet — the planner computes hourly.</div>
+                <div className="meta">No practice plan yet — the planner computes one hourly.</div>
               )}
             </div>
           </div>
