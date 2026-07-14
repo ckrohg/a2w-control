@@ -817,8 +817,14 @@ async def test_auto_rediscovery_follows_the_mac(rig):
     poller._discoverer = fake_discover
 
     await pump.server.shutdown()               # original gateway vanishes
-    for _ in range(3):
-        await poller.poll_once()               # hits offline threshold -> rediscovery
+    # The poller's client holds an established connection and shutdown() only closes the
+    # listener — on a slow runner (CI) the old socket can serve one extra poll before it
+    # drops. Poll until the offline threshold trips and rediscovery lands (bounded, not
+    # a fixed count), then assert the switch actually happened.
+    for _ in range(8):
+        await poller.poll_once()
+        if poller.cfg.port == pump2.port:
+            break
     await poller.poll_once()                   # next poll uses the new address
     assert poller.cfg.port == pump2.port
     assert poller.online
