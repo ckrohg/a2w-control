@@ -58,11 +58,77 @@ export class Store {
         computed_at timestamptz NOT NULL DEFAULT now(),
         plan        jsonb NOT NULL
       );
+      ALTER TABLE shadow_plans ADD COLUMN IF NOT EXISTS meta jsonb;
+      CREATE TABLE IF NOT EXISTS plan_scores (
+        hour_ts          timestamptz PRIMARY KEY,
+        shadow_target_f  real,
+        actual_target_f  real,
+        actual_tank_f    real,
+        gap_f            real,
+        plan_computed_at timestamptz
+      );
     `);
   }
 
-  async insertShadowPlan(plan: unknown): Promise<void> {
-    await this.pool.query(`INSERT INTO shadow_plans (plan) VALUES ($1)`, [JSON.stringify(plan)]);
+  async insertShadowPlan(plan: unknown, meta: unknown): Promise<void> {
+    await this.pool.query(`INSERT INTO shadow_plans (plan, meta) VALUES ($1, $2)`, [
+      JSON.stringify(plan), JSON.stringify(meta),
+    ]);
+  }
+
+  /** tank_f history for the DHW learner (ascending). */
+  async getTankHistory(days: number): Promise<{ ts: Date; tankF: number }[]> {
+    const res = await this.pool.query(
+      `SELECT ts, tank_f FROM slx_readings
+       WHERE ts >= now() - ($1 || ' days')::interval AND tank_f IS NOT NULL
+       ORDER BY ts ASC`,
+      [days],
+    );
+    return res.rows.map((r) => ({ ts: new Date(r.ts), tankF: Number(r.tank_f) }));
+  }
+
+  /** All shadow plans computed in the last N hours (ascending). */
+  async recentPlans(hours: number): Promise<{ computedAt: Date; plan: any[] }[]> {
+    const res = await this.pool.query(
+      `SELECT computed_at, plan FROM shadow_plans
+       WHERE computed_at >= now() - ($1 || ' hours')::interval
+       ORDER BY computed_at ASC`,
+      [hours],
+    );
+    return res.rows.map((r) => ({ computedAt: new Date(r.computed_at), plan: r.plan }));
+  }
+
+  /** Hourly averages of actual HBX target + tank for completed hours (ascending). */
+  async hourlyActuals(hours: number): Promise<{ hour: Date; targetF: number | null; tankF: number | null }[]> {
+    const res = await this.pool.query(
+      `SELECT date_trunc('hour', ts) AS h, avg(tank_target_f) AS target_f, avg(tank_f) AS tank_f
+       FROM slx_readings
+       WHERE ts >= now() - ($1 || ' hours')::interval AND ts < date_trunc('hour', now())
+       GROUP BY 1 ORDER BY 1 ASC`,
+      [hours],
+    );
+    return res.rows.map((r) => ({
+      hour: new Date(r.h),
+      targetF: r.target_f == null ? null : Number(r.target_f),
+      tankF: r.tank_f == null ? null : Number(r.tank_f),
+    }));
+  }
+
+  async upsertPlanScore(s: {
+    hourTs: Date; shadowTargetF: number; actualTargetF: number | null;
+    actualTankF: number | null; gapF: number | null; planComputedAt: Date;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO plan_scores (hour_ts, shadow_target_f, actual_target_f, actual_tank_f, gap_f, plan_computed_at)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (hour_ts) DO UPDATE SET
+         shadow_target_f = EXCLUDED.shadow_target_f,
+         actual_target_f = EXCLUDED.actual_target_f,
+         actual_tank_f   = EXCLUDED.actual_tank_f,
+         gap_f           = EXCLUDED.gap_f,
+         plan_computed_at = EXCLUDED.plan_computed_at`,
+      [s.hourTs, s.shadowTargetF, s.actualTargetF, s.actualTankF, s.gapF, s.planComputedAt],
+    );
   }
 
   async insertReading(r: SlxReading): Promise<void> {

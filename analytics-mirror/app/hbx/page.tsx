@@ -92,6 +92,7 @@ type SlxRow = {
 type PumpRow = { ts: number; pump_id: string; setpoint_c: number | null };
 type VersionRow = { id: number; t: number; changed_fields: Record<string, { old: unknown; new: unknown }> | null };
 type ShadowBlock = { ts: string; outdoor_f: number; tank_target_f: number; hp1_setpoint_f: number; reason: string };
+type ShadowMeta = { dhw_windows?: [number, number][]; windows_learned?: boolean; learn_days?: number; draw_events?: number };
 
 export default async function HbxPage({ searchParams }: { searchParams: { hours?: string } }) {
   const hours = searchParams.hours === "168" ? 168 : 24;
@@ -104,6 +105,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let versions: VersionRow[] = [];
   let shadow: ShadowBlock[] | null = null;
   let shadowAt: number | null = null;
+  let shadowMeta: ShadowMeta | null = null;
+  let gap: { avg: number; n: number } | null = null;
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -119,9 +122,16 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
       SELECT id, EXTRACT(EPOCH FROM observed_at)::float8 AS t, changed_fields
       FROM hbx_config_versions ORDER BY id DESC LIMIT 12`).rows;
     try {
-      const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
-      if (sp.rowCount) { shadow = sp.rows[0].plan as ShadowBlock[]; shadowAt = sp.rows[0].t as number; }
-    } catch { /* table appears with the first planner deploy that computes a plan */ }
+      const sp = await sql`SELECT plan, meta, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
+      if (sp.rowCount) {
+        shadow = sp.rows[0].plan as ShadowBlock[];
+        shadowAt = sp.rows[0].t as number;
+        shadowMeta = (sp.rows[0].meta ?? null) as ShadowMeta | null;
+      }
+      const g = await sql`SELECT avg(gap_f)::float8 AS avg_gap, count(gap_f)::int AS n
+                          FROM plan_scores WHERE hour_ts >= now() - interval '24 hours'`;
+      if (g.rowCount && g.rows[0].n > 0) gap = { avg: g.rows[0].avg_gap as number, n: g.rows[0].n as number };
+    } catch { /* tables appear with the first planner deploy that computes a plan */ }
   } catch {
     dbError = true;
   }
@@ -247,6 +257,13 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                 <span><i style={{ background: "#ffd666" }} />Shadow tank target</span>
                 <span><i style={{ background: "#63e6be" }} />Shadow HP1 setpoint</span>
                 <span><i style={{ background: "#845ef7" }} />Forecast outdoor</span>
+              </div>
+              <div className="meta">
+                DHW windows: {shadowMeta?.dhw_windows?.map(([a, b2]) => `${String(a).padStart(2, "0")}–${String(b2).padStart(2, "0")}`).join(", ") ?? "06–09, 17–22"}
+                {" "}({shadowMeta?.windows_learned
+                  ? `learned from ${shadowMeta.learn_days}d / ${shadowMeta.draw_events} draws`
+                  : "defaults — learner activates after 5 days of tank history"})
+                {gap && <> · 24h opportunity gap: actual target ran <b>{gap.avg >= 0 ? "+" : ""}{gap.avg.toFixed(1)}°F</b> above shadow ({gap.n} hrs scored)</>}
               </div>
               {shadow.filter((b) => !b.reason.startsWith("idle")).slice(0, 8).map((b, i) => (
                 <div className="meta" key={i}>

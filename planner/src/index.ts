@@ -12,6 +12,7 @@ import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
 import { HubClient } from "./hub";
 import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
+import { learnDhwWindows } from "./dhw";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -127,15 +128,66 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
 async function shadowOnce(): Promise<void> {
   const forecast = await fetchForecast(LAT, LON);
   const cfg = await store.latestConfig();
-  const plan = computeShadowPlan(forecast, cfg);
+
+  // learned DHW windows once ≥5 days of tank history exist; fixed defaults until then
+  let learned = null;
+  try {
+    learned = learnDhwWindows(await store.getTankHistory(14));
+  } catch (e) {
+    console.warn("dhw learner failed, using default windows:", (e as Error).message);
+  }
+  const opts = learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows } : DEFAULT_OPTS;
+
+  const plan = computeShadowPlan(forecast, cfg, opts);
   if (!plan.length) throw new Error("empty forecast");
-  await store.insertShadowPlan(plan);
+  await store.insertShadowPlan(plan, {
+    dhw_windows: opts.dhwWindows,
+    windows_learned: !!learned,
+    learn_days: learned?.days ?? 0,
+    draw_events: learned?.drawEvents ?? 0,
+  });
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);
   console.log(
-    `shadow plan: ${plan.length} blocks, targets ${Math.min(...targets)}–${Math.max(...targets)}°F ` +
-    `(vs live HBX curve ~153°F) — first: ${plan[0].reason}`,
+    `shadow plan: ${plan.length} blocks, targets ${Math.min(...targets)}–${Math.max(...targets)}°F, ` +
+    `windows ${JSON.stringify(opts.dhwWindows)} (${learned ? `learned, ${learned.days}d/${learned.drawEvents} draws` : "defaults"})`,
   );
+}
+
+/**
+ * Plan-vs-actual: for each completed hour, score the shadow block from the most recent
+ * plan computed BEFORE that hour against what HBX actually targeted. gap_f > 0 = the
+ * as-found system ran hotter than the shadow plan wanted — the opportunity, in °F-hours.
+ */
+async function scoreOnce(): Promise<void> {
+  const [plans, actuals] = await Promise.all([store.recentPlans(30), store.hourlyActuals(26)]);
+  if (!plans.length || !actuals.length) return;
+  let scored = 0;
+  const gaps: number[] = [];
+  for (const a of actuals) {
+    const eligible = plans.filter((p) => p.computedAt < a.hour);
+    if (!eligible.length) continue;
+    const plan = eligible[eligible.length - 1];
+    const block = plan.plan.find(
+      (b: { ts: string }) => new Date(b.ts).getTime() === a.hour.getTime(),
+    );
+    if (!block) continue;
+    const gap = a.targetF == null ? null : a.targetF - block.tank_target_f;
+    await store.upsertPlanScore({
+      hourTs: a.hour,
+      shadowTargetF: block.tank_target_f,
+      actualTargetF: a.targetF,
+      actualTankF: a.tankF,
+      gapF: gap,
+      planComputedAt: plan.computedAt,
+    });
+    scored++;
+    if (gap != null) gaps.push(gap);
+  }
+  if (scored) {
+    const avg = gaps.length ? gaps.reduce((s, g) => s + g, 0) / gaps.length : NaN;
+    console.log(`plan-vs-actual: scored ${scored} hours, avg gap ${isNaN(avg) ? "—" : `+${avg.toFixed(1)}°F`} (actual target above shadow)`);
+  }
 }
 
 async function pollOnce(): Promise<void> {
@@ -192,6 +244,7 @@ async function main(): Promise<void> {
   if (process.env.POLL_ONCE === "1") {
     await pollOnce();
     await shadowOnce();
+    await scoreOnce();
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -214,7 +267,10 @@ async function main(): Promise<void> {
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);
-  const shadowLoop = () => shadowOnce().catch((e) => console.error("shadow plan failed:", (e as Error).message));
+  const shadowLoop = () =>
+    shadowOnce()
+      .then(() => scoreOnce())
+      .catch((e) => console.error("shadow/score failed:", (e as Error).message));
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
 }
