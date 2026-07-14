@@ -50,12 +50,14 @@ the wall controller's own power button).
 
 ---
 
-## Result (fill in)
+## Result — ANSWERED
 
-- Date/time: ____
-- Pump that took the DHW call: ____
-- Outcome: ☐ call wins ☐ Modbus wins ☐ cyclic re-assert (period: ____)
-- Notes (compressor stop/start timing, wall-controller behavior): ____
-
-**Consequences:** update `heatpump-bridge-handoff.md` §6.4 and the Phase E gate in
-`HARDWARE-DAY.md` with the answer; set the standing write posture accordingly.
+- Date/time: 2026-07-13 (evening, DHW call window)
+- Outcome: ☑ **Modbus wins** — a Modbus power-off written during an active heat call
+  stops the compressor. Software CAN hold heat off while the HBX is calling.
+- Consequence: the write guardrails are **load-bearing**, not belt-and-suspenders:
+  the winter-safe floor (`unattended_min_setpoint_c`), attended-only power/mode writes
+  (`restrict_unattended_writes`), and the optimizer lease-revert are the mechanisms that
+  keep a wrong write from freezing the house. They stay strict, permanently.
+- Details/measurements: recorded in subsequent session journals (see also the I1-margin
+  work measuring HBX termination behavior).
