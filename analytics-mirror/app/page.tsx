@@ -123,6 +123,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
         <h1>A2W Control</h1>
         <span className="dim">home</span>
         <a className="btn" href="/hbx" style={{ marginLeft: "auto", textDecoration: "none" }}>HBX</a>
+        <a className="btn" href="/curve" style={{ textDecoration: "none" }}>Curve</a>
         <a className="btn" href="/savings" style={{ textDecoration: "none" }}>Savings</a>
         <a className="btn" href="/advanced" style={{ textDecoration: "none" }}>Advanced</a>
         <a className="btn" href="/control" style={{ textDecoration: "none" }}>Control</a>

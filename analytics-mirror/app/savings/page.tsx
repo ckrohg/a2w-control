@@ -76,7 +76,8 @@ export default async function SavingsPage() {
       <header>
         <h1>Savings</h1>
         <span className="dim">shadow mode — measuring what optimization is worth, not acting yet</span>
-        <a className="btn" href="/" style={{ marginLeft: "auto", textDecoration: "none" }}>Home</a>
+        <a className="btn" href="/curve" style={{ marginLeft: "auto", textDecoration: "none" }}>Curve</a>
+        <a className="btn" href="/" style={{ textDecoration: "none" }}>Home</a>
         <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
       </header>
 

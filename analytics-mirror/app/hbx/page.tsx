@@ -166,6 +166,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
         <h1>HBX — Buffer Tank</h1>
         <span className="dim">ECO-0600 via SensorLinx · 5-min polls</span>
         <a className="btn" href="/" style={{ marginLeft: "auto", textDecoration: "none" }}>Pumps</a>
+        <a className="btn" href="/curve" style={{ textDecoration: "none" }}>Curve</a>
         <a className="btn" href="/control" style={{ textDecoration: "none" }}>Control</a>
         <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
       </header>
