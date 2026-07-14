@@ -30,6 +30,7 @@ export default async function SavingsPage() {
   let elementCallH7d = 0;
   let hygieneHoursAgo: number | null = null;
   let writes: { ts: number; source: string; action: string; result: string; detail: string }[] = [];
+  let episodes: { s: number; c: number | null; detail: string }[] = [];
   let dbError = false;
 
   try {
@@ -51,6 +52,12 @@ export default async function SavingsPage() {
     writes = (await sql`
       SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, source, action, result, detail
       FROM hbx_writes ORDER BY id DESC LIMIT 8`).rows as any[];
+    try {
+      episodes = (await sql`
+        SELECT EXTRACT(EPOCH FROM started_at)::float8 AS s,
+               EXTRACT(EPOCH FROM cleared_at)::float8 AS c, detail
+        FROM i1_episodes ORDER BY id DESC LIMIT 6`).rows as any[];
+    } catch { /* table appears with the planner deploy that persists episodes */ }
   } catch {
     dbError = true;
   }
@@ -156,6 +163,18 @@ export default async function SavingsPage() {
               <div className="meta" key={i}>
                 {fmtDateTime(w.ts)} ·
                 {" "}<b style={{ color: w.result === "accepted" ? "var(--ok)" : "var(--warm)" }}>{w.result}</b> · {w.detail}
+              </div>
+            ))}
+          </div>
+
+          <div className="chart-block">
+            <h3>Conflict incidents <span className="dim">(times a pump setpoint sat below what the tank target required)</span></h3>
+            {episodes.length === 0 ? (
+              <div className="meta">None recorded since episode tracking began.</div>
+            ) : episodes.map((e, i) => (
+              <div className="meta" key={i}>
+                {fmtDateTime(e.s)} → {e.c ? fmtDateTime(e.c) : <b style={{ color: "var(--crit)" }}>ongoing</b>}
+                {e.c ? ` (${((e.c - e.s) / 3600).toFixed(1)}h)` : ""} · {e.detail}
               </div>
             ))}
           </div>

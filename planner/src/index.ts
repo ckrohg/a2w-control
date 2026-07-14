@@ -143,6 +143,27 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   }
 }
 
+/** I8 thermal hygiene (plan §5.1): page if a rolling 26 h passes without the tank
+ *  spending time ≥131 °F — the DHW coil's potable slug must get its daily hot soak.
+ *  Checked hourly alongside the shadow loop; edge-alerted with a clear once satisfied.
+ *  Trivially satisfied under as-found temps; load-bearing once optimized targets run. */
+let i8Alerted = false;
+async function checkI8(): Promise<void> {
+  const res = await store.getRecentSeries(26);
+  const hot = res.some((r) => r.tankF != null && r.tankF >= 131);
+  if (!hot && !i8Alerted && res.length > 200) { // require a mostly-complete window
+    i8Alerted = true;
+    await ntfy(
+      "I8 hygiene: no 131°F tank excursion in 26h",
+      "The DHW coil's potable slug hasn't had its daily hot soak. Boost the tank target to 131°F+ for an hour (Control → HBX card), or check why the planner's sanitize boost didn't run.",
+      "high",
+    );
+  } else if (hot && i8Alerted) {
+    i8Alerted = false;
+    await ntfy("I8 hygiene satisfied", "Tank reached ≥131°F — daily soak requirement met.");
+  }
+}
+
 /** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
  *  page — legitimate on a design-cold day, a planner bug or config drift any other time.
  *  Edge-triggered; the element's actual runtime (breaker permitting) lives in SPAN. */
@@ -348,7 +369,8 @@ async function main(): Promise<void> {
     shadowOnce()
       .then(() => scoreOnce())
       .then(() => decayScanOnce(store).then(() => {}))
-      .catch((e) => console.error("shadow/score/decay failed:", (e as Error).message));
+      .then(() => checkI8())
+      .catch((e) => console.error("shadow/score/decay/i8 failed:", (e as Error).message));
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
 }
