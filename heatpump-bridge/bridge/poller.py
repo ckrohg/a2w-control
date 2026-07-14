@@ -66,7 +66,10 @@ class PumpPoller:
         self.identity_ok: bool = True   # MAC-vs-IP verification (see _check_identity)
         self._mac_resolver = get_mac_for_ip  # injectable for tests
         self._discoverer = discover          # injectable for tests
-        self._last_rediscover = 0.0
+        # -inf, NOT 0.0: time.monotonic() is ~seconds-since-boot on Linux, so a 0.0 seed
+        # silently suppresses the first rediscovery for REDISCOVER_MIN_INTERVAL_S after a
+        # reboot — exactly the post-power-blip window where DHCP reshuffles need healing.
+        self._last_rediscover = float("-inf")
         self.on_gateway_change = None   # optional async callback(pump_id, host, port)
         # _write_lock makes guardrail check-then-act atomic under concurrent requests
         # (rate limit was bypassable by requests arriving during a slow 2400-baud write);
