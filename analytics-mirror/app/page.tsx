@@ -8,6 +8,11 @@ import { I1Banner } from "./i1-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// force-no-store matters as much as force-dynamic: @vercel/postgres runs over HTTP fetch,
+// and parameterless queries (identical request bodies) otherwise hit Vercel's Data Cache —
+// the tank card once fossilized on a 10-hour-old row this way while parameterized queries
+// (changing ${since}) stayed fresh.
+export const fetchCache = "force-no-store";
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 0) => (v == null ? "—" : v.toFixed(d));

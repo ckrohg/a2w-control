@@ -6,6 +6,7 @@ import ControlClient from "./control-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store"; // the I1 banner's queries are parameterless (see home page note)
 
 export default function ControlPage() {
   return (

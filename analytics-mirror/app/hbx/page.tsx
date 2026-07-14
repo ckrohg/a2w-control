@@ -8,6 +8,7 @@ import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store"; // parameterless sql = cacheable fetch bodies (see home page note)
 
 const I1_MARGIN_F = 8; // target + ½·diff + margin ≈ target + 8 °F (plan §3; calibrated by A-4)
 
