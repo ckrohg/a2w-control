@@ -4,6 +4,7 @@
 // target+margin vs HP setpoints vs outdoor — crossing lines = the deadlock), the reset
 // curve card (configured line vs observed scatter), and the config-drift version history.
 import { sql } from "@vercel/postgres";
+import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -164,6 +165,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
         <a className="btn" href="/control" style={{ textDecoration: "none" }}>Control</a>
         <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
       </header>
+
+      <I1Banner />
 
       <div className="controls">
         <div className="seg">
