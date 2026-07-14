@@ -81,6 +81,7 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
       if it landed, `unconfirmed` if unknowable, never a bare `failed` for a write that may
       have applied.
 - [x] Phase 2: flip write_enabled on pump 1; confirm wall controller reflects the change. **DONE 2026-07-13.**
+- [x] **A-6 baseline FROZEN 2026-07-14** → `reference/a6-baseline.md`: weather-normalized ledger model (base 50°F + solar term, r²=0.66, monthly-claim-grade) in Neon `baseline_model`; register half rides `release-20260714-1`.
 - [x] **A-4 charge-dynamics test DONE 2026-07-14** → `reference/a4-results.md`: LWT follows setpoint (with min-modulation tail overshoot), HBX terminated at +3.1°F margin (I1 margin now 5°F), Modbus-off overrides an active HBX call, reg 2088 = inverter-only confirmed live.
 
 ## Later — Phases 3–4
