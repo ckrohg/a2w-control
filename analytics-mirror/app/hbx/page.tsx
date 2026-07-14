@@ -11,7 +11,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store"; // parameterless sql = cacheable fetch bodies (see home page note)
 
-const I1_MARGIN_F = 8; // target + ½·diff + margin ≈ target + 8 °F (plan §3; calibrated by A-4)
+const I1_MARGIN_F = 5; // A-4-measured 2026-07-14 (HBX terminated at +3.1°F); revisit as charges accumulate
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 1) => (v == null ? "—" : v.toFixed(d));

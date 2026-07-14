@@ -161,10 +161,13 @@ the call ends. That is exactly what TempIQ's flat 2.69 shows, and it means:
   HP setpoint far enough above the tank target that HBX always ends the call:
 
 > **Invariant I1 (never fight):**
-> `HP_setpoint ≥ HBX_target + ½·differential + margin` — in HBX units, target + 3 °F
-> (default diff) + ~5 °F for tank-thermistor-vs-HP-inlet disagreement and loop losses
-> ≈ **target + 8 °F (≈ 4.5 °C)**. Tune the margin at commissioning; alert whenever the
-> live HBX target violates it against the current HP setpoint or the reg 2027 cap.
+> `HP_setpoint ≥ HBX_target + ½·differential + margin` — **MEASURED at A-4 (2026-07-14):**
+> a full deep-drawdown charge at setpoint = target + 3.1 °F still terminated on the HBX
+> tank sensor (pump's return-cutoff never fired; the 10–15 °F mid-charge stratification
+> offset converges to ≈0 at charge end, so only the convergence gap needs covering).
+> Margin set to **target + 5 °F (≈ 3 °C)** = ½·diff (+2) + convergence (~1) + cushion (~2);
+> one summer data point — revisit as charges accumulate. Alert whenever the live HBX
+> target violates it against the current HP setpoint or the reg 2027 cap.
 
 Optimization = **moving both levers together, downward and in time** — never letting them
 cross. Your tank-target-above-HP-setpoint problem is the crossed state; Phase B makes it

@@ -5,7 +5,7 @@
 // nothing when data is stale/missing or the invariant holds.
 import { sql } from "@vercel/postgres";
 
-const I1_MARGIN_F = 8;
+const I1_MARGIN_F = 5; // A-4-measured 2026-07-14: HBX terminated at +3.1°F; 5 keeps a cushion
 const SLX_FRESH_S = 20 * 60;
 const PUMP_FRESH_S = 15 * 60;
 

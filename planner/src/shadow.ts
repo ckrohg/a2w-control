@@ -39,7 +39,7 @@ export const DEFAULT_OPTS: ShadowOpts = {
   dhwFloorF: 120,
   idleF: 110,
   prechargeLookbackH: 3,
-  i1MarginF: 8,
+  i1MarginF: 5, // A-4-measured 2026-07-14: tank sensor terminated at +3.1°F; 5 keeps a cushion
   hpMinF: 113,
   hpMaxF: 131,
   winterGuardF: 50,
