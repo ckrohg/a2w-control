@@ -13,6 +13,10 @@ export const fetchCache = "force-no-store";
 
 const RATE = Number(process.env.ELECTRIC_RATE_USD_KWH ?? "0.30");
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
+// Daily pump energy: the Modbus power regs (2063/2088) are NOT yet calibrated (pump2 maxes
+// at 27 raw while SPAN shows ~6.8 kW; pump1 reads 0) — a known commissioning item. Until
+// they're calibrated against SPAN, use the SPAN-measured July average as the baseline.
+const DAILY_KWH = Number(process.env.DAILY_KWH_BASELINE ?? "11.8"); // SPAN, July 2026 avg
 
 const fmt = (v: number | null | undefined, d = 1) =>
   v == null || !isFinite(v as number) ? "—" : (v as number).toFixed(d);
@@ -32,12 +36,8 @@ export default async function SavingsPage() {
                         FROM plan_scores WHERE hour_ts >= now() - interval '24 hours'`;
     if (g.rows[0].n > 0) { gap24avg = g.rows[0].avg; gap24n = g.rows[0].n; }
 
-    const k1 = await sql`SELECT (sum(power_w) / 60000)::float8 AS kwh FROM readings
-                         WHERE ts >= extract(epoch FROM now() - interval '24 hours')`;
-    kwh24 = k1.rows[0].kwh == null ? null : Number(k1.rows[0].kwh);
-    const k7 = await sql`SELECT (sum(power_w) / 60000)::float8 AS kwh FROM readings
-                         WHERE ts >= extract(epoch FROM now() - interval '7 days')`;
-    kwh7d = k7.rows[0].kwh == null ? null : Number(k7.rows[0].kwh);
+    kwh24 = DAILY_KWH;
+    kwh7d = DAILY_KWH * 7;
 
     const e = await sql`SELECT (count(*) FILTER (WHERE backup_called))::float8 * 5 / 60 AS callh
                         FROM slx_readings WHERE ts >= now() - interval '7 days'`;
@@ -134,14 +134,15 @@ export default async function SavingsPage() {
             </div>
 
             <div className="card">
-              <h2>Your pumps this week<span className="chip">measured</span></h2>
+              <h2>Your pumps this week<span className="chip">SPAN baseline</span></h2>
               <div className="temps">
                 <div className="temp"><div className="v">{fmt(kwh7d, 0)}</div><div className="l">kWh (7d)</div></div>
                 <div className="temp"><div className="v">{kwh7d == null ? "—" : `$${(kwh7d * RATE).toFixed(0)}`}</div><div className="l">≈ cost (7d)</div></div>
               </div>
               <div className="meta">
-                Estimated from the Pi&apos;s minute-by-minute power readings (the SPAN panel remains the
-                billing-grade truth). All of it is hot water right now — no space heating in July.
+                From your SPAN panel&apos;s July average ({DAILY_KWH} kWh/day) — all hot water, no space
+                heating this month. Live per-minute numbers take over once the pumps&apos; power registers
+                are calibrated against SPAN (a known commissioning item riding the next release).
               </div>
             </div>
           </div>
