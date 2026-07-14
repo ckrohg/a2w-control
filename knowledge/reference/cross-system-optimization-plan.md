@@ -662,8 +662,12 @@ threshold, planner dead-man. Same discipline as ever: P17-class noise never page
   data; the winter version's binding-zone math depends on A-7.
 - A-7: **TempIQ insights seam — FILED as [ckrohg-org/TempIQv2#1470](https://github.com/ckrohg-org/TempIQv2/issues/1470)**
   (2026-07-14): generic token-scoped read-only insights API (zone UA/thermal mass, COP
-  points with `sinkTempF`, zone-energy). A TempIQ agent builds it in that repo; **circle
-  back here before heating season** to wire the planner as its first consumer.
+  points with `sinkTempF`, zone-energy, + hydronic-learner outputs per the scope comment).
+  Companion write side **[#1480](https://github.com/ckrohg-org/TempIQv2/issues/1480)**:
+  external-readings ingest so the planner can push per-pump setpoint/LWT/inlet — measured
+  10–15 °F stratification offset (A-4) means TempIQ's COP fits need the pump-side water
+  temps, not just the tank probe. Planner-side pusher is a ~20-line add once the endpoint
+  exists. A TempIQ agent builds both; **circle back before heating season**.
 - A-6: **Freeze the baseline** (gate for Phase B — nothing may change before this):
   record the as-found operating point — HP setpoints (owner: 75 °C at all times; the
   register snapshot confirms, including reg 2027, whose factory default of 55 °C would
