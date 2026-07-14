@@ -251,7 +251,7 @@ Secrets live where they run: Railway service variables (hub, planner), Vercel en
 **Where data lives:**
 | Store | What | Retention |
 |---|---|---|
-| Pi SQLite (`~/bridge-data`) | full-rate pump telemetry (15–30 s), fault events, **the write audit log**, comm stats | unbounded (small) — ⚠️ no off-Pi backup today; nightly snapshot push is a cheap Phase A add |
+| Pi SQLite (`~/bridge-data`) | full-rate pump telemetry (15–30 s), fault events, **the write audit log**, comm stats | unbounded (small) — ⚠️ no off-Pi backup today. **Design (2026-07-14, rides the next bridge tag):** nightly push of the *irreplaceable* tables only (events + audit, KBs — the time series is already mirrored at 60 s) to a mirror ingest sibling → Neon latest-only |
 | Neon Postgres (the mirror's DB, shared) | 1-min state mirror (90-day); **new planner schema**: plans + per-block "why", SensorLinx readings, HBX curve versions, COP fits, DHW patterns, baseline model, savings ledger (planner tables are tiny — exempt from the 90-day trim) | mixed, as noted |
 | TempIQ's database | ~1 year of SensorLinx history (the A-0 goldmine), SPAN energy, weather archive with vintages, learned metrics, cost analytics | TempIQ-owned; consumed via API only |
 
