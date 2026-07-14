@@ -82,7 +82,8 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
       shadow = sp.rowCount ? (sp.rows[0].plan as ShadowBlock[]) : null;
       const d = await sql`
         SELECT EXTRACT(EPOCH FROM observed_at)::float8 AS t FROM hbx_config_versions
-        WHERE changed_fields IS NOT NULL AND observed_at >= now() - interval '48 hours'
+        WHERE changed_fields IS NOT NULL AND changed_fields->>'_source' IS NULL
+          AND observed_at >= now() - interval '48 hours'
         ORDER BY id DESC LIMIT 1`;
       driftAt = d.rowCount ? (d.rows[0].t as number) : null;
     } catch { /* planner tables may not exist yet */ }
