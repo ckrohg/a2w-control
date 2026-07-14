@@ -19,6 +19,7 @@ type Pump = {
   ambient_c?: number | null;
   power_w?: number | null;
   remote_lease_until?: number | null;
+  write_enabled?: boolean;
 };
 type StateResp = { pi_connected?: boolean; ts?: number | null; pumps?: Pump[] };
 
@@ -120,6 +121,62 @@ export default function ControlClient() {
     }
   }
 
+  // --- write-mode arming (Gate 1: fresh password re-entry -> 5-min armed window) ---
+  const [armedUntil, setArmedUntil] = useState<number | null>(null);
+  const [armMsg, setArmMsg] = useState("");
+  const armed = armedUntil != null && Date.now() < armedUntil;
+
+  async function arm() {
+    const password = window.prompt("Re-enter the dashboard password to arm write-mode controls (5 min):");
+    if (!password) return;
+    setArmMsg("");
+    try {
+      const res = await fetch("/api/hub/arm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      const out: { ok?: boolean; armed_seconds?: number; error?: string } = await res.json().catch(() => ({}));
+      if (res.ok && out.ok) {
+        setArmedUntil(Date.now() + (out.armed_seconds ?? 300) * 1000);
+        setArmMsg("Armed for 5 minutes.");
+      } else {
+        setArmMsg(out.error || `Arm failed (${res.status}).`);
+      }
+    } catch {
+      setArmMsg("Network error — try again.");
+    }
+  }
+
+  async function toggleWrite(p: Pump) {
+    const next = !(p.write_enabled === true);
+    const name = p.name ?? p.id;
+    if (!window.confirm(
+      next
+        ? `ENABLE remote writes for ${name}? This arms the pump's write path (audited; sends a high-priority push). Guardrails stay active.`
+        : `Disable remote writes for ${name}? Setpoint commands will be refused until re-enabled.`,
+    )) return;
+    setMsgs((m) => ({ ...m, [p.id]: "" }));
+    try {
+      const res = await fetch("/api/hub/write-enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pump_id: p.id, enabled: next }),
+      });
+      const out: { ok?: boolean; detail?: string; error?: string } = await res.json().catch(() => ({}));
+      setMsgs((m) => ({
+        ...m,
+        [p.id]: res.ok && out.ok
+          ? `Write mode ${next ? "ENABLED" : "disabled"} ✓`
+          : `Refused: ${out.error || out.detail || res.status}`,
+      }));
+    } catch {
+      setMsgs((m) => ({ ...m, [p.id]: "Network error — try again." }));
+    } finally {
+      poll();
+    }
+  }
+
   const connected = data?.pi_connected === true;
   const pumps = data?.pumps ?? [];
 
@@ -144,7 +201,11 @@ export default function ControlClient() {
           <a href="/">Analytics</a>
           <a className="active" href="/control">Control</a>
         </div>
+        <button type="button" onClick={arm} disabled={armed} style={{ marginLeft: "auto" }}>
+          {armed ? `🔓 Armed (${Math.max(0, Math.ceil((armedUntil! - Date.now()) / 60000))} min)` : "🔒 Arm write-mode controls"}
+        </button>
       </div>
+      {armMsg ? <div className="meta" style={{ marginTop: -8, marginBottom: 10 }}>{armMsg}</div> : null}
 
       {loadErr ? (
         <div className="empty">{loadErr}</div>
@@ -169,8 +230,20 @@ export default function ControlClient() {
               <div className="card" key={p.id}>
                 <h2>
                   {p.name ?? p.id}
-                  <span className={`chip ${chip}`}>{chip}</span>
+                  <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                    <span className={`chip ${p.write_enabled ? "heating" : "off"}`}>
+                      writes {p.write_enabled ? "on" : "off"}
+                    </span>
+                    <span className={`chip ${chip}`}>{chip}</span>
+                  </span>
                 </h2>
+                {armed && (
+                  <div className="meta" style={{ marginBottom: 6 }}>
+                    <button type="button" onClick={() => toggleWrite(p)} style={{ fontSize: 12, padding: "5px 10px" }}>
+                      {p.write_enabled ? "Disable writes" : "Enable writes"}
+                    </button>
+                  </div>
+                )}
                 <div className="temps">
                   <div className="temp">
                     <div className="v">{fmt(liveF)}°</div>

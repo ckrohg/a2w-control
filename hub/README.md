@@ -28,6 +28,7 @@ stay human-only on the direct LAN/Funnel path and are never relayed by the hub.
 | GET    | `/health`      | open                    | `{ok, pi_connected, last_state_ts}` |
 | GET    | `/api/state`   | Bearer `HUB_CLIENT_TOKEN` | latest state the Pi pushed |
 | POST   | `/api/command` | Bearer `HUB_CLIENT_TOKEN` | relay a setpoint to the Pi, await ack |
+| POST   | `/api/write-enable` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | arm/disarm a pump's write path (owner 2026-07-14); Pi applies audit + push ceremony |
 
 `POST /api/command` body:
 
@@ -50,6 +51,7 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | ------------------ | ------- |
 | `HUB_PI_TOKEN`     | Bearer token the Pi presents on its WS handshake. Wrong/absent → WS close `4401`. |
 | `HUB_CLIENT_TOKEN` | Bearer token the optimizer + dashboard present on HTTP. |
+| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` (unset = feature off). Held only by the dashboard's server, released only after a fresh password re-entry. |
 | `PORT`             | HTTP + WS port. Railway injects this automatically; defaults to `8080`. |
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
 | `NTFY_SERVER`      | Optional. ntfy base URL (default `https://ntfy.sh`). |

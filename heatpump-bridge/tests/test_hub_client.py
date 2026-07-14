@@ -207,3 +207,38 @@ async def test_hub_non_setpoint_action_is_ignored(hubrig):
     assert await pump.get_reg(R.REG_MODE) == mode_before      # mode untouched
     acked_ids = {a.get("command_id") for a in hub.acks()}
     assert power_id not in acked_ids and mode_id not in acked_ids  # ignored, no ack
+
+
+async def test_hub_write_enable_action_toggles_persists_and_acks(hubrig):
+    # (d) the armed-dashboard toggle (2026-07-14): write_enable IS relayed — it must set
+    # the flag, persist it, audit it, and ack; invalid payloads nack cleanly.
+    pump, poller, store, hub = hubrig
+    assert poller.cfg.write_enabled is True  # rig default
+
+    cid = await hub.send_command(action="write_enable", pump_id="p1", enabled=False)
+    await asyncio.sleep(0.4)
+    ack = next(a for a in hub.acks() if a.get("command_id") == cid)
+    assert ack["ok"] is True and "write_enabled=False" in ack["detail"]
+    assert poller.cfg.write_enabled is False
+    assert poller.snapshot["write_enabled"] is False
+
+    # the state push now carries the flag — the dashboard renders it live
+    await asyncio.sleep(0.3)
+    latest = hub.states()[-1]["pumps"][0]
+    assert latest["write_enabled"] is False
+
+    # re-enable: acks, audited as write_enabled
+    cid2 = await hub.send_command(action="write_enable", pump_id="p1", enabled=True)
+    await asyncio.sleep(0.4)
+    ack2 = next(a for a in hub.acks() if a.get("command_id") == cid2)
+    assert ack2["ok"] is True
+    assert poller.cfg.write_enabled is True
+    events = await store.get_events("p1", 1)
+    codes = {e["code"] for e in events}
+    assert "write_enabled" in codes and "write_disabled" in codes
+
+    # bad payload: clean nack, flag untouched
+    cid3 = await hub.send_command(action="write_enable", pump_id="p1", enabled="yes")
+    await asyncio.sleep(0.4)
+    ack3 = next(a for a in hub.acks() if a.get("command_id") == cid3)
+    assert ack3["ok"] is False and poller.cfg.write_enabled is True

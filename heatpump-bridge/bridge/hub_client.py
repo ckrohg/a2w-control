@@ -107,15 +107,22 @@ class HubClient:
             log.debug("hub: ignoring frame type %r", mtype)
 
     async def _handle_command(self, ws, msg: dict) -> None:
-        """setpoint is the ONLY relayed action — route it through the guarded write path
-        exactly as a machine token would; ignore everything else (power/mode/params are
-        human-only on the direct path and MUST NOT be applied here)."""
+        """setpoint and write_enable are the ONLY relayed actions. write_enable was added
+        2026-07-14 by owner decision (remote arm/disarm from the dashboard): the hub gates
+        it behind a SEPARATE arm token, the dashboard gates that behind a password
+        re-entry, and here it lands on the same loud ceremony as the local UI toggle
+        (audit event + high-priority push on enable; disable always wins instantly).
+        Everything else (power/mode/params) remains human-only on the direct path and
+        MUST NOT be applied here."""
         command_id = msg.get("command_id")
         action = msg.get("action")
+        if action == "write_enable":
+            await self._handle_write_enable(ws, msg)
+            return
         if action != "setpoint":
             log.warning("hub: ignoring non-setpoint action %r (command %s)",
                         action, command_id)
-            return  # do NOT ack — the hub only relays setpoints; nothing changes here
+            return  # do NOT ack — nothing changes for unrelayed actions
         pump_id = msg.get("pump_id")
         poller = self.pollers.get(pump_id)
         if poller is None:
@@ -152,6 +159,41 @@ class HubClient:
             return
         await self._ack(ws, command_id, True, "ok", result.get("setpoint_c"))
 
+    async def _handle_write_enable(self, ws, msg: dict) -> None:
+        """The armed-dashboard toggle: same behavior as api.py's /write-enable route —
+        set + persist + audit + push — and acked so the dashboard shows the outcome."""
+        from .config import save_write_enabled
+
+        command_id = msg.get("command_id")
+        pump_id = msg.get("pump_id")
+        poller = self.pollers.get(pump_id)
+        if poller is None:
+            await self._ack(ws, command_id, False, f"unknown pump {pump_id!r}", None)
+            return
+        enabled = msg.get("enabled")
+        if not isinstance(enabled, bool):
+            await self._ack(ws, command_id, False, f"invalid enabled {enabled!r}", None)
+            return
+        source = "hub:" + str(msg.get("source") or "armed-dashboard")
+        was = poller.cfg.write_enabled
+        poller.cfg.write_enabled = enabled
+        poller.snapshot["write_enabled"] = enabled
+        save_write_enabled(poller.app_cfg, pump_id, enabled)
+        if enabled != was:
+            await poller.store.add_event(
+                pump_id, "config",
+                code="write_enabled" if enabled else "write_disabled",
+                severity="warning" if enabled else "info",
+                message=f"remote control {'ENABLED' if enabled else 'disabled'} "
+                        f"for {poller.cfg.name} ({source})")
+            if enabled:
+                poller._push(
+                    title=f"⚠ {poller.cfg.name}: remote control enabled",
+                    message=f"Writes are now allowed ({source}). Guardrails "
+                            f"(clamp, rate limit, read-back verify) remain active.",
+                    priority="high", tags="warning")
+        await self._ack(ws, command_id, True, f"write_enabled={enabled}", None)
+
     async def _ack(self, ws, command_id, ok: bool, detail: str,
                    setpoint_c: float | None) -> None:
         await self._safe_send(ws, {
@@ -180,6 +222,7 @@ class HubClient:
                 "active_faults": len(s.get("active_faults", [])),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
                 "remote_lease_until": s.get("remote_lease_until"),
+                "write_enabled": p.cfg.write_enabled,
             })
         return {"type": "state", "ts": time.time(), "pumps": pumps}
 

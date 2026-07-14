@@ -307,6 +307,74 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/write-enable — body {pump_id, enabled} (owner decision 2026-07-14: remote
+ * arm/disarm of a pump's write path from the dashboard). DOUBLE-GATED: the client bearer
+ * AND a SEPARATE X-Arm-Token header (HUB_ARM_TOKEN) which the dashboard's server releases
+ * only after a fresh password re-entry — a stolen session or the ordinary client token
+ * alone can never arm. Relays the write_enable action to the Pi (which applies its own
+ * loud ceremony: audit event + high-priority push on enable) and awaits the ack.
+ * 503 if HUB_ARM_TOKEN is unset (feature off), 401 on a bad arm token.
+ */
+app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) => {
+  const armToken = process.env.HUB_ARM_TOKEN ?? "";
+  if (!armToken) {
+    res.status(503).json({ ok: false, detail: "arming not configured (HUB_ARM_TOKEN unset)" });
+    return;
+  }
+  if (!constantTimeEqual(String(req.header("x-arm-token") ?? ""), armToken)) {
+    res.status(401).json({ ok: false, detail: "bad arm token" });
+    return;
+  }
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const pumpId = body.pump_id;
+  const enabled = body.enabled;
+  if (typeof pumpId !== "string" || pumpId.length === 0) {
+    res.status(400).json({ ok: false, detail: "pump_id is required (string)" });
+    return;
+  }
+  if (typeof enabled !== "boolean") {
+    res.status(400).json({ ok: false, detail: "enabled is required (boolean)" });
+    return;
+  }
+  const sock = piSocket;
+  if (!sock || sock.readyState !== WebSocket.OPEN) {
+    res.status(503).json({ ok: false, detail: "no Pi connected" });
+    return;
+  }
+  const commandId = randomUUID();
+  const timer = setTimeout(() => {
+    if (pending.delete(commandId)) {
+      res.status(504).json({ ok: false, detail: "ack timeout" });
+    }
+  }, COMMAND_ACK_TIMEOUT_MS);
+  pending.set(commandId, {
+    timer,
+    resolve: (ack: AckMessage) => {
+      if (ack.ok) {
+        res.status(200).json({ ok: true, detail: ack.detail });
+      } else {
+        res.status(502).json({ ok: false, detail: ack.detail });
+      }
+    },
+  });
+  try {
+    sock.send(JSON.stringify({
+      type: "command" as const,
+      command_id: commandId,
+      action: "write_enable" as const,
+      pump_id: pumpId,
+      enabled,
+      source: "armed-dashboard",
+    }));
+  } catch (err) {
+    if (pending.delete(commandId)) {
+      clearTimeout(timer);
+      res.status(503).json({ ok: false, detail: `relay failed: ${(err as Error).message}` });
+    }
+  }
+});
+
 const server = app.listen(PORT, () => {
   console.log(`[hub] HTTP + WS listening on :${PORT}`);
 });
