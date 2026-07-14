@@ -76,7 +76,65 @@ export class Store {
         result     text NOT NULL,
         detail     text
       );
+      CREATE TABLE IF NOT EXISTS tank_decay_fits (
+        window_start timestamptz PRIMARY KEY,
+        window_end   timestamptz NOT NULL,
+        t_start_f    real NOT NULL,
+        t_end_f      real NOT NULL,
+        hours        real NOT NULL,
+        slope_f_per_h real NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS i1_episodes (
+        id         serial PRIMARY KEY,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        cleared_at timestamptz,
+        detail     text
+      );
     `);
+  }
+
+  /** Recent tank series with call flags — for quiet-window (decay) detection. */
+  async getRecentSeries(hours: number): Promise<
+    { ts: Date; tankF: number | null; anyCall: boolean }[]
+  > {
+    const res = await this.pool.query(
+      `SELECT ts, tank_f,
+              (backup_called OR EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s)) AS any_call
+       FROM slx_readings
+       WHERE ts >= now() - ($1 || ' hours')::interval
+       ORDER BY ts ASC`,
+      [hours],
+    );
+    return res.rows.map((r) => ({
+      ts: new Date(r.ts),
+      tankF: r.tank_f == null ? null : Number(r.tank_f),
+      anyCall: r.any_call === true,
+    }));
+  }
+
+  async upsertDecayFit(f: {
+    windowStart: Date; windowEnd: Date; tStartF: number; tEndF: number;
+    hours: number; slopeFPerH: number;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO tank_decay_fits (window_start, window_end, t_start_f, t_end_f, hours, slope_f_per_h)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (window_start) DO UPDATE SET
+         window_end = EXCLUDED.window_end, t_end_f = EXCLUDED.t_end_f,
+         hours = EXCLUDED.hours, slope_f_per_h = EXCLUDED.slope_f_per_h`,
+      [f.windowStart, f.windowEnd, f.tStartF, f.tEndF, f.hours, f.slopeFPerH],
+    );
+  }
+
+  async openI1Episode(detail: string): Promise<void> {
+    await this.pool.query(`INSERT INTO i1_episodes (detail) VALUES ($1)`, [detail]);
+  }
+
+  async closeI1Episode(): Promise<void> {
+    await this.pool.query(
+      `UPDATE i1_episodes SET cleared_at = now()
+       WHERE cleared_at IS NULL AND id = (SELECT max(id) FROM i1_episodes)`,
+    );
   }
 
   /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */

@@ -16,6 +16,7 @@ import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
 import { PhaseB } from "./phaseb";
+import { decayScanOnce } from "./decay";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -128,6 +129,7 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     i1Violated = true;
     i1Detail = offenders.join("; ");
     console.warn(`I1 VIOLATION: ${i1Detail}`);
+    await store.openI1Episode(i1Detail).catch(() => {});
     await ntfy(
       "I1 violation: HP setpoint below HBX target + margin",
       `Tank target ${tankTargetF.toFixed(1)}°F.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
@@ -136,7 +138,26 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   } else if (!offenders.length && i1Violated) {
     i1Violated = false;
     i1Detail = null;
+    await store.closeI1Episode().catch(() => {});
     await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`);
+  }
+}
+
+/** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
+ *  page — legitimate on a design-cold day, a planner bug or config drift any other time.
+ *  Edge-triggered; the element's actual runtime (breaker permitting) lives in SPAN. */
+let backupWasCalled = false;
+async function checkBackupCalled(called: boolean | null): Promise<void> {
+  if (called === true && !backupWasCalled) {
+    backupWasCalled = true;
+    await ntfy(
+      "16.5 kW backup element CALLED",
+      "HBX has called the backup element (≈$5/hour if its breaker is on). Legitimate in design-cold; otherwise investigate.",
+      "high",
+    );
+  } else if (called === false && backupWasCalled) {
+    backupWasCalled = false;
+    await ntfy("Backup element call ended", "HBX released the backup element.");
   }
 }
 
@@ -210,6 +231,7 @@ async function pollOnce(): Promise<void> {
   const reading = toReading(dev);
   await store.insertReading(reading);
   await checkI1(reading.tankTargetF);
+  await checkBackupCalled(reading.backupCalled);
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
 
   const config = extractConfig(dev);
@@ -261,6 +283,7 @@ async function main(): Promise<void> {
     await pollOnce();
     await shadowOnce();
     await scoreOnce();
+    await decayScanOnce(store);
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -324,7 +347,8 @@ async function main(): Promise<void> {
   const shadowLoop = () =>
     shadowOnce()
       .then(() => scoreOnce())
-      .catch((e) => console.error("shadow/score failed:", (e as Error).message));
+      .then(() => decayScanOnce(store).then(() => {}))
+      .catch((e) => console.error("shadow/score/decay failed:", (e as Error).message));
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
 }
