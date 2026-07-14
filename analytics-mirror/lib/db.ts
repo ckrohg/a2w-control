@@ -20,6 +20,14 @@ export async function ensureSchema() {
     error_rate REAL
   )`;
   await sql`CREATE INDEX IF NOT EXISTS idx_readings_pump_ts ON readings (pump_id, ts)`;
+  // Latest-only full snapshot per pump (parameters, per-stage details, status/switch
+  // words) — attached by the Pi every ~5 min; feeds the Advanced view + register baseline.
+  await sql`CREATE TABLE IF NOT EXISTS pump_snapshots (
+    pump_id TEXT PRIMARY KEY,
+    ts DOUBLE PRECISION NOT NULL,
+    name TEXT,
+    snapshot JSONB NOT NULL
+  )`;
 }
 
 export type Reading = {

@@ -538,6 +538,14 @@ async def test_analytics_exporter_pushes_snapshot(rig):
     assert "ts" in payload and len(payload["pumps"]) == 1
     p = payload["pumps"][0]
     assert p["id"] == "p1" and "setpoint_c" in p and "outlet_c" in p and "power_w" in p
+    # first push after boot carries the FULL snapshot (Advanced view + register baseline)
+    assert "full" in p and "parameters" in p["full"] and "details" in p["full"]
+    assert any(param["key"] == "max_water_temp" or param.get("label")
+               for param in p["full"]["parameters"])
+
+    # an immediate second push is inside FULL_SNAPSHOT_EVERY_S — compact only
+    await exporter.push_once()
+    assert len(received) == 2 and "full" not in received[1][1]["pumps"][0]
 
     srv.shutdown()
     # dead endpoint: must not raise

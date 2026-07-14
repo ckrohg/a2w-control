@@ -27,6 +27,12 @@ export async function POST(req: Request) {
 
   await ensureSchema();
   for (const p of pumps) {
+    if (p.full && typeof p.full === "object") {
+      await sql`INSERT INTO pump_snapshots (pump_id, ts, name, snapshot)
+        VALUES (${p.id}, ${ts}, ${p.name ?? null}, ${JSON.stringify(p.full)})
+        ON CONFLICT (pump_id) DO UPDATE SET
+          ts = EXCLUDED.ts, name = EXCLUDED.name, snapshot = EXCLUDED.snapshot`;
+    }
     await sql`INSERT INTO readings
       (ts, pump_id, name, online, state, mode_kind, setpoint_c, inlet_c, outlet_c,
        ambient_c, power_w, active_faults, error_rate)

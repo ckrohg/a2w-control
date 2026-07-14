@@ -19,11 +19,20 @@ from .poller import PumpPoller
 log = logging.getLogger(__name__)
 
 
+# Every ~60s push carries the compact row; every FULL_SNAPSHOT_EVERY_S one push also
+# attaches each pump's ENTIRE cached snapshot (parameters 2010-2039, per-stage details,
+# status/switch words, comm stats — exactly what /api/pumps/{id}/status serves). The
+# mirror stores latest-only per pump; this feeds the Advanced view + the A-6 register
+# baseline without a second transport.
+FULL_SNAPSHOT_EVERY_S = 300
+
+
 class Exporter:
     def __init__(self, cfg: AnalyticsConfig, pollers: dict[str, PumpPoller]):
         self.cfg = cfg
         self.pollers = pollers
         self._task: asyncio.Task | None = None
+        self._last_full = 0.0
 
     def start(self) -> None:
         if self.cfg.endpoint_url and self.cfg.token:
@@ -44,11 +53,13 @@ class Exporter:
             await asyncio.sleep(self.cfg.interval_s)
 
     def snapshot(self) -> dict:
-        """Compact per-pump state for the cloud time series — no control-relevant fields."""
+        """Compact per-pump state for the cloud time series — no control-relevant fields.
+        Periodically attaches the full cached snapshot per pump (see FULL_SNAPSHOT_EVERY_S)."""
+        include_full = time.time() - self._last_full >= FULL_SNAPSHOT_EVERY_S
         pumps = []
         for p in self.pollers.values():
             s = p.snapshot
-            pumps.append({
+            entry = {
                 "id": p.cfg.id,
                 "name": p.cfg.name,
                 "online": bool(s.get("online")),
@@ -61,7 +72,12 @@ class Exporter:
                 "power_w": (s.get("power_sys1") or 0) + (s.get("power_sys2") or 0),
                 "active_faults": len(s.get("active_faults", [])),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
-            })
+            }
+            if include_full:
+                entry["full"] = dict(s)  # the whole cached snapshot; JSON-safe (the API serves it)
+            pumps.append(entry)
+        if include_full:
+            self._last_full = time.time()
         return {"ts": time.time(), "pumps": pumps}
 
     async def push_once(self) -> None:
