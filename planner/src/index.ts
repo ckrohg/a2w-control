@@ -14,7 +14,18 @@ import crypto from "node:crypto";
 import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
-import { computeShadowPlan, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import {
+  fetchNwsAlerts,
+  fetchStormForecast,
+  deriveSyntheticTriggers,
+  fetchOutageStatus,
+  evaluateStormState,
+  stormCeilingF,
+  StormAlert,
+  SyntheticTrigger,
+  StormState,
+} from "./storm";
 import { DemandFeed } from "./demand";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
@@ -48,6 +59,12 @@ const LON = process.env.LON ?? "-70.87";
 const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
 
 const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
+
+// Storm mode (§6.11, W0-5). Notify-first: triggers always page the owner, but the plan
+// is only shaped when STORM_MODE_ENABLED=1 (plan §11 Q6 is an open owner question).
+const STORM_MODE_ENABLED = process.env.STORM_MODE_ENABLED === "1";
+const STORM_CAP_F = Number(process.env.STORM_CAP_F ?? "135");
+const OUTAGEWATCH_URL = process.env.OUTAGEWATCH_URL ?? "https://victorious-light-production.up.railway.app";
 
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
 const store = new Store(DATABASE_URL);
@@ -99,6 +116,14 @@ let consecutiveFailures = 0;
 let offlineAlerted = false;
 let i1Violated = false;
 let i1Detail: string | null = null;
+
+// §6.11 storm machine state: trigger caches refreshed by the 30-min poll, the state
+// itself stepped once per 5-min loop tick (and immediately on a manual arm/disarm).
+let stormState: StormState = { kind: "idle" };
+let pendingManual: { armHours?: number; disarm?: boolean } | null = null;
+let stormAlerts: StormAlert[] = [];
+let stormSynthetic: SyntheticTrigger[] = [];
+let lastStormPollAt: string | null = null;
 
 async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
   if (!NTFY_TOPIC) return;
@@ -211,6 +236,66 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
   }
 }
 
+/** §6.11 trigger poll (every 30 min): NWS alerts + OpenMeteo-derived synthetic triggers.
+ *  A dead feed leaves its cache empty — fetch failures never arm anything. */
+async function stormTriggerPoll(): Promise<void> {
+  try {
+    stormAlerts = await fetchNwsAlerts(LAT, LON);
+  } catch (e) {
+    stormAlerts = [];
+    console.warn("NWS alert fetch failed:", (e as Error).message);
+  }
+  try {
+    stormSynthetic = deriveSyntheticTriggers(await fetchStormForecast(LAT, LON));
+  } catch (e) {
+    stormSynthetic = [];
+    console.warn("storm forecast fetch failed:", (e as Error).message);
+  }
+  lastStormPollAt = new Date().toISOString();
+}
+
+/** Fold cached triggers + the outage signal + any pending manual command through the
+ *  pure state machine; persist an event row and page on every transition. */
+async function stormEvaluate(outageActive: boolean | null): Promise<void> {
+  const manual = pendingManual ?? undefined;
+  pendingManual = null; // consumed exactly once
+  const { state, transitions } = evaluateStormState(
+    stormState,
+    { alerts: stormAlerts, synthetic: stormSynthetic, outageActive, manual },
+    new Date(),
+  );
+  stormState = state;
+  if (!transitions.length) return;
+
+  if (state.kind === "armed" || state.kind === "active") {
+    let ceilingF = STORM_CAP_F;
+    try {
+      const cfg = await store.latestConfig();
+      const latest = await store.getLatestSlx();
+      const curve = cfg && latest?.outdoorF != null ? curveTargetF(cfg, latest.outdoorF) : null;
+      ceilingF = stormCeilingF(curve, STORM_CAP_F);
+    } catch { /* no config/reading yet — the cap stands */ }
+    await store
+      .insertStormEvent(state.trigger, { transitions, windowEnd: state.windowEnd }, ceilingF)
+      .catch((e) => console.error("storm event insert failed:", (e as Error).message));
+    await ntfy(
+      `Storm mode ${state.kind}: ${transitions.join(", ")}`,
+      `Trigger: ${state.trigger}. Window ends ${state.windowEnd}. Pre-charge ceiling ${ceilingF.toFixed(0)}°F.` +
+        (STORM_MODE_ENABLED ? "" : "\nNotify-only: STORM_MODE_ENABLED off, plan not shaped."),
+      "high",
+    );
+  } else {
+    await store.closeStormEvent().catch((e) => console.error("storm event close failed:", (e as Error).message));
+    await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.");
+  }
+}
+
+/** 5-min tick: OutageWatch (unreachable → null = NO signal) then one machine step. */
+async function stormTick(): Promise<void> {
+  const outage = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
+  await stormEvaluate(outage ? outage.hasActiveOutage : null);
+}
+
 async function shadowOnce(): Promise<void> {
   const forecast = await fetchForecast(LAT, LON);
   const cfg = await store.latestConfig();
@@ -252,6 +337,25 @@ async function shadowOnce(): Promise<void> {
 
   const plan = computeShadowPlan(forecast, cfg, opts, demandFloor);
   if (!plan.length) throw new Error("empty forecast");
+
+  // §6.11 storm shaping — gated on the flag; notify-only mode leaves the plan untouched.
+  // Only-raises rule: a storm never lowers a block below what the plan already wanted.
+  if (STORM_MODE_ENABLED && (stormState.kind === "armed" || stormState.kind === "active")) {
+    const storm = stormState;
+    const startMs = storm.kind === "armed" ? Date.parse(storm.windowStart) : 0;
+    const endMs = Date.parse(storm.windowEnd);
+    for (const block of plan) {
+      const tsMs = Date.parse(block.ts);
+      if (!(tsMs >= startMs && tsMs <= endMs)) continue;
+      const ceiling = Math.round(stormCeilingF(cfg ? curveTargetF(cfg, block.outdoor_f) : null, STORM_CAP_F));
+      const raised = Math.max(block.tank_target_f, ceiling);
+      if (raised === block.tank_target_f) continue;
+      block.tank_target_f = raised;
+      block.hp1_setpoint_f = Math.round(Math.min(Math.max(raised + opts.i1MarginF, opts.hpMinF), opts.hpMaxF));
+      block.reason = `storm mode: banking heat (${storm.trigger})`;
+    }
+  }
+
   await store.insertShadowPlan(plan, {
     dhw_windows: opts.dhwWindows,
     windows_learned: !!learned,
@@ -354,6 +458,14 @@ async function loop(): Promise<void> {
       );
     }
   }
+
+  // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
+  // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
+  try {
+    await stormTick();
+  } catch (e) {
+    console.error("storm tick failed:", (e as Error).message);
+  }
 }
 
 async function main(): Promise<void> {
@@ -405,6 +517,13 @@ async function main(): Promise<void> {
             winter_solver: demandFeed
               ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
               : "off",
+            storm: {
+              state: stormState.kind,
+              trigger: stormState.kind === "idle" ? null : stormState.trigger,
+              windowEnd: stormState.kind === "idle" ? null : stormState.windowEnd,
+              enabled: STORM_MODE_ENABLED,
+              lastTriggerPollAt: lastStormPollAt,
+            },
           });
         }
         if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore" || req.url === "/api/hbx/boost") {
@@ -422,6 +541,19 @@ async function main(): Promise<void> {
           }
           return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard"));
         }
+        if (req.url === "/api/storm/arm" || req.url === "/api/storm/disarm") {
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          if (req.url === "/api/storm/arm") {
+            const body = JSON.parse((await readBody(req)) || "{}");
+            const hours = Math.min(Math.max(Number(body.hours) || 24, 1), 72);
+            pendingManual = { armHours: hours };
+          } else {
+            pendingManual = { disarm: true };
+          }
+          await stormEvaluate(null); // manual wins in the machine — no need to wait on OutageWatch
+          return json(res, 200, { state: stormState });
+        }
         res.writeHead(404).end();
       } catch (e) {
         if (e instanceof WriteError) return json(res, e.status, { error: e.message });
@@ -430,6 +562,11 @@ async function main(): Promise<void> {
       }
     })
     .listen(PORT, () => console.log(`a2w-planner (A-2 reader + A-5 shadow + I1 monitor + write API) on :${PORT}, polling every ${POLL_SECONDS}s`));
+
+  // §6.11 trigger poll: own cadence, immediate first run so the first 5-min tick
+  // (inside loop) already sees fresh NWS/OpenMeteo triggers.
+  await stormTriggerPoll();
+  setInterval(() => void stormTriggerPoll(), 30 * 60 * 1000);
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);
