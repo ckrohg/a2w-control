@@ -105,6 +105,33 @@ export class Store {
         value_c  real,
         result   text
       );
+      CREATE TABLE IF NOT EXISTS tempiq_zone_physics (
+        zone_id            text PRIMARY KEY,
+        name               text,
+        ua_btu_hr_f        real,
+        thermal_mass_btu_f real,
+        emitter_type       text,
+        confidence         real,
+        source             text,
+        fetched_at         timestamptz NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS tempiq_cop_points (
+        measured_at    timestamptz NOT NULL,
+        system         text NOT NULL,
+        outdoor_temp_f real,
+        sink_temp_f    real,
+        cop            real,
+        thermal_kwh    real,
+        electrical_kwh real,
+        quality        text,
+        quality_score  real,
+        PRIMARY KEY (measured_at, system)
+      );
+      CREATE TABLE IF NOT EXISTS tempiq_zone_energy (
+        id         integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        fetched_at timestamptz NOT NULL,
+        payload    jsonb NOT NULL
+      );
     `);
   }
 
@@ -142,6 +169,64 @@ export class Store {
     await this.pool.query(
       `INSERT INTO phase_b_log (pump_id, mode, value_c, result) VALUES ($1,$2,$3,$4)`,
       [l.pumpId, l.mode, l.valueC, l.result],
+    );
+  }
+
+  /** Latest learned per-zone physics from TempIQ (§6.7: consumed, never re-derived). */
+  async upsertTempiqZonePhysics(zonesIn: Array<{
+    zoneId: string; name: string | null; uaBtuHrF: number | null;
+    thermalMassBtuF: number | null; emitterType: string | null;
+    confidence: number | null; source: string | null;
+  }>): Promise<void> {
+    for (const z of zonesIn) {
+      await this.pool.query(
+        `INSERT INTO tempiq_zone_physics
+           (zone_id, name, ua_btu_hr_f, thermal_mass_btu_f, emitter_type, confidence, source, fetched_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+         ON CONFLICT (zone_id) DO UPDATE SET
+           name = EXCLUDED.name, ua_btu_hr_f = EXCLUDED.ua_btu_hr_f,
+           thermal_mass_btu_f = EXCLUDED.thermal_mass_btu_f,
+           emitter_type = EXCLUDED.emitter_type, confidence = EXCLUDED.confidence,
+           source = EXCLUDED.source, fetched_at = EXCLUDED.fetched_at`,
+        [z.zoneId, z.name, z.uaBtuHrF, z.thermalMassBtuF, z.emitterType, z.confidence, z.source],
+      );
+    }
+  }
+
+  /** Newest stored COP point — the reader's incremental ?since cursor. */
+  async latestTempiqCopAt(): Promise<Date | null> {
+    const res = await this.pool.query(`SELECT max(measured_at) AS m FROM tempiq_cop_points`);
+    return res.rows[0]?.m ? new Date(res.rows[0].m) : null;
+  }
+
+  /** Insert-only COP points, deduped on (measured_at, system). Returns rows actually inserted. */
+  async insertTempiqCopPoints(points: Array<{
+    measuredAt: Date; system: string; outdoorTempF: number | null; sinkTempF: number | null;
+    cop: number | null; thermalKwh: number | null; electricalKwh: number | null;
+    quality: string | null; qualityScore: number | null;
+  }>): Promise<number> {
+    let inserted = 0;
+    for (const p of points) {
+      const res = await this.pool.query(
+        `INSERT INTO tempiq_cop_points
+           (measured_at, system, outdoor_temp_f, sink_temp_f, cop, thermal_kwh, electrical_kwh, quality, quality_score)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (measured_at, system) DO NOTHING`,
+        [p.measuredAt, p.system, p.outdoorTempF, p.sinkTempF, p.cop,
+         p.thermalKwh, p.electricalKwh, p.quality, p.qualityScore],
+      );
+      inserted += res.rowCount ?? 0;
+    }
+    return inserted;
+  }
+
+  /** Latest TempIQ zone-energy snapshot (single-row upsert; shadow model picks fields). */
+  async upsertTempiqZoneEnergy(payload: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO tempiq_zone_energy (id, fetched_at, payload) VALUES (1, now(), $1)
+       ON CONFLICT (id) DO UPDATE SET
+         fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
+      [JSON.stringify(payload)],
     );
   }
 

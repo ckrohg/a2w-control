@@ -12,6 +12,7 @@ import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
 import crypto from "node:crypto";
 import { TempiqPusher } from "./tempiq";
+import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 import { learnDhwWindows } from "./dhw";
@@ -69,6 +70,14 @@ const tempiq = TEMPIQ_PUSH_ENABLED && hub && TEMPIQ_SURFACE_TOKEN
   ? new TempiqPusher(hub, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
 if (TEMPIQ_PUSH_ENABLED && !tempiq) console.warn("TEMPIQ_PUSH_ENABLED but hub/TEMPIQ_SURFACE_TOKEN missing — pusher disabled");
+
+// TempIQ read seam (§6.7, TempIQ#1470 read half — live 2026-07-14). Inert without the flag+token.
+const TEMPIQ_READ_ENABLED = process.env.TEMPIQ_READ_ENABLED === "1";
+const TEMPIQ_READ_EVERY_MIN = Number(process.env.TEMPIQ_READ_EVERY_MIN ?? "60");
+const tempiqRead = TEMPIQ_READ_ENABLED && TEMPIQ_SURFACE_TOKEN
+  ? new TempiqReader(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  : null;
+if (TEMPIQ_READ_ENABLED && !tempiqRead) console.warn("TEMPIQ_READ_ENABLED but TEMPIQ_SURFACE_TOKEN missing — reader disabled");
 if (PHASE_B_ENABLED && !hub) console.warn("PHASE_B_ENABLED but no hub configured — tracking disabled");
 if (phaseB) console.log(`PHASE B ${PHASE_B_DRY_RUN ? "DRY-RUN" : "ACTIVE"} for ${PHASE_B_PUMPS.join(", ")} (target + ${5}°F, leased)`);
 
@@ -321,6 +330,7 @@ async function main(): Promise<void> {
     await scoreOnce();
     await decayScanOnce(store);
     if (tempiq) await tempiq.tick();
+    if (tempiqRead) await tempiqRead.tick();
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -353,6 +363,7 @@ async function main(): Promise<void> {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
+            tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
@@ -387,6 +398,10 @@ async function main(): Promise<void> {
   if (tempiq) {
     void tempiq.tick();
     setInterval(() => void tempiq.tick(), TEMPIQ_PUSH_EVERY_MIN * 60 * 1000);
+  }
+  if (tempiqRead) {
+    void tempiqRead.tick();
+    setInterval(() => void tempiqRead.tick(), TEMPIQ_READ_EVERY_MIN * 60 * 1000);
   }
   const shadowLoop = () =>
     shadowOnce()
