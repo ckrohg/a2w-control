@@ -574,6 +574,10 @@ parameters come from behavior, not the label:
   mass, DHW-vs-standby-loss decomposition of hydronic overhead, per-zone loads. These
   outputs are now in scope for the TempIQv2#1470 insights API — the planner consumes,
   never re-derives.
+- **RESOLVED 2026-07-15 (`ceff-resolution.md`): C_eff = 110 gal [90, 125] for energy
+  accounting (150 excluded; A-4 COP restates to 2.63 [2.15–2.99]); ~45 gal probe-referred
+  for draw-response; ~1 kWh per-cycle charge overhead → deeper charges beat shallow
+  top-ups (feeds §6.6).** The element calibration charge (§10) is the decisive tightener.
 - **The planner self-learns C_eff continuously** from its own 5-min data: every charge is
   a known-input slope (SPAN kW in ÷ °F/h rise), every idle overnight a decay fit, and
   events like the 2026-07-14 tub (pump off + full draw = pure discharge slope, then a
@@ -933,7 +937,10 @@ rule HP2's failure never had).
 
 - [x] HBX settings snapshot committed (A-1, 2026-07-13) — `hbx-config-asfound-20260713.json`
 - [x] Summer DHW demand mechanism = `permHD` = 1 (permanent heat demand; WWSD set 125 °F = never)
-- [ ] Buffer tank actual volume + model (planner thermal-mass constant)
+- [x] ~~Buffer tank actual volume~~ **C_eff MEASURED 2026-07-15: 110 gal [90,125]**
+      (`ceff-resolution.md`). Decisive tightener when desired: the ELEMENT CALIBRATION
+      CHARGE (COP=1.000 exactly; 5 kWh → 18.6°F @ 110 gal vs 13.6 @ 150; owner-gated,
+      element breaker per §5.5). Nameplate photo still welcome but not decisive.
 - [ ] Verify coil-in-buffer topology; confirm no downstream potable storage (§6.5)
 - [x] Element mapped: SPAN circuit "Buffer Tank", measured peak 16.5–16.8 kW; actual
       delivered energy 582 kWh this record (SPAN-disabled most of the time) — see §5.5

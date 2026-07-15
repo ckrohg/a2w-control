@@ -71,3 +71,11 @@ confounded by the off/on window) — schedulable as morning-boost comparisons.
 - Queued: `lagT` staging experiment (§6.6, owner applies in app); tank nameplate photo
   (pins C_eff→COP); repeat-charge A/B for the °F-COP slope; TempIQv2#1480 will carry
   pump-side water temps into TempIQ's COP fits.
+
+
+---
+
+**ADDENDUM 2026-07-15 (`ceff-resolution.md`):** the COP-vs-volume degeneracy above is
+resolved — C_eff measured at 110 gal [90, 125] from 181 clean charges + 3 pure
+discharges. This test's COP restates to **2.63 [2.15–2.99]** (the 3.6 @ 150 gal end is
+physically excluded by the manufacturer's second-law ceiling).
