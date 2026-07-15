@@ -94,24 +94,19 @@ export function computeFloors(
 }
 
 /**
- * TempIQv2#1508 — upstream zone emitter data is wrong/incomplete (owner survey
- * 2026-07-14): "Living Room Baseboard" is actually radiant (name AND delivery_type
- * mislabeled), and Xmas Room's baseboard loop has NO hydronic zone in TempIQ at all.
- * Until #1508 lands these carry the surveyed ground truth; override via env
- * EMITTER_OVERRIDES / EMITTER_SYNTHETIC_ZONES (JSON). TEMPORARY — delete with #1508.
+ * TempIQv2#1508 — owner identification 2026-07-15 supersedes the 2026-07-14 survey
+ * inference: the zone TempIQ names "Living Room Baseboard" IS physically the Xmas Room
+ * thermostat — its delivery_type "baseboard" was correct all along; only the NAME is
+ * wrong (rename pending TempIQv2#1508). Its baseboard loop serves Xmas Room +
+ * Den/Office + indirectly the Dining room. There is no missing Xmas Room zone, so no
+ * synthetic zone is needed and no delivery_type override applies. Env escape hatches
+ * EMITTER_OVERRIDES / EMITTER_SYNTHETIC_ZONES (JSON) remain for future corrections.
  */
 export const DEFAULT_EMITTER_OVERRIDES: Record<string, string> = {
-  "Living Room Baseboard": "radiant_floor",
+  // empty — owner identification 2026-07-15: TempIQ delivery_types were correct
 };
 export const DEFAULT_SYNTHETIC_ZONES: InsightZone[] = [
-  {
-    id: "synthetic:xmas-baseboard",
-    name: "Xmas Room (baseboard)",
-    deliveryType: "baseboard",
-    uaBtuHrF: null,
-    thermalMassBtuF: null,
-    confidence: null,
-  },
+  // empty — "Living Room Baseboard" IS the Xmas Room zone; a synthetic Xmas zone would duplicate it
 ];
 
 function envJson<T>(name: string, fallback: T): T {

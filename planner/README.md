@@ -99,8 +99,8 @@ override + synthetic Xmas Room baseboard zone).
 |---|---|
 | `WINTER_SOLVER_SHADOW=1` | enable the demand feed + floor proposals (default off) |
 | `TEMPIQ_BASE_URL` / `TEMPIQ_SURFACE_TOKEN` | the insights seam (shared with the pusher) |
-| `EMITTER_OVERRIDES` | JSON name→deliveryType map (default carries the survey) |
-| `EMITTER_SYNTHETIC_ZONES` | JSON InsightZone[] (default: the invisible Xmas Room loop) |
+| `EMITTER_OVERRIDES` | JSON name→deliveryType map (default empty — owner ID 2026-07-15: TempIQ delivery_types were right) |
+| `EMITTER_SYNTHETIC_ZONES` | JSON InsightZone[] (default empty — no missing zones; "Living Room Baseboard" IS the Xmas Room zone) |
 
 Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed).
 `/health.winter_solver` = off | shadow | degraded.
