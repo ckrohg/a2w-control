@@ -633,8 +633,8 @@ calling. Each emitter class has its own service temperature; the tank should rid
 
 | Constraint | Required water at emitter | Active when |
 |---|---|---|
-| Fin-tube baseboard (Living Rm, Upstairs, ?Dining, ?Mud Rm) | `AWT = T_room + (135 − T_room)·f^(1/1.35)`, `f = (65 − T_out)/60` → ≈135 °F @ 5 °F out, ≈115 @ 30, with a ~108–110 °F practical floor (fin-tube convection collapses below it) | zone calling (or predicted within recharge horizon) |
-| Radiant floors (Kitchen, Master Bath, Upstairs Bath, ?Dining, ?Mud Rm) | 95–110 °F — behind tempering hardware that is *assumed but never inspected* (tank has run 150 °F+ into these loops for years) | zone calling; rarely binds |
+| Fin-tube baseboard — **Xmas Room + Upstairs ONLY** (owner survey 2026-07-14) | `AWT = T_room + (135 − T_room)·f^(1/1.35)`, `f = (65 − T_out)/60` → ≈135 °F @ 5 °F out, ≈115 @ 30, with a ~108–110 °F practical floor (fin-tube convection collapses below it) | zone calling (or predicted within recharge horizon) |
+| Radiant floors — **everything else hydronic**: Dining, Kitchen, Mud Rm, Master Bath, Upstairs Bath, AND Living Room (TempIQ's "Living Room Baseboard" name + delivery_type are both wrong) | 95–110 °F — behind tempering hardware that is *assumed but never inspected* (tank has run 150 °F+ into these loops for years) | zone calling; rarely binds |
 | DHW comfort (I3) | tank ≥ 120 °F during draw windows (delivery + 5–8 °F coil approach; window learner live) | draw windows |
 | Thermal hygiene (I8) | ≥60 min ≥ 131 °F per rolling 24 h | daily, scheduled at best COP |
 | Freeze floor (I2) | HP setpoint ≥ 45 °C / 113 °F | always, unattended |
@@ -672,13 +672,26 @@ to heat the house.
 6. **Exposure rows** for the hydronic Nest zones on the a2w surface token, and a
    `triggeredBy='a2w-planner'` provenance value on `applySetpoints`.
 
-**Known unknowns that gate the floors (walk + first cold snap, see §10):** TempIQ's DB
-says Dining and Mud Room are *radiant_floor* while the winter-floor analysis anchored the
-135 °F design floor to “Dining baseboard” — a five-minute walk decides the binding zone.
-Mud Room carries the largest learned load in the house (UA 232 BTU/hr/°F, design
-16.7 kBTU/hr): if it's baseboard, *it* likely binds, not Dining. Current accepted UA fits
-are summer artifacts pinned at optimizer bounds — the solver must wait for winter re-fits
-(the early-July rejected fits already echo the real winter numbers).
+**Ground truth (owner survey, 2026-07-14 — supersedes both prior sources):** baseboard =
+**Xmas Room (Nest) + Upstairs (Nest)**, all other Nest hydronic zones are radiant, Kumos
+are mini-splits except **Downstairs = forced air**. Consequences:
+- The winter-floor doc's “Dining baseboard = 135 °F design floor” was WRONG (Dining is
+  radiant), and TempIQ is wrong twice: “Living Room Baseboard” is radiant (name and
+  delivery_type both misleading), and **Xmas Room has no hydronic zone at all** in
+  TempIQ — its baseboard loop is invisible to every learner (filed as a TempIQ data
+  correction; until fixed the planner carries an emitter-override map so the solver
+  can't inherit the errors).
+- Mud Room — the largest learned load (UA 232 BTU/hr/°F, 16.7 kBTU/hr design) — is
+  RADIANT: the biggest heat consumer is served at 95–110 °F water. The I4 lower line
+  (135 °F @ 5 °F) is now known-conservative; only two modest baseboard zones ever need
+  hot water (Upstairs design load: 7.7 kBTU/hr; Xmas unknown — zone missing).
+- §6.10 unlock, sharpened: **Xmas Room has its own Kumo** — design-day mini-split assist
+  there (and possibly for Upstairs' spaces) could drop the whole-tank design floor from
+  135 °F toward the radiant/DHW band (~110–120 °F). This is now the single biggest
+  quantifiable arbitrage play.
+Current accepted UA fits are summer artifacts pinned at optimizer bounds — the solver
+must wait for winter re-fits (the early-July rejected fits already echo the real winter
+numbers).
 
 **Phasing (the W-track):** W0 now — file the TempIQ asks, consume what's already shipped,
 owner walk. W1 first heating weeks — solver runs **winter-shadow** (log-only next to the
@@ -934,9 +947,12 @@ rule HP2's failure never had).
 - [ ] Real $/kWh from the utility bill set in TempIQ `utility_config` (replace the $0.15 default)
 - [ ] Regs 2063/2088 calibrated against the SPAN HP circuits (units/scaling + the fixed-freq compressor gap quantified)
 - [ ] 16.5 kW element's SPAN circuit identified and its baseline runtime recorded (backup-cost watch)
-- [ ] **WALK (gates §6.9): Dining + Mud Room emitter type** — TempIQ DB says radiant, the
-      winter-floor doc says Dining baseboard; Mud Room is the largest learned load
-      (UA 232 BTU/hr/°F). Five minutes with a flashlight decides the binding zone.
+- [x] **WALK (gates §6.9): emitter survey — DONE 2026-07-14 (owner):** baseboard =
+      Xmas Room + Upstairs only; Dining/Mud Room/Living Room all radiant (TempIQ's
+      "Living Room Baseboard" mislabeled); Downstairs Kumo = forced air. Follow-ups:
+      Xmas Room hydronic zone must be created in TempIQ; confirm what heat source feeds
+      the Downstairs air handler (refrigerant vs hydronic coil — if hydronic, it's a
+      tank draw at fan-coil temps and joins the floor table).
 - [ ] Radiant manifolds inspected: tempering/injection hardware confirmed + its output
       setpoint recorded (the radiant zones' true service temp)
 - [ ] First cold snap: per-zone room temps logged with tank held at the solver floor;
@@ -954,8 +970,9 @@ rule HP2's failure never had).
    rotation and accepting the COP penalty on HP2-led charges?
 4. Winnie reply (already owed: series number + forced defrost): add the HP2 CN22 dead-port
    repair question?
-5. §6.9 walk: are Dining and Mud Room baseboard or radiant (a photo of each emitter and
-   of the radiant manifolds settles both §6.9 unknowns at once)?
+5. ~~§6.9 walk~~ **ANSWERED 2026-07-14:** baseboard = Xmas Room + Upstairs only; the rest
+   radiant; Downstairs = Kumo forced air. Still open from the same area: radiant manifold
+   tempering hardware (photo), and the Downstairs air handler's heat source.
 6. Storm mode (§6.11): comfort with the planner auto-arming on NWS warnings, or
    notify-and-ask-first for the first season?
 
