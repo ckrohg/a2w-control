@@ -4,9 +4,10 @@
 // target+margin vs HP setpoints vs outdoor — crossing lines = the deadlock), the reset
 // curve card (configured line vs observed scatter), and the config-drift version history.
 import { sql } from "@vercel/postgres";
-import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
+import { fmtTime, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";
+import { Chart, type Series } from "@/app/ui/chart";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,41 +17,6 @@ const I1_MARGIN_F = 5; // A-4-measured 2026-07-14 (HBX terminated at +3.1°F); r
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 1) => (v == null ? "—" : v.toFixed(d));
-
-type Pt = { x: number; y: number | null };
-type Series = { color: string; points: Pt[]; dash?: boolean; width?: number };
-
-function LineChart({ series, hours }: { series: Series[]; hours: number }) {
-  const W = 900, H = 220, pad = { l: 38, r: 10, t: 10, b: 20 };
-  const all = series.flatMap((s) => s.points.filter((p) => p.y != null && isFinite(p.y as number))) as { x: number; y: number }[];
-  if (!all.length) return <div className="empty" style={{ padding: 20 }}>No data yet</div>;
-  const xs = all.map((p) => p.x), ys = all.map((p) => p.y);
-  const x0 = Math.min(...xs), x1 = Math.max(...xs);
-  let y0 = Math.min(...ys), y1 = Math.max(...ys);
-  if (y1 - y0 < 4) { const m = (y0 + y1) / 2; y0 = m - 2; y1 = m + 2; }
-  const X = (x: number) => pad.l + ((x - x0) / Math.max(1, x1 - x0)) * (W - pad.l - pad.r);
-  const Y = (y: number) => pad.t + (1 - (y - y0) / (y1 - y0)) * (H - pad.t - pad.b);
-  const grid = [y0, (y0 + y1) / 2, y1];
-  const lab = (d: Date) => (hours > 48 ? fmtDay(d) : fmtTime(d));
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
-      {grid.map((g, i) => (
-        <g key={i}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={1} />
-          <text x={4} y={Y(g) + 4} fill="#8b98a5" fontSize={11}>{Math.round(g)}</text>
-        </g>
-      ))}
-      {series.map((s, i) => {
-        const pts = s.points.filter((p) => p.y != null && isFinite(p.y as number)) as { x: number; y: number }[];
-        if (!pts.length) return null;
-        const d = pts.map((p, j) => `${j ? "L" : "M"}${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join("");
-        return <path key={i} d={d} fill="none" stroke={s.color} strokeWidth={s.width ?? 1.8} strokeLinejoin="round" strokeDasharray={s.dash ? "5 4" : undefined} />;
-      })}
-      <text x={pad.l} y={H - 4} fill="#8b98a5" fontSize={11}>{lab(new Date(x0 * 1000))}</text>
-      <text x={W - pad.r} y={H - 4} fill="#8b98a5" fontSize={11} textAnchor="end">{lab(new Date(x1 * 1000))}</text>
-    </svg>
-  );
-}
 
 /** Reset-curve card: configured line (from the latest config version) + observed (outdoor, target) scatter. */
 function CurveChart({ cfg, pts }: { cfg: Record<string, number> | null; pts: { x: number; y: number }[] }) {
@@ -65,10 +31,11 @@ function CurveChart({ cfg, pts }: { cfg: Record<string, number> | null; pts: { x
   const xticks = [x0 + 4, (x0 + x1) / 2, x1 - 4].map(Math.round);
   const yticks = [y0 + 3, (y0 + y1) / 2, y1 - 3].map(Math.round);
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet"
+      style={{ width: "100%", height: "auto", aspectRatio: `${W}/${H}` }}>
       {yticks.map((g, i) => (
         <g key={`y${i}`}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={1} />
+          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={1} vectorEffect="non-scaling-stroke" />
           <text x={4} y={Y(g) + 4} fill="#8b98a5" fontSize={11}>{g}</text>
         </g>
       ))}
@@ -76,11 +43,11 @@ function CurveChart({ cfg, pts }: { cfg: Record<string, number> | null; pts: { x
         <text key={`x${i}`} x={X(g)} y={H - 6} fill="#8b98a5" fontSize={11} textAnchor="middle">{g}°F out</text>
       ))}
       {pts.map((p, i) => (
-        <circle key={i} cx={X(p.x)} cy={Y(p.y)} r={2.2} fill="#4dabf7" fillOpacity={0.55} />
+        <circle key={i} cx={X(p.x)} cy={Y(p.y)} r={2.2} fill="#4dabf7" fillOpacity={0.55} vectorEffect="non-scaling-stroke" />
       ))}
       {cfg && (
         <line x1={X(cfg.dot)} y1={Y(cfg.dbt)} x2={X(cfg.wwsd)} y2={Y(cfg.mbt)}
-          stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" />
+          stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" vectorEffect="non-scaling-stroke" />
       )}
     </svg>
   );
@@ -195,15 +162,6 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
 
   return (
     <>
-      <header>
-        <h1>HBX — Buffer Tank</h1>
-        <span className="dim">ECO-0600 via SensorLinx · 5-min polls</span>
-        <a className="btn" href="/" style={{ marginLeft: "auto", textDecoration: "none" }}>Pumps</a>
-        <a className="btn" href="/curve" style={{ textDecoration: "none" }}>Curve</a>
-        <a className="btn" href="/control" style={{ textDecoration: "none" }}>Control</a>
-        <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
-      </header>
-
       <I1Banner />
       <StormBanner />
 
@@ -240,16 +198,16 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               {curveCfg && (
                 <div className="meta">
                   Curve: {curveCfg.dbt}°F @ {curveCfg.dot}°F out → {curveCfg.mbt}°F @ {curveCfg.wwsd}°F out
-                  {" "}· diff {cfg!.htDif}°F · bkLag {cfg!.bkLag}m · permHD {cfg!.permHD ? "on" : "off"}
+                  {" "}· temp differential {cfg!.htDif}°F · backup lag {cfg!.bkLag} min · permanent heat demand {cfg!.permHD ? "on" : "off"}
                 </div>
               )}
             </div>
           </div>
 
           <div className="chart-block">
-            <h3>Tank vs target vs HP setpoints °F <span className="dim">(HP lines must stay above the red line — plan §3, invariant I1)</span></h3>
+            <h3>Tank vs. target vs. pump setpoints <span className="dim">(pump lines must stay above the red line, or calls stall)</span></h3>
             <div className="chart">
-              <LineChart hours={hours} series={[
+              <Chart hours={hours} series={[
                 { color: "#4dabf7", points: pick("tank_f") },
                 { color: "#ffd666", points: pick("tank_target_f"), dash: true },
                 { color: "#ff6b6b", points: i1Line, dash: true, width: 1.2 },
@@ -261,7 +219,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
             <div className="legend">
               <span><i style={{ background: "#4dabf7" }} />Tank</span>
               <span><i style={{ background: "#ffd666" }} />Target</span>
-              <span><i style={{ background: "#ff6b6b" }} />Target + {I1_MARGIN_F}°F (I1)</span>
+              <span><i style={{ background: "#ff6b6b" }} />Minimum pump setpoint</span>
               <span><i style={{ background: "#e599f7" }} />Planner wanted (shadow)</span>
               {pumpSeries.map((s, i) => (
                 <span key={s.id}><i style={{ background: i === 0 ? "#63e6be" : "#f783ac" }} />{s.id} setpoint</span>
@@ -281,11 +239,11 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
 
           {shadow && shadow.length > 0 && (
             <div className="chart-block">
-              <h3>Shadow plan — next 24h <span className="dim">
-                (what the planner WOULD command; nothing is written · computed {shadowAt ? fmtTime(shadowAt) : "—"})
+              <h3>Practice plan — next 24h <span className="dim">
+                (what the planner would do — nothing is sent yet · computed {shadowAt ? fmtTime(shadowAt) : "—"})
               </span></h3>
               <div className="chart">
-                <LineChart hours={24} series={[
+                <Chart hours={24} series={[
                   { color: "#ffd666", points: shadow.flatMap((b) => {
                     const t = new Date(b.ts).getTime() / 1000;
                     return [{ x: t, y: b.tank_target_f }, { x: t + 3599, y: b.tank_target_f }];
@@ -319,7 +277,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
 
           {phasebLog.length > 0 && (
             <div className="chart-block">
-              <h3>Phase B rehearsal <span className="dim">(what the tracking loop {phasebLog[0]?.mode === "active" ? "sent" : "WOULD have sent"} — the flip evidence)</span></h3>
+              <h3>Practice-control log <span className="dim">(what it would have sent)</span></h3>
               {phasebLog.map((r, i) => (
                 <div className="meta" key={i}>
                   {fmtDateTime(r.t)} · {r.pump_id} → {r.value_c == null ? "—" : `${r.value_c}°C`} · {r.mode} · {r.result}
@@ -330,7 +288,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
 
           {stormEvents.length > 0 && (
             <div className="chart-block">
-              <h3>Storm events <span className="dim">(§6.11 ledger — armed windows, manual or triggered)</span></h3>
+              <h3>Storm events <span className="dim">(armed heat-banking windows — manual or automatic)</span></h3>
               {stormEvents.map((ev) => (
                 <div className="meta" key={ev.id}>
                   {fmtDateTime(ev.s)} · {ev.trigger} · {ev.e ? `${((ev.e - ev.s) / 3600).toFixed(1)} h` : "open"}
@@ -359,7 +317,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               ? Math.round((nextFloor.awtF + margin) * 10) / 10 : null;
             return (
               <div className="chart-block">
-                <h3>Winter solver — zone service floors <span className="dim">(§6.9 SHADOW — proposes, never commands)</span></h3>
+                <h3>Zone heating floors <span className="dim">(a suggestion — never commands · {floorSnap.source ?? "insights"})</span></h3>
                 <div className="meta">
                   Call feed:{" "}
                   <b>{callDriven ? "live zone calls (Nest hvacStatus)" : "conservative — all zones (calls feed stale)"}</b>
@@ -388,14 +346,14 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                   const copUnlocked = copAt(outNow, unlocked);
                   return copUnlocked - copNow >= 0.05 ? (
                     <div className="meta" style={{ color: "#e599f7" }}>
-                      §6.10 unlock (recommend-only, modeled): mini-split assist for the baseboard zones would drop the
+                      Mini-split assist (suggestion only): assist for the baseboard zones would drop the
                       floor {fmt(floorSnap.floorF)}°F → {fmt(unlocked)}°F — modeled COP{" "}
                       {copNow.toFixed(2)} → {copUnlocked.toFixed(2)} at {fmt(outNow)}°F out.
                       Measured split COP arrives with TempIQ#1506.
                     </div>
                   ) : (
                     <div className="meta">
-                      §6.10 unlock: floor would drop {fmt(floorSnap.floorF)}°F → {fmt(unlocked)}°F with baseboard
+                      Mini-split assist (suggestion only): floor would drop {fmt(floorSnap.floorF)}°F → {fmt(unlocked)}°F with baseboard
                       assist, but at {fmt(outNow)}°F out the lift is already tiny — this bites in heating season.
                     </div>
                   );
@@ -406,7 +364,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
           })()}
 
           <div className="chart-block">
-            <h3>Storm auto-raise <span className="dim">(§6.11 — what pre-charges the tank, and why)</span></h3>
+            <h3>Storm auto-raise <span className="dim">(what pre-charges the tank, and why)</span></h3>
             <div className="meta">
               Posture: <b>auto-raise + notify</b>. A qualifying storm lifts the in-window tank ceiling to the
               HBX reset-curve target <b>+3°F</b> (capped 135°F), <b>only ever raises</b> a block (never lowers below
