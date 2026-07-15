@@ -1,44 +1,7 @@
-# TENET — a2w-control
+You build code from a spec. Read AGENT.md, then create or modify the files listed under "Files in scope" so the spec's acceptance criteria pass.
 
-You are in a TENET workspace. Every session, use these tools:
+Files you can create or edit: planner/src/storm.ts
+Do NOT edit: AGENT.md, EXPERIMENTS.md, eval scripts, tests
 
-**Start:** `tenet_context` — get project state, recent journals, team activity
-**Work:** `tenet_journal_write` — record every feature, decision, fix, discovery (mandatory)
-**Check:** `tenet_memory_search` — search past decisions before making new ones
-**Skills:** `/skill <name>` — load specialized instructions on demand
-
-## Journal Protocol
-
-Write journal entries AS YOU WORK, not at session end. Each entry needs:
-- type: feature | decision | fix | discovery
-- title: short description
-- summary: 2-3 sentences
-- files: relevant paths
-- next: what should happen next
-
-## Rules
-
-- Journal every significant action — no exceptions
-- Every code file gets a `@purpose` header comment
-- Search memory before making architectural decisions
-- Use `/skill` to load domain expertise — don't guess
-
-## Current Focus
-
-**A2W Control** — custom IoT control bridge for 2× Arctic (Guangdong Macon MAHRW030ZA/BEH2) air-to-water heat pumps at 6 Black Brook Rd, South Hamilton, MA (North Shore; DOE climate zone 5A — same house as TempIQ / 6bb-solar / OutageWatch). Personal infrastructure project, not a startup — ignore GTM/brand framing.
-
-**Read first, in order:**
-1. `knowledge/reference/heatpump-bridge-handoff.md` — complete build spec. Hardware architecture and stack decisions are SETTLED; do not redesign or propose alternatives.
-2. `knowledge/reference/modbus-register-map.md` — distilled register map (source of truth: `A2W Modbus.docx` same folder, from Winnie @ Guangdong Macon)
-3. `knowledge/PRODUCT_SPEC.md` + `knowledge/ROADMAP.md` — working summaries
-
-**Stage:** Phase 0 COMPLETE (2026-07-04) — `heatpump-bridge/` is built and verified against the simulator (27 tests, UI exit criteria met). Cloud side deployed + self-wiring (2026-07-07): Railway hub + Vercel dashboard + Neon Postgres all live; `pi-bootstrap.sh` injects hub + analytics from env vars. **Phase 1 is now UNGATED — Winnie confirmed the BMS port 2026-07-07** (`knowledge/reference/winnie-bms-port-reply.md`): CN22, pins 2/3/4=GND/A/B (not pin 1/12V), separate bus from CN23 (keep wall controller connected), no activation, slave address 1. Next: W610 bench config + Pi provisioning (`heatpump-bridge/deploy/`), then Phase 1 read-only commissioning (waits only on hardware). Still owed Winnie: series number (MAHRW030ZA/BEH2) + forced-defrost register question. Dev quickstart in `heatpump-bridge/README.md`.
-
-**Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
-
-Owner rejects over-engineering — right-sized solutions first (SQLite, single process, Cloudflare Tunnel).
-
-## Relationship to TempIQ
-
-- **NEVER edit TempIQv2** (`~/Documents/Claude/TempIQv2`) — it is a reference library only. Read it, learn from it, copy patterns from it (HBX read/write, SPAN panel power ingestion). No writes, no shared runtime dependencies in v1.
-- A2W Control is a **standalone platform**. Future integration (TempIQ setting heat pump targets, or feeding signals so A2W decides) arrives as an API consumer of the existing endpoints — never as a coupling that makes A2W depend on TempIQ to function. See `knowledge/reference/tempiq-borrowables.md` for the catalog of borrowable code.
+Use the Write tool for files that don't exist yet, Edit for files that do.
+Stop when the spec's files exist with the contents the spec describes — the eval runs automatically after you exit.
