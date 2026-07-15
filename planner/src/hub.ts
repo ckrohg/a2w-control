@@ -12,6 +12,7 @@ export interface HubPump {
   // Pi pushes these in every state frame (hub PumpState); typed here for the
   // TempIQ pusher (§A-7). Older hub builds may omit them — keep them optional-null.
   inlet_c?: number | null;
+  state?: string | null; // "heating" | "idle" | "offline" — for the unserved-call check
   outlet_c?: number | null;
 }
 

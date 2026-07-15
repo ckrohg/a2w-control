@@ -92,6 +92,12 @@ export class Store {
         cleared_at timestamptz,
         detail     text
       );
+      CREATE TABLE IF NOT EXISTS unserved_call_episodes (
+        id         serial PRIMARY KEY,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        cleared_at timestamptz,
+        detail     text
+      );
       CREATE TABLE IF NOT EXISTS hbx_boosts (
         id         serial PRIMARY KEY,
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -278,6 +284,17 @@ export class Store {
          window_end = EXCLUDED.window_end, t_end_f = EXCLUDED.t_end_f,
          hours = EXCLUDED.hours, slope_f_per_h = EXCLUDED.slope_f_per_h`,
       [f.windowStart, f.windowEnd, f.tStartF, f.tEndF, f.hours, f.slopeFPerH],
+    );
+  }
+
+  async openUnservedEpisode(detail: string): Promise<void> {
+    await this.pool.query(`INSERT INTO unserved_call_episodes (detail) VALUES ($1)`, [detail]);
+  }
+
+  async closeUnservedEpisode(): Promise<void> {
+    await this.pool.query(
+      `UPDATE unserved_call_episodes SET cleared_at = now()
+       WHERE cleared_at IS NULL AND id = (SELECT max(id) FROM unserved_call_episodes)`,
     );
   }
 

@@ -21,7 +21,7 @@ const fmt = (v: number | null | undefined, d = 0) => (v == null ? "—" : v.toFi
 
 type Pt = { x: number; y: number | null };
 type Series = { color: string; points: Pt[]; dash?: boolean };
-type Band = { x0: number; x1: number };
+type Band = { x0: number; x1: number; color?: string };
 
 function Chart({ series, hours, bands }: { series: Series[]; hours: number; bands?: Band[] }) {
   const W = 900, H = 200, pad = { l: 38, r: 10, t: 10, b: 20 };
@@ -47,7 +47,7 @@ function Chart({ series, hours, bands }: { series: Series[]; hours: number; band
       {(bands ?? []).map((b, i) => {
         const bx0 = Math.max(b.x0, x0), bx1 = Math.min(b.x1, x1);
         if (bx1 <= bx0) return null;
-        return <rect key={`b${i}`} x={X(bx0)} y={pad.t - 6} width={Math.max(2, X(bx1) - X(bx0))} height={5} rx={2} fill="#63e6be" fillOpacity={0.85} />;
+        return <rect key={`b${i}`} x={X(bx0)} y={pad.t - 6} width={Math.max(2, X(bx1) - X(bx0))} height={5} rx={2} fill={b.color ?? "#63e6be"} fillOpacity={0.85} />;
       })}
       {series.map((s, i) => {
         const pts = s.points.filter((p) => p.y != null && isFinite(p.y as number)) as { x: number; y: number }[];
@@ -75,6 +75,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let shadow: ShadowBlock[] | null = null;
   let driftAt: number | null = null;
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
+  let calls: { ts: number; any_call: boolean }[] = [];
   let dbError = false;
   try {
     await ensureSchema();
@@ -93,6 +94,11 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
           AND observed_at >= now() - interval '48 hours'
         ORDER BY id DESC LIMIT 1`;
       driftAt = d.rowCount ? (d.rows[0].t as number) : null;
+      calls = (await sql`
+        SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts,
+               (backup_called OR EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s)) AS any_call
+        FROM slx_readings WHERE ts >= now() - (${hours} || ' hours')::interval
+        ORDER BY ts ASC`).rows as { ts: number; any_call: boolean }[];
       const fs = await sql`
         SELECT pump_id, name, ts, snapshot->'active_faults' AS faults FROM pump_snapshots
         WHERE jsonb_array_length(snapshot->'active_faults') > 0`;
@@ -249,19 +255,34 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               rs.map((r) => ({ x: r.ts, y: conv ? f(r[k] as number | null) : (r[k] as number | null) }));
             // Running band: contiguous state === "heating" stretches (compressors on),
             // bridged across normal 60s sample gaps — the "was it actually running" strip.
-            const runBands: { x0: number; x1: number }[] = [];
+            const runBands: Band[] = [];
             for (const r of rs) {
               if (r.state !== "heating") continue;
               const last = runBands[runBands.length - 1];
               if (last && r.ts - last.x1 <= 180) last.x1 = r.ts + 60;
               else runBands.push({ x0: r.ts, x1: r.ts + 60 });
             }
+            // Unserved-call band (red): an HBX call was up but NO pump anywhere was
+            // running (±3 min tolerance for start ramps) — the HP2-winter-failure
+            // signature, drawn as a system condition on every pump's chart.
+            const heatingTs = rows.filter((r) => r.state === "heating").map((r) => r.ts);
+            const unservedBands: Band[] = [];
+            for (const c of calls) {
+              if (!c.any_call) continue;
+              const served = heatingTs.some((t) => Math.abs(t - c.ts) <= 180);
+              if (served) continue;
+              const last = unservedBands[unservedBands.length - 1];
+              if (last && c.ts - last.x1 <= 420) last.x1 = c.ts + 300;
+              else unservedBands.push({ x0: c.ts, x1: c.ts + 300, color: "#ff6b6b" });
+            }
+            // require persistence ≥10 min so anti-short-cycle restarts stay innocent
+            const flaggedBands = unservedBands.filter((b) => b.x1 - b.x0 >= 600);
             return (
               <div key={id}>
                 <div className="chart-block">
                   <h3>{name} — Temperatures °F</h3>
                   <div className="chart">
-                    <Chart hours={hours} bands={runBands} series={[
+                    <Chart hours={hours} bands={[...runBands, ...flaggedBands]} series={[
                       { color: "#4dabf7", points: pick("outlet_c", true) },
                       { color: "#63e6be", points: pick("inlet_c", true) },
                       { color: "#845ef7", points: pick("ambient_c", true) },
@@ -270,6 +291,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                   </div>
                   <div className="legend">
                     <span><i style={{ background: "#63e6be", borderRadius: 3 }} />Running (top strip)</span>
+                    <span><i style={{ background: "#ff6b6b", borderRadius: 3 }} />Called, nothing running</span>
                     <span><i style={{ background: "#4dabf7" }} />Outlet</span>
                     <span><i style={{ background: "#63e6be" }} />Inlet</span>
                     <span><i style={{ background: "#845ef7" }} />Outdoor</span>

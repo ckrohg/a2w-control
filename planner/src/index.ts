@@ -218,6 +218,57 @@ async function checkI8(): Promise<void> {
   }
 }
 
+/**
+ * Called-but-not-running (owner ask 2026-07-15; §8.1's capacity-outage rule made live):
+ * an HBX stage call is up but NO pump's compressors are running. Requires the condition
+ * to persist ≥2 consecutive polls (~10 min) — anti-short-cycle restarts and normal
+ * call-to-start ramps are innocent. This is the alarm HP2's silent winter failure never
+ * had, and the exact state the A-4 power-cycle produced. Episodes persist for the
+ * incident log; edge-triggered ntfy both ways.
+ */
+let unservedStreak = 0;
+let unservedAlerted = false;
+async function checkUnservedCall(reading: SlxReading): Promise<void> {
+  if (!hub) return;
+  const anyStageCall = reading.stagesCalled?.some(Boolean) === true;
+  if (!anyStageCall) {
+    unservedStreak = 0;
+    if (unservedAlerted) {
+      unservedAlerted = false;
+      await store.closeUnservedEpisode().catch(() => {});
+      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.");
+    }
+    return;
+  }
+  let running = false;
+  try {
+    const st = await hub.getState();
+    running = st.pumps.some((p) => p.online && p.state === "heating");
+  } catch {
+    return; // hub unreachable — can't judge; don't false-alarm
+  }
+  if (running) {
+    unservedStreak = 0;
+    if (unservedAlerted) {
+      unservedAlerted = false;
+      await store.closeUnservedEpisode().catch(() => {});
+      await ntfy("Unserved call cleared", "A pump is running against the call again.");
+    }
+    return;
+  }
+  unservedStreak++;
+  if (unservedStreak >= 2 && !unservedAlerted) {
+    unservedAlerted = true;
+    const detail = `HBX stage call active ~${unservedStreak * 5} min with no pump running (tank ${reading.tankF ?? "?"}°F / target ${reading.tankTargetF ?? "?"}°F)`;
+    await store.openUnservedEpisode(detail).catch(() => {});
+    await ntfy(
+      "⚠ Heat call active but NO pump is running",
+      `${detail}. Causes: pump powered off, failure-to-start (the HP2 winter pattern), or a write-disabled/faulted unit. The tank is falling while HBX waits.`,
+      "high",
+    );
+  }
+}
+
 /** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
  *  page — legitimate on a design-cold day, a planner bug or config drift any other time.
  *  Edge-triggered; the element's actual runtime (breaker permitting) lives in SPAN. */
@@ -415,6 +466,7 @@ async function pollOnce(): Promise<void> {
   await store.insertReading(reading);
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
+  await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
 
