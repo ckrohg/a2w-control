@@ -66,6 +66,14 @@ const copAt = (o: number, w: number) =>
   w - o <= 5 ? 6 : Math.max(1, Math.min(6, (eta(o) * (w + 459.67)) / (w - o)));
 /** water temp of the iso-COP contour `c` at outdoor `o` (invert copAt) */
 const isoW = (c: number, o: number) => (c * o + eta(o) * 459.67) / (c - eta(o));
+/** n-weighted (by measured-hour count) model COP over a mild/warm outdoor bin — lets the
+ *  receipt card show the MODELED "possible" COP at planner-cool tanks over the SAME weather
+ *  the measurements sampled (mild <65°F, warm ≥65°F, matching the extractor's cop_summary). */
+const nwCop = (key: "af" | "cur" | "pot", lo: number, hi: number) => {
+  const rows = history.receipt.filter((r) => r.n_v3 && r.o >= lo && r.o < hi && r[key] != null);
+  const w = rows.reduce((s, r) => s + (r.n_v3 as number), 0);
+  return w ? Math.round((rows.reduce((s, r) => s + (r[key] as number) * (r.n_v3 as number), 0) / w) * 10) / 10 : null;
+};
 
 const fmtK = (n: number) => n.toLocaleString("en-US");
 const copHue = (c: number) => Math.max(0, Math.min(1, (c - 1.6) / 2.9)) * 120; // red→green
@@ -390,6 +398,9 @@ export default async function CurvePage() {
   const era = `${new Date(m.era.from + "T12:00:00").toLocaleString("en-US", { month: "short", day: "numeric" })} → ${new Date(m.era.to + "T12:00:00").toLocaleString("en-US", { month: "short", day: "numeric" })}`;
   const copPts = history.cop_points.filter((p) => p.o != null) as { o: number; cop: number; v: number | null }[];
   const cop = history.meta.cop;
+  // Possible (modeled) COP at planner-cool tanks vs the model at as-found tanks, same weather.
+  const possMild = nwCop("cur", 0, 65), possWarm = nwCop("cur", 65, 999);
+  const afMild = nwCop("af", 0, 65), afWarm = nwCop("af", 65, 999);
 
   return (
     <>
@@ -406,12 +417,17 @@ export default async function CurvePage() {
           </div>
         </div>
         <div className="card">
-          <h2>The receipt <span className="chip warn">measured · corrected</span></h2>
-          <div className="temps"><div className="temp"><div className="v">COP {cop.v3_median_mild} → {cop.v3_median_warm}</div><div className="l">mild → warm, auditable data</div></div></div>
+          <h2>The receipt <span className="chip warn">measured vs. modeled</span></h2>
+          <div className="temps">
+            <div className="temp"><div className="v">{cop.v3_median_mild} → {cop.v3_median_warm}</div><div className="l">measured · old hot tanks</div></div>
+            <div className="temp"><div className="v">{possMild} → {possWarm}</div><div className="l">possible · planner-cool</div></div>
+          </div>
           <div className="meta">
-            The earlier &ldquo;flat 2.33&rdquo; was a measurement artifact — two calculators glued across seasons, and the
-            winter one reads above the machine&apos;s own 1.96 spec ceiling at W75. The auditable measurements rise with
-            outdoor temp like physics demands, but still sit 1–2 COP below what these pumps do at planner-cool tank temps.
+            Left = what the pumps actually did at 150–165°F tanks (mild → warm outdoor): auditable, but draw-contaminated,
+            so a floor. Right = the same efficiency model at the planner&apos;s cooler targets, over the same weather. Same
+            model, only the water gets cooler — the honest tank-temperature prize is {afMild} → {possMild} (mild) and{" "}
+            {afWarm} → {possWarm} (warm). The old &ldquo;flat 2.33&rdquo; was an artifact: two calculators glued across
+            seasons, the winter one beating the machine&apos;s 1.96 W75 spec.
           </div>
         </div>
         <div className="card">
