@@ -20,8 +20,8 @@ export async function StormBanner() {
         className="banner"
         style={{ background: "#3d3222", border: "1px solid #6b5a30", color: "#ffe0a3" }}
       >
-        ⛈ Storm mode ARMED — {trigger} · since {fmtTime(t)}
-        {ceiling_f ? ` · banking to ${ceiling_f}°F` : ""}
+        ⛈ <b>Storm mode armed</b> — banking heat ahead of {trigger} · since {fmtTime(t)}
+        {ceiling_f ? ` · up to ${ceiling_f}°F` : ""}
       </div>
     );
   } catch {

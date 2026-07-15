@@ -33,9 +33,7 @@ export async function I1Banner() {
 
     return (
       <div className="banner">
-        ⚠ <b>I1 conflict:</b> HBX tank target {target.toFixed(1)}°F needs pump setpoints ≥ {required.toFixed(0)}°F,
-        but {offenders.join(" and ")} {offenders.length > 1 ? "are" : "is"} below it — the tank can never
-        satisfy calls (deadlock → backup timer). Raise the pump setpoint or lower the target.
+        ⚠ <b>Heat can&apos;t reach the tank:</b> the buffer needs pump setpoints ≥ {required.toFixed(0)}°F to hit its {target.toFixed(1)}°F target, but {offenders.join(" and ")} {offenders.length > 1 ? "are" : "is"} set below that — calls will stall and fall back to the backup heater. Raise the pump setpoint or lower the tank target. <span className="dim" style={{ fontSize: 11 }}>(conflict I1)</span>
       </div>
     );
   } catch {
