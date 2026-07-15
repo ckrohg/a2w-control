@@ -373,6 +373,7 @@ export default async function CurvePage() {
   let now: { o: number; t: number } | null = null;
   let blocks: ShadowBlock[] = [];
   let shadowAt: number | null = null;
+  let liveCop: { o: number; cop: number; q: number | null }[] = [];
   try {
     const slx = (await sql<SlxRow>`
       SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, tank_f, outdoor_f
@@ -391,6 +392,13 @@ export default async function CurvePage() {
     if (last && Date.now() / 1000 - last.ts < 1200) now = { o: last.outdoor_f as number, t: last.tank_f as number };
     const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
     if (sp.rowCount) { blocks = sp.rows[0].plan as ShadowBlock[]; shadowAt = sp.rows[0].t as number; }
+    // Live COP surface: the planner's incremental feed from TempIQ /cop-measurements — now
+    // de-flattened per TempIQ#1503 — stored in a2w Neon. The honest current COP, not the frozen bake.
+    const cp = await sql`
+      SELECT outdoor_temp_f AS o, cop, quality_score AS q FROM tempiq_cop_points
+      WHERE system LIKE 'hydronic%' AND measured_at >= now() - interval '30 days'
+        AND cop > 0 AND outdoor_temp_f IS NOT NULL ORDER BY measured_at ASC`;
+    liveCop = cp.rows as { o: number; cop: number; q: number | null }[];
   } catch { /* history still renders without Neon */ }
 
   const m = history.meta;
@@ -401,6 +409,11 @@ export default async function CurvePage() {
   // Possible (modeled) COP at planner-cool tanks vs the model at as-found tanks, same weather.
   const possMild = nwCop("cur", 0, 65), possWarm = nwCop("cur", 65, 999);
   const afMild = nwCop("af", 0, 65), afWarm = nwCop("af", 65, 999);
+  // Live de-flattened COP (TempIQ#1503) stats, binned like the receipt.
+  const med = (xs: number[]) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] : null);
+  const lcAll = med(liveCop.map((p) => p.cop));
+  const lcMild = med(liveCop.filter((p) => p.o <= 65).map((p) => p.cop));
+  const lcWarm = med(liveCop.filter((p) => p.o > 65).map((p) => p.cop));
 
   return (
     <>
@@ -408,6 +421,19 @@ export default async function CurvePage() {
       <StormBanner />
 
       <div className="cards">
+        <div className="card">
+          <h2>Live COP <span className="chip on">de-flattened · #1503</span></h2>
+          <div className="temps">
+            <div className="temp"><div className="v">{lcAll?.toFixed(2) ?? "—"}</div><div className="l">median · last 30d</div></div>
+            <div className="temp"><div className="v">{lcMild?.toFixed(2) ?? "—"}</div><div className="l">mild ≤65°F out</div></div>
+            <div className="temp"><div className="v">{lcWarm?.toFixed(2) ?? "—"}</div><div className="l">warm &gt;65°F out</div></div>
+          </div>
+          <div className="meta">
+            The planner&apos;s live COP feed ({liveCop.length} points) from TempIQ, now segmented to the honest
+            v3 calorimetric measurement (TempIQ#1503) — no longer the flat ~2.33 artifact. This is the current
+            efficiency read; the frozen July-14 bake below is kept for the before/after story.
+          </div>
+        </div>
         <div className="card">
           <h2>Before <span className="chip off">8 months</span></h2>
           <div className="temps"><div className="temp"><div className="v">150–165°</div><div className="l">tank, all year</div></div></div>
