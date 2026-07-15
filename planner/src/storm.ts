@@ -105,11 +105,14 @@ function triggerWindow(qualifying: StormForecastHour[]): { onset: string; expire
 export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTrigger[] {
   const triggers: SyntheticTrigger[] = [];
 
-  const cold = hours.filter((h) => h.tempF < 0);
-  if (cold.length >= 1) {
+  // North Shore (5A coastal) design temp ~7°F: a sub-0°F bar almost never fires here, so a
+  // genuine cold snap never pre-charged. Bar is <10°F sustained ≥3 h (matches the wind ≥3 h /
+  // freezing-rain ≥2 h sustained-count pattern) — fires on a real cold event, not every dip.
+  const cold = hours.filter((h) => h.tempF < 10);
+  if (cold.length >= 3) {
     triggers.push({
       kind: "extreme-cold",
-      detail: `forecast low ${Math.min(...cold.map((h) => h.tempF))}F`,
+      detail: `forecast low ${Math.min(...cold.map((h) => h.tempF))}F across ${cold.length} h`,
       ...triggerWindow(cold),
     });
   }

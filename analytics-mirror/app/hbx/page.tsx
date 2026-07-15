@@ -419,7 +419,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
             </div>
             <div className="meta">
               <b>What arms a raise:</b> an NWS <i>Warning</i> (Winter Storm · Ice Storm · Blizzard · High Wind ·
-              Extreme Cold / Wind Chill) · forecast &lt; 0°F · gusts &gt; 45 mph for ≥3 h · freezing rain ≥2 h ·
+              Extreme Cold / Wind Chill) · forecast &lt; 10°F for ≥3 h · gusts &gt; 45 mph for ≥3 h · freezing rain ≥2 h ·
               ≥8 in total snow · a confirmed grid outage (activates immediately, to bank heat before power loss).
             </div>
             <div className="meta dim">
