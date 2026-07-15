@@ -1,5 +1,5 @@
 // @purpose App-shell nav bar (W1-D) — client component rendered by the root layout on
-// every page except /login. Brand + primary tabs (Home/Tank/Curve/Savings/Control) with
+// every page except /login. Brand + primary tabs (Home/Tank/Curve/Savings/Optimize/Control) with
 // active-state derived from the current pathname, an Advanced overflow link, and a
 // sign-out form that POSTs to /api/logout.
 "use client";
@@ -24,6 +24,9 @@ export function Nav() {
         </a>
         <a href="/savings" className={pathname.startsWith("/savings") ? "active" : undefined}>
           Savings
+        </a>
+        <a href="/optimize" className={pathname.startsWith("/optimize") ? "active" : undefined}>
+          Optimize
         </a>
         <a href="/control" className={pathname.startsWith("/control") ? "active" : undefined}>
           Control
