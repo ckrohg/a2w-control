@@ -117,18 +117,18 @@ function CurveField({
   const hp1 = history.meta.asfound.hp1_setpoint_f, hp2 = history.meta.asfound.hp2_setpoint_f;
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: "auto", aspectRatio: "900/430" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/430" }}>
       {/* axes */}
       {[90, 110, 130, 150, 170].map((t) => (
         <g key={`y${t}`}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(t)} y2={Y(t)} stroke="#2c3640" strokeWidth={0.7} />
+          <line x1={pad.l} x2={W - pad.r} y1={Y(t)} y2={Y(t)} stroke="#2c3640" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />
           <text x={4} y={Y(t) + 4} fill="#8b98a5" fontSize={12}>{t}°</text>
         </g>
       ))}
       {[0, 20, 40, 60, 80, 100].map((o) => (
         <text key={`x${o}`} x={X(o)} y={H - 8} fill="#8b98a5" fontSize={12} textAnchor="middle">{o}°F out</text>
       ))}
-      <line x1={X(5)} x2={X(5)} y1={pad.t + 6} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.4} strokeDasharray="3 5" />
+      <line x1={X(5)} x2={X(5)} y1={pad.t + 6} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.4} strokeDasharray="3 5" vectorEffect="non-scaling-stroke" />
       <Note x={X(5) + 5} y={Y(91)} color="#8b7355" size={11} weight={500}>design day 5°F</Note>
 
       {/* iso-COP arcs */}
@@ -136,7 +136,7 @@ function CurveField({
         <g key={`c${c}`}>
           <path
             d={pts.map((p, j) => `${j ? "L" : "M"}${X(p.o).toFixed(1)},${Y(p.w).toFixed(1)}`).join("")}
-            fill="none" stroke="#5d6c7b" strokeWidth={1.2} strokeDasharray="2 5"
+            fill="none" stroke="#5d6c7b" strokeWidth={1.2} strokeDasharray="2 5" vectorEffect="non-scaling-stroke"
           />
           <text x={lx} y={ly - 5} fill="#8b98a5" fontSize={12} fontWeight={600} textAnchor="middle"
             transform={`rotate(${angle.toFixed(1)} ${lx.toFixed(1)} ${(ly - 5).toFixed(1)})`}
@@ -147,31 +147,31 @@ function CurveField({
       {/* BEFORE: density cloud of hourly (outdoor, tank), 2°F bins */}
       {bins.filter((b) => b[1] >= HY.min && b[1] <= HY.max).map(([o, t, n], i) => (
         <rect key={`d${i}`} x={X(o - 1)} y={Y(t + 1)} width={X(o + 1) - X(o - 1)} height={Y(t - 1) - Y(t + 1)}
-          fill="#4dabf7" fillOpacity={0.1 + 0.5 * (Math.log(n + 1) / Math.log(maxN + 1))} rx={1} />
+          fill="#4dabf7" fillOpacity={0.1 + 0.5 * (Math.log(n + 1) / Math.log(maxN + 1))} rx={1} vectorEffect="non-scaling-stroke" />
       ))}
 
       {/* as-found regime: HBX target curve + parked HP setpoints */}
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(curveF(o)).toFixed(1)}`).join("")}
-        fill="none" stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" />
+        fill="none" stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" vectorEffect="non-scaling-stroke" />
       {[hp1, hp2].map((sp) => (
         <line key={sp} x1={X(HX.min)} x2={X(HX.max)} y1={Y(sp)} y2={Y(sp)}
-          stroke="#8b98a5" strokeWidth={1.1} strokeDasharray="2 4" />
+          stroke="#8b98a5" strokeWidth={1.1} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
       ))}
 
       {/* AFTER: optimizer envelope */}
-      <path d={`M${envTop.join("L")}L${envBot.join("L")}Z`} fill="#e599f7" fillOpacity={0.12} />
+      <path d={`M${envTop.join("L")}L${envBot.join("L")}Z`} fill="#e599f7" fillOpacity={0.12} vectorEffect="non-scaling-stroke" />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(hiF(o)).toFixed(1)}`).join("")}
-        fill="none" stroke="#e599f7" strokeWidth={1.6} />
+        fill="none" stroke="#e599f7" strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(loF(o)).toFixed(1)}`).join("")}
-        fill="none" stroke="#e599f7" strokeWidth={1.6} />
+        fill="none" stroke="#e599f7" strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
 
       {/* live: hourly means, last 24 h + current point */}
       {live.map((p, i) => (
-        <circle key={`l${i}`} cx={X(p.x)} cy={Y(clampY(p.y))} r={2.4} fill="#e6edf3" fillOpacity={0.8} />
+        <circle key={`l${i}`} cx={X(p.x)} cy={Y(clampY(p.y))} r={2.4} fill="#e6edf3" fillOpacity={0.8} vectorEffect="non-scaling-stroke" />
       ))}
       {now && (
         <g>
-          <circle cx={X(now.o)} cy={Y(clampY(now.t))} r={7} fill="none" stroke="#e6edf3" strokeWidth={1.6} />
+          <circle cx={X(now.o)} cy={Y(clampY(now.t))} r={7} fill="none" stroke="#e6edf3" strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
           <Note x={X(now.o) + 11} y={Y(clampY(now.t)) + 4} color="#e6edf3">live now</Note>
         </g>
       )}
@@ -179,7 +179,7 @@ function CurveField({
       {/* today's plan blocks */}
       {blocks.map((b, i) => (
         <circle key={`p${i}`} cx={X(b.outdoor_f)} cy={Y(b.tank_target_f)} r={4}
-          fill="#e599f7" stroke={b.reason.includes("sanitize") ? "#ffd666" : "#0f1419"} strokeWidth={1.4}>
+          fill="#e599f7" stroke={b.reason.includes("sanitize") ? "#ffd666" : "#0f1419"} strokeWidth={1.4} vectorEffect="non-scaling-stroke">
           <title>{`${fmtTime(new Date(b.ts))} → ${b.tank_target_f}°F · ${b.reason} · modeled COP ${copAt(b.outdoor_f, b.tank_target_f).toFixed(2)}`}</title>
         </circle>
       ))}
@@ -227,10 +227,10 @@ function ReceiptChart({ points, receipt, mfr }: {
     return pts.map((r, j) => `${j ? "L" : "M"}${X(r.o).toFixed(1)},${Y(r[key] as number).toFixed(1)}`).join("");
   };
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: "auto", aspectRatio: "900/280" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/280" }}>
       {[1, 2, 3, 4, 5, 6].map((c) => (
         <g key={c}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(c)} y2={Y(c)} stroke="#2c3640" strokeWidth={0.7} />
+          <line x1={pad.l} x2={W - pad.r} y1={Y(c)} y2={Y(c)} stroke="#2c3640" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />
           <text x={4} y={Y(c) + 4} fill="#8b98a5" fontSize={12}>{c.toFixed(0)}</text>
         </g>
       ))}
@@ -239,18 +239,18 @@ function ReceiptChart({ points, receipt, mfr }: {
       ))}
       {points.map((p, i) => (
         <circle key={i} cx={X(p.o)} cy={Y(p.cop)} r={2}
-          fill={(p.v ?? 0) >= 3 ? "#4dabf7" : "#8b98a5"} fillOpacity={(p.v ?? 0) >= 3 ? 0.32 : 0.22} />
+          fill={(p.v ?? 0) >= 3 ? "#4dabf7" : "#8b98a5"} fillOpacity={(p.v ?? 0) >= 3 ? 0.32 : 0.22} vectorEffect="non-scaling-stroke" />
       ))}
-      <path d={line("af")} fill="none" stroke="#8b98a5" strokeWidth={1.5} strokeDasharray="5 4" />
-      <path d={line("measured_v1")} fill="none" stroke="#ff6b6b" strokeWidth={1.6} strokeDasharray="2 4" />
-      <path d={line("measured_v3")} fill="none" stroke="#4dabf7" strokeWidth={2.6} />
-      <path d={line("cur")} fill="none" stroke="#e599f7" strokeWidth={2.2} />
-      <path d={line("pot")} fill="none" stroke="#e599f7" strokeWidth={1.5} strokeDasharray="5 4" />
+      <path d={line("af")} fill="none" stroke="#8b98a5" strokeWidth={1.5} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
+      <path d={line("measured_v1")} fill="none" stroke="#ff6b6b" strokeWidth={1.6} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
+      <path d={line("measured_v3")} fill="none" stroke="#4dabf7" strokeWidth={2.6} vectorEffect="non-scaling-stroke" />
+      <path d={line("cur")} fill="none" stroke="#e599f7" strokeWidth={2.2} vectorEffect="non-scaling-stroke" />
+      <path d={line("pot")} fill="none" stroke="#e599f7" strokeWidth={1.5} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
       {/* manufacturer rated points at W75 — the machine's own ceiling at hot water */}
       {mfr.map((m, i) => (
         <g key={`m${i}`}>
           <path d={`M${X(m.o)},${Y(m.cop) - 6}L${X(m.o) + 6},${Y(m.cop)}L${X(m.o)},${Y(m.cop) + 6}L${X(m.o) - 6},${Y(m.cop)}Z`}
-            fill="#ffd666" stroke="#0f1419" strokeWidth={1} />
+            fill="#ffd666" stroke="#0f1419" strokeWidth={1} vectorEffect="non-scaling-stroke" />
           <text x={X(m.o) + 9} y={Y(m.cop) - 6} fill="#ffd666" fontSize={11.5} fontWeight={600}
             paintOrder="stroke" stroke="#0f1419" strokeWidth={3}>spec {m.cop} @ W75</text>
         </g>
@@ -288,10 +288,10 @@ function SeasonKwh({ daily }: { daily: Daily[] }) {
     cfPath += `${cfPath ? "L" : "M"}${(X(i) + bw / 2).toFixed(1)},${Y(h * (d.cop_af / d.cop_cur)).toFixed(1)}`;
   });
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: "auto", aspectRatio: "900/240" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/240" }}>
       {grid.map((g, i) => (
         <g key={i}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={0.7} />
+          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />
           <text x={4} y={Y(g) + 4} fill="#8b98a5" fontSize={12}>{g}</text>
         </g>
       ))}
@@ -299,16 +299,16 @@ function SeasonKwh({ daily }: { daily: Daily[] }) {
         const h = hp(d), e = el(d);
         return (
           <g key={d.d}>
-            {h > 0 && <rect x={X(i)} y={Y(h)} width={bw} height={Y(0) - Y(h)} fill="#ff9f43" fillOpacity={0.8}>
+            {h > 0 && <rect x={X(i)} y={Y(h)} width={bw} height={Y(0) - Y(h)} fill="#ff9f43" fillOpacity={0.8} vectorEffect="non-scaling-stroke">
               <title>{`${d.d} · HP ${h.toFixed(1)} kWh ($${(h * history.meta.rate_usd_kwh).toFixed(2)}) · ${d.out}°F mean`}</title>
             </rect>}
-            {e > 0.2 && <rect x={X(i)} y={Y(h + e)} width={bw} height={Y(0) - Y(e)} fill="#ff6b6b" fillOpacity={0.85}>
+            {e > 0.2 && <rect x={X(i)} y={Y(h + e)} width={bw} height={Y(0) - Y(e)} fill="#ff6b6b" fillOpacity={0.85} vectorEffect="non-scaling-stroke">
               <title>{`${d.d} · element ${e.toFixed(1)} kWh ($${(e * history.meta.rate_usd_kwh).toFixed(2)})`}</title>
             </rect>}
           </g>
         );
       })}
-      <path d={cfPath} fill="none" stroke="#e599f7" strokeWidth={1.6} strokeDasharray="4 3" />
+      <path d={cfPath} fill="none" stroke="#e599f7" strokeWidth={1.6} strokeDasharray="4 3" vectorEffect="non-scaling-stroke" />
       {monthTicks(daily).map((t) => (
         <text key={t.i} x={X(t.i)} y={H - 8} fill="#8b98a5" fontSize={12}>{t.label}</text>
       ))}
@@ -335,20 +335,20 @@ function SeasonTemps({ daily }: { daily: Daily[] }) {
     daily.map((d, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(d.out_hi).toFixed(1)}`).join("") +
     daily.slice().reverse().map((d, i) => `L${X(n - 1 - i).toFixed(1)},${Y(d.out_lo).toFixed(1)}`).join("") + "Z";
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ height: "auto", aspectRatio: "900/260" }}>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/260" }}>
       {[0, 40, 80, 120, 160].map((g) => (
         <g key={g}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={0.7} />
+          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />
           <text x={4} y={Y(g) + 4} fill="#8b98a5" fontSize={12}>{g}°</text>
         </g>
       ))}
-      <path d={band} fill="#845ef7" fillOpacity={0.14} />
-      <path d={path((d) => d.out)} fill="none" stroke="#845ef7" strokeWidth={1.5} />
-      <path d={path((d) => d.tank)} fill="none" stroke="#4dabf7" strokeWidth={1.8} />
-      <path d={path((d) => d.tgt)} fill="none" stroke="#ffd666" strokeWidth={1.5} strokeDasharray="5 4" />
-      <path d={path((d) => d.tgt_cur)} fill="none" stroke="#e599f7" strokeWidth={1.8} />
+      <path d={band} fill="#845ef7" fillOpacity={0.14} vectorEffect="non-scaling-stroke" />
+      <path d={path((d) => d.out)} fill="none" stroke="#845ef7" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+      <path d={path((d) => d.tank)} fill="none" stroke="#4dabf7" strokeWidth={1.8} vectorEffect="non-scaling-stroke" />
+      <path d={path((d) => d.tgt)} fill="none" stroke="#ffd666" strokeWidth={1.5} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
+      <path d={path((d) => d.tgt_cur)} fill="none" stroke="#e599f7" strokeWidth={1.8} vectorEffect="non-scaling-stroke" />
       <line x1={pad.l} x2={W - pad.r} y1={Y(history.meta.asfound.hp1_setpoint_f)} y2={Y(history.meta.asfound.hp1_setpoint_f)}
-        stroke="#63e6be" strokeWidth={1.1} strokeDasharray="2 3" />
+        stroke="#63e6be" strokeWidth={1.1} strokeDasharray="2 3" vectorEffect="non-scaling-stroke" />
       {monthTicks(daily).map((t) => (
         <text key={t.i} x={X(t.i)} y={H - 8} fill="#8b98a5" fontSize={12}>{t.label}</text>
       ))}
@@ -393,15 +393,6 @@ export default async function CurvePage() {
 
   return (
     <>
-      <header>
-        <h1>The Curve</h1>
-        <span className="dim">before vs. after · {era} baked · live overlay</span>
-        <a className="btn" href="/" style={{ marginLeft: "auto", textDecoration: "none" }}>Pumps</a>
-        <a className="btn" href="/hbx" style={{ textDecoration: "none" }}>HBX</a>
-        <a className="btn" href="/savings" style={{ textDecoration: "none" }}>Savings</a>
-        <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
-      </header>
-
       <I1Banner />
       <StormBanner />
 
@@ -512,7 +503,7 @@ export default async function CurvePage() {
         </div>
         <div className="meta">
           The counterfactual&apos;s winter plateau is the I4 strict cap (135°) — enough for the binding baseboard zone on
-          design day but with zero margin, because the demand-driven winter solver isn&apos;t built yet (plan §6.9). Once
+          design day but with zero margin, because the demand-driven winter solver isn&apos;t built yet. Once
           zone demand feeds in, winter targets ride each day&apos;s actual binding-zone need instead of a fixed cap.
         </div>
       </div>
@@ -539,7 +530,7 @@ export default async function CurvePage() {
       <div className="chart-block">
         <h3>Honesty notes</h3>
         {m.notes.map((n, i) => <div className="meta" key={i}>· {n}</div>)}
-        <div className="meta">· counterfactuals scale measured daily HP kWh by the modeled COP ratio — the meter is the ledger, models are diagnostics (plan §8.1)</div>
+        <div className="meta">· counterfactuals scale measured daily HP kWh by the modeled COP ratio — the meter is the ledger, models are diagnostics</div>
         <div className="meta">· winter months conflate HP2 degradation and the disabled element; the A-6 baseline model is claim-grade at monthly aggregation only</div>
         <div className="meta">· extract {m.extracted_at} · rate ${m.rate_usd_kwh}/kWh flat, 1:1 net metering · COP surface η = {ETA_BASE} Carnot-style (TempIQ)</div>
       </div>
