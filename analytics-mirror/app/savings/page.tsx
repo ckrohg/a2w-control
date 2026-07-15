@@ -8,6 +8,7 @@ import { sql } from "@vercel/postgres";
 import { fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";
+import history from "@/lib/curve-history.json";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,6 +23,23 @@ const DAILY_KWH = Number(process.env.DAILY_KWH_BASELINE ?? "11.8"); // SPAN, Jul
 
 const fmt = (v: number | null | undefined, d = 1) =>
   v == null || !isFinite(v as number) ? "—" : (v as number).toFixed(d);
+
+// COP before/after (from the frozen /curve extract, lib/curve-history.json): measured
+// old-regime vs modeled at planner-cool tanks, n-weighted over the same mild/warm weather.
+const _H = history as any;
+const _nwCop = (key: "af" | "cur", lo: number, hi: number) => {
+  const rows = _H.receipt.filter((r: any) => r.n_v3 && r.o >= lo && r.o < hi && r[key] != null);
+  const w = rows.reduce((s: number, r: any) => s + r.n_v3, 0);
+  return w ? Math.round((rows.reduce((s: number, r: any) => s + r[key] * r.n_v3, 0) / w) * 10) / 10 : 0;
+};
+const COP_MEAS = { mild: _H.meta.cop.v3_median_mild as number, warm: _H.meta.cop.v3_median_warm as number };
+const COP_POSS = { mild: _nwCop("cur", 0, 65), warm: _nwCop("cur", 65, 999) };
+const COP_AF = { mild: _nwCop("af", 0, 65), warm: _nwCop("af", 65, 999) };
+// same-model tank-temp effect → % less electricity for the same heat (honest, model-to-model)
+const LESS_ELEC = {
+  mild: Math.round((1 - COP_AF.mild / COP_POSS.mild) * 100),
+  warm: Math.round((1 - COP_AF.warm / COP_POSS.warm) * 100),
+};
 
 const WINDOWS: Record<string, { label: string; interval: string | null }> = {
   "24h": { label: "24h", interval: "24 hours" },
@@ -160,6 +178,23 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                 that&apos;s ≈ <b>${fmt(dailyWasteUsd, 2)}/day</b> currently left on the table.
                 This is a summer (hot-water-only) figure; the winter number is larger.
                 The ~1%/°F slope is the exact thing the A-4 test measures for your pumps.
+              </div>
+            </div>
+
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <h2>Why cooler water is cheaper<span className="chip warn">measured vs. modeled</span></h2>
+              <div className="temps">
+                <div className="temp"><div className="v">{COP_MEAS.mild} → {COP_MEAS.warm}</div><div className="l">COP today · measured</div></div>
+                <div className="temp"><div className="v">{COP_POSS.mild} → {COP_POSS.warm}</div><div className="l">COP possible · modeled</div></div>
+                <div className="temp"><div className="v">{LESS_ELEC.mild}–{LESS_ELEC.warm}%</div><div className="l">less power, same heat</div></div>
+              </div>
+              <div className="meta">
+                Efficiency (COP) is heat delivered per unit of electricity — higher is cheaper. Today the pumps hold a
+                150–165°F tank and measure COP ≈ {COP_MEAS.mild}–{COP_MEAS.warm} (mild → warm weather). The same pumps making
+                the planner&apos;s cooler ~120°F summer water model out at COP ≈ {COP_POSS.mild}–{COP_POSS.warm}. Apples-to-apples
+                (same efficiency model, only the water gets cooler) that&apos;s <b>{LESS_ELEC.mild}–{LESS_ELEC.warm}% less
+                electricity for the same hot water</b> — which is where the dollars above come from.{" "}
+                <a href="/curve" style={{ color: "#4dabf7" }}>Full breakdown on the curve →</a>
               </div>
             </div>
 

@@ -19,6 +19,9 @@ export const fetchCache = "force-no-store";
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 0) => (v == null ? "—" : v.toFixed(d));
+// Comm health — the Pi pushes readings.error_rate (fraction or %); surface it as link quality.
+const commPct = (er: number | null) =>
+  er == null ? "" : ` · ${(er <= 1 ? er * 100 : er).toFixed(0)}% comm err`;
 
 type SlxLatest = {
   ts: number; tank_f: number | null; tank_target_f: number | null; outdoor_f: number | null;
@@ -139,7 +142,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                   </div>
                   <div className="meta">
                     {fmt(last.power_w, 0)} W · {last.active_faults ? `${last.active_faults} fault(s) · ` : ""}
-                    last {fmtTime(last.ts)}
+                    last {fmtTime(last.ts)}{commPct(last.error_rate)}
                   </div>
                 </div>
               );
