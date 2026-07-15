@@ -21,6 +21,13 @@ export interface ShadowBlock {
   reason: string;
 }
 
+/** §6.9 winter-solver shadow: the demand engine's proposed tank floor for this plan. */
+export interface DemandFloor {
+  tankTargetF: number;
+  bindingZone: string;
+  awtF: number;
+}
+
 export interface ShadowOpts {
   dhwWindows: [number, number][]; // local-hour ranges [start, endExclusive]
   dhwFloorF: number;
@@ -80,6 +87,7 @@ export function computeShadowPlan(
   forecast: ForecastHour[],
   hbxConfig: Record<string, any> | null,
   opts: ShadowOpts = DEFAULT_OPTS,
+  demandFloor?: DemandFloor | null,
 ): ShadowBlock[] {
   const hours = forecast.slice(0, 24);
   const inWindow = (h: number) => opts.dhwWindows.some(([a, b]) => h >= a && h < b);
@@ -125,11 +133,16 @@ export function computeShadowPlan(
   return draft.map((d) => {
     let target = d.target;
     let reason = d.reason;
-    if (d.f.outdoorF < opts.winterGuardF && hbxConfig) {
-      const curve = curveTargetF(hbxConfig, d.f.outdoorF);
-      if (curve != null && curve > target) {
-        target = curve;
-        reason = "winter guard: mimic HBX curve (winter solver not built yet)";
+    if (d.f.outdoorF < opts.winterGuardF) {
+      if (demandFloor) {
+        target = Math.max(target, demandFloor.tankTargetF);
+        reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+      } else if (hbxConfig) {
+        const curve = curveTargetF(hbxConfig, d.f.outdoorF);
+        if (curve != null && curve > target) {
+          target = curve;
+          reason = "winter guard: mimic HBX curve (winter solver not built yet)";
+        }
       }
     }
     const band = bandFor(d.f.outdoorF, hbxConfig, opts.strictCapF);

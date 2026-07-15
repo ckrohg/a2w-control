@@ -14,7 +14,8 @@ import crypto from "node:crypto";
 import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
-import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
+import { computeShadowPlan, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { DemandFeed } from "./demand";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
 import { PhaseB } from "./phaseb";
@@ -78,6 +79,14 @@ const tempiqRead = TEMPIQ_READ_ENABLED && TEMPIQ_SURFACE_TOKEN
   ? new TempiqReader(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
 if (TEMPIQ_READ_ENABLED && !tempiqRead) console.warn("TEMPIQ_READ_ENABLED but TEMPIQ_SURFACE_TOKEN missing — reader disabled");
+
+// Winter-solver shadow seam (§6.9, W0-4). SHADOW ONLY: proposes demand floors to the
+// shadow planner and snapshots them; flag off = today's behavior byte-for-byte.
+const WINTER_SOLVER_SHADOW = process.env.WINTER_SOLVER_SHADOW === "1";
+const demandFeed = WINTER_SOLVER_SHADOW && TEMPIQ_SURFACE_TOKEN
+  ? new DemandFeed(TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  : null;
+if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but TEMPIQ_SURFACE_TOKEN missing — winter solver shadow disabled");
 if (PHASE_B_ENABLED && !hub) console.warn("PHASE_B_ENABLED but no hub configured — tracking disabled");
 if (phaseB) console.log(`PHASE B ${PHASE_B_DRY_RUN ? "DRY-RUN" : "ACTIVE"} for ${PHASE_B_PUMPS.join(", ")} (target + ${5}°F, leased)`);
 
@@ -215,7 +224,33 @@ async function shadowOnce(): Promise<void> {
   }
   const opts = learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows } : DEFAULT_OPTS;
 
-  const plan = computeShadowPlan(forecast, cfg, opts);
+  // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
+  let demandFloor: DemandFloor | null = null;
+  if (demandFeed) {
+    await demandFeed.refresh(); // never throws
+    const latest = await store.getLatestSlx().catch(() => null);
+    const outdoorF = latest?.outdoorF ?? forecast[0]?.outdoorF ?? null;
+    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF) : null;
+    if (floor) {
+      try {
+        await store.insertZoneFloorSnapshot({
+          ts: new Date(),
+          zones: floor.perZone,
+          bindingZone: floor.bindingZone,
+          bindingAwtF: floor.bindingAwtF,
+          tankTargetF: floor.tankTargetF,
+          source: "insights",
+        });
+      } catch (e) {
+        console.error("zone floor snapshot failed:", (e as Error).message);
+      }
+      if (floor.tankTargetF != null && floor.bindingZone != null && floor.bindingAwtF != null) {
+        demandFloor = { tankTargetF: floor.tankTargetF, bindingZone: floor.bindingZone, awtF: floor.bindingAwtF };
+      }
+    }
+  }
+
+  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor);
   if (!plan.length) throw new Error("empty forecast");
   await store.insertShadowPlan(plan, {
     dhw_windows: opts.dhwWindows,
@@ -367,6 +402,9 @@ async function main(): Promise<void> {
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
+            winter_solver: demandFeed
+              ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
+              : "off",
           });
         }
         if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore" || req.url === "/api/hbx/boost") {
