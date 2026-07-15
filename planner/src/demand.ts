@@ -93,6 +93,53 @@ export function computeFloors(
   };
 }
 
+/**
+ * TempIQv2#1508 — upstream zone emitter data is wrong/incomplete (owner survey
+ * 2026-07-14): "Living Room Baseboard" is actually radiant (name AND delivery_type
+ * mislabeled), and Xmas Room's baseboard loop has NO hydronic zone in TempIQ at all.
+ * Until #1508 lands these carry the surveyed ground truth; override via env
+ * EMITTER_OVERRIDES / EMITTER_SYNTHETIC_ZONES (JSON). TEMPORARY — delete with #1508.
+ */
+export const DEFAULT_EMITTER_OVERRIDES: Record<string, string> = {
+  "Living Room Baseboard": "radiant_floor",
+};
+export const DEFAULT_SYNTHETIC_ZONES: InsightZone[] = [
+  {
+    id: "synthetic:xmas-baseboard",
+    name: "Xmas Room (baseboard)",
+    deliveryType: "baseboard",
+    uaBtuHrF: null,
+    thermalMassBtuF: null,
+    confidence: null,
+  },
+];
+
+function envJson<T>(name: string, fallback: T): T {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    console.warn(`[demand] ${name} is not valid JSON — using built-in ground truth`);
+    return fallback;
+  }
+}
+
+/** Correct TempIQ's zone list against the owner-surveyed emitter map. */
+export function applyEmitterGroundTruth(
+  zones: InsightZone[],
+  overrides: Record<string, string> = envJson("EMITTER_OVERRIDES", DEFAULT_EMITTER_OVERRIDES),
+  synthetic: InsightZone[] = envJson("EMITTER_SYNTHETIC_ZONES", DEFAULT_SYNTHETIC_ZONES),
+): InsightZone[] {
+  const out = zones.map((z) =>
+    overrides[z.name] ? { ...z, deliveryType: overrides[z.name] } : z,
+  );
+  for (const s of synthetic) {
+    if (!out.some((z) => z.id === s.id || z.name === s.name)) out.push({ ...s });
+  }
+  return out;
+}
+
 /** GET {baseUrl}/api/insights/zones with a bearer token; defensive field mapping. */
 export async function fetchInsightZones(baseUrl: string, token: string): Promise<InsightZone[]> {
   const res = await fetch(`${baseUrl}/api/insights/zones`, {
@@ -134,7 +181,7 @@ export class DemandFeed {
 
   async refresh(): Promise<void> {
     try {
-      this.cached = await fetchInsightZones(this.baseUrl, this.token);
+      this.cached = applyEmitterGroundTruth(await fetchInsightZones(this.baseUrl, this.token));
       this.lastSuccessAt = new Date();
     } catch (err) {
       console.warn(`[demand] TempIQ zone refresh failed: ${(err as Error).message}`);
