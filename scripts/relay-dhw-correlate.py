@@ -1,152 +1,130 @@
 #!/usr/bin/env python3
 """
-@purpose Relay-map self-calibration starter (TempIQ#1505 follow-up). Read-only.
-Proposes the SensorLinx ECO-0600 relay index -> function map that #1505 currently
-ships as generic `relay_N` (RELAY_FUNCTION_MAP_VERSION "1505-tbd-generic-v1"), by
-correlating each relay's energized state against known demand signals:
+@purpose Relay-map self-calibration (TempIQv2#1505 follow-up). Read-only. Proposes the
+SensorLinx ECO-0600 relay index -> function labels that RELAY_FUNCTION_MAP still leaves
+generic (relays 6-16, and confirming relay 5), by correlating each relay's energized
+state against demand signals:
 
-  * DHW-draw windows  -> the DHW pump/diverter relay (identifiable YEAR-ROUND, since
-                         hot-water draws happen every day — the fast win).
-  * per-zone HEATING  -> that zone's circulator relay (needs HEATING-season data; in
-                         summer the space zones are idle so those stay unresolved).
+  * DHW-draw hours   -> the DHW pump/diverter relay (draws happen YEAR-ROUND).
+  * per-zone HEATING -> that zone's circulator relay (needs HEATING-season data; the
+                        space zones are idle in summer, so 6-16 mostly stay 0 until winter).
 
-Method: for each relay index r and each demand signal s, compute the "lift"
-    P(relay r energized | s active) / P(relay r energized overall).
-A lift >> 1 means relay r tracks signal s -> r is s's pump/valve. The DHW relay is
-whichever index has the highest lift against the draw signal.
+DATA SOURCE (verified against prod 2026-07-15):
+  * Relays: `hydronic_load_snapshots.relay_states` — the jsonb 16-element array the #1505
+    writer now populates (was 0 rows before #1505). This is the authoritative per-relay
+    source; a2w only stores a coarse relay bitmask.
+  * DHW draws: `readings` rows with `unit = 'gallons'` (the streamlabs water meter).
+    NOTE: the `readings` table has NO top-level metric column — signal identity lives in
+    `metadata` jsonb; the water meter is distinguished here by `unit='gallons'`.
 
-DATA SOURCE (TempIQ DB — the per-relay truth; a2w only stores a coarse relay count):
-  * Preferred once #1505 has deployed + synced: `hydronic_load_snapshots.relay_states`
-    (jsonb array of 16) with `--snapshots`.
-  * Available now historically: individual `relay_N_status` readings with `--readings`.
-Both need a read-only connection in $TEMPIQ_DATABASE_URL. Nothing runs without it —
-this is a ready-to-run starter, not a live result. Rerun after #1505 deploys, or point
-it at historical relay_N_status readings today for the DHW relay.
+Needs a read-only connection in $TEMPIQ_DATABASE_URL (e.g. TempIQ's Supabase session
+pooler). Rows accrue from the #1505 deploy forward, so run with more `--days` as history
+builds; zone-circulator resolution (relays 6-16) needs winter heat calls.
 
 Usage:
-    export TEMPIQ_DATABASE_URL='postgres://...:5432/postgres?sslmode=require'
-    python3 scripts/relay-dhw-correlate.py --readings --days 30
-    python3 scripts/relay-dhw-correlate.py --snapshots --days 14   # post-#1505
+    export TEMPIQ_DATABASE_URL='postgresql://...pooler.supabase.com:5432/postgres'
+    python3 scripts/relay-dhw-correlate.py --days 30
 """
 import argparse
-import json
 import os
 import subprocess
 import sys
 
-# Property + signal conventions verified from the #1503/#1505 recon (2026-07-15):
-#   readings.metadata->>'hvacStatus' = 'HEATING'  -> a space zone calling
-#   readings.unit = 'gal' (streamlabs water meter)  -> DHW draw when bucket sum > 2 gal/h
-#   readings.metric_type = 'relay_1_status'..'relay_16_status', value 0|1
-PROPERTY_ID = "10ade374-bd2e-466b-83aa-6329b8f39c71"  # 6 Black Brook (a2w property)
-DHW_GAL_PER_HOUR = 2.0
+PROPERTY_ID = "10ade374-bd2e-466b-83aa-6329b8f39c71"  # 6 Black Brook
+DHW_GAL_PER_HOUR = 2.0  # a "draw hour" — >2 gal of metered water in the hour
 
 
-def psql(sql: str) -> list[dict]:
-    """Run a read-only query via psql, return rows as dicts. Empty list on any error."""
+def psql(sql: str) -> list[list[str]]:
+    """Run a read-only query via psql; return rows as field lists. Exits on connect error."""
     url = os.environ.get("TEMPIQ_DATABASE_URL")
     if not url:
         sys.exit(
             "TEMPIQ_DATABASE_URL is not set.\n"
-            "This starter needs a read-only TempIQ DB connection. Export it and rerun:\n"
-            "  export TEMPIQ_DATABASE_URL='postgres://...sslmode=require'\n"
-            "(Until then the relay map stays the safe generic relay_N / tbd:true from #1505.)"
+            "This needs a read-only TempIQ DB connection (Supabase session pooler). Export it:\n"
+            "  export TEMPIQ_DATABASE_URL='postgresql://...:5432/postgres'\n"
         )
     try:
         out = subprocess.run(
-            ["psql", url, "-t", "-A", "-F", "\x1f", "--no-psqlrc", "-c", sql],
+            ["psql", url, "-t", "-A", "-F", "\x1f", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-c", sql],
             capture_output=True, text=True, timeout=120, check=True,
         ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-        print(f"[warn] query failed: {e}", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"[error] query failed:\n{e.stderr.strip()}", file=sys.stderr)
         return []
-    rows = []
-    for line in out.splitlines():
-        if line.strip():
-            rows.append(line.split("\x1f"))
-    return rows
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return []
+    return [line.split("\x1f") for line in out.splitlines() if line.strip()]
 
 
-def lift_table(mode: str, days: int) -> None:
-    # Draw windows (hour buckets with > DHW_GAL_PER_HOUR of metered flow) and zone-HEATING
-    # hours are the demand signals; relay energization is the response we're mapping.
-    relay_src = {
-        "readings": """
-            SELECT date_trunc('hour', r.timestamp) AS hour,
-                   (regexp_replace(r.metric_type, '\\D', '', 'g'))::int AS relay_idx,
-                   max(r.value) AS energized
-            FROM readings r JOIN equipment e ON r.equipment_id = e.id
-            WHERE e.property_id = %(pid)s AND r.metric_type LIKE 'relay_%%_status'
-              AND r.timestamp > now() - interval '%(days)s days'
-            GROUP BY 1, 2""",
-        "snapshots": """
-            SELECT date_trunc('hour', timestamp) AS hour,
-                   idx + 1 AS relay_idx,
-                   max((relay_states->>idx)::numeric) AS energized
-            FROM hydronic_load_snapshots,
-                 generate_series(0, 15) AS idx
-            WHERE property_id = %(pid)s AND relay_states IS NOT NULL
-              AND timestamp > now() - interval '%(days)s days'
-            GROUP BY 1, 2""",
-    }[mode]
-
+def correlate(days: int) -> None:
+    pid, thr = PROPERTY_ID, DHW_GAL_PER_HOUR
     sql = f"""
-    WITH relay AS ({relay_src}),
+    WITH relay AS (
+        SELECT date_trunc('hour', timestamp) AS hour,
+               idx + 1 AS relay_idx,
+               max((relay_states->>idx)::int) AS energized
+        FROM hydronic_load_snapshots, generate_series(0, 15) AS idx
+        WHERE property_id = '{pid}' AND relay_states IS NOT NULL
+          AND timestamp > now() - interval '{days} days'
+        GROUP BY 1, 2
+    ),
     draw AS (
         SELECT date_trunc('hour', r.timestamp) AS hour
         FROM readings r JOIN equipment e ON r.equipment_id = e.id
-        WHERE e.property_id = %(pid)s AND r.unit = 'gal'
-          AND r.timestamp > now() - interval '%(days)s days'
-        GROUP BY 1 HAVING sum(r.value::float) > {DHW_GAL_PER_HOUR}
+        WHERE e.property_id = '{pid}' AND r.unit = 'gallons'
+          AND r.timestamp > now() - interval '{days} days'
+        GROUP BY 1 HAVING sum(r.value::float) > {thr}
     )
     SELECT rl.relay_idx,
-           count(*) FILTER (WHERE rl.energized > 0)::float / nullif(count(*), 0) AS p_overall,
-           count(*) FILTER (WHERE rl.energized > 0 AND d.hour IS NOT NULL)::float
-             / nullif(count(*) FILTER (WHERE d.hour IS NOT NULL), 0) AS p_during_draw,
-           count(*) FILTER (WHERE d.hour IS NOT NULL) AS draw_hours
+           round(avg((rl.energized > 0)::int)::numeric, 3)                                   AS p_overall,
+           round(avg((rl.energized > 0)::int) FILTER (WHERE d.hour IS NOT NULL)::numeric, 3) AS p_draw,
+           count(*)                                                                          AS hours,
+           count(*) FILTER (WHERE d.hour IS NOT NULL)                                        AS draw_hours
     FROM relay rl LEFT JOIN draw d ON rl.hour = d.hour
     GROUP BY rl.relay_idx ORDER BY rl.relay_idx
-    """.replace("%(pid)s", f"'{PROPERTY_ID}'").replace("%(days)s", str(days))
-
+    """
     rows = psql(sql)
     if not rows:
-        print(
-            f"No relay data in the last {days}d via --{mode}.\n"
-            + ("  hydronic_load_snapshots is empty until #1505 deploys + the ECO-0600 syncs — "
-               "rerun then, or use --readings on historical relay_N_status.\n" if mode == "snapshots"
-               else "  no relay_N_status readings found for this property/window.\n")
-        )
+        print(f"No snapshot rows in the last {days}d. hydronic_load_snapshots accrues from the "
+              f"#1505 deploy forward — rerun with more history.")
         return
 
-    print(f"\nRelay ↔ DHW-draw correlation (--{mode}, last {days}d)")
-    print(f"{'relay':>5}  {'P(on)':>7}  {'P(on|draw)':>10}  {'lift':>6}  candidate")
+    total_hours = rows[0][3] if rows else "0"
+    draw_hours = rows[0][4] if rows else "0"
+    print(f"\nRelay correlation — {total_hours} snapshot-hours ({draw_hours} with a DHW draw), last {days}d")
+    print(f"{'relay':>5}  {'P(on)':>7}  {'P(on|draw)':>10}  {'lift':>6}  note")
     best_idx, best_lift = None, 0.0
-    for idx, p_overall, p_draw, draw_h in rows:
+    for idx, p_overall, p_draw, _h, _dh in rows:
         po = float(p_overall) if p_overall not in ("", None) else 0.0
         pd = float(p_draw) if p_draw not in ("", None) else 0.0
         lift = (pd / po) if po > 0 else 0.0
-        flag = "← DHW pump?" if lift >= 1.5 and pd >= 0.3 else ""
-        if lift > best_lift:
+        note = ""
+        if po >= 0.98:
+            note = "always-on (circulator/system pump — not a call)"
+        elif lift >= 1.5 and pd >= 0.3:
+            note = "← DHW pump candidate"
+        elif po == 0:
+            note = "never energized in window"
+        if lift > best_lift and po < 0.98:
             best_idx, best_lift = idx, lift
-        print(f"{idx:>5}  {po:>7.2f}  {pd:>10.2f}  {lift:>6.2f}  {flag}")
+        print(f"{idx:>5}  {po:>7.3f}  {pd:>10.3f}  {lift:>6.2f}  {note}")
 
     print()
     if best_idx and best_lift >= 1.5:
-        print(f"Proposed: relay {best_idx} = DHW pump (lift {best_lift:.2f}). Edit RELAY_FUNCTION_MAP")
-        print(f'  index {best_idx}: {{ label: "dhw_pump", isCall: true, tbd: false }} and bump the map version.')
+        print(f"Proposed: relay {best_idx} = DHW pump (lift {best_lift:.2f}). In RELAY_FUNCTION_MAP set "
+              f"index {best_idx}: {{ label: \"dhw_pump\", isCall: false, tbd: false }} and bump the version.")
     else:
-        print("No relay yet clears the lift≥1.5 / P(on|draw)≥0.3 bar — collect more days and rerun.")
-    print("Zone circulators need HEATING-season data; extend this with a per-zone HEATING join once winter calls land.")
+        print("No relay clears the lift>=1.5 / P(on|draw)>=0.3 bar yet — need more DHW-draw hours.")
+    print("Zone circulators (relays 6-16) need winter heat calls; extend this with a per-zone "
+          "HEATING join (readings metadata->>'hvacStatus'='HEATING') once heating season lands.")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Propose the ECO-0600 relay→function map from correlation.")
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--readings", action="store_const", dest="mode", const="readings", help="use historical relay_N_status readings (works now)")
-    g.add_argument("--snapshots", action="store_const", dest="mode", const="snapshots", help="use hydronic_load_snapshots.relay_states (post-#1505)")
+    ap = argparse.ArgumentParser(description="Propose ECO-0600 relay->function labels from correlation.")
     ap.add_argument("--days", type=int, default=30, help="lookback window (default 30)")
-    args = ap.parse_args()
-    lift_table(args.mode or "readings", args.days)
+    ap.parse_args()
+    correlate(ap.parse_args().days)
 
 
 if __name__ == "__main__":
