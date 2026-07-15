@@ -55,20 +55,12 @@ export default async function AdvancedPage() {
 
   return (
     <>
-      <header>
-        <h1>Advanced</h1>
-        <span className="dim">every register, param &amp; status bit · 5-min full snapshots</span>
-        <a className="btn" href="/" style={{ marginLeft: "auto", textDecoration: "none" }}>Home</a>
-        <form action="/api/logout" method="post"><button type="submit">Sign out</button></form>
-      </header>
-
       <I1Banner />
 
       {dbError || snaps.length === 0 ? (
         <div className="empty">
-          No full snapshots yet. This feed ships with the next Pi release tag (exporter
-          change is on main). Until then the Pi&apos;s own dashboard has the complete
-          advanced view over LAN/Tailscale.
+          Full register detail appears here once a pump pushes its next 5-minute snapshot.
+          Until then, the Pi&apos;s own dashboard (over the local network) has the complete view.
         </div>
       ) : (
         snaps.map(({ pump_id, ts, name, snapshot: s }) => {

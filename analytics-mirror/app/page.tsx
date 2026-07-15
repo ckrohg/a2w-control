@@ -7,6 +7,7 @@ import { ensureSchema, recentReadings, type Reading } from "@/lib/db";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
 import { StormBanner } from "./storm-banner";
+import { Chart, type Series, type Band } from "@/app/ui/chart";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,48 +19,6 @@ export const fetchCache = "force-no-store";
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 0) => (v == null ? "—" : v.toFixed(d));
-
-type Pt = { x: number; y: number | null };
-type Series = { color: string; points: Pt[]; dash?: boolean };
-type Band = { x0: number; x1: number; color?: string };
-
-function Chart({ series, hours, bands }: { series: Series[]; hours: number; bands?: Band[] }) {
-  const W = 900, H = 200, pad = { l: 38, r: 10, t: 10, b: 20 };
-  const all = series.flatMap((s) => s.points.filter((p) => p.y != null && isFinite(p.y as number))) as { x: number; y: number }[];
-  if (!all.length) return <div className="empty" style={{ padding: 20 }}>No data yet</div>;
-  const xs = all.map((p) => p.x), ys = all.map((p) => p.y);
-  const x0 = Math.min(...xs), x1 = Math.max(...xs);
-  let y0 = Math.min(...ys), y1 = Math.max(...ys);
-  if (y1 - y0 < 4) { const m = (y0 + y1) / 2; y0 = m - 2; y1 = m + 2; }
-  const X = (x: number) => pad.l + ((x - x0) / Math.max(1, x1 - x0)) * (W - pad.l - pad.r);
-  const Y = (y: number) => pad.t + (1 - (y - y0) / (y1 - y0)) * (H - pad.t - pad.b);
-  const grid = [y0, (y0 + y1) / 2, y1];
-  const t0 = new Date(x0 * 1000), t1 = new Date(x1 * 1000);
-  const lab = (d: Date) => (hours > 48 ? fmtDay(d) : fmtTime(d));
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
-      {grid.map((g, i) => (
-        <g key={i}>
-          <line x1={pad.l} x2={W - pad.r} y1={Y(g)} y2={Y(g)} stroke="#2c3640" strokeWidth={1} />
-          <text x={4} y={Y(g) + 4} fill="#8b98a5" fontSize={11}>{Math.round(g)}</text>
-        </g>
-      ))}
-      {(bands ?? []).map((b, i) => {
-        const bx0 = Math.max(b.x0, x0), bx1 = Math.min(b.x1, x1);
-        if (bx1 <= bx0) return null;
-        return <rect key={`b${i}`} x={X(bx0)} y={pad.t - 6} width={Math.max(2, X(bx1) - X(bx0))} height={5} rx={2} fill={b.color ?? "#63e6be"} fillOpacity={0.85} />;
-      })}
-      {series.map((s, i) => {
-        const pts = s.points.filter((p) => p.y != null && isFinite(p.y as number)) as { x: number; y: number }[];
-        if (!pts.length) return null;
-        const d = pts.map((p, j) => `${j ? "L" : "M"}${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join("");
-        return <path key={i} d={d} fill="none" stroke={s.color} strokeWidth={1.8} strokeLinejoin="round" strokeDasharray={s.dash ? "5 4" : undefined} />;
-      })}
-      <text x={pad.l} y={H - 4} fill="#8b98a5" fontSize={11}>{lab(t0)}</text>
-      <text x={W - pad.r} y={H - 4} fill="#8b98a5" fontSize={11} textAnchor="end">{lab(t1)}</text>
-    </svg>
-  );
-}
 
 type SlxLatest = {
   ts: number; tank_f: number | null; tank_target_f: number | null; outdoor_f: number | null;
@@ -140,19 +99,6 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
 
   return (
     <>
-      <header>
-        <h1>A2W Control</h1>
-        <span className="dim">home</span>
-        <a className="btn" href="/hbx" style={{ marginLeft: "auto", textDecoration: "none" }}>HBX</a>
-        <a className="btn" href="/curve" style={{ textDecoration: "none" }}>Curve</a>
-        <a className="btn" href="/savings" style={{ textDecoration: "none" }}>Savings</a>
-        <a className="btn" href="/advanced" style={{ textDecoration: "none" }}>Advanced</a>
-        <a className="btn" href="/control" style={{ textDecoration: "none" }}>Control</a>
-        <form action="/api/logout" method="post">
-          <button type="submit">Sign out</button>
-        </form>
-      </header>
-
       <I1Banner />
       <StormBanner />
 
@@ -176,7 +122,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
       )}
 
       {dbError ? (
-        <div className="empty">Database not reachable — check the Vercel Postgres integration &amp; env vars.</div>
+        <div className="empty">Can&apos;t load live data right now — this page retries on its own.</div>
       ) : (
         <>
           <div className="cards">
