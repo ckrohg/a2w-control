@@ -26,6 +26,7 @@ type HbxStatus = {
   last_write_at: string | null;
   i1_margin_f: number;
   active_boost?: { target_f: number; restore_at: string } | null;
+  auto_sanitize_enabled?: boolean;
   error?: string;
 };
 
@@ -117,6 +118,8 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
   const extraUsd = target == null ? 0 : Math.max(0, savedPerMonth(target - DEEPER_CUT_F) - savedUsd);
 
   const alreadyApplied = st.curve_overridden && target === SAFE_FLOOR_F;
+  const autoSanitizeOn = st.auto_sanitize_enabled === true;
+  const deeperApplied = st.curve_overridden && target === DEEPER_CUT_F;
 
   return (
     <div className="cards" style={{ marginTop: 4 }}>
@@ -196,11 +199,13 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
         ) : null}
       </div>
 
-      {/* Preview: the deeper cut — disabled, coming next */}
-      <div className="card" style={{ gridColumn: "1 / -1", opacity: 0.7 }}>
+      {/* The deeper cut — a REAL apply once the daily auto-sanitize is on, else disabled */}
+      <div className="card" style={{ gridColumn: "1 / -1", opacity: autoSanitizeOn ? 1 : 0.7 }}>
         <h2>
           Deeper cut — {DEEPER_CUT_F}°F
-          <span className="chip">coming next</span>
+          <span className={`chip ${autoSanitizeOn ? (deeperApplied ? "ok" : "warn") : ""}`}>
+            {autoSanitizeOn ? (deeperApplied ? "applied" : "rough estimate") : "coming next"}
+          </span>
         </h2>
         <div className="temps">
           <div className="temp">
@@ -212,15 +217,50 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
             <div className="l">more / month</div>
           </div>
         </div>
-        <div className="meta">
-          Needs the narrow daily-131°F auto-sanitize (coming next) so the cooler tank stays safe,
-          plus a small pump-setpoint trim. Guided apply lands with that automation.
-        </div>
-        <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
-          <button type="button" disabled style={{ flex: "0 0 auto" }}>
-            Apply — coming next
-          </button>
-        </div>
+        {autoSanitizeOn ? (
+          <>
+            <div className="meta">
+              Cutting to <b>{DEEPER_CUT_F}°F</b> banks the extra COP win over the {SAFE_FLOOR_F}°F
+              floor. Safe because the daily auto-sanitize keeps the tank sanitized on its own — it
+              boosts to {SAFE_FLOOR_F}°F for an hour once a day. Reversible via Restore curve;
+              applied through the same I4/I1 guardrails.
+            </div>
+            <div className="meta">daily auto-sanitize: on</div>
+            <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
+              <button
+                type="button"
+                disabled={busy || deeperApplied}
+                onClick={() =>
+                  act(
+                    "/api/planner/target",
+                    { target_f: DEEPER_CUT_F },
+                    `Set the HBX tank target to ${DEEPER_CUT_F}°F? The daily auto-sanitize keeps the tank sanitized. Reversible via Restore curve. Pump setpoints must stay ≥${DEEPER_CUT_F + st.i1_margin_f}°F, which is checked.`,
+                  )
+                }
+                style={{ flex: "0 0 auto" }}
+              >
+                {deeperApplied ? "Already applied ✓" : busy ? "…" : `Apply — set tank target to ${DEEPER_CUT_F}°F`}
+              </button>
+            </div>
+            {msg ? (
+              <div className="meta">
+                <span style={{ color: "var(--text)" }}>{msg}</span>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div className="meta">
+              The daily auto-sanitize must be enabled (ops flag AUTO_SANITIZE_ENABLED) before the
+              {" "}{DEEPER_CUT_F}°F cut is safe — it keeps the tank sanitized.
+            </div>
+            <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
+              <button type="button" disabled style={{ flex: "0 0 auto" }}>
+                Apply — coming next
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

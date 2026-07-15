@@ -38,6 +38,9 @@ export class HbxWriter {
     private readonly buildingId: string,
     private readonly syncCode: string,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    // Phase 3 v2: surfaced in status() so the Optimize UI knows whether the daily
+    // auto-sanitize is live (gates the deeper 120°F cut). Does NOT change any write path.
+    private readonly autoSanitizeEnabled = false,
   ) {}
 
   /** Current status for the dashboard card: live target, envelope, write state. */
@@ -62,6 +65,7 @@ export class HbxWriter {
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
+      auto_sanitize_enabled: this.autoSanitizeEnabled,
     };
   }
 

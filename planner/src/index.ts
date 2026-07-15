@@ -74,6 +74,12 @@ if (!PLANNER_API_TOKEN) console.warn("PLANNER_API_TOKEN not set — write API di
 
 const PHASE_B_ENABLED = process.env.PHASE_B_ENABLED === "1";
 const PHASE_B_DRY_RUN = process.env.PHASE_B_DRY_RUN === "1";
+
+// Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
+// OFF by default — deploying this changes NOTHING until AUTO_SANITIZE_ENABLED=1.
+// When on, the I8 hygiene check fires one durable/guarded boost(131,60) per overdue
+// soak (see checkI8). Fail-safe: a rejected boost falls through to the existing alert.
+const AUTO_SANITIZE_ENABLED = process.env.AUTO_SANITIZE_ENABLED === "1";
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
@@ -205,7 +211,33 @@ let i8Alerted = false;
 async function checkI8(): Promise<void> {
   const res = await store.getRecentSeries(26);
   const hot = res.some((r) => r.tankF != null && r.tankF >= 131);
-  if (!hot && !i8Alerted && res.length > 200) { // require a mostly-complete window
+  const overdue = !hot && res.length > 200; // require a mostly-complete window
+
+  // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE
+  // durable/guarded boost to 131°F for 60 min before alerting. Idempotency guard: skip
+  // if a boost is already active (prevents a double-fire during the tank's ramp to 131 —
+  // the soak stays unsatisfied for several polls while the water heats). The boost reuses
+  // the existing human-triggered write primitive verbatim (setTarget's I4 envelope + I1
+  // cross-check + rate limit + read-back + audit all apply). Fail-safe: if setTarget
+  // rejects (e.g. I1 — a pump setpoint is below 136°F), do NOT retry; fall through to the
+  // existing overdue-soak alert so the owner is still notified and nothing is forced.
+  if (overdue && AUTO_SANITIZE_ENABLED) {
+    const active = await store.activeBoost().catch(() => null);
+    if (!active) {
+      try {
+        await writer.boost(131, 60, "auto-sanitize");
+        await ntfy("Auto-sanitize", "Daily 131°F soak triggered automatically.");
+        return; // boost placed; the soak will satisfy within ~24h — don't also alert
+      } catch (e) {
+        // Rejected (guardrail) or write failure — let the overdue alert below fire.
+        console.warn("auto-sanitize boost rejected/failed:", (e as Error).message);
+      }
+    } else {
+      return; // boost already running toward 131 — soak is in progress, don't alert
+    }
+  }
+
+  if (overdue && !i8Alerted) {
     i8Alerted = true;
     await ntfy(
       "I8 hygiene: no 131°F tank excursion in 26h",
@@ -471,7 +503,7 @@ async function scoreOnce(): Promise<void> {
 }
 
 // Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
-const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy);
+const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED);
 
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
