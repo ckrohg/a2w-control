@@ -351,22 +351,36 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
             const margin = floorSnap.floorF != null && floorSnap.bindingAwtF != null
               ? floorSnap.floorF - floorSnap.bindingAwtF : 4.5;
             const floors = floorSnap.zones.filter((z) => z.awtF != null).sort((a, b) => (b.awtF ?? 0) - (a.awtF ?? 0));
+            const calling = floors.filter((z) => z.calling);
+            const callDriven = (floorSnap.source ?? "").includes("calls"); // "insights+calls" vs conservative "insights"
             const bindingIsBaseboard = floors[0]?.deliveryType === "baseboard";
             const nextFloor = floors.find((z) => z.deliveryType !== "baseboard");
             const unlocked = bindingIsBaseboard && nextFloor?.awtF != null && floorSnap.floorF != null
               ? Math.round((nextFloor.awtF + margin) * 10) / 10 : null;
             return (
               <div className="chart-block">
-                <h3>Winter solver — zone service floors <span className="dim">(§6.9 SHADOW — proposes, never commands · {floorSnap.source})</span></h3>
+                <h3>Winter solver — zone service floors <span className="dim">(§6.9 SHADOW — proposes, never commands)</span></h3>
                 <div className="meta">
-                  Binding zone: <b>{floorSnap.bindingZone || floors[0]?.name || "—"}</b> needs{" "}
-                  <b>{fmt(floorSnap.bindingAwtF)}°F</b> at the emitter → proposed tank floor{" "}
-                  <b>{fmt(floorSnap.floorF)}°F</b> (live HBX target: {fmt(last?.tank_target_f)}°F).
-                  DHW window / sanitize floors still govern the final plan on top of this.
+                  Call feed:{" "}
+                  <b>{callDriven ? "live zone calls (Nest hvacStatus)" : "conservative — all zones (calls feed stale)"}</b>
+                  {" · "}<b>{calling.length}</b> of {floors.length} hydronic zones calling{callDriven ? "" : " (assumed)"}.
+                  <span className="dim"> Plant-level call truth (SensorLinx relays) joins as a second source with TempIQ#1505.</span>
+                </div>
+                <div className="meta">
+                  {floorSnap.bindingAwtF != null ? (
+                    <>Binding zone: <b>{floorSnap.bindingZone || calling[0]?.name || "—"}</b> needs{" "}
+                    <b>{fmt(floorSnap.bindingAwtF)}°F</b> at the emitter → proposed tank floor{" "}
+                    <b>{fmt(floorSnap.floorF)}°F</b> (live HBX target: {fmt(last?.tank_target_f)}°F).</>
+                  ) : (
+                    <>Binding zone: <b>none calling</b> → no hydronic demand, riding the HBX reset curve
+                    (live target {fmt(last?.tank_target_f)}°F).</>
+                  )}
+                  {" "}DHW window / sanitize floors still govern the final plan on top of this.
                 </div>
                 {floors.slice(0, 8).map((z, i) => (
-                  <div className="meta" key={i}>
-                    {z.name || "(unnamed zone)"} · {z.deliveryType} → {fmt(z.awtF)}°F{z.calling ? "" : " · not calling"}
+                  <div className="meta" key={i} style={z.calling ? { color: "#a9e34b" } : { opacity: 0.5 }}>
+                    {z.calling ? "● " : "○ "}{z.name || "(unnamed zone)"} · {z.deliveryType} → {fmt(z.awtF)}°F
+                    {z.calling ? " · calling" : ""}
                   </div>
                 ))}
                 {unlocked != null && outNow != null && floorSnap.floorF != null && (() => {
