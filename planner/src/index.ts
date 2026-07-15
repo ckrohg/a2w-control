@@ -11,6 +11,7 @@ import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
 import crypto from "node:crypto";
+import { TempiqPusher } from "./tempiq";
 import { HubClient } from "./hub";
 import { computeShadowPlan, fetchForecast, DEFAULT_OPTS } from "./shadow";
 import { learnDhwWindows } from "./dhw";
@@ -58,6 +59,16 @@ const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").ma
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
   : null;
+
+// TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.
+const TEMPIQ_PUSH_ENABLED = process.env.TEMPIQ_PUSH_ENABLED === "1";
+const TEMPIQ_BASE_URL = process.env.TEMPIQ_BASE_URL ?? "https://tempiq.vercel.app";
+const TEMPIQ_SURFACE_TOKEN = process.env.TEMPIQ_SURFACE_TOKEN;
+const TEMPIQ_PUSH_EVERY_MIN = Number(process.env.TEMPIQ_PUSH_EVERY_MIN ?? "5");
+const tempiq = TEMPIQ_PUSH_ENABLED && hub && TEMPIQ_SURFACE_TOKEN
+  ? new TempiqPusher(hub, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  : null;
+if (TEMPIQ_PUSH_ENABLED && !tempiq) console.warn("TEMPIQ_PUSH_ENABLED but hub/TEMPIQ_SURFACE_TOKEN missing — pusher disabled");
 if (PHASE_B_ENABLED && !hub) console.warn("PHASE_B_ENABLED but no hub configured — tracking disabled");
 if (phaseB) console.log(`PHASE B ${PHASE_B_DRY_RUN ? "DRY-RUN" : "ACTIVE"} for ${PHASE_B_PUMPS.join(", ")} (target + ${5}°F, leased)`);
 
@@ -305,6 +316,7 @@ async function main(): Promise<void> {
     await shadowOnce();
     await scoreOnce();
     await decayScanOnce(store);
+    if (tempiq) await tempiq.tick();
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -337,6 +349,7 @@ async function main(): Promise<void> {
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
+            tempiq_push: tempiq ? tempiq.status() : "disabled",
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
@@ -365,6 +378,10 @@ async function main(): Promise<void> {
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);
+  if (tempiq) {
+    void tempiq.tick();
+    setInterval(() => void tempiq.tick(), TEMPIQ_PUSH_EVERY_MIN * 60 * 1000);
+  }
   const shadowLoop = () =>
     shadowOnce()
       .then(() => scoreOnce())

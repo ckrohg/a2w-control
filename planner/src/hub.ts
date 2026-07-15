@@ -9,6 +9,10 @@ export interface HubPump {
   name: string;
   online: boolean;
   setpoint_c: number | null;
+  // Pi pushes these in every state frame (hub PumpState); typed here for the
+  // TempIQ pusher (§A-7). Older hub builds may omit them — keep them optional-null.
+  inlet_c?: number | null;
+  outlet_c?: number | null;
 }
 
 export interface HubState {
