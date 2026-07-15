@@ -392,6 +392,28 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
           })()}
 
           <div className="chart-block">
+            <h3>Storm auto-raise <span className="dim">(§6.11 — what pre-charges the tank, and why)</span></h3>
+            <div className="meta">
+              Posture: <b>auto-raise + notify</b>. A qualifying storm lifts the in-window tank ceiling to the
+              HBX reset-curve target <b>+3°F</b> (capped 135°F), <b>only ever raises</b> a block (never lowers below
+              the plan), and pages you on every transition. The winter solver stays shadow; this is the one
+              plan-shaping path, safe because Phase B is still dry-run.
+            </div>
+            <div className="meta">
+              <b>Prediction sources:</b> NWS active alerts (api.weather.gov), the OpenMeteo 3-day hourly forecast,
+              and OutageWatch grid status. A dead feed never arms anything.
+            </div>
+            <div className="meta">
+              <b>What arms a raise:</b> an NWS <i>Warning</i> (Winter Storm · Ice Storm · Blizzard · High Wind ·
+              Extreme Cold / Wind Chill) · forecast &lt; 0°F · gusts &gt; 45 mph for ≥3 h · freezing rain ≥2 h ·
+              ≥8 in total snow · a confirmed grid outage (activates immediately, to bank heat before power loss).
+            </div>
+            <div className="meta dim">
+              Watches &amp; Advisories page you but do <b>not</b> raise. Tune any threshold in planner/src/storm.ts.
+            </div>
+          </div>
+
+          <div className="chart-block">
             <h3>Config versions <span className="dim">(append-only; every row after #1 is a detected edit)</span></h3>
             {versions.map((v) => (
               <div className="meta" key={v.id}>

@@ -332,7 +332,9 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
     await ntfy(
       `Storm mode ${state.kind}: ${transitions.join(", ")}`,
       `Trigger: ${state.trigger}. Window ends ${state.windowEnd}. Pre-charge ceiling ${ceilingF.toFixed(0)}°F.` +
-        (STORM_MODE_ENABLED ? "" : "\nNotify-only: STORM_MODE_ENABLED off, plan not shaped."),
+        (STORM_MODE_ENABLED
+          ? `\nAuto-raise ON: shaping the plan — in-window blocks lifted toward ${ceilingF.toFixed(0)}°F (only raises, never lowers).`
+          : "\nNotify-only: STORM_MODE_ENABLED off, plan not shaped."),
       "high",
     );
   } else {
