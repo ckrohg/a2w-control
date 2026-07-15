@@ -102,16 +102,17 @@ export function computeFloors(
 }
 
 /**
- * TempIQv2#1508 — owner identification 2026-07-15 supersedes the 2026-07-14 survey
- * inference: the zone TempIQ names "Living Room Baseboard" IS physically the Xmas Room
- * thermostat — its delivery_type "baseboard" was correct all along; only the NAME is
- * wrong (rename pending TempIQv2#1508). Its baseboard loop serves Xmas Room +
- * Den/Office + indirectly the Dining room. There is no missing Xmas Room zone, so no
- * synthetic zone is needed and no delivery_type override applies. Env escape hatches
- * EMITTER_OVERRIDES / EMITTER_SYNTHETIC_ZONES (JSON) remain for future corrections.
+ * TempIQv2#1508 — owner confirmation 2026-07-15: the zone TempIQ names "Living Room
+ * Baseboard" (id e849e306) IS physically the Xmas Room baseboard loop — delivery_type
+ * **baseboard**, NOT the `radiant_floor` that prod currently reports (verified against
+ * /api/insights/zones 2026-07-15). It serves Xmas Room + Den/Office + indirectly Dining.
+ * The separate "Xmas Room" zone is the Kumo mini-split (correctly mini_split). Until
+ * #1508 fixes the source (rename + delivery_type), we override the type here so the
+ * winter floor math uses the baseboard curve (radiant would under-heat it by ~15-25°F).
+ * NOTE: the key is the zone NAME — when #1508 renames the zone, update or drop this entry.
  */
 export const DEFAULT_EMITTER_OVERRIDES: Record<string, string> = {
-  // empty — owner identification 2026-07-15: TempIQ delivery_types were correct
+  "Living Room Baseboard": "baseboard", // owner-confirmed 2026-07-15; prod mislabels radiant_floor (TempIQv2#1508)
 };
 export const DEFAULT_SYNTHETIC_ZONES: InsightZone[] = [
   // empty — "Living Room Baseboard" IS the Xmas Room zone; a synthetic Xmas zone would duplicate it
