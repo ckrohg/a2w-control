@@ -67,6 +67,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let slx: SlxLatest | null = null;
   let shadow: ShadowBlock[] | null = null;
   let driftAt: number | null = null;
+  let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
   let dbError = false;
   try {
     await ensureSchema();
@@ -85,6 +86,12 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
           AND observed_at >= now() - interval '48 hours'
         ORDER BY id DESC LIMIT 1`;
       driftAt = d.rowCount ? (d.rows[0].t as number) : null;
+      const fs = await sql`
+        SELECT pump_id, name, ts, snapshot->'active_faults' AS faults FROM pump_snapshots
+        WHERE jsonb_array_length(snapshot->'active_faults') > 0`;
+      faults = fs.rows.flatMap((r: any) =>
+        (r.faults as { code: string; message: string; severity: string; since?: number }[])
+          .map((f) => ({ pump: (r.name as string) ?? r.pump_id, ...f })));
     } catch { /* planner tables may not exist yet */ }
   } catch {
     dbError = true;
@@ -106,6 +113,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   if (slxStale) chips.push({ cls: "offline", text: "HBX reader stale" });
   if (slx?.backup_called) chips.push({ cls: "offline", text: "16.5 kW backup CALLED" });
   if (driftAt) chips.push({ cls: "warn", text: `HBX config changed ${fmtDateTime(driftAt)}` });
+  if (faults.length) chips.push({ cls: "offline", text: `${faults.length} active pump fault${faults.length > 1 ? "s" : ""}` });
   if (!chips.length) chips.push({ cls: "ok", text: "all systems normal" });
 
   // current + next interesting shadow block
@@ -137,6 +145,21 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
       <div className="chips-row">
         {chips.map((c, i) => <span key={i} className={`chip ${c.cls}`}>{c.text}</span>)}
       </div>
+
+      {faults.length > 0 && (
+        <div className="cards">
+          {faults.map((f, i) => (
+            <div className="card" key={i} style={{ borderColor: f.severity === "critical" ? "var(--crit)" : "#6b5330" }}>
+              <h2>
+                {f.pump}: {f.code}
+                <span className={`chip ${f.severity === "critical" || f.severity === "high" ? "offline" : "warn"}`}>{f.severity}</span>
+              </h2>
+              <div className="meta" style={{ color: "var(--text)" }}>{f.message}</div>
+              {f.since ? <div className="meta">active since {fmtDateTime(f.since)}</div> : null}
+            </div>
+          ))}
+        </div>
+      )}
 
       {dbError ? (
         <div className="empty">Database not reachable — check the Vercel Postgres integration &amp; env vars.</div>

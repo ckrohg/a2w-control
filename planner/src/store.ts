@@ -90,7 +90,59 @@ export class Store {
         cleared_at timestamptz,
         detail     text
       );
+      CREATE TABLE IF NOT EXISTS hbx_boosts (
+        id         serial PRIMARY KEY,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        target_f   real NOT NULL,
+        restore_at timestamptz NOT NULL,
+        restored   boolean NOT NULL DEFAULT false
+      );
+      CREATE TABLE IF NOT EXISTS phase_b_log (
+        id       serial PRIMARY KEY,
+        ts       timestamptz NOT NULL DEFAULT now(),
+        pump_id  text NOT NULL,
+        mode     text NOT NULL,
+        value_c  real,
+        result   text
+      );
     `);
+  }
+
+  async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2)`,
+      [targetF, restoreAt],
+    );
+  }
+
+  /** Boosts whose restore is due (survives planner restarts — durability is the point). */
+  async dueBoosts(): Promise<{ id: number; targetF: number }[]> {
+    const res = await this.pool.query(
+      `SELECT id, target_f FROM hbx_boosts WHERE NOT restored AND restore_at <= now() ORDER BY id`,
+    );
+    return res.rows.map((r) => ({ id: r.id, targetF: Number(r.target_f) }));
+  }
+
+  async activeBoost(): Promise<{ targetF: number; restoreAt: Date } | null> {
+    const res = await this.pool.query(
+      `SELECT target_f, restore_at FROM hbx_boosts
+       WHERE NOT restored AND restore_at > now() ORDER BY id DESC LIMIT 1`,
+    );
+    return res.rowCount
+      ? { targetF: Number(res.rows[0].target_f), restoreAt: new Date(res.rows[0].restore_at) }
+      : null;
+  }
+
+  async markBoostsRestored(ids: number[]): Promise<void> {
+    if (!ids.length) return;
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE id = ANY($1)`, [ids]);
+  }
+
+  async insertPhaseBLog(l: { pumpId: string; mode: string; valueC: number | null; result: string }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO phase_b_log (pump_id, mode, value_c, result) VALUES ($1,$2,$3,$4)`,
+      [l.pumpId, l.mode, l.valueC, l.result],
+    );
   }
 
   /** Recent tank series with call flags — for quiet-window (decay) detection. */

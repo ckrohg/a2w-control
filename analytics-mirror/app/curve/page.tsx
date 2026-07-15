@@ -194,7 +194,10 @@ function CurveField({
         HBX target curve (as-found)
       </Note>
       <Note x={X(27)} y={Y(114)} anchor="middle" color="#eeb7fb" size={13.5}>
-        AFTER — the planner’s band: 95–135° by outdoor
+        AFTER — where the planner MAY command (95–135° by outdoor)
+      </Note>
+      <Note x={X(27)} y={Y(109)} anchor="middle" color="#a984b5" size={11.5} weight={550}>
+        bottom edge = permission floor, not a target — the plan itself runs 110–131°
       </Note>
       <Note x={X(84)} y={Y(106)} anchor="middle" color="#eeb7fb" size={12} weight={550}>
         today’s plan, hour by hour
@@ -504,6 +507,11 @@ export default async function CurvePage() {
           <span><i style={{ background: "#ffd666" }} />HBX target</span>
           <span><i style={{ background: "#e599f7" }} />planner counterfactual target</span>
           <span><i style={{ background: "#63e6be" }} />HP1 setpoint 167°F</span>
+        </div>
+        <div className="meta">
+          The counterfactual&apos;s winter plateau is the I4 strict cap (135°) — enough for the binding baseboard zone on
+          design day but with zero margin, because the demand-driven winter solver isn&apos;t built yet (plan §6.9). Once
+          zone demand feeds in, winter targets ride each day&apos;s actual binding-zone need instead of a fixed cap.
         </div>
       </div>
 

@@ -328,6 +328,7 @@ type HbxStatus = {
   band: { lo: number; hi: number } | null;
   curve_overridden: boolean; baseline: { dbt: number; mbt: number } | null;
   last_write_at: string | null; i1_margin_f: number;
+  active_boost?: { target_f: number; restore_at: string } | null;
   error?: string;
 };
 
@@ -423,7 +424,23 @@ function HbxTargetCard() {
           >
             Restore curve
           </button>
+          <button
+            type="button"
+            disabled={busy || !!st.active_boost}
+            onClick={() => act("/api/planner/boost", { target_f: 131, minutes: 60 },
+              "Boost the tank to 131°F for 60 minutes (sanitize soak / A-B charge)? The curve restores itself automatically — even if the planner restarts.")}
+            style={{ flex: "0 0 auto" }}
+          >
+            {st.active_boost ? "Boost active" : "Boost 131° / 1h"}
+          </button>
         </div>
+        {st.active_boost && (
+          <div className="meta">
+            Active boost: {st.active_boost.target_f}°F until{" "}
+            {new Date(st.active_boost.restore_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            {" "}(auto-restores).
+          </div>
+        )}
         <div className="meta">
           Writes go through the planner&apos;s guardrails: outdoor-indexed envelope, I1 check vs live pump
           setpoints, 15-min rate limit, read-back, audit. Restore is never rate-limited.

@@ -109,6 +109,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let shadowMeta: ShadowMeta | null = null;
   let gap: { avg: number; n: number } | null = null;
   let scored: { t: number; s: number }[] = [];
+  let phasebLog: { t: number; pump_id: string; mode: string; value_c: number | null; result: string }[] = [];
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -133,6 +134,11 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
         shadowAt = sp.rows[0].t as number;
         shadowMeta = (sp.rows[0].meta ?? null) as ShadowMeta | null;
       }
+      try {
+        phasebLog = (await sql`
+          SELECT EXTRACT(EPOCH FROM ts)::float8 AS t, pump_id, mode, value_c::float8 AS value_c, result
+          FROM phase_b_log ORDER BY id DESC LIMIT 10`).rows as any[];
+      } catch { /* table appears with the planner deploy that logs decisions */ }
       const g = await sql`SELECT avg(gap_f)::float8 AS avg_gap, count(gap_f)::int AS n
                           FROM plan_scores WHERE hour_ts >= now() - interval '24 hours'`;
       if (g.rowCount && g.rows[0].n > 0) gap = { avg: g.rows[0].avg_gap as number, n: g.rows[0].n as number };
@@ -278,6 +284,17 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               {shadow.filter((b) => !b.reason.startsWith("idle")).slice(0, 8).map((b, i) => (
                 <div className="meta" key={i}>
                   {fmtTime(new Date(b.ts))} → {b.tank_target_f}°F · {b.reason}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {phasebLog.length > 0 && (
+            <div className="chart-block">
+              <h3>Phase B rehearsal <span className="dim">(what the tracking loop {phasebLog[0]?.mode === "active" ? "sent" : "WOULD have sent"} — the flip evidence)</span></h3>
+              {phasebLog.map((r, i) => (
+                <div className="meta" key={i}>
+                  {fmtDateTime(r.t)} · {r.pump_id} → {r.value_c == null ? "—" : `${r.value_c}°C`} · {r.mode} · {r.result}
                 </div>
               ))}
             </div>

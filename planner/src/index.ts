@@ -258,12 +258,16 @@ async function scoreOnce(): Promise<void> {
   }
 }
 
+// Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
+const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy);
+
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
   await store.insertReading(reading);
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
+  await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
 
   const config = extractConfig(dev);
@@ -322,7 +326,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy);
   const authed = (req: http.IncomingMessage): boolean => {
     if (!PLANNER_API_TOKEN) return false;
     const got = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
@@ -355,7 +358,7 @@ async function main(): Promise<void> {
               : "disabled",
           });
         }
-        if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore") {
+        if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore" || req.url === "/api/hbx/boost") {
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });
           if (req.url === "/api/hbx/target" && req.method === "GET") {
             return json(res, 200, await writer.status());
@@ -365,6 +368,9 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.restore("dashboard"));
           }
           const body = JSON.parse((await readBody(req)) || "{}");
+          if (req.url === "/api/hbx/boost") {
+            return json(res, 200, await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard"));
+          }
           return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard"));
         }
         res.writeHead(404).end();

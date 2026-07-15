@@ -82,12 +82,14 @@ export class PhaseB {
       if (this.dryRun) {
         this.lastResults[d.pump_id] = `DRY-RUN would send ${d.value_c}°C — ${d.reason}`;
         console.log(`[phase-b] ${this.lastResults[d.pump_id]}`);
+        await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "dry-run", valueC: d.value_c, result: "would-send" }).catch(() => {});
         continue;
       }
       const res = await this.hub.sendSetpoint(d.pump_id, d.value_c, LEASE_MINUTES, "phase-b");
       this.lastResults[d.pump_id] = res.ok
         ? `ok ${d.value_c}°C (lease ${LEASE_MINUTES}m)`
         : `failed: ${res.detail}`;
+      await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "active", valueC: d.value_c, result: res.ok ? "sent" : `failed: ${res.detail}` }).catch(() => {});
       if (res.ok) {
         this.failStreak[d.pump_id] = 0;
         if (this.alerted[d.pump_id]) {
