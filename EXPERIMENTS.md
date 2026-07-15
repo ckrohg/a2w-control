@@ -2,8 +2,8 @@
 
 ## Goal
 Optimize metric: **spec_compliance** (higher is better)
-Current value: **0.2353**
-Baseline: 0.2353
+Current value: **0.9412**
+Baseline: 0.9412
 
 ## Files to Modify
 Focus your changes on these specific files:
@@ -16,7 +16,7 @@ Focus your changes on these specific files:
 ## Past Experiments
 
 ## Eval Diagnostics
-- {"failed_checks":["storm-events-table","storm-events-columns","zone-floor-snapshots-table","snapshot-columns","insertStormEvent","closeStormEvent","activeStormEvent","insertZoneFloorSnapshot","latestZoneFloorSnapshot","snapshot-conflict-do-nothing","close-newest-open-row","purpose-header-updated","compiles"],"score":0.23529411764705882}
+- {"failed_checks":["compiles"],"score":0.9411764705882353}
 
 ## Code Context — READ BEFORE MODIFYING
 The following is the full content of each scope file (up to 500 lines). Understand the code before making changes.
@@ -27,8 +27,10 @@ The following is the full content of each scope file (up to 500 lines). Understa
  * @purpose Neon Postgres store for the planner. Two tables, additive (CREATE IF NOT
  * EXISTS) in the shared mirror DB: slx_readings (narrow 5-min HBX telemetry) and
  * hbx_config_versions (append-only config history; row 1 = first observation, every
- * later row = detected drift with the changed fields). Planner tables are tiny and
- * exempt from the mirror's 90-day trim (plan §4.1).
+ * later row = detected drift with the changed fields), plus storm_events (storm-mode
+ * episodes with trigger/ceiling, §6.11) and zone_floor_snapshots (hourly winter-solver
+ * zone service floors, §6.9). Planner tables are tiny and exempt from the mirror's
+ * 90-day trim (plan §4.1).
  */
 
 import { Pool } from "pg";
@@ -156,6 +158,22 @@ export class Store {
         id         integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         fetched_at timestamptz NOT NULL,
         payload    jsonb NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS storm_events (
+        id         serial PRIMARY KEY,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        ended_at   timestamptz,
+        trigger    text NOT NULL,
+        detail     jsonb,
+        ceiling_f  real
+      );
+      CREATE TABLE IF NOT EXISTS zone_floor_snapshots (
+        ts             timestamptz PRIMARY KEY,
+        zones          jsonb NOT NULL,
+        binding_zone   text,
+        binding_awt_f  real,
+        tank_target_f  real,
+        source         text
       );
     `);
   }
@@ -299,6 +317,62 @@ export class Store {
     );
   }
 
+  async insertStormEvent(trigger: string, detail: unknown, ceilingF: number | null): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO storm_events (trigger, detail, ceiling_f) VALUES ($1, $2, $3)`,
+      [trigger, JSON.stringify(detail), ceilingF],
+    );
+  }
+
+  async closeStormEvent(): Promise<void> {
+    await this.pool.query(
+      `UPDATE storm_events SET ended_at = now()
+       WHERE ended_at IS NULL AND id = (SELECT max(id) FROM storm_events)`,
+    );
+  }
+
+  async activeStormEvent(): Promise<{ id: number; startedAt: Date; trigger: string; ceilingF: number | null } | null> {
+    const res = await this.pool.query(
+      `SELECT id, started_at, trigger, ceiling_f FROM storm_events
+       WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1`,
+    );
+    if (!res.rowCount) return null;
+    const r = res.rows[0];
+    return {
+      id: Number(r.id),
+      startedAt: new Date(r.started_at),
+      trigger: r.trigger,
+      ceilingF: r.ceiling_f == null ? null : Number(r.ceiling_f),
+    };
+  }
+
+  async insertZoneFloorSnapshot(s: {
+    ts: Date; zones: unknown; bindingZone: string | null; bindingAwtF: number | null;
+    tankTargetF: number | null; source: string;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO zone_floor_snapshots (ts, zones, binding_zone, binding_awt_f, tank_target_f, source)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (ts) DO NOTHING`,
+      [s.ts, JSON.stringify(s.zones), s.bindingZone, s.bindingAwtF, s.tankTargetF, s.source],
+    );
+  }
+
+  async latestZoneFloorSnapshot(): Promise<{ ts: Date; bindingZone: string | null; bindingAwtF: number | null; tankTargetF: number | null } | null> {
+    const res = await this.pool.query(
+      `SELECT ts, binding_zone, binding_awt_f, tank_target_f
+       FROM zone_floor_snapshots ORDER BY ts DESC LIMIT 1`,
+    );
+    if (!res.rowCount) return null;
+    const r = res.rows[0];
+    return {
+      ts: new Date(r.ts),
+      bindingZone: r.binding_zone == null ? null : String(r.binding_zone),
+      bindingAwtF: r.binding_awt_f == null ? null : Number(r.binding_awt_f),
+      tankTargetF: r.tank_target_f == null ? null : Number(r.tank_target_f),
+    };
+  }
+
   /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */
   async insertHbxWrite(w: {
     source: string; action: string; requested: unknown; result: string; detail: string;
@@ -429,7 +503,14 @@ export class Store {
 
 ```
 
-## Past Experiments
-No experiments yet. This is round 1.
+### Kept (1 experiments that improved the metric):
+- R1: "BUILD TASK — Create the files described below. Write code im" → +0.7059 (files: .claude/settings.json, CLAUDE.md, planner/src/store.ts)
 
-Read the eval diagnostics above. Identify WHY queries fail. Make ONE targeted change to the code.
+### Rejected (0 experiments that did NOT improve):
+None yet.
+
+## What to Do
+1. DO NOT repeat rejected experiments
+2. BUILD on kept experiments — they worked
+3. Make ONE small, focused change
+4. Prefer modifying existing code over adding new files
