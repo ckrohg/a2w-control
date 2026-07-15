@@ -29,9 +29,9 @@ const FILE = "planner/src/demand.ts"
 const near = (v: unknown, t: number, tol: number) => typeof v === "number" && Math.abs(v - t) <= tol
 
 const ZONES = [
-  { id: "z1", name: "Dining", deliveryType: "baseboard", uaBtuHrF: 90, thermalMassBtuF: 780, confidence: 0.8 },
-  { id: "z2", name: "Kitchen", deliveryType: "radiant_floor", uaBtuHrF: 104, thermalMassBtuF: 857, confidence: 0.8 },
-  { id: "z3", name: "Den", deliveryType: "mini_split", uaBtuHrF: 10, thermalMassBtuF: null, confidence: 0.9 },
+  { id: "z1", name: "Dining", deliveryType: "baseboard", deliveryTypeVerified: true, uaBtuHrF: 90, thermalMassBtuF: 780, confidence: 0.8 },
+  { id: "z2", name: "Kitchen", deliveryType: "radiant_floor", deliveryTypeVerified: false, uaBtuHrF: 104, thermalMassBtuF: 857, confidence: 0.8 },
+  { id: "z3", name: "Den", deliveryType: "mini_split", deliveryTypeVerified: null, uaBtuHrF: 10, thermalMassBtuF: null, confidence: 0.9 },
 ]
 
 export async function evaluate(_dataPath: string): Promise<number> {
@@ -64,6 +64,9 @@ export async function evaluate(_dataPath: string): Promise<number> {
   let floorsCalling: any = null
   try { floorsCalling = m?.computeFloors(ZONES, ["z2"], 5) } catch {}
   checks.push({ name: "calling-set-respected", pass: floorsCalling?.bindingZone === "Kitchen" && near(floorsCalling?.bindingAwtF, 110, 0.01) })
+  // TempIQ#1508 delivery_type provenance propagates: binding on the unverified Kitchen zone
+  // flags bindingVerified=false, and per-zone verified carries through.
+  checks.push({ name: "provenance-propagates", pass: floorsCalling?.bindingVerified === false && floorsCalling?.perZone?.find((z: any) => z.zoneId === "z1")?.verified === true })
   let floorsNone: any = null
   try { floorsNone = m?.computeFloors(ZONES, [], 5) } catch {}
   checks.push({ name: "no-calls-null-binding", pass: !!floorsNone && floorsNone.bindingZone === null && floorsNone.tankTargetF === null })
