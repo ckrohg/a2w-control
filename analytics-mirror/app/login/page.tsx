@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { startAuthentication } from "@simplewebauthn/browser";
 
 export default function Login() {
   const [pw, setPw] = useState("");
@@ -20,6 +21,37 @@ export default function Login() {
     else setErr((await res.json().catch(() => ({}))).error || "sign-in failed");
   }
 
+  async function passkey() {
+    setBusy(true);
+    setErr("");
+    try {
+      const optRes = await fetch("/api/webauthn/auth/options", { method: "POST" });
+      if (!optRes.ok) throw new Error("could not start passkey sign-in");
+      const opts = await optRes.json();
+      if (!opts.allowCredentials?.length) {
+        throw new Error("No passkey registered on this account yet");
+      }
+      const response = await startAuthentication({ optionsJSON: opts });
+      const verRes = await fetch("/api/webauthn/auth/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response }),
+      });
+      const data = await verRes.json().catch(() => ({}));
+      if (verRes.ok && data.ok) window.location.href = "/";
+      else throw new Error(data.error || "passkey sign-in failed");
+    } catch (e: any) {
+      // NotAllowedError = user cancelled / no matching passkey on the device.
+      const msg =
+        e?.name === "NotAllowedError"
+          ? "Passkey sign-in cancelled"
+          : e?.message || "passkey sign-in failed";
+      setErr(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="login">
       <h1>A2W Analytics</h1>
@@ -34,6 +66,12 @@ export default function Login() {
           {busy ? "…" : "Sign in"}
         </button>
       </form>
+      <button
+        type="button" onClick={passkey} disabled={busy}
+        style={{ width: "100%", marginTop: 10 }}
+      >
+        Sign in with a passkey
+      </button>
     </div>
   );
 }

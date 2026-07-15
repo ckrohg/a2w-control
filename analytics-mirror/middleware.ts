@@ -9,6 +9,7 @@ export function middleware(req: NextRequest) {
   const open =
     pathname.startsWith("/api/ingest") ||
     pathname.startsWith("/api/login") ||
+    pathname.startsWith("/api/webauthn/auth") ||
     pathname === "/login";
   if (open) return NextResponse.next();
 

@@ -32,6 +32,9 @@ export function Nav() {
       <a className="nav-more" href="/advanced">
         Advanced →
       </a>
+      <a className="nav-more" href="/security">
+        Security
+      </a>
       <form action="/api/logout" method="post">
         <button type="submit">Sign out</button>
       </form>
