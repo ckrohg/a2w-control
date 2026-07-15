@@ -8,8 +8,15 @@
     "spec"
   ],
   "preset": "zero",
-  "focus": "Building a new product from scratch. Start by filling in knowledge/VISION.md — what are you building and why? Then use /skill startup for stage assessment, /skill brand-architect for identity, /skill spec for technical spec.",
+  "focus": "Building a new product from scratch. Start by filling in knowledge/VISION.md \u2014 what are you building and why? Then use /skill startup for stage assessment, /skill brand-architect for identity, /skill spec for technical spec.",
   "contextHub": {
     "port": 4672
-  }
+  },
+  "registered_services": [
+    {
+      "name": "a2w-control",
+      "path": "/Users/ckrohg/Documents/Claude/a2w-control",
+      "description": "this repo \u2014 planner (Railway), analytics-mirror (Vercel), heatpump-bridge (Pi)"
+    }
+  ]
 }

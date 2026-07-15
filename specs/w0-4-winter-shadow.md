@@ -1,0 +1,38 @@
+# W0-4 — winter-shadow wiring (issue #11, plan §6.9 W1)
+
+Modify `planner/src/shadow.ts` and `planner/src/index.ts` only. SHADOW-ONLY: no write
+path is touched; flag off = today's behavior byte-for-byte.
+
+## shadow.ts
+
+- Add exported type: `export interface DemandFloor { tankTargetF: number; bindingZone: string; awtF: number }`
+- `computeShadowPlan(forecast, hbxConfig, opts, demandFloor?: DemandFloor | null)` —
+  new optional 4th parameter, default undefined.
+- Behavior change **only** in the winter branch (`d.f.outdoorF < opts.winterGuardF`):
+  - When `demandFloor` is provided: `target = max(target, demandFloor.tankTargetF)` and
+    `reason = "binding zone: " + demandFloor.bindingZone + " needs " + round(demandFloor.awtF) + "°F (winter solver shadow)"`
+    — replacing the HBX-curve mimic for those blocks.
+  - When `demandFloor` is null/undefined: existing winter-guard curve mimic, unchanged.
+- The I4 clamp (`bandFor`) still runs LAST on every block — the envelope stays authoritative.
+- `hp1_setpoint_f` computation unchanged (recomputed after the final target as today).
+- `DEFAULT_OPTS` values unchanged.
+
+## index.ts
+
+- New env: `WINTER_SOLVER_SHADOW` ("1" = on, default off). Reuse existing
+  `TEMPIQ_BASE_URL`; token env: `TEMPIQ_SURFACE_TOKEN`.
+- Import `DemandFeed` from `./demand`. Instantiate once at module scope when the flag is
+  on AND the token is set; otherwise null (log one `console.warn` like the other feature gates).
+- In `shadowOnce()`:
+  - If the feed exists: `await feed.refresh()` (never throws), then
+    `const floor = feed.proposeFloor(latestOutdoorF)` where `latestOutdoorF` comes from
+    `store.getLatestSlx()` (fall back to first forecast hour when null).
+  - Pass `floor` (or null) as the 4th arg to `computeShadowPlan`.
+  - When a floor was proposed: `await store.insertZoneFloorSnapshot({ ts: new Date(), zones: floor.perZone, bindingZone: floor.bindingZone, bindingAwtF: floor.bindingAwtF, tankTargetF: floor.tankTargetF, source: "insights" })` (wrap in try/catch like other store calls).
+- `/health` response gains:
+  `winter_solver: feed ? { mode: feed.isHealthy() ? "shadow" : "degraded", ...feed.status() } : "off"`.
+- `POLL_ONCE === "1"` path still completes without the flag set.
+
+## Constraints
+- `npx -p typescript tsc --noEmit -p planner/tsconfig.json` passes.
+- Max 2 files changed. No new dependencies.

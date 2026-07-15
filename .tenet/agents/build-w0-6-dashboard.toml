@@ -1,0 +1,77 @@
+# Build Agent: w0-6-dashboard
+# Auto-generated from spec — edit [task] description to change what the agent builds
+# Pattern: decomposed eval checks, AGENT_WORKTREE, build supervisor
+
+[agent]
+name = "build-w0-6-dashboard"
+scope = "build"
+metric = "spec_compliance"
+direction = "maximize"
+time_budget_seconds = 600
+target_repo = "."
+
+[eval]
+data = "eval/fixtures/build-baseline.jsonl"
+script = "eval/build/w0-6-dashboard.ts"
+
+[constraints]
+files_in_scope = ["analytics-mirror/app/storm-banner.tsx", "analytics-mirror/app/api/planner/storm/route.ts", "analytics-mirror/app/control/control-client.tsx", "analytics-mirror/app/hbx/page.tsx", "analytics-mirror/app/page.tsx", "analytics-mirror/app/curve/page.tsx", "analytics-mirror/app/savings/page.tsx"]
+files_readonly = ["eval/**", "AGENT.md", "AGENTS.md"]
+max_file_changes = 7
+
+[task]
+description = """
+# W0-6 — dashboard: storm banner + controls + history (issue #13)
+
+All changes in `analytics-mirror/`. Follow the house idioms exactly: every new page/route
+exports `runtime="nodejs"`, `dynamic="force-dynamic"`, `fetchCache="force-no-store"`;
+parameterized `sql` tagged templates from `@vercel/postgres`; try/catch degraded states;
+°F display; Eastern time via `@/lib/tz`.
+
+## 1. Storm banner — `analytics-mirror/app/storm-banner.tsx` (new)
+
+Server component modeled on `app/i1-banner.tsx`: query
+`SELECT id, EXTRACT(EPOCH FROM started_at)::float8 AS t, trigger, ceiling_f FROM storm_events WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1`
+(try/catch → render nothing on error or no row). When a row exists render a `.banner`
+div (amber styling inline: background #3d3222, border #6b5a30, color #ffe0a3):
+`⛈ Storm mode ARMED — {trigger} · since {fmtTime(t)}{ceiling_f ? " · banking to " + ceiling_f + "°F" : ""}`.
+Render `<StormBanner />` directly under `<I1Banner />` on the home page (`app/page.tsx`),
+`/hbx`, `/curve`, and `/savings` pages.
+
+## 2. Storm controls on /control
+
+- New route handler `app/api/planner/storm/route.ts`: `POST` with JSON body
+  `{ action: "arm" | "disarm", hours?: number }`. Auth: `isAuthed()` from `@/lib/auth`
+  (401 otherwise) — mirror the existing `app/api/planner/target/route.ts` pattern,
+  including reading `PLANNER_URL` + `PLANNER_API_TOKEN` from env and proxying to
+  `{PLANNER_URL}/api/storm/arm` or `/api/storm/disarm` with the bearer token
+  server-side. Return the planner's JSON + status.
+- In `app/control/control-client.tsx`: add a "Storm Mode" card after the HBX target card:
+  shows current state (poll `GET /api/planner/storm` — add a GET in the same route that
+  proxies the planner `/health` and returns just its `storm` field), an "Arm 24h" button
+  and a "Disarm" button POSTing the actions, with the result line pattern used elsewhere
+  in the file. Buttons disabled while a request is in flight.
+
+## 3. Storm history on /hbx
+
+In `app/hbx/page.tsx`, add a `chart-block` titled "Storm events" listing the last 5 rows:
+`SELECT id, EXTRACT(EPOCH FROM started_at)::float8 AS s, EXTRACT(EPOCH FROM ended_at)::float8 AS e, trigger, ceiling_f FROM storm_events ORDER BY id DESC LIMIT 5`
+(guard with try/catch — table may not exist yet → omit the block). Each row:
+`{fmtDateTime(s)} · {trigger} · {e ? duration in h : "open"}`. Omit the whole block when
+there are no rows.
+
+## 4. Binding-zone reasons
+
+No new UI: verify plan-block `reason` strings (which now include
+"binding zone: … (winter solver shadow)" and "storm mode: …") surface through the
+existing /hbx shadow-plan list and /curve plan-strip titles untruncated. If any
+`slice()`/CSS truncation cuts them, widen it.
+
+## Constraints
+- `npx -p typescript tsc --noEmit` passes in `analytics-mirror/` (or `npm run build`).
+- No secrets to the browser: planner token stays server-side in route handlers.
+- Max 7 files changed.
+"""
+
+[context]
+spec = "specs/w0-6-dashboard.md"
