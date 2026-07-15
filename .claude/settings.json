@@ -1,16 +1,5 @@
 {
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "tenet context-hub ensure 2>/dev/null; exit 0"
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "",
@@ -18,30 +7,6 @@
           {
             "type": "command",
             "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"PostToolUse\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
-            "async": true
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"Stop\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
-            "async": true
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"PreCompact\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
@@ -66,6 +31,41 @@
           {
             "type": "command",
             "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"SubagentStop\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tenet context-hub ensure 2>/dev/null; exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BODY=$(timeout 1 cat 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"Stop\"}'; printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST http://localhost:4672/api/hooks -H 'Content-Type: application/json' -d @- --connect-timeout 2 2>/dev/null; exit 0",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BODY=$(timeout 1 cat 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"PreCompact\"}'; printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST http://localhost:4672/api/hooks -H 'Content-Type: application/json' -d @- --connect-timeout 2 2>/dev/null; exit 0",
             "async": true
           }
         ]

@@ -319,6 +319,8 @@ export default function ControlClient() {
       )}
 
       <HbxTargetCard />
+
+      <StormCard />
     </>
   );
 }
@@ -444,6 +446,99 @@ function HbxTargetCard() {
         <div className="meta">
           Writes go through the planner&apos;s guardrails: outdoor-indexed envelope, I1 check vs live pump
           setpoints, 15-min rate limit, read-back, audit. Restore is never rate-limited.
+          {msg ? (<><br /><span style={{ color: "var(--text)" }}>{msg}</span></>) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type StormStatus = {
+  state?: string;
+  trigger?: string | null;
+  windowEnd?: string | null;
+  enabled?: boolean;
+};
+
+/** Storm Mode card — manual arm/disarm through the planner's storm state machine
+ *  (§6.11). The planner owns the real logic (triggers, only-raises shaping, event
+ *  ledger); this card just asks and reports, same as the HBX target card above. */
+function StormCard() {
+  const [storm, setStorm] = useState<StormStatus | null>(null);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch("/api/planner/storm", { cache: "no-store" });
+      const body: { storm?: StormStatus | null; error?: string } = await res.json().catch(() => ({}));
+      if (res.ok && body.storm) {
+        setStorm(body.storm);
+      } else {
+        setStorm(null);
+        setMsg(body.error || `Planner error (${res.status}).`);
+      }
+    } catch {
+      setMsg("Could not reach the dashboard server.");
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  async function act(action: "arm" | "disarm") {
+    setBusy(true);
+    setMsg("");
+    try {
+      const res = await fetch("/api/planner/storm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(action === "arm" ? { action, hours: 24 } : { action }),
+      });
+      const out: { state?: { kind?: string }; detail?: string; error?: string } =
+        await res.json().catch(() => ({}));
+      setMsg(res.ok
+        ? `${action === "arm" ? "Armed" : "Disarmed"} ✓${out.state?.kind ? ` (now: ${out.state.kind})` : ""}`
+        : `Rejected: ${out.error || out.detail || res.status}`);
+    } catch {
+      setMsg("Network error — try again.");
+    } finally {
+      setBusy(false);
+      load();
+    }
+  }
+
+  const active = storm?.state === "armed" || storm?.state === "active";
+  return (
+    <div className="cards" style={{ marginTop: 4 }}>
+      <div className="card">
+        <h2>
+          Storm Mode
+          <span className={`chip ${active ? "heating" : "off"}`}>
+            {storm?.state ?? "unknown"}
+          </span>
+        </h2>
+        <div className="meta">
+          {active
+            ? <>Banking heat — {storm?.trigger ?? "manual"}{storm?.windowEnd
+                ? ` · until ${new Date(storm.windowEnd).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`
+                : ""}</>
+            : "Idle. Arming banks heat ahead of an outage window (only ever raises the plan)."}
+          {storm?.enabled === false ? " Shaping flag is OFF — arming is notify-only." : ""}
+        </div>
+        <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
+          <button type="button" disabled={busy} onClick={() => act("arm")} style={{ flex: "0 0 auto" }}>
+            {busy ? "…" : "Arm 24h"}
+          </button>
+          <button type="button" disabled={busy} onClick={() => act("disarm")} style={{ flex: "0 0 auto" }}>
+            {busy ? "…" : "Disarm"}
+          </button>
+        </div>
+        <div className="meta">
+          Manual arm/disarm wins over NWS/forecast/outage triggers until the window ends.
           {msg ? (<><br /><span style={{ color: "var(--text)" }}>{msg}</span></>) : null}
         </div>
       </div>

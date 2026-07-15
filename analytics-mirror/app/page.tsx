@@ -6,6 +6,7 @@ import { sql } from "@vercel/postgres";
 import { ensureSchema, recentReadings, type Reading } from "@/lib/db";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
+import { StormBanner } from "./storm-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -141,6 +142,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
       </header>
 
       <I1Banner />
+      <StormBanner />
 
       <div className="chips-row">
         {chips.map((c, i) => <span key={i} className={`chip ${c.cls}`}>{c.text}</span>)}
