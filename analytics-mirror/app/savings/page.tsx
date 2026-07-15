@@ -23,7 +23,20 @@ const DAILY_KWH = Number(process.env.DAILY_KWH_BASELINE ?? "11.8"); // SPAN, Jul
 const fmt = (v: number | null | undefined, d = 1) =>
   v == null || !isFinite(v as number) ? "—" : (v as number).toFixed(d);
 
-export default async function SavingsPage() {
+const WINDOWS: Record<string, { label: string; interval: string | null }> = {
+  "24h": { label: "24h", interval: "24 hours" },
+  "7d": { label: "7d", interval: "7 days" },
+  "30d": { label: "30d", interval: "30 days" },
+  all: { label: "all", interval: null }, // since scoring began (2026-07-14)
+};
+
+export default async function SavingsPage({ searchParams }: { searchParams: { window?: string } }) {
+  const win = WINDOWS[searchParams.window ?? "24h"] ? (searchParams.window ?? "24h") : "24h";
+  const winInterval = WINDOWS[win].interval;
+
+  let gapAvg: number | null = null;
+  let gapSum: number | null = null;
+  let gapN = 0;
   let gap24avg: number | null = null;
   let gap24n = 0;
   let kwh24: number | null = null;
@@ -38,6 +51,13 @@ export default async function SavingsPage() {
     const g = await sql`SELECT avg(gap_f)::float8 AS avg, count(gap_f)::int AS n
                         FROM plan_scores WHERE hour_ts >= now() - interval '24 hours'`;
     if (g.rows[0].n > 0) { gap24avg = g.rows[0].avg; gap24n = g.rows[0].n; }
+
+    const gw = winInterval
+      ? await sql`SELECT avg(gap_f)::float8 AS avg, sum(gap_f)::float8 AS sum, count(gap_f)::int AS n
+                  FROM plan_scores WHERE hour_ts >= now() - (${winInterval})::interval`
+      : await sql`SELECT avg(gap_f)::float8 AS avg, sum(gap_f)::float8 AS sum, count(gap_f)::int AS n
+                  FROM plan_scores`;
+    if (gw.rows[0].n > 0) { gapAvg = gw.rows[0].avg; gapSum = gw.rows[0].sum; gapN = gw.rows[0].n; }
 
     kwh24 = DAILY_KWH;
     kwh7d = DAILY_KWH * 7;
@@ -70,6 +90,30 @@ export default async function SavingsPage() {
   const monthlyWasteUsd = dailyWasteUsd != null ? dailyWasteUsd * 30 : null;
   const dailyCostUsd = dailyKwh != null ? dailyKwh * RATE : null;
 
+  // The accumulating would-have-saved ledger (owner ask 2026-07-15): every scored hour
+  // contributes hourly_kWh × gap°F × sensitivity × rate. Because savings scale ~linearly
+  // with how much of the gap you close, partial-adoption scenarios are fractions of the
+  // full number — "run 10°F cooler than today" ≈ (10 / avg gap) of the full plan.
+  const hourlyKwh = DAILY_KWH / 24;
+  const savedAt = (frac: number) =>
+    gapSum == null ? null : hourlyKwh * Math.min(gapSum * frac * COP_SENS_PER_F, gapN * 0.5) * RATE;
+  const projectMonthly = (v: number | null) =>
+    v == null || gapN === 0 ? null : (v / gapN) * 720; // per-scored-hour rate × hours/month
+  const scenarios = [
+    { frac: 1.0, label: "Full plan (planner's recs)" },
+    { frac: 0.75, label: "75% of the way" },
+    { frac: 0.5, label: "Halfway (e.g. modest curve + setpoint trim)" },
+    { frac: 0.25, label: "Light touch (a few °F cooler)" },
+  ].map((s) => {
+    const saved = savedAt(s.frac);
+    return {
+      ...s,
+      saved,
+      monthly: projectMonthly(saved),
+      coolerF: gapAvg == null ? null : gapAvg * s.frac,
+    };
+  });
+
   const hygieneOk = hygieneHoursAgo != null && hygieneHoursAgo <= 26;
 
   return (
@@ -84,6 +128,17 @@ export default async function SavingsPage() {
 
       <I1Banner />
       <StormBanner />
+
+      <div className="controls">
+        <div className="seg">
+          {Object.entries(WINDOWS).map(([k, w]) => (
+            <a key={k} className={win === k ? "active" : ""} href={`/savings?window=${k}`}>{w.label}</a>
+          ))}
+        </div>
+        <span className="dim" style={{ alignSelf: "center", fontSize: 12 }}>
+          would-have-saved ledger window · accumulating since Jul 14
+        </span>
+      </div>
 
       {dbError ? (
         <div className="empty">Database not reachable.</div>
@@ -114,6 +169,59 @@ export default async function SavingsPage() {
                 This is a summer (hot-water-only) figure; the winter number is larger.
                 The ~1%/°F slope is the exact thing the A-4 test measures for your pumps.
               </div>
+            </div>
+
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <h2>What you&apos;d have saved — and at partial adoption<span className="chip">forward ledger · {WINDOWS[win].label}</span></h2>
+              {gapN === 0 ? (
+                <div className="meta">No scored hours in this window yet — the ledger fills as the planner scores each completed hour.</div>
+              ) : (
+                <>
+                  <div className="temps">
+                    <div className="temp">
+                      <div className="v">{scenarios[0].saved == null ? "—" : `$${scenarios[0].saved.toFixed(2)}`}</div>
+                      <div className="l">full plan, this window</div>
+                    </div>
+                    <div className="temp">
+                      <div className="v">{scenarios[0].monthly == null ? "—" : `$${scenarios[0].monthly.toFixed(0)}`}</div>
+                      <div className="l">≈ / month at this rate</div>
+                    </div>
+                    <div className="temp">
+                      <div className="v">{gapN}</div>
+                      <div className="l">hours scored</div>
+                    </div>
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", fontSize: 12.5, borderCollapse: "collapse", marginTop: 6 }}>
+                      <thead>
+                        <tr style={{ color: "var(--dim)", textAlign: "left" }}>
+                          <th style={{ padding: "3px 8px" }}>if you ran…</th>
+                          <th style={{ padding: "3px 8px" }}>≈ how much cooler</th>
+                          <th style={{ padding: "3px 8px" }}>saved ({WINDOWS[win].label})</th>
+                          <th style={{ padding: "3px 8px" }}>≈ / month forward</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {scenarios.map((s) => (
+                          <tr key={s.frac} style={{ borderTop: "1px solid var(--line)" }}>
+                            <td style={{ padding: "3px 8px" }}>{s.label}</td>
+                            <td style={{ padding: "3px 8px" }}>{s.coolerF == null ? "—" : `${s.coolerF.toFixed(0)}°F below today`}</td>
+                            <td style={{ padding: "3px 8px", fontVariantNumeric: "tabular-nums" }}>{s.saved == null ? "—" : `$${s.saved.toFixed(2)}`}</td>
+                            <td style={{ padding: "3px 8px", fontVariantNumeric: "tabular-nums" }}>{s.monthly == null ? "—" : `$${s.monthly.toFixed(0)}`}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="meta">
+                    Every scored hour adds to this ledger — it only grows more accurate. Partial rows
+                    answer &quot;what if I don&apos;t go all the way&quot;: e.g. the halfway row ≈ trimming
+                    setpoints below 75 °C and the curve by ~{scenarios[2].coolerF == null ? "—" : scenarios[2].coolerF.toFixed(0)}°F.
+                    Savings scale ~linearly with °F closed (capped at 50% total). Monthly projections
+                    extrapolate this window&apos;s rate; summer regime — winter will run higher.
+                  </div>
+                </>
+              )}
             </div>
 
             <div className="card">
