@@ -152,8 +152,12 @@ export async function fetchOutageStatus(baseUrl: string): Promise<{ hasActiveOut
     });
     if (!res.ok) return null;
     const body = (await res.json()) as any;
-    if (typeof body?.hasActiveOutage !== "boolean") return null;
-    return { hasActiveOutage: body.hasActiveOutage };
+    // OutageWatch returns an ARRAY of monitor statuses (verified live 2026-07-14);
+    // accept both shapes and report an outage if any monitor has one.
+    const monitors = Array.isArray(body) ? body : [body];
+    const flags = monitors.map((m) => m?.hasActiveOutage).filter((v) => typeof v === "boolean");
+    if (!flags.length) return null;
+    return { hasActiveOutage: flags.some(Boolean) };
   } catch {
     return null;
   }
