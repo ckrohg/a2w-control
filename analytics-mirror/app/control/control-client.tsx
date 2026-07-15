@@ -6,6 +6,7 @@
 // stay human-only on the direct LAN/Funnel path and are not exposed here. Temps shown in
 // °F (whole degrees) but commands SEND value_c in Celsius, since the hub/Pi are Celsius.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useModals } from "../ui/modal";
 
 type Pump = {
   id: string;
@@ -30,6 +31,13 @@ const fmt = (v: number | null | undefined, d = 0) =>
   v == null || !isFinite(v) ? "—" : v.toFixed(d);
 
 export default function ControlClient() {
+  const { confirm, prompt, Modals } = useModals();
+  // Live clock so the armed countdown ticks down every second (and the window can expire).
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
   const [data, setData] = useState<StateResp | null>(null);
   const [loadErr, setLoadErr] = useState("");
   const [loaded, setLoaded] = useState(false);
@@ -124,10 +132,18 @@ export default function ControlClient() {
   // --- write-mode arming (Gate 1: fresh password re-entry -> 5-min armed window) ---
   const [armedUntil, setArmedUntil] = useState<number | null>(null);
   const [armMsg, setArmMsg] = useState("");
-  const armed = armedUntil != null && Date.now() < armedUntil;
+  const armed = armedUntil != null && nowMs < armedUntil;
+  // When the armed window elapses, flip the button back and clear armedUntil.
+  useEffect(() => {
+    if (armedUntil != null && nowMs >= armedUntil) setArmedUntil(null);
+  }, [nowMs, armedUntil]);
 
   async function arm() {
-    const password = window.prompt("Re-enter the dashboard password to arm write-mode controls (5 min):");
+    const password = await prompt({
+      title: "Arm write-mode controls",
+      body: "Re-enter the dashboard password to arm write-mode controls (5 min):",
+      inputType: "password",
+    });
     if (!password) return;
     setArmMsg("");
     try {
@@ -151,11 +167,13 @@ export default function ControlClient() {
   async function toggleWrite(p: Pump) {
     const next = !(p.write_enabled === true);
     const name = p.name ?? p.id;
-    if (!window.confirm(
-      next
+    if (!(await confirm({
+      title: next ? "Enable remote writes" : "Disable remote writes",
+      body: next
         ? `ENABLE remote writes for ${name}? This arms the pump's write path (audited; sends a high-priority push). Guardrails stay active.`
         : `Disable remote writes for ${name}? Setpoint commands will be refused until re-enabled.`,
-    )) return;
+      danger: true,
+    }))) return;
     setMsgs((m) => ({ ...m, [p.id]: "" }));
     try {
       const res = await fetch("/api/hub/write-enable", {
@@ -182,27 +200,19 @@ export default function ControlClient() {
 
   return (
     <>
-      <header>
-        <h1>A2W Control</h1>
-        <span className="dim">remote setpoint control · via hub</span>
+      {Modals}
+      <div className="meta" style={{ marginBottom: 12 }}>
         <span
           className={`chip ${connected ? "heating" : "offline"}`}
-          style={{ marginLeft: 4 }}
         >
           {connected ? "Pi connected" : "Pi offline"}
-        </span>
-        <form action="/api/logout" method="post">
-          <button type="submit">Sign out</button>
-        </form>
-      </header>
+        </span>{" "}
+        remote setpoint control · via hub
+      </div>
 
       <div className="controls">
-        <div className="seg">
-          <a href="/">Analytics</a>
-          <a className="active" href="/control">Control</a>
-        </div>
         <button type="button" onClick={arm} disabled={armed} style={{ marginLeft: "auto" }}>
-          {armed ? `🔓 Armed (${Math.max(0, Math.ceil((armedUntil! - Date.now()) / 60000))} min)` : "🔒 Arm write-mode controls"}
+          {armed ? `🔓 Armed (${Math.max(0, Math.ceil((armedUntil! - nowMs) / 60000))} min)` : "🔒 Arm write-mode controls"}
         </button>
       </div>
       {armMsg ? <div className="meta" style={{ marginTop: -8, marginBottom: 10 }}>{armMsg}</div> : null}
@@ -338,6 +348,7 @@ type HbxStatus = {
  *  (I4 outdoor-indexed envelope, I1 cross-check, rate limit, audit all enforced
  *  planner-side; this card just asks and reports). */
 function HbxTargetCard() {
+  const { confirm, Modals } = useModals();
   const [st, setSt] = useState<HbxStatus | null>(null);
   const [target, setTarget] = useState<number | null>(null);
   const [msg, setMsg] = useState("");
@@ -365,8 +376,8 @@ function HbxTargetCard() {
     return () => clearInterval(id);
   }, [load]);
 
-  async function act(path: string, body?: unknown, confirmText?: string) {
-    if (confirmText && !window.confirm(confirmText)) return;
+  async function act(path: string, body?: unknown, confirmText?: string, confirmTitle?: string) {
+    if (confirmText && !(await confirm({ title: confirmTitle ?? "Confirm", body: confirmText, danger: true }))) return;
     setBusy(true);
     setMsg("");
     try {
@@ -389,6 +400,7 @@ function HbxTargetCard() {
   const band = st.band;
   return (
     <div className="cards" style={{ marginTop: 4 }}>
+      {Modals}
       <div className="card">
         <h2>
           HBX tank target
@@ -402,17 +414,18 @@ function HbxTargetCard() {
           <div className="temp"><div className="v">{band ? `${band.lo}–${band.hi}` : "—"}</div><div className="l">Allowed °F (I4)</div></div>
         </div>
         <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
-          <button type="button" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) - 1)} style={{ flex: "0 0 auto" }}>−</button>
+          <button type="button" aria-label="decrease" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) - 1)} style={{ flex: "0 0 auto" }}>−</button>
           <div className="temp" style={{ flex: 1 }}>
             <div className="v">{target ?? "—"}°</div>
             <div className="l">New target °F</div>
           </div>
-          <button type="button" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) + 1)} style={{ flex: "0 0 auto" }}>+</button>
+          <button type="button" aria-label="increase" disabled={busy || target == null} onClick={() => setTarget((t) => (t ?? 120) + 1)} style={{ flex: "0 0 auto" }}>+</button>
           <button
             type="button"
             disabled={busy || target == null}
             onClick={() => act("/api/planner/target", { target_f: target },
-              `Set the HBX tank target to ${target}°F? This flattens the reset curve until you restore it. Pump setpoints must stay ${st.i1_margin_f}°F above it (checked).`)}
+              `Set the HBX tank target to ${target}°F? This flattens the reset curve until you restore it. Pump setpoints must stay ${st.i1_margin_f}°F above it (checked).`,
+              "Set HBX tank target")}
             style={{ flex: "0 0 auto" }}
           >
             {busy ? "…" : "Set"}
@@ -421,7 +434,8 @@ function HbxTargetCard() {
             type="button"
             disabled={busy}
             onClick={() => act("/api/planner/restore", undefined,
-              `Restore the as-found curve (${st.baseline ? `${st.baseline.dbt}/${st.baseline.mbt}°F` : "baseline"})?`)}
+              `Restore the as-found curve (${st.baseline ? `${st.baseline.dbt}/${st.baseline.mbt}°F` : "baseline"})?`,
+              "Restore curve")}
             style={{ flex: "0 0 auto" }}
           >
             Restore curve
@@ -430,7 +444,8 @@ function HbxTargetCard() {
             type="button"
             disabled={busy || !!st.active_boost}
             onClick={() => act("/api/planner/boost", { target_f: 131, minutes: 60 },
-              "Boost the tank to 131°F for 60 minutes (sanitize soak / A-B charge)? The curve restores itself automatically — even if the planner restarts.")}
+              "Boost the tank to 131°F for 60 minutes (sanitize soak / A-B charge)? The curve restores itself automatically — even if the planner restarts.",
+              "Boost tank")}
             style={{ flex: "0 0 auto" }}
           >
             {st.active_boost ? "Boost active" : "Boost 131° / 1h"}
