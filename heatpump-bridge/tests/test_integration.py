@@ -529,7 +529,7 @@ async def test_analytics_exporter_pushes_snapshot(rig):
     await poller.poll_once()
     cfg = AnalyticsConfig(endpoint_url=f"http://127.0.0.1:{port}/api/ingest",
                           token="secret123", interval_s=999)
-    exporter = Exporter(cfg, {"p1": poller})
+    exporter = Exporter(cfg, {"p1": poller}, store, db_path=store.path)
     await exporter.push_once()
 
     assert len(received) == 1
@@ -550,7 +550,7 @@ async def test_analytics_exporter_pushes_snapshot(rig):
     srv.shutdown()
     # dead endpoint: must not raise
     cfg2 = AnalyticsConfig(endpoint_url="http://127.0.0.1:59997/x", token="t")
-    await Exporter(cfg2, {"p1": poller}).push_once()   # no exception = pass
+    await Exporter(cfg2, {"p1": poller}, store, db_path=store.path).push_once()  # no exception = pass
 
 
 async def test_store_concurrent_reads_and_writes_dont_corrupt(rig):

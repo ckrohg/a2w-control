@@ -58,7 +58,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await poller.start()
         scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url)
         scheduler.start()
-        exporter = Exporter(cfg.analytics, pollers)
+        exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
         hub_client.start()

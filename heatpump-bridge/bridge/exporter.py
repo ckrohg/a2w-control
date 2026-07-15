@@ -10,11 +10,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 import urllib.request
+from pathlib import Path
 
 from .config import AnalyticsConfig
 from .poller import PumpPoller
+from .store import Store
 
 log = logging.getLogger(__name__)
 
@@ -26,13 +29,43 @@ log = logging.getLogger(__name__)
 # baseline without a second transport.
 FULL_SNAPSHOT_EVERY_S = 300
 
+# Max events attached to a single push (matches store.get_events_since default). A backlog
+# drains a batch per cycle; the cursor only advances on an HTTP 2xx so nothing is dropped.
+EVENTS_BATCH = 200
+
 
 class Exporter:
-    def __init__(self, cfg: AnalyticsConfig, pollers: dict[str, PumpPoller]):
+    def __init__(self, cfg: AnalyticsConfig, pollers: dict[str, PumpPoller],
+                 store: Store, *, db_path: str):
         self.cfg = cfg
         self.pollers = pollers
+        self.store = store
         self._task: asyncio.Task | None = None
         self._last_full = 0.0
+        # Durable "max event id pushed" cursor — a small file next to the DB (same dir as
+        # gateway-overrides.json) so events aren't re-shipped from id 0 after a restart.
+        # The cloud dedups on (pump_id, source_id) anyway, but this keeps pushes small.
+        self._cursor_path = Path(db_path).parent / "exporter-events-cursor"
+        self._cursor = self._read_cursor()
+
+    def _read_cursor(self) -> int:
+        try:
+            return int(self._cursor_path.read_text().strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _write_cursor(self, value: int) -> None:
+        # atomic write (same discipline as config._write_state) — a half-written cursor at
+        # this power-outage-prone site must not corrupt the resume point
+        tmp = self._cursor_path.with_suffix(".tmp")
+        try:
+            with open(tmp, "w") as f:
+                f.write(str(value))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._cursor_path)
+        except OSError as exc:  # noqa: BLE001 — cursor persistence must never break a push
+            log.warning("event cursor persist failed: %s", exc)
 
     def start(self) -> None:
         if self.cfg.endpoint_url and self.cfg.token:
@@ -83,17 +116,41 @@ class Exporter:
     async def push_once(self) -> None:
         if not (self.cfg.endpoint_url and self.cfg.token):
             return
-        payload = json.dumps(self.snapshot()).encode("utf-8")
+        body = self.snapshot()
+
+        # New local events since the last successfully-pushed id. source_id = the Pi's own
+        # event id (the cloud dedups on (pump_id, source_id)); cursor advances only on 2xx.
+        max_id = 0
+        try:
+            new_events = await self.store.get_events_since(self._cursor, EVENTS_BATCH)
+        except Exception as exc:  # noqa: BLE001 — never block/break the push on a read error
+            log.warning("event read for export failed: %s", exc)
+            new_events = []
+        if new_events:
+            body["events"] = [
+                {"pump_id": e["pump_id"], "source_id": e["id"], "ts": e["ts"],
+                 "type": e["type"], "code": e["code"], "severity": e["severity"],
+                 "message": e["message"], "detail": e["detail"]}
+                for e in new_events
+            ]
+            max_id = max(e["id"] for e in new_events)
+
+        payload = json.dumps(body).encode("utf-8")
         url, token = self.cfg.endpoint_url, self.cfg.token
 
-        def _post():
+        def _post() -> bool:
             try:
                 req = urllib.request.Request(
                     url, data=payload, method="POST",
                     headers={"Content-Type": "application/json",
                              "Authorization": f"Bearer {token}"})
                 urllib.request.urlopen(req, timeout=10).read()
+                return True
             except Exception as exc:  # noqa: BLE001
                 log.warning("analytics push failed: %s", exc)
+                return False
 
-        await asyncio.to_thread(_post)
+        ok = await asyncio.to_thread(_post)
+        if ok and max_id > self._cursor:
+            self._cursor = max_id
+            self._write_cursor(max_id)

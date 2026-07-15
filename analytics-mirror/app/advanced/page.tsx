@@ -3,12 +3,69 @@
 // Read-only. Until the Pi ships the exporter change (release-* tag), this page shows an
 // explanatory empty state — the Pi UI over LAN/Funnel remains the break-glass full view.
 import { sql } from "@vercel/postgres";
-import { fmtTime } from "@/lib/tz";
+import { fmtTime, fmtDateTime } from "@/lib/tz";
+import { recentEvents, type Event, type EventFilter } from "@/lib/db";
 import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
+
+const EVENT_TABS: { key: EventFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "faults", label: "Faults" },
+  { key: "writes", label: "Writes" },
+  { key: "runtime", label: "Runtime" },
+];
+
+// Colored chip mirroring the Pi UI: fault/critical → red, write → warn, state → blue.
+function eventChip(e: Event): string {
+  const sev = (e.severity ?? "").toLowerCase();
+  if (e.type === "fault_on" || e.type === "fault_off" || sev === "critical") return "offline";
+  if (e.type && e.type.endsWith("_write")) return "warn";
+  if (e.type === "state") return "cooling";
+  return "";
+}
+
+async function EventLog({ filter, pumpNames }: { filter: EventFilter; pumpNames: Map<string, string> }) {
+  let events: Event[] = [];
+  let dbError = false;
+  try {
+    events = await recentEvents({ filter, limit: 100 });
+  } catch {
+    dbError = true; // pump_events table appears with the first events push from the Pi
+  }
+  return (
+    <div className="chart-block">
+      <h3>Event log</h3>
+      <div className="seg" style={{ marginBottom: 12 }}>
+        {EVENT_TABS.map((t) => (
+          <a key={t.key} className={filter === t.key ? "active" : ""} href={`/advanced?events=${t.key}`}>
+            {t.label}
+          </a>
+        ))}
+      </div>
+      {dbError || events.length === 0 ? (
+        <div className="empty">
+          Event history appears here once the Pi ships the events feed (next Pi update) —
+          faults, setpoint changes, defrosts, and comm drops will land here.
+        </div>
+      ) : (
+        <div className="meta" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {events.map((e) => (
+            <div key={e.id} style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+              <span className="dim">{fmtDateTime(e.ts)}</span>
+              <span className="dim">·</span>
+              <span>{pumpNames.get(e.pump_id) ?? e.pump_id}</span>
+              <span className={`chip ${eventChip(e)}`}>{e.severity ?? e.type ?? "event"}</span>
+              <span>{e.message ?? e.type ?? ""}{e.code ? ` (${e.code})` : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const f = (c: number | null | undefined) => (c == null ? null : (c * 9) / 5 + 32);
 const fmt = (v: number | null | undefined, d = 1, suffix = "") =>
@@ -42,7 +99,7 @@ function KV({ data, degC }: { data: Record<string, unknown> | undefined; degC?: 
   );
 }
 
-export default async function AdvancedPage() {
+export default async function AdvancedPage({ searchParams }: { searchParams: { events?: string } }) {
   let snaps: SnapRow[] = [];
   let dbError = false;
   try {
@@ -53,9 +110,17 @@ export default async function AdvancedPage() {
   }
   const now = Date.now() / 1000;
 
+  const eventFilter: EventFilter =
+    EVENT_TABS.some((t) => t.key === searchParams.events)
+      ? (searchParams.events as EventFilter)
+      : "all";
+  const pumpNames = new Map(snaps.map((s) => [s.pump_id, s.name ?? s.pump_id]));
+
   return (
     <>
       <I1Banner />
+
+      <EventLog filter={eventFilter} pumpNames={pumpNames} />
 
       {dbError || snaps.length === 0 ? (
         <div className="empty">

@@ -139,6 +139,18 @@ class Store:
             (pump_id, since),
         )
 
+    async def get_events_since(self, cursor: int, limit: int = 200) -> list[dict]:
+        """New events strictly after `cursor` (an event id), oldest-first, capped. Feeds the
+        cloud mirror push (bridge/exporter.py); id ordering makes the cursor durable/resumable."""
+        rows = await self._query(
+            "SELECT id, pump_id, ts, type, code, severity, message, detail FROM events"
+            " WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (cursor, limit),
+        )
+        for r in rows:
+            r["detail"] = json.loads(r["detail"]) if r["detail"] else None
+        return rows
+
     async def get_events(self, pump_id: str, days: float) -> list[dict]:
         since = time.time() - days * 86400
         rows = await self._query(

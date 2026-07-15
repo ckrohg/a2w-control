@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
-import { ensureSchema } from "@/lib/db";
+import { ensureSchema, ensureEventsSchema } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,5 +43,39 @@ export async function POST(req: Request) {
   }
   // retention: keep ~90 days (free-tier friendly)
   await sql`DELETE FROM readings WHERE ts < ${ts - 90 * 86400}`;
-  return NextResponse.json({ ok: true, stored: pumps.length });
+
+  // Events feed (bridge/exporter.py): the Pi attaches new local events keyed by
+  // source_id = its own event id. ON CONFLICT DO NOTHING makes re-sends idempotent.
+  // Wrapped so a malformed batch never fails the telemetry ingest above.
+  let eventsStored = 0;
+  const events = Array.isArray(body?.events) ? body.events : [];
+  if (events.length) {
+    try { await ensureEventsSchema(); }
+    catch (err) { console.error("events schema ensure failed (telemetry unaffected):", err); }
+    // Per-event guard: the Pi advances its cursor on our 2xx, so a batch-level failure would
+    // silently lose the whole batch. Skip a bad row, keep the rest.
+    for (const e of events.slice(0, 500)) {
+      try {
+        const pumpId = e?.pump_id;
+        const evTs = Number(e?.ts);
+        if (!pumpId || !evTs) continue; // pump_id + ts are NOT NULL / meaningful
+        const sourceId = e?.source_id == null ? null : Number(e.source_id);
+        const detail =
+          e?.detail == null ? null
+          : typeof e.detail === "string" ? e.detail
+          : JSON.stringify(e.detail);
+        await sql`INSERT INTO pump_events
+          (pump_id, source_id, ts, type, code, severity, message, detail)
+          VALUES (${String(pumpId)}, ${sourceId}, ${evTs}, ${e?.type ?? null},
+                  ${e?.code ?? null}, ${e?.severity ?? null}, ${e?.message ?? null},
+                  ${detail}::jsonb)
+          ON CONFLICT (pump_id, source_id) DO NOTHING`;
+        eventsStored++;
+      } catch (err) {
+        console.error("event ingest row skipped:", err);
+      }
+    }
+  }
+
+  return NextResponse.json({ ok: true, stored: pumps.length, events: eventsStored });
 }
