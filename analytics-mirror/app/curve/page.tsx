@@ -10,6 +10,7 @@
 import { sql } from "@vercel/postgres";
 import { fmtTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
+import { StormBanner } from "../storm-banner";
 import historyJson from "@/lib/curve-history.json";
 
 // explicit shape (per-day kwh key sets vary, which trips JSON literal inference)
@@ -402,6 +403,7 @@ export default async function CurvePage() {
       </header>
 
       <I1Banner />
+      <StormBanner />
 
       <div className="cards">
         <div className="card">

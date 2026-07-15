@@ -7,6 +7,7 @@
 import { sql } from "@vercel/postgres";
 import { fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
+import { StormBanner } from "../storm-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -82,6 +83,7 @@ export default async function SavingsPage() {
       </header>
 
       <I1Banner />
+      <StormBanner />
 
       {dbError ? (
         <div className="empty">Database not reachable.</div>

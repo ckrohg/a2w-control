@@ -6,6 +6,7 @@
 import { sql } from "@vercel/postgres";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
+import { StormBanner } from "../storm-banner";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -110,6 +111,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let gap: { avg: number; n: number } | null = null;
   let scored: { t: number; s: number }[] = [];
   let phasebLog: { t: number; pump_id: string; mode: string; value_c: number | null; result: string }[] = [];
+  let stormEvents: { id: number; s: number; e: number | null; trigger: string; ceiling_f: number | null }[] = [];
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -143,6 +145,11 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                           FROM plan_scores WHERE hour_ts >= now() - interval '24 hours'`;
       if (g.rowCount && g.rows[0].n > 0) gap = { avg: g.rows[0].avg_gap as number, n: g.rows[0].n as number };
     } catch { /* tables appear with the first planner deploy that computes a plan */ }
+    try {
+      stormEvents = (await sql`
+        SELECT id, EXTRACT(EPOCH FROM started_at)::float8 AS s, EXTRACT(EPOCH FROM ended_at)::float8 AS e, trigger, ceiling_f
+        FROM storm_events ORDER BY id DESC LIMIT 5`).rows as typeof stormEvents;
+    } catch { /* storm_events appears with the W0-5 planner deploy */ }
   } catch {
     dbError = true;
   }
@@ -178,6 +185,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
       </header>
 
       <I1Banner />
+      <StormBanner />
 
       <div className="controls">
         <div className="seg">
@@ -295,6 +303,17 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               {phasebLog.map((r, i) => (
                 <div className="meta" key={i}>
                   {fmtDateTime(r.t)} · {r.pump_id} → {r.value_c == null ? "—" : `${r.value_c}°C`} · {r.mode} · {r.result}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {stormEvents.length > 0 && (
+            <div className="chart-block">
+              <h3>Storm events <span className="dim">(§6.11 ledger — armed windows, manual or triggered)</span></h3>
+              {stormEvents.map((ev) => (
+                <div className="meta" key={ev.id}>
+                  {fmtDateTime(ev.s)} · {ev.trigger} · {ev.e ? `${((ev.e - ev.s) / 3600).toFixed(1)} h` : "open"}
                 </div>
               ))}
             </div>
