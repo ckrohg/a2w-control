@@ -84,3 +84,41 @@ lease, never a stale value. Renewals are free on the Pi (renew-without-rewrite).
 
 Rollback = unset `PHASE_B_ENABLED` → leases lapse → Pi reverts to `baseline_setpoint_c`.
 Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow record.
+
+## Winter solver — shadow (W0, FLAG-OFF; plan §6.9)
+
+Demand-driven service floors: TempIQ `/api/insights/zones` → per-zone required water
+temp (baseboard curve / radiant band) → binding calling zone + 4.5 °F buffer margin →
+the shadow plan's winter blocks ride that floor instead of mimicking the HBX curve.
+Reasons name the binding zone. Degraded mode (feed stale >30 min) = exactly the old
+behavior; A2W never depends on TempIQ to heat the house. Emitter ground truth from the
+owner survey is enforced in code until TempIQv2#1508 lands (Living Room→radiant
+override + synthetic Xmas Room baseboard zone).
+
+| Env | Meaning |
+|---|---|
+| `WINTER_SOLVER_SHADOW=1` | enable the demand feed + floor proposals (default off) |
+| `TEMPIQ_BASE_URL` / `TEMPIQ_SURFACE_TOKEN` | the insights seam (shared with the pusher) |
+| `EMITTER_OVERRIDES` | JSON name→deliveryType map (default carries the survey) |
+| `EMITTER_SYNTHETIC_ZONES` | JSON InsightZone[] (default: the invisible Xmas Room loop) |
+
+Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed).
+`/health.winter_solver` = off | shadow | degraded.
+
+## Storm mode (W0, NOTIFY-FIRST; plan §6.11)
+
+Triggers: NWS active alerts (point query, 30-min poll) + OpenMeteo 72 h heuristics
+(<0 °F, gusts >45 mph ≥3 h, freezing rain ≥2 h, snow ≥8 in) + OutageWatch `/api/status`
+(5-min loop; unreachable = no signal, never = outage) + manual. Default posture pages
+the owner and shapes NOTHING — set `STORM_MODE_ENABLED=1` to let armed/active windows
+raise in-window plan blocks to the storm ceiling (min(HBX curve+3, `STORM_CAP_F`)) —
+only-raises, I4 clamp last, hp1 setpoint recomputed.
+
+| Env | Meaning |
+|---|---|
+| `STORM_MODE_ENABLED=1` | let storm state shape the plan (default off = notify-only) |
+| `STORM_CAP_F` | storm ceiling cap, default 135 (lift after Phase B) |
+| `OUTAGEWATCH_URL` | default the Railway OutageWatch service |
+
+Manual (authed with `PLANNER_API_TOKEN`): `POST /api/storm/arm {hours}` /
+`POST /api/storm/disarm`. Audit: `storm_events`. `/health.storm` = state + trigger.
