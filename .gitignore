@@ -18,8 +18,14 @@ worktrees/
 
 # Node / Python deps
 node_modules/
+node_modules
 .venv/
 __pycache__/
 
 # OS cruft
 .DS_Store
+
+# Tenet build-agent runner scratch (worktree-local)
+EXPERIMENTS.md
+AGENT.md
+.tenet/provenance-key
