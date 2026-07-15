@@ -81,7 +81,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let stormEvents: { id: number; s: number; e: number | null; trigger: string; ceiling_f: number | null }[] = [];
   let floorSnap: {
     t: number;
-    zones: { name: string; deliveryType: string; awtF: number | null; calling: boolean }[];
+    zones: { name: string; deliveryType: string; awtF: number | null; calling: boolean; verified?: boolean | null }[];
     bindingZone: string | null; bindingAwtF: number | null; floorF: number | null; source: string | null;
   } | null = null;
   let dbError = false;
@@ -129,7 +129,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
       if (zf.rowCount) {
         floorSnap = {
           t: zf.rows[0].t as number,
-          zones: (zf.rows[0].zones ?? []) as { name: string; deliveryType: string; awtF: number | null; calling: boolean }[],
+          zones: (zf.rows[0].zones ?? []) as { name: string; deliveryType: string; awtF: number | null; calling: boolean; verified?: boolean | null }[],
           bindingZone: (zf.rows[0].binding_zone as string | null) || null,
           bindingAwtF: zf.rows[0].awt as number | null,
           floorF: zf.rows[0].floor as number | null,
@@ -311,6 +311,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
             const floors = floorSnap.zones.filter((z) => z.awtF != null).sort((a, b) => (b.awtF ?? 0) - (a.awtF ?? 0));
             const calling = floors.filter((z) => z.calling);
             const callDriven = (floorSnap.source ?? "").includes("calls"); // "insights+calls" vs conservative "insights"
+            const bindingZoneObj = floors.find((z) => z.name === floorSnap.bindingZone) ?? calling[0];
+            const bindingUnverified = bindingZoneObj?.verified === false; // TempIQ#1508 provenance
             const bindingIsBaseboard = floors[0]?.deliveryType === "baseboard";
             const nextFloor = floors.find((z) => z.deliveryType !== "baseboard");
             const unlocked = bindingIsBaseboard && nextFloor?.awtF != null && floorSnap.floorF != null
@@ -328,7 +330,10 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                   {floorSnap.bindingAwtF != null ? (
                     <>Binding zone: <b>{floorSnap.bindingZone || calling[0]?.name || "—"}</b> needs{" "}
                     <b>{fmt(floorSnap.bindingAwtF)}°F</b> at the emitter → proposed tank floor{" "}
-                    <b>{fmt(floorSnap.floorF)}°F</b> (live HBX target: {fmt(last?.tank_target_f)}°F).</>
+                    <b>{fmt(floorSnap.floorF)}°F</b> (live HBX target: {fmt(last?.tank_target_f)}°F).
+                    {bindingUnverified && (
+                      <span style={{ color: "#ffa94d" }}> ⚠ binding on an <b>unverified</b> emitter type — the floor may be off ~15-25°F; confirm it in TempIQ.</span>
+                    )}</>
                   ) : (
                     <>Binding zone: <b>none calling</b> → no hydronic demand, riding the HBX reset curve
                     (live target {fmt(last?.tank_target_f)}°F).</>
@@ -339,6 +344,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                   <div className="meta" key={i} style={z.calling ? { color: "#a9e34b" } : { opacity: 0.5 }}>
                     {z.calling ? "● " : "○ "}{z.name || "(unnamed zone)"} · {z.deliveryType} → {fmt(z.awtF)}°F
                     {z.calling ? " · calling" : ""}
+                    {z.verified === false ? <span style={{ color: "#ffa94d" }}> · unverified</span> : null}
                   </div>
                 ))}
                 {unlocked != null && outNow != null && floorSnap.floorF != null && (() => {
@@ -364,12 +370,13 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
           })()}
 
           <div className="chart-block">
-            <h3>Storm auto-raise <span className="dim">(what pre-charges the tank, and why)</span></h3>
+            <h3>Storm auto-raise <span className="dim">(what a storm does today — and what arms it)</span></h3>
             <div className="meta">
-              Posture: <b>auto-raise + notify</b>. A qualifying storm lifts the in-window tank ceiling to the
-              HBX reset-curve target <b>+3°F</b> (capped 135°F), <b>only ever raises</b> a block (never lowers below
-              the plan), and pages you on every transition. The winter solver stays shadow; this is the one
-              plan-shaping path, safe because Phase B is still dry-run.
+              Posture: <b>propose &amp; notify</b>. A qualifying storm raises the in-window tank target in the{" "}
+              <b>shadow plan</b> to the HBX reset-curve target <b>+3°F</b> (capped 135°F), <b>only ever raises</b>{" "}
+              (never lowers below the plan), and pages you on every transition. It does <b>not physically pre-charge
+              the tank yet</b> — the winter solver is shadow and Phase B tracking is dry-run. Real pre-charge begins
+              when Phase B goes live, at which point the same raise commands the pump.
             </div>
             <div className="meta">
               <b>Prediction sources:</b> NWS active alerts (api.weather.gov), the OpenMeteo 3-day hourly forecast,

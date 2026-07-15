@@ -12,6 +12,9 @@ export interface InsightZone {
   id: string;
   name: string;
   deliveryType: string; // "baseboard" | "radiant_floor" | "mini_split" | "dhw" | ...
+  // TempIQ#1508 delivery_type provenance: null = unknown (pre-#1582 TempIQ deploy),
+  // false = seeded/unconfirmed (the floor math may be wrong — flag it), true = owner-verified.
+  deliveryTypeVerified: boolean | null;
   uaBtuHrF: number | null;
   thermalMassBtuF: number | null;
   confidence: number | null;
@@ -31,6 +34,7 @@ export interface ZoneFloor {
   deliveryType: string;
   awtF: number | null;
   calling: boolean;
+  verified: boolean | null; // TempIQ#1508: is this zone's delivery_type owner-verified?
 }
 
 export interface FloorResult {
@@ -38,6 +42,9 @@ export interface FloorResult {
   bindingZone: string | null; // zone NAME with the highest active floor
   bindingAwtF: number | null;
   tankTargetF: number | null; // bindingAwtF + BUFFER_MARGIN_F, rounded to 1 decimal
+  // TempIQ#1508: is the BINDING zone's delivery_type owner-verified? false = the tank floor
+  // is being set from a seeded/unconfirmed emitter type (may be wrong by 15-25°F) — surface it.
+  bindingVerified: boolean | null;
 }
 
 /** Buffer→emitter margin, °F (plan §6.9; measure via reg 2051 later). */
@@ -81,7 +88,7 @@ export function computeFloors(
   const perZone: ZoneFloor[] = zones.map((z) => {
     const awtF = requiredAwtF(z.deliveryType, outdoorF);
     const calling = callingZoneIds === null ? awtF !== null : callingZoneIds.includes(z.id);
-    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling };
+    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling, verified: z.deliveryTypeVerified };
   });
 
   let binding: ZoneFloor | null = null;
@@ -91,13 +98,14 @@ export function computeFloors(
   }
 
   if (binding === null || binding.awtF === null) {
-    return { perZone, bindingZone: null, bindingAwtF: null, tankTargetF: null };
+    return { perZone, bindingZone: null, bindingAwtF: null, tankTargetF: null, bindingVerified: null };
   }
   return {
     perZone,
     bindingZone: binding.name,
     bindingAwtF: binding.awtF,
     tankTargetF: Math.round((binding.awtF + BUFFER_MARGIN_F) * 10) / 10,
+    bindingVerified: binding.verified,
   };
 }
 
@@ -165,6 +173,9 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       id: typeof o.zoneId === "string" ? o.zoneId : typeof o.id === "string" ? o.id : String(o.id ?? ""),
       name: typeof o.zoneName === "string" ? o.zoneName : typeof o.name === "string" ? o.name : "",
       deliveryType: typeof o.deliveryType === "string" ? o.deliveryType : "",
+      // TempIQ#1508: only an EXPLICIT boolean counts; absent (pre-#1582 deploy) → null =
+      // unknown (don't flag), false → seeded/unconfirmed (flag), true → owner-verified.
+      deliveryTypeVerified: typeof o.deliveryTypeVerified === "boolean" ? o.deliveryTypeVerified : null,
       uaBtuHrF: num(env.ua) ?? num(o.uaBtuHrF),
       thermalMassBtuF: num(env.thermalMass) ?? num(o.thermalMassBtuF),
       confidence: num(env.confidence) ?? num(o.confidence),

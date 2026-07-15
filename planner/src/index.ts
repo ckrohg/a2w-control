@@ -332,9 +332,11 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
     await ntfy(
       `Storm mode ${state.kind}: ${transitions.join(", ")}`,
       `Trigger: ${state.trigger}. Window ends ${state.windowEnd}. Pre-charge ceiling ${ceilingF.toFixed(0)}°F.` +
-        (STORM_MODE_ENABLED
-          ? `\nAuto-raise ON: shaping the plan — in-window blocks lifted toward ${ceilingF.toFixed(0)}°F (only raises, never lowers).`
-          : "\nNotify-only: STORM_MODE_ENABLED off, plan not shaped."),
+        (!STORM_MODE_ENABLED
+          ? "\nNotify-only: STORM_MODE_ENABLED off, plan not shaped."
+          : PHASE_B_ENABLED && !PHASE_B_DRY_RUN
+            ? `\nAuto-raise ACTIVE: pre-charging the tank toward ${ceilingF.toFixed(0)}°F (only raises, never lowers).`
+            : `\nAuto-raise: proposing ${ceilingF.toFixed(0)}°F in the SHADOW plan only — the tank will NOT physically pre-charge until Phase B goes live (currently dry-run).`),
       "high",
     );
   } else {
@@ -388,6 +390,11 @@ async function shadowOnce(): Promise<void> {
       }
       if (floor.tankTargetF != null && floor.bindingZone != null && floor.bindingAwtF != null) {
         demandFloor = { tankTargetF: floor.tankTargetF, bindingZone: floor.bindingZone, awtF: floor.bindingAwtF };
+        // TempIQ#1508: binding on a seeded/unconfirmed emitter type means the floor may be
+        // off by 15-25°F (radiant vs baseboard). Surface it; the /hbx card flags it too.
+        if (floor.bindingVerified === false) {
+          console.warn(`[demand] binding zone "${floor.bindingZone}" has an UNVERIFIED delivery_type — tank floor ${floor.tankTargetF}°F may be wrong; confirm in TempIQ (#1508)`);
+        }
       }
     }
   }
