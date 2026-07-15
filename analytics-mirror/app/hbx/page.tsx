@@ -112,6 +112,11 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let scored: { t: number; s: number }[] = [];
   let phasebLog: { t: number; pump_id: string; mode: string; value_c: number | null; result: string }[] = [];
   let stormEvents: { id: number; s: number; e: number | null; trigger: string; ceiling_f: number | null }[] = [];
+  let floorSnap: {
+    t: number;
+    zones: { name: string; deliveryType: string; awtF: number | null; calling: boolean }[];
+    bindingZone: string | null; bindingAwtF: number | null; floorF: number | null; source: string | null;
+  } | null = null;
   let dbError = false;
   try {
     slx = (await sql<SlxRow>`
@@ -150,6 +155,21 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
         SELECT id, EXTRACT(EPOCH FROM started_at)::float8 AS s, EXTRACT(EPOCH FROM ended_at)::float8 AS e, trigger, ceiling_f
         FROM storm_events ORDER BY id DESC LIMIT 5`).rows as typeof stormEvents;
     } catch { /* storm_events appears with the W0-5 planner deploy */ }
+    try {
+      const zf = await sql`
+        SELECT EXTRACT(EPOCH FROM ts)::float8 AS t, zones, binding_zone, binding_awt_f::float8 AS awt, tank_target_f::float8 AS floor, source
+        FROM zone_floor_snapshots ORDER BY ts DESC LIMIT 1`;
+      if (zf.rowCount) {
+        floorSnap = {
+          t: zf.rows[0].t as number,
+          zones: (zf.rows[0].zones ?? []) as { name: string; deliveryType: string; awtF: number | null; calling: boolean }[],
+          bindingZone: (zf.rows[0].binding_zone as string | null) || null,
+          bindingAwtF: zf.rows[0].awt as number | null,
+          floorF: zf.rows[0].floor as number | null,
+          source: zf.rows[0].source as string | null,
+        };
+      }
+    } catch { /* zone_floor_snapshots appears once WINTER_SOLVER_SHADOW runs */ }
   } catch {
     dbError = true;
   }
@@ -318,6 +338,58 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               ))}
             </div>
           )}
+
+          {floorSnap && (() => {
+            // Zone service floors (§6.9, shadow-only) + the §6.10 unlock, recommend-only.
+            // Modeled COP mirrors the planner's Carnot-style surface (η base 0.43).
+            const outNow = last?.outdoor_f ?? null;
+            const copAt = (o: number, w: number) => {
+              if (w - o <= 5) return 6;
+              const eta = Math.max(0.3, 0.43 - Math.max(0, 17 - o) * 0.001);
+              return Math.max(1, Math.min(6, (eta * (w + 459.67)) / (w - o)));
+            };
+            const margin = floorSnap.floorF != null && floorSnap.bindingAwtF != null
+              ? floorSnap.floorF - floorSnap.bindingAwtF : 4.5;
+            const floors = floorSnap.zones.filter((z) => z.awtF != null).sort((a, b) => (b.awtF ?? 0) - (a.awtF ?? 0));
+            const bindingIsBaseboard = floors[0]?.deliveryType === "baseboard";
+            const nextFloor = floors.find((z) => z.deliveryType !== "baseboard");
+            const unlocked = bindingIsBaseboard && nextFloor?.awtF != null && floorSnap.floorF != null
+              ? Math.round((nextFloor.awtF + margin) * 10) / 10 : null;
+            return (
+              <div className="chart-block">
+                <h3>Winter solver — zone service floors <span className="dim">(§6.9 SHADOW — proposes, never commands · {floorSnap.source})</span></h3>
+                <div className="meta">
+                  Binding zone: <b>{floorSnap.bindingZone || floors[0]?.name || "—"}</b> needs{" "}
+                  <b>{fmt(floorSnap.bindingAwtF)}°F</b> at the emitter → proposed tank floor{" "}
+                  <b>{fmt(floorSnap.floorF)}°F</b> (live HBX target: {fmt(last?.tank_target_f)}°F).
+                  DHW window / sanitize floors still govern the final plan on top of this.
+                </div>
+                {floors.slice(0, 8).map((z, i) => (
+                  <div className="meta" key={i}>
+                    {z.name || "(unnamed zone)"} · {z.deliveryType} → {fmt(z.awtF)}°F{z.calling ? "" : " · not calling"}
+                  </div>
+                ))}
+                {unlocked != null && outNow != null && floorSnap.floorF != null && (() => {
+                  const copNow = copAt(outNow, floorSnap.floorF);
+                  const copUnlocked = copAt(outNow, unlocked);
+                  return copUnlocked - copNow >= 0.05 ? (
+                    <div className="meta" style={{ color: "#e599f7" }}>
+                      §6.10 unlock (recommend-only, modeled): mini-split assist for the baseboard zones would drop the
+                      floor {fmt(floorSnap.floorF)}°F → {fmt(unlocked)}°F — modeled COP{" "}
+                      {copNow.toFixed(2)} → {copUnlocked.toFixed(2)} at {fmt(outNow)}°F out.
+                      Measured split COP arrives with TempIQ#1506.
+                    </div>
+                  ) : (
+                    <div className="meta">
+                      §6.10 unlock: floor would drop {fmt(floorSnap.floorF)}°F → {fmt(unlocked)}°F with baseboard
+                      assist, but at {fmt(outNow)}°F out the lift is already tiny — this bites in heating season.
+                    </div>
+                  );
+                })()}
+                <div className="meta">snapshot {fmtDateTime(floorSnap.t)} · degraded mode falls back to the HBX curve (never depends on TempIQ)</div>
+              </div>
+            );
+          })()}
 
           <div className="chart-block">
             <h3>Config versions <span className="dim">(append-only; every row after #1 is a detected edit)</span></h3>

@@ -155,13 +155,18 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       : [];
   return raw.map((z) => {
     const o = (z ?? {}) as Record<string, unknown>;
+    // live payload shape (verified 2026-07-14, cf. tempiq-read.ts): zoneId, zoneName,
+    // deliveryType, envelope.{ua, thermalMass, confidence}; older spec names kept as
+    // fallbacks so a payload change degrades to nulls, never throws
+    const env = (o.envelope ?? {}) as Record<string, unknown>;
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
     return {
-      id: typeof o.id === "string" ? o.id : String(o.id ?? ""),
-      name: typeof o.name === "string" ? o.name : "",
+      id: typeof o.zoneId === "string" ? o.zoneId : typeof o.id === "string" ? o.id : String(o.id ?? ""),
+      name: typeof o.zoneName === "string" ? o.zoneName : typeof o.name === "string" ? o.name : "",
       deliveryType: typeof o.deliveryType === "string" ? o.deliveryType : "",
-      uaBtuHrF: typeof o.uaBtuHrF === "number" ? o.uaBtuHrF : null,
-      thermalMassBtuF: typeof o.thermalMassBtuF === "number" ? o.thermalMassBtuF : null,
-      confidence: typeof o.confidence === "number" ? o.confidence : null,
+      uaBtuHrF: num(env.ua) ?? num(o.uaBtuHrF),
+      thermalMassBtuF: num(env.thermalMass) ?? num(o.thermalMassBtuF),
+      confidence: num(env.confidence) ?? num(o.confidence),
     };
   });
 }
