@@ -621,6 +621,129 @@ fallback; the wall controllers and the SensorLinx app remain untouched beneath i
 HBX curve drift, unexpected 16.5 kW element runtime, plan-vs-actual divergence beyond
 threshold, planner dead-man. Same discipline as ever: P17-class noise never pages.
 
+### 6.9 The winter solver — demand-driven service floors (added 2026-07-15, owner direction)
+
+The I4 lower line is a **permission floor, not a demand model** — and the owner's reading
+of the /curve counterfactual is correct: a winter pinned at the 135 °F strict cap serves
+the binding baseboard zone with *zero margin* and serves it even when that zone isn't
+calling. Each emitter class has its own service temperature; the tank should ride the
+**maximum of the floors that are actually active**, not a static curve.
+
+**Service floors (per-zone ground truth, inventoried 2026-07-14 from TempIQ + docs):**
+
+| Constraint | Required water at emitter | Active when |
+|---|---|---|
+| Fin-tube baseboard (Living Rm, Upstairs, ?Dining, ?Mud Rm) | `AWT = T_room + (135 − T_room)·f^(1/1.35)`, `f = (65 − T_out)/60` → ≈135 °F @ 5 °F out, ≈115 @ 30, with a ~108–110 °F practical floor (fin-tube convection collapses below it) | zone calling (or predicted within recharge horizon) |
+| Radiant floors (Kitchen, Master Bath, Upstairs Bath, ?Dining, ?Mud Rm) | 95–110 °F — behind tempering hardware that is *assumed but never inspected* (tank has run 150 °F+ into these loops for years) | zone calling; rarely binds |
+| DHW comfort (I3) | tank ≥ 120 °F during draw windows (delivery + 5–8 °F coil approach; window learner live) | draw windows |
+| Thermal hygiene (I8) | ≥60 min ≥ 131 °F per rolling 24 h | daily, scheduled at best COP |
+| Freeze floor (I2) | HP setpoint ≥ 45 °C / 113 °F | always, unattended |
+
+**Solver:** every plan block, `target = clamp( max(active floors) + buffer→emitter margin
+(~4–5 °F, measure via reg 2051), I4.lo, I4.hi )`, with pre-charge moved to the best-COP
+feasible hour (existing §6.6 anticipation) and coast-to-idle when nothing calls and
+nothing is predicted. Demand inputs per zone: calling state + room error (Nest, ~2-min),
+learned UA·(T_set − T_out) + recovery term from thermal mass C — all of which TempIQ
+already learns (zone_envelope metrics, updated daily). The block's *why* gains the
+binding zone: “Dining calling, needs 128 °F” instead of “winter guard”.
+
+**TempIQ-first data plane (§6.7 doctrine), with a hard degraded mode:** the solver
+consumes the shipped `/api/insights` seam (#1470/#1480 CLOSED via PRs #1490/#1502 —
+`/zones` with UA + thermal mass + deliveryType is live today, and our pusher token
+already authenticates). If TempIQ is unreachable or stale >30 min, the solver falls back
+to exactly today's behavior (static I4 + winter guard) — A2W never *depends* on TempIQ
+to heat the house.
+
+**Contract asks to file on TempIQv2** (the “what's missing from TempIQ” list):
+1. **Live demand read:** extend `GET /api/insights/zones` (or add `/calls`) with
+   designLoad, zoneType, min/max setpoint, current room temp, current setpoint,
+   hvacStatus — today no token-readable endpoint says *which zones are calling*.
+2. **Cost surfaces:** `GET /api/insights/cop-surfaces` — fitted hydronic COP(outdoor,
+   sink temp) *after the #1503 measurement fixes land*, plus per-cluster mini-split
+   copByBand (exists internally at conf 0.95, session-auth only).
+3. **Space service map:** expose space → {hydronic zone, mini-split zones} with weights
+   (`space_service_weights` exists in schema, 0 rows).
+4. **Bug:** SensorLinx `stgRun` parser expects "Zone N"/"Stage N" but this device sends
+   numeric codes ("3170:00") → `zone_calls_active` is permanently 0 and
+   `hydronic_load_snapshots` (exactly the right table) has never gained a row.
+5. **Ship the promised #1470 tank outputs:** effective thermal mass C_eff (BTU/°F) +
+   DHW/standby decomposition — recorded internally (`hydronic_distribution`), absent
+   from the insights payloads.
+6. **Exposure rows** for the hydronic Nest zones on the a2w surface token, and a
+   `triggeredBy='a2w-planner'` provenance value on `applySetpoints`.
+
+**Known unknowns that gate the floors (walk + first cold snap, see §10):** TempIQ's DB
+says Dining and Mud Room are *radiant_floor* while the winter-floor analysis anchored the
+135 °F design floor to “Dining baseboard” — a five-minute walk decides the binding zone.
+Mud Room carries the largest learned load in the house (UA 232 BTU/hr/°F, design
+16.7 kBTU/hr): if it's baseboard, *it* likely binds, not Dining. Current accepted UA fits
+are summer artifacts pinned at optimizer bounds — the solver must wait for winter re-fits
+(the early-July rejected fits already echo the real winter numbers).
+
+**Phasing (the W-track):** W0 now — file the TempIQ asks, consume what's already shipped,
+owner walk. W1 first heating weeks — solver runs **winter-shadow** (log-only next to the
+as-found curve, scored like A-5). W2 — solver output replaces the winter guard behind a
+flag once Phase B is live (strict cap lifts) and winter fits land. Command of the HBX
+target itself stays Phase C per §7.
+
+### 6.10 Space-source arbitrage — hydronic vs mini-splits (added 2026-07-15)
+
+Ten Kumo mini-splits cover most spaces the hydronic zones serve, TempIQ already has a
+**live, hardened write path** to them (applySetpoints → oracle → 50–85 °F clamp →
+per-serial lease + rate limit + audit), and their COP is measured per outdoor band at
+0.95 confidence. That enables two distinct optimizations:
+
+- **Direct dispatch:** serve a space with whichever source is cheaper at the margin —
+  `$/kBTU = rate / (COP·3.412)` — mini-split COP by outdoor band vs hydronic COP at the
+  tank temp *that space's zone would require*. Mild weather favors splits (no hot-tank
+  penalty); deep cold favors hydronic (EVI cascade holds capacity; splits defrost).
+- **The binding-constraint unlock (usually worth more):** if the binding zone (say
+  Dining at 128 °F) is partially served by its mini-split, the *whole tank* drops to the
+  next zone's floor (say 112 °F) — every other zone's heat gets cheaper simultaneously.
+  The value of relaxing the max() dominates the per-space delta; this is the solve the
+  owner described as “dynamically pick the best source per space”.
+
+**Division of authority:** the A2W planner computes the dispatch (it owns the tank-side
+COP consequence); **actuation goes only through TempIQ's applySetpoints chokepoint** (it
+owns comfort, schedules, leases, and the owner's thermostat trust) — A2W is a surface
+token, never a second controller. Phases: recommendations rendered on the dashboard
+(winter 1) → owner-approved one-tap nudges → autonomous within owner-set bands
+(winter 2). Blocked on: contract items 2 + 3 above, and #1503 (a trustworthy hydronic
+COP surface). Nothing else about this plan waits for it.
+
+### 6.11 Storm mode — resilience banking (added 2026-07-15, owner ask)
+
+Bank heat in the tank before power-loss risk or extreme cold. The tank is the house's
+only controllable thermal storage today (no battery yet — FranklinWH is planned, Kohler
+generator + ATS exist), and ~30 °F of extra tank ≈ 11 kWh thermal ≈ hours of baseboard
+delivery with zero compressor load on the generator.
+
+- **Triggers (tiered, any arms it):**
+  - *Predictive:* NWS active-alerts point query (`api.weather.gov/alerts/active?point=…`,
+    free, no auth — Winter Storm / Ice Storm / Blizzard / High Wind / Extreme Cold
+    warnings with onset/expires) — **nothing in the fleet ingests this today**; plus
+    OpenMeteo 48 h heuristics (min forecast < 0 °F, freezing-rain hours, gusts) — a
+    trivial extension of the planner's existing hourly fetch.
+  - *Detective:* OutageWatch `GET /api/status` (public REST, already polling National
+    Grid's Kubra feed every 5 min for this address) — in-outage / restored; `/api/stats`
+    supplies outage-frequency priors. Unreachable = *no signal*, never = outage.
+  - *Manual:* a Storm Mode button on the dashboard (and it always wins).
+- **Action ladder:** from T−24 h, ramp the tank to the **storm ceiling** =
+  min(as-found curve + 3 °F, HP ceiling − I1 margin) in the best-COP hours; fold the
+  day's I8 sanitize into the ramp (one charge, two jobs); stage both pumps early
+  (§6.6 lagT experiment); hold through the event window. Pre-Phase-B the 135 °F strict
+  cap stands, so storm mode reaches full value only after Phase B — ship the triggers
+  and the capped version first.
+- **During an outage:** planner freezes writes (leases lapse to the safe baseline —
+  I5/I7 already guarantee this is fine); recovery after restore respects the
+  anti-short-cycle delay (A-4 measured). The element stays owner-only per §5.5.
+- **Rules:** storm mode may only *raise* targets within I4-upper — never lower, never
+  touch staging or the element, never bypass I1. Entry/exit logged to Neon
+  (`storm_events`), chip on every dashboard page, ntfy on arm/stand-down.
+- **Future seam:** the trigger interface stays source-agnostic so a FranklinWH SOC
+  signal can join later (charge-battery-vs-heat-tank arbitration is explicitly out of
+  scope until the battery exists).
+
 ---
 
 ## 7. Phased roadmap
@@ -811,6 +934,15 @@ rule HP2's failure never had).
 - [ ] Real $/kWh from the utility bill set in TempIQ `utility_config` (replace the $0.15 default)
 - [ ] Regs 2063/2088 calibrated against the SPAN HP circuits (units/scaling + the fixed-freq compressor gap quantified)
 - [ ] 16.5 kW element's SPAN circuit identified and its baseline runtime recorded (backup-cost watch)
+- [ ] **WALK (gates §6.9): Dining + Mud Room emitter type** — TempIQ DB says radiant, the
+      winter-floor doc says Dining baseboard; Mud Room is the largest learned load
+      (UA 232 BTU/hr/°F). Five minutes with a flashlight decides the binding zone.
+- [ ] Radiant manifolds inspected: tempering/injection hardware confirmed + its output
+      setpoint recorded (the radiant zones' true service temp)
+- [ ] First cold snap: per-zone room temps logged with tank held at the solver floor;
+      reg 2051 outlet vs commanded setpoint sizes the buffer→emitter drop (§6.9 margin)
+- [ ] Winter re-fit of zone UA/thermal-mass (current accepted fits are summer artifacts
+      pinned at optimizer bounds — unusable for the winter solver)
 
 ## 11. Open questions for the owner (none block Phase A)
 
@@ -822,6 +954,10 @@ rule HP2's failure never had).
    rotation and accepting the COP penalty on HP2-led charges?
 4. Winnie reply (already owed: series number + forced defrost): add the HP2 CN22 dead-port
    repair question?
+5. §6.9 walk: are Dining and Mud Room baseboard or radiant (a photo of each emitter and
+   of the radiant manifolds settles both §6.9 unknowns at once)?
+6. Storm mode (§6.11): comfort with the planner auto-arming on NWS warnings, or
+   notify-and-ask-first for the first season?
 
 ---
 
