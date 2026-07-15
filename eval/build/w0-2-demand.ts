@@ -74,12 +74,41 @@ export async function evaluate(_dataPath: string): Promise<number> {
   } catch {}
   checks.push({ name: "degraded-mode-null", pass: degradedOk })
 
+  // L5: call-driven floors (TempIQ#1506 /calls). Endpoint + defensive fetch present.
+  checks.push({ name: "fetch-calls-endpoint", pass: src.includes("/api/insights/calls") && src.includes("Bearer") })
+  // HEATING derivation is a pure, case-insensitive, id-filtered helper.
+  let heatingOk = false
+  try {
+    const ids = m.deriveCallingZoneIds([
+      { zoneId: "a", hvacStatus: "HEATING" },
+      { zoneId: "b", hvacStatus: "OFF" },
+      { zoneId: "c", hvacStatus: "heating" },
+      { zoneId: "d", hvacStatus: null },
+      { zoneId: "", hvacStatus: "HEATING" },
+    ])
+    heatingOk = Array.isArray(ids) && ids.length === 2 && ids.includes("a") && ids.includes("c")
+  } catch {}
+  checks.push({ name: "calls-heating-derivation", pass: heatingOk })
+  let noneCalling = false
+  try { noneCalling = m.deriveCallingZoneIds([{ zoneId: "a", hvacStatus: "OFF" }]).length === 0 } catch {}
+  checks.push({ name: "calls-none-empty-array", pass: noneCalling })
+  // GUARDRAIL: an unavailable/never-refreshed call feed yields null (conservative
+  // all-zones), NEVER [] (which would zero the floor and under-heat the house).
+  let guardrailOk = false
+  try {
+    const feed = new m.DemandFeed("http://127.0.0.1:9", "t")
+    guardrailOk = feed.callsHealthy() === false && feed.callingZoneIds() === null
+  } catch {}
+  checks.push({ name: "calls-unavailable-null-not-empty", pass: guardrailOk })
+  // Ground truth: a refrigerant mini-split (Downstairs) never binds the buffer.
+  checks.push({ name: "minisplit-excluded-from-floor", pass: !!m && m.requiredAwtF("mini_split", 5) === null })
+
   // L3: substantive + regression bounds
   const primaryLineCount = lineCount(src)
   checks.push({ name: "primary-file-substantive-min-20-lines", pass: primaryLineCount >= 20 })
   const PRIMARY_LINE_BASELINE = 60
   checks.push({ name: "lines-not-shrinking-massively", pass: primaryLineCount === 0 || primaryLineCount >= PRIMARY_LINE_BASELINE * 0.5 })
-  const KNOWN_EXPORTS: string[] = ["BUFFER_MARGIN_F", "requiredAwtF", "computeFloors", "fetchInsightZones", "DemandFeed"]
+  const KNOWN_EXPORTS: string[] = ["BUFFER_MARGIN_F", "requiredAwtF", "computeFloors", "fetchInsightZones", "fetchInsightCalls", "deriveCallingZoneIds", "DemandFeed"]
   checks.push({ name: "required_exports_present", pass: KNOWN_EXPORTS.every(e => src.includes(e)) })
 
   // L3: compile

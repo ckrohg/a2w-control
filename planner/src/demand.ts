@@ -17,6 +17,14 @@ export interface InsightZone {
   confidence: number | null;
 }
 
+/** Live per-zone call state from TempIQ GET /api/insights/calls (TempIQ#1506). The
+ * endpoint already filters to the property's hydronic zones, so a mini-split can never
+ * appear here — but we still match by zoneId against the /zones feed, never by type. */
+export interface InsightCall {
+  zoneId: string;
+  hvacStatus: string | null; // "OFF" | "HEATING" | null (no recent reading)
+}
+
 export interface ZoneFloor {
   zoneId: string;
   name: string;
@@ -166,13 +174,52 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
   });
 }
 
+/** GET {baseUrl}/api/insights/calls — live hvacStatus for the property's hydronic zones
+ * (TempIQ#1506). Same defensive posture as fetchInsightZones: shape drift degrades to
+ * nulls/[], never throws past the HTTP guard. */
+export async function fetchInsightCalls(baseUrl: string, token: string): Promise<InsightCall[]> {
+  const res = await fetch(`${baseUrl}/api/insights/calls`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (res.status !== 200) throw new Error(`tempiq calls: HTTP ${res.status}`);
+  const body = (await res.json()) as unknown;
+  const raw = Array.isArray(body)
+    ? body
+    : Array.isArray((body as { zones?: unknown[] })?.zones)
+      ? (body as { zones: unknown[] }).zones
+      : [];
+  return raw.map((z) => {
+    const o = (z ?? {}) as Record<string, unknown>;
+    return {
+      zoneId:
+        typeof o.zoneId === "string" ? o.zoneId : typeof o.id === "string" ? o.id : String(o.id ?? ""),
+      hvacStatus: typeof o.hvacStatus === "string" ? o.hvacStatus : null,
+    };
+  });
+}
+
+/** Pure: IDs of zones actively calling for heat. HEATING is matched case-insensitively;
+ * everything else (OFF, null, unknown) is treated as not-calling. */
+export function deriveCallingZoneIds(calls: InsightCall[]): string[] {
+  return calls
+    .filter((c) => (c.hvacStatus ?? "").toUpperCase() === "HEATING")
+    .map((c) => c.zoneId)
+    .filter((id) => id.length > 0);
+}
+
 /**
- * Cached TempIQ zone feed with a 30-minute health window. refresh() never throws;
- * proposeFloor() returns null whenever the feed is unhealthy (degraded mode, §6.9).
+ * Cached TempIQ zone + call feeds, each with an independent 30-minute health window.
+ * refresh() never throws. proposeFloor() returns null when the zone feed is unhealthy
+ * (degraded mode, §6.9). The call feed is separate on purpose: a /calls hiccup must NOT
+ * zero the floor — it falls back to the conservative all-zones posture (callingZoneIds()
+ * returns null, never []), so A2W never under-heats the house when TempIQ blips.
  */
 export class DemandFeed {
   private cached: InsightZone[] = [];
   private lastSuccessAt: Date | null = null;
+  private calls: InsightCall[] = [];
+  private callsLastSuccessAt: Date | null = null;
 
   constructor(
     private baseUrl: string,
@@ -180,11 +227,19 @@ export class DemandFeed {
   ) {}
 
   async refresh(): Promise<void> {
+    // Zones and calls refresh independently — one failing must not taint the other's
+    // freshness stamp (that is what keeps the safety fallback correct).
     try {
       this.cached = applyEmitterGroundTruth(await fetchInsightZones(this.baseUrl, this.token));
       this.lastSuccessAt = new Date();
     } catch (err) {
       console.warn(`[demand] TempIQ zone refresh failed: ${(err as Error).message}`);
+    }
+    try {
+      this.calls = await fetchInsightCalls(this.baseUrl, this.token);
+      this.callsLastSuccessAt = new Date();
+    } catch (err) {
+      console.warn(`[demand] TempIQ calls refresh failed: ${(err as Error).message}`);
     }
   }
 
@@ -194,20 +249,50 @@ export class DemandFeed {
     );
   }
 
+  callsHealthy(): boolean {
+    return (
+      this.callsLastSuccessAt !== null &&
+      Date.now() - this.callsLastSuccessAt.getTime() < HEALTHY_WINDOW_MS
+    );
+  }
+
+  /**
+   * Live calling set for proposeFloor. Returns null (NOT []) whenever the call feed is
+   * unavailable or stale — the three-state contract computeFloors relies on: null →
+   * conservative all-zones, [] → nobody calling → curve mimic.
+   */
+  callingZoneIds(): string[] | null {
+    if (!this.callsHealthy()) return null;
+    return deriveCallingZoneIds(this.calls);
+  }
+
   zones(): InsightZone[] {
     return this.cached;
   }
 
   proposeFloor(outdoorF: number, callingZoneIds?: string[] | null): FloorResult | null {
     if (!this.isHealthy()) return null; // degraded mode: A2W never depends on TempIQ
-    return computeFloors(this.cached, callingZoneIds ?? null, outdoorF);
+    // Explicit arg wins (tests); otherwise ride the live call feed, falling back to the
+    // conservative all-zones posture (null) when /calls is unhealthy.
+    const calling = callingZoneIds !== undefined ? callingZoneIds : this.callingZoneIds();
+    return computeFloors(this.cached, calling ?? null, outdoorF);
   }
 
-  status(): { healthy: boolean; zoneCount: number; lastSuccessAt: string | null } {
+  status(): {
+    healthy: boolean;
+    zoneCount: number;
+    lastSuccessAt: string | null;
+    callsHealthy: boolean;
+    callingCount: number | null;
+    callsLastSuccessAt: string | null;
+  } {
     return {
       healthy: this.isHealthy(),
       zoneCount: this.cached.length,
       lastSuccessAt: this.lastSuccessAt ? this.lastSuccessAt.toISOString() : null,
+      callsHealthy: this.callsHealthy(),
+      callingCount: this.callingZoneIds()?.length ?? null,
+      callsLastSuccessAt: this.callsLastSuccessAt ? this.callsLastSuccessAt.toISOString() : null,
     };
   }
 }

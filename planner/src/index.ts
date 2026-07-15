@@ -368,6 +368,10 @@ async function shadowOnce(): Promise<void> {
     const outdoorF = latest?.outdoorF ?? forecast[0]?.outdoorF ?? null;
     const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF) : null;
     if (floor) {
+      // "insights+calls" = call-driven (only HEATING zones bind); "insights" = the
+      // conservative all-zones fallback when /calls is stale. Lets the /hbx card show
+      // which posture produced the snapshot.
+      const source = demandFeed.callsHealthy() ? "insights+calls" : "insights";
       try {
         await store.insertZoneFloorSnapshot({
           ts: new Date(),
@@ -375,7 +379,7 @@ async function shadowOnce(): Promise<void> {
           bindingZone: floor.bindingZone,
           bindingAwtF: floor.bindingAwtF,
           tankTargetF: floor.tankTargetF,
-          source: "insights",
+          source,
         });
       } catch (e) {
         console.error("zone floor snapshot failed:", (e as Error).message);
