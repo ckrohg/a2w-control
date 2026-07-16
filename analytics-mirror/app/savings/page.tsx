@@ -41,6 +41,25 @@ const LESS_ELEC = {
   warm: Math.round((1 - COP_AF.warm / COP_POSS.warm) * 100),
 };
 
+// ── REALIZED savings from the 2026-07-16 cutover (buffer 154→135°F, setpoints 160→145°F) ──
+// Model from MEASURED parameters: standby UA≈25 BTU/hr·°F (coast-down, 2026-07-16), summer
+// COP≈2.6 (A-4 tub test), SPAN daily pump energy 11.8 kWh/day. Two compounding effects:
+//   (1) cooler leaving-water temp → higher COP (Carnot factor ∝ (W+459.67)/(W−outdoor));
+//   (2) cooler tank → less standby heat to re-make (UA·ΔT).
+// Metered confirmation from tempiq_cop_points accrues over the coming days.
+const CUT = { bufBefore: 154, bufAfter: 135, spBefore: 160, spAfter: 145 };
+const UA_BTU = 25, AMBIENT_F = 70, COP_BEFORE = 2.6, OUTDOOR_SUMMER = 85;
+const copFactor = (w: number) => (w + 459.67) / (w - OUTDOOR_SUMMER); // ∝ COP at LWT = w
+const COP_AFTER = COP_BEFORE * (copFactor(CUT.spAfter) / copFactor(CUT.spBefore));
+const COP_PCT = Math.round((1 - copFactor(CUT.spBefore) / copFactor(CUT.spAfter)) * 100); // % less elec
+const STBY_THERMAL_KWH_DAY = (UA_BTU * (CUT.bufBefore - CUT.bufAfter) * 24) / 3412; // less heat lost/day
+const THERMAL_BEFORE = DAILY_KWH * COP_BEFORE;
+const ELEC_AFTER = Math.max(0, (THERMAL_BEFORE - STBY_THERMAL_KWH_DAY) / COP_AFTER);
+const REALIZED_KWH_DAY = Math.max(0, DAILY_KWH - ELEC_AFTER);
+const REALIZED_DAY_USD = REALIZED_KWH_DAY * RATE;
+const REALIZED_MO_USD = REALIZED_DAY_USD * 30;
+const STBY_ELEC_KWH_DAY = STBY_THERMAL_KWH_DAY / COP_AFTER;
+
 const WINDOWS: Record<string, { label: string; interval: string | null }> = {
   "24h": { label: "24h", interval: "24 hours" },
   "7d": { label: "7d", interval: "7 days" },
@@ -155,6 +174,25 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
       ) : (
         <>
           <div className="cards">
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <h2>Realized — since today&apos;s cutover<span className="chip ok">live · measured params</span></h2>
+              <div className="temps">
+                <div className="temp"><div className="v">${REALIZED_MO_USD.toFixed(0)}</div><div className="l">≈ saved / month</div></div>
+                <div className="temp"><div className="v">{REALIZED_KWH_DAY.toFixed(1)} kWh</div><div className="l">≈ saved / day</div></div>
+                <div className="temp"><div className="v">154→135 · 160→145</div><div className="l">buffer · setpoints °F</div></div>
+              </div>
+              <div className="meta">
+                Today the buffer target dropped <b>154→135°F</b> and both pump setpoints <b>160→145°F</b> — two
+                compounding wins. Cooler leaving water raises efficiency (≈ <b>{COP_PCT}% less electricity</b> for
+                the same hot water, COP ~{COP_BEFORE.toFixed(1)}→{COP_AFTER.toFixed(1)}), and the cooler tank bleeds
+                ≈ <b>{STBY_ELEC_KWH_DAY.toFixed(1)} kWh/day</b> less standby heat (measured UA ≈ {UA_BTU} BTU/hr·°F).
+                Combined ≈ <b>{REALIZED_KWH_DAY.toFixed(1)} kWh/day (${REALIZED_DAY_USD.toFixed(2)}/day, ${REALIZED_MO_USD.toFixed(0)}/mo)</b>
+                {" "}at ${RATE.toFixed(2)}/kWh. Model-based on measured parameters (UA from the coast-down, COP from the
+                A-4 test, {fmt(DAILY_KWH, 1)} kWh/day from SPAN); metered confirmation from the pumps&apos; COP telemetry
+                accrues over the coming days. Summer / hot-water-only figure — winter is larger.
+              </div>
+            </div>
+
             <div className="card" style={{ gridColumn: "1 / -1" }}>
               <h2>If the planner were in charge<span className="chip">rough estimate</span></h2>
               <div className="temps">
