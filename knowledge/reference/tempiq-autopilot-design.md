@@ -27,10 +27,12 @@ Flags (same pattern as Phase B): `AUTOPILOT_ENABLED=1`, `AUTOPILOT_DRY_RUN=1`.
 
 ## Rollout (dry-run first — do NOT skip)
 1. **Dry-run** (`AUTOPILOT_ENABLED=1 AUTOPILOT_DRY_RUN=1`): watch the logs for a few days — what would
-   it set each hour? The shadow plan currently targets ~110°F idle / 120°F DHW-window / 131°F daily
-   sanitize — noticeably lower/more-aggressive than the manual 135. **Validate those targets match
-   real usage before ever writing** (esp. whether 110–120 leaves comfort margin for off-window draws;
-   tune `shadow.ts` DEFAULT_OPTS `dhwFloorF`/`idleF`/`dhwWindows` if not).
+   it set each hour? The shadow plan targets 120°F off-window/DHW-window / 131°F daily sanitize —
+   lower than the manual 135 (COP + standby win) but never below DHW-ready. **Off-window idle was
+   raised 110→120 (commit 337628a):** the buffer feeds DHW and draws are unpredictable/year-round, so
+   it must not coast below what a tap needs — enforced `Math.max(idleF, dhwFloorF)` in `shadow.ts`.
+   Still **validate the windows match real usage before writing** (tune `DEFAULT_OPTS`
+   `dhwFloorF`/`idleF`/`dhwWindows`; idle can be raised to bank extra capacity, never below dhwFloorF).
 2. **Companion — Phase B** (`PHASE_B_DRY_RUN` → live) so the setpoints track the auto-pilot target
    down (the COP half). Full autonomy = both live.
 3. **Live** (`AUTOPILOT_DRY_RUN=0`): the buffer now tracks the plan. Rollback = unset the flag (last
