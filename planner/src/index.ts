@@ -15,6 +15,7 @@ import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { AutoPilot } from "./autopilot";
 import {
   fetchNwsAlerts,
   fetchStormForecast,
@@ -75,6 +76,10 @@ if (!PLANNER_API_TOKEN) console.warn("PLANNER_API_TOKEN not set — write API di
 
 const PHASE_B_ENABLED = process.env.PHASE_B_ENABLED === "1";
 const PHASE_B_DRY_RUN = process.env.PHASE_B_DRY_RUN === "1";
+// Auto-pilot: drive the HBX buffer TARGET to the shadow plan's current-hour value (target-side
+// twin of Phase B). Off by default; DRY_RUN=1 logs what it would set without writing.
+const AUTOPILOT_ENABLED = process.env.AUTOPILOT_ENABLED === "1";
+const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
 // OFF by default — deploying this changes NOTHING until AUTO_SANITIZE_ENABLED=1.
@@ -545,6 +550,7 @@ async function scoreOnce(): Promise<void> {
 
 // Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
 const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED);
+const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
@@ -555,6 +561,7 @@ async function pollOnce(): Promise<void> {
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
+  if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
 
   const config = extractConfig(dev);
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
