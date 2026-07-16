@@ -325,6 +325,36 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
   }
 }
 
+/**
+ * Adoption monitor: a commanded HBX target (the reset-curve midpoint) only takes effect on the
+ * device at the START of the next reheat cycle (proven 2026-07-16 — the device re-reads the cloud
+ * curve when a call begins). So if a stage is CALLING (a reheat is running) yet the operative
+ * target (temp1.target) still doesn't match the commanded curve, the cloud write did NOT take —
+ * the dial silently failed. Edge-triggered high alert; clears on convergence. No alert while
+ * merely satisfied/coasting with no reheat — that's the normal adoption lag, not a failure.
+ */
+let adoptionAlerted = false;
+async function checkAdoption(reading: SlxReading, config: Record<string, number>): Promise<void> {
+  const operative = reading.tankTargetF;
+  const dbt = config.dbt, mbt = config.mbt;
+  if (operative == null || dbt == null || mbt == null) return;
+  const commanded = (dbt + mbt) / 2;
+  const off = Math.abs(commanded - operative) > 3;
+  const reheating = reading.stagesCalled?.some(Boolean) === true;
+  if (off && reheating && !adoptionAlerted) {
+    adoptionAlerted = true;
+    console.warn(`ADOPTION FAILED: commanded ${commanded.toFixed(1)}°F, reheat running at operative ${operative.toFixed(1)}°F`);
+    await ntfy(
+      "HBX target not adopting",
+      `Commanded ${commanded.toFixed(1)}°F but a reheat is running at operative ${operative.toFixed(1)}°F — the cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
+      "high",
+    );
+  } else if (!off && adoptionAlerted) {
+    adoptionAlerted = false;
+    await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`);
+  }
+}
+
 /** §6.11 trigger poll (every 30 min): NWS alerts + OpenMeteo-derived synthetic triggers.
  *  A dead feed leaves its cache empty — fetch failures never arm anything. */
 async function stormTriggerPoll(): Promise<void> {
@@ -527,6 +557,7 @@ async function pollOnce(): Promise<void> {
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
 
   const config = extractConfig(dev);
+  await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
   const prev = await store.latestConfig();
   if (prev === null) {
     await store.insertConfigVersion(config, null);
