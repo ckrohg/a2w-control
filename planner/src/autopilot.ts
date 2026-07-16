@@ -7,7 +7,7 @@
  * push an unsafe target. FLAG-OFF by default: AUTOPILOT_ENABLED=1 turns it on; AUTOPILOT_DRY_RUN=1
  * computes + logs what it WOULD set without writing. A2W stays STANDALONE — the shadow plan falls
  * back to the HBX reset curve if TempIQ is down, so the auto-pilot never hard-depends on TempIQ.
- * Rollback = unset the flag (the last commanded curve stands; a manual restore reverts to baseline).
+ * Every decision is recorded to autopilot_log (dedup'd on change) so the dashboard can show it.
  */
 
 import { Store } from "./store";
@@ -18,6 +18,7 @@ const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this 
 export class AutoPilot {
   public lastRunAt: string | null = null;
   public lastResult = "not run yet";
+  private lastLogged: string | null = null;
 
   constructor(
     private readonly store: Store,
@@ -25,6 +26,16 @@ export class AutoPilot {
     private readonly dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
   ) {}
+
+  /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
+  private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {
+    this.lastResult = verbose;
+    const key = `${result}|${target}`;
+    if (key !== this.lastLogged) {
+      this.lastLogged = key;
+      await this.store.insertAutopilotLog({ targetF: target, reason, result, dryRun: this.dryRun }).catch(() => {});
+    }
+  }
 
   /** Pick the shadow plan's current-hour target and apply it (guarded). Called each poll cycle. */
   async applyLatestPlan(): Promise<void> {
@@ -49,30 +60,30 @@ export class AutoPilot {
     const status = await this.writer.status();
     const commanded = status.commanded_target_f as number | null;
     if (commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
-      this.lastResult = `holding ${target}°F (${reason}) — already commanded`;
+      await this.record(target, reason, "held", `holding ${target}°F (${reason}) — already commanded`);
       return;
     }
 
     if (this.dryRun) {
-      this.lastResult = `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`;
+      await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
       console.log(`[autopilot] ${this.lastResult}`);
       return;
     }
 
     try {
       await this.writer.setTarget(target, "autopilot");
-      this.lastResult = `set ${target}°F — ${reason}`;
+      await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
       console.log(`[autopilot] ${this.lastResult}`);
     } catch (e) {
       if (e instanceof WriteError && e.status === 429) {
         // The 15-min rate limit — expected when the plan changes faster than we may write. Not an error.
-        this.lastResult = `rate-limited, retry next cycle → ${target}°F (${reason})`;
+        await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${target}°F (${reason})`);
         return;
       }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
-      // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure
-      // is caught by the standing I1 monitor + the adoption monitor.
-      this.lastResult = `rejected ${target}°F: ${msg}`;
+      // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
+      // caught by the standing I1 monitor + the adoption monitor.
+      await this.record(target, reason, `rejected: ${msg}`, `rejected ${target}°F: ${msg}`);
       console.warn(`[autopilot] ${this.lastResult}`);
     }
   }

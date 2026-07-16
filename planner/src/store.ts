@@ -78,6 +78,14 @@ export class Store {
         result     text NOT NULL,
         detail     text
       );
+      CREATE TABLE IF NOT EXISTS autopilot_log (
+        id        serial PRIMARY KEY,
+        ts        timestamptz NOT NULL DEFAULT now(),
+        target_f  real,
+        reason    text,
+        result    text NOT NULL,
+        dry_run   boolean NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS tank_decay_fits (
         window_start timestamptz PRIMARY KEY,
         window_end   timestamptz NOT NULL,
@@ -194,6 +202,22 @@ export class Store {
       `INSERT INTO phase_b_log (pump_id, mode, value_c, result) VALUES ($1,$2,$3,$4)`,
       [l.pumpId, l.mode, l.valueC, l.result],
     );
+  }
+
+  async insertAutopilotLog(l: { targetF: number | null; reason: string; result: string; dryRun: boolean }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO autopilot_log (target_f, reason, result, dry_run) VALUES ($1,$2,$3,$4)`,
+      [l.targetF, l.reason, l.result, l.dryRun],
+    );
+  }
+
+  async latestAutopilotLog(): Promise<{ ts: Date; targetF: number | null; reason: string; result: string; dryRun: boolean } | null> {
+    const r = await this.pool.query(
+      `SELECT ts, target_f, reason, result, dry_run FROM autopilot_log ORDER BY id DESC LIMIT 1`,
+    );
+    if (!r.rowCount) return null;
+    const x = r.rows[0];
+    return { ts: new Date(x.ts), targetF: x.target_f, reason: x.reason, result: x.result, dryRun: x.dry_run };
   }
 
   /** Latest learned per-zone physics from TempIQ (§6.7: consumed, never re-derived). */

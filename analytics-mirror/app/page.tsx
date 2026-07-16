@@ -35,6 +35,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let rows: Reading[] = [];
   let slx: SlxLatest | null = null;
   let commandedTargetF: number | null = null;
+  let autopilot: { ts: number; targetF: number | null; reason: string; result: string; dryRun: boolean } | null = null;
   let shadow: ShadowBlock[] | null = null;
   let driftAt: number | null = null;
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
@@ -55,6 +56,17 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
         SELECT (config->>'dbt')::float8 AS dbt, (config->>'mbt')::float8 AS mbt
         FROM hbx_config_versions ORDER BY id DESC LIMIT 1`;
       commandedTargetF = cc.rowCount ? Math.round((cc.rows[0].dbt + cc.rows[0].mbt) / 2) : null;
+      // Auto-pilot latest decision. Its own try/catch — the table isn't created until the planner
+      // deploys + runs ensureSchema, and a missing table must not break the whole page.
+      try {
+        const ap = await sql<{ ts: number; target_f: number | null; reason: string; result: string; dry_run: boolean }>`
+          SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, target_f, reason, result, dry_run
+          FROM autopilot_log ORDER BY id DESC LIMIT 1`;
+        if (ap.rowCount) {
+          const r = ap.rows[0];
+          autopilot = { ts: r.ts, targetF: r.target_f, reason: r.reason, result: r.result, dryRun: r.dry_run };
+        }
+      } catch { /* autopilot_log not created yet — ignore */ }
       const sp = await sql`SELECT plan FROM shadow_plans ORDER BY id DESC LIMIT 1`;
       shadow = sp.rowCount ? (sp.rows[0].plan as ShadowBlock[]) : null;
       const d = await sql`
@@ -176,6 +188,19 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <div className="meta">
                 Stages: {stagesTxt} · Backup: {slx?.backup_called ? "CALLED" : "off"} · <a href="/hbx" style={{ color: "#4dabf7" }}>details →</a>
               </div>
+              {autopilot && (
+                <div className="meta" style={{ marginTop: 4 }}>
+                  <span className={`chip ${autopilot.dryRun ? "warn" : "ok"}`} style={{ marginRight: 6 }}>
+                    auto-pilot · {autopilot.dryRun ? "dry-run" : "LIVE"}
+                  </span>
+                  {autopilot.result === "held"
+                    ? `holding ${autopilot.targetF}°F`
+                    : autopilot.result === "would-set"
+                      ? `would set ${autopilot.targetF}°F`
+                      : `${autopilot.result} · ${autopilot.targetF}°F`}
+                  {autopilot.reason ? ` — ${autopilot.reason}` : ""}
+                </div>
+              )}
             </div>
 
             <div className="card">
