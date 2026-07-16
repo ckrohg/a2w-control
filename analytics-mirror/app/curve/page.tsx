@@ -1,14 +1,16 @@
-// @purpose /curve — the optimization story in one view (plan §6.8): curve-space hero
-// chart (outdoor °F × tank °F) with an iso-COP background showing WHERE the tank lived
-// for 8 months under the as-found regime vs the I4 envelope the planner operates in,
-// plus the COP receipt (measured tank-calorimetry vs the same model at planner targets),
-// season kWh/$ strips, and today's plan blocks with per-block reasons + modeled COP.
-// Before-era data is a static extract (lib/curve-history.json, dev-time script) — the
-// dashboard has NO runtime dependency on TempIQ. Live overlays come from Neon.
-// Honesty per the net-accounting doctrine: measured (SPAN, cop_measurements) vs model
-// (COP surface, counterfactuals) is labeled on every number.
+// @purpose /curve — the base-system EFFICIENCY MAP in one view: a curve-space hero chart
+// (outdoor °F × tank °F) whose background is the modeled heat-pump COP at every tank/outdoor
+// pair, with the COP=1 crossover drawn bold in red (below it the tank's own resistive backup
+// element is the cheaper way to make the same hot water). The historical operating cloud, the
+// as-found HBX curve, and the summer/DHW-only permission band are overlaid to tell the
+// before/after story; the live point shows where the tank sits now. The hour-by-hour plan
+// (per-block targets + reasons) has MOVED to the Plan/Optimize tab — no plan overlays here.
+// Below the hero: the COP receipt (measured tank-calorimetry vs the same model at planner
+// targets) and the season kWh/$ + temperature strips. Before-era data is a static extract
+// (lib/curve-history.json, dev-time script) — the dashboard has NO runtime dependency on
+// TempIQ. Live overlays come from Neon. Honesty per the net-accounting doctrine: measured
+// (SPAN, cop_measurements) vs model (COP surface, counterfactuals) is labeled on every number.
 import { sql } from "@vercel/postgres";
-import { fmtTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";
 import historyJson from "@/lib/curve-history.json";
@@ -61,11 +63,6 @@ const curveF = (o: number) => {
 };
 const loF = (o: number) => 95 + ((55 - Math.min(Math.max(o, 5), 55)) / 50) * 40;
 const hiF = (o: number) => Math.max(Math.min(curveF(o) + 3, STRICT_CAP), loF(o));
-const eta = (o: number) => Math.max(0.3, ETA_BASE - Math.max(0, 17 - o) * 0.001);
-const copAt = (o: number, w: number) =>
-  w - o <= 5 ? 6 : Math.max(1, Math.min(6, (eta(o) * (w + 459.67)) / (w - o)));
-/** water temp of the iso-COP contour `c` at outdoor `o` (invert copAt) */
-const isoW = (c: number, o: number) => (c * o + eta(o) * 459.67) / (c - eta(o));
 /** n-weighted (by measured-hour count) model COP over a mild/warm outdoor bin — lets the
  *  receipt card show the MODELED "possible" COP at planner-cool tanks over the SAME weather
  *  the measurements sampled (mild <65°F, warm ≥65°F, matching the extractor's cop_summary). */
@@ -76,39 +73,89 @@ const nwCop = (key: "af" | "cur" | "pot", lo: number, hi: number) => {
 };
 
 const fmtK = (n: number) => n.toLocaleString("en-US");
-const copHue = (c: number) => Math.max(0, Math.min(1, (c - 1.6) / 2.9)) * 120; // red→green
 
 // ---- hero: curve space ---------------------------------------------------------------
+// HX is the module-level outdoor domain the ReceiptChart + SeasonKwh share. The hero chart
+// uses its OWN wider domain (HHX below) so the COP=1 crossover in deep cold is visible.
 const HX = { min: 0, max: 105 };
 const HY = { min: 88, max: 174 };
+// Hero-local outdoor domain: extended to the cold so the COP=1 line is on-chart.
+const HHX = { min: -15, max: 105 };
+
+// ---- hero-local COP model (do NOT use for ReceiptChart/SeasonKwh — those keep the global
+// model). This model reaches COP 1 in the visible range so the resistive-backup crossover
+// reads. Carnot-style with an outdoor-indexed fraction of ideal. ---------------------------
+const heroFrac = (o: number) =>
+  o >= 45 ? 0.5 : o >= 0 ? 0.3 + (o / 45) * 0.2 : o >= -15 ? 0.22 + ((o + 15) / 15) * 0.08 : 0.22;
+const heroCop = (o: number, w: number) => {
+  const Tc = w + 10 + 459.67, Te = o - 12 + 459.67;
+  return Math.max(0.4, Math.min(5, heroFrac(o) * (Tc / Math.max(Tc - Te, 1))));
+};
+// binary-search the tank temp where heroCop(o,w)=C (cop decreases as w rises); null if off-domain
+const heroContourW = (C: number, o: number): number | null => {
+  let lo = 88, hi = 185;
+  if (heroCop(o, lo) < C || heroCop(o, hi) > C) return null;
+  for (let i = 0; i < 40; i++) { const m = (lo + hi) / 2; if (heroCop(o, m) > C) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+};
+const heroColor = (c: number) => { // desaturated green(cheap)→red(dear); calm wash
+  const k = Math.max(0, Math.min(1, (c - 1) / (4.3 - 1)));
+  return `hsl(${(8 + k * 114).toFixed(0)} 30% ${(20 + k * 13).toFixed(0)}%)`;
+};
 
 function CurveField({
-  bins, live, blocks, now,
+  bins, live, now,
 }: {
   bins: number[][];
   live: { x: number; y: number }[];
-  blocks: { outdoor_f: number; tank_target_f: number; reason: string; ts: string }[];
   now: { o: number; t: number } | null;
 }) {
   const W = 900, H = 430, pad = { l: 44, r: 14, t: 14, b: 30 };
-  const X = (o: number) => pad.l + ((o - HX.min) / (HX.max - HX.min)) * (W - pad.l - pad.r);
+  // Hero uses its OWN wide domain (HHX) so the COP=1 crossover in deep cold is on-chart.
+  // ReceiptChart/SeasonKwh keep the module-level HX — only this local X() uses HHX.
+  const X = (o: number) => pad.l + ((o - HHX.min) / (HHX.max - HHX.min)) * (W - pad.l - pad.r);
   const Y = (t: number) => pad.t + (1 - (t - HY.min) / (HY.max - HY.min)) * (H - pad.t - pad.b);
   const clampY = (t: number) => Math.max(HY.min, Math.min(HY.max, t));
   const xs: number[] = [];
-  for (let o = HX.min; o <= HX.max; o += 3) xs.push(o);
+  for (let o = HHX.min; o <= HHX.max; o += 3) xs.push(o);
 
-  // three iso-COP arcs, labeled ON the arc (rotated to its slope) so they can't be
-  // misread as gridlines or column headers
-  const contours = [
-    { c: 2, labelAt: 12 },
-    { c: 3, labelAt: 40 },
-    { c: 4, labelAt: 62 },
-  ].map(({ c, labelAt }) => {
-    const pts = xs.map((o) => ({ o, w: isoW(c, o) })).filter((p) => p.w > HY.min + 1 && p.w < HY.max - 1);
-    const w0 = isoW(c, labelAt - 3), w1 = isoW(c, labelAt + 3);
-    const angle = (Math.atan2(Y(w1) - Y(w0), X(labelAt + 3) - X(labelAt - 3)) * 180) / Math.PI;
-    return { c, pts, lx: X(labelAt), ly: Y(isoW(c, labelAt)), angle };
-  }).filter((c) => c.pts.length > 1);
+  // ---- COP EFFICIENCY FIELD (the star): coarse grid of cells shaded by heroCop ----------
+  const CELL = 4; // ° step, both axes
+  const field: { o: number; w: number; c: number }[] = [];
+  for (let o = HHX.min; o < HHX.max; o += CELL)
+    for (let w = HY.min; w < HY.max; w += CELL)
+      field.push({ o: o + CELL / 2, w: w + CELL / 2, c: heroCop(o + CELL / 2, w + CELL / 2) });
+
+  // ---- contours: faint 2/3/4, bold red COP 1 -------------------------------------------
+  // sample o finely across HHX; drop points where the contour is null or off the tank axis
+  const contourPath = (C: number) => {
+    let d = "", pen = false;
+    for (let o = HHX.min; o <= HHX.max; o += 1.5) {
+      const w = heroContourW(C, o);
+      if (w == null || w < HY.min || w > HY.max) { pen = false; continue; }
+      d += `${pen ? "L" : "M"}${X(o).toFixed(1)},${Y(w).toFixed(1)}`;
+      pen = true;
+    }
+    return d;
+  };
+  // right-end label anchor for a faint contour (last on-chart point scanning from the right)
+  const contourLabel = (C: number): { x: number; y: number } | null => {
+    for (let o = HHX.max; o >= HHX.min; o -= 1) {
+      const w = heroContourW(C, o);
+      if (w != null && w >= HY.min + 3 && w <= HY.max - 3) return { x: X(o), y: Y(w) };
+    }
+    return null;
+  };
+  const faint = [2, 3, 4].map((c) => ({ c, d: contourPath(c), lbl: contourLabel(c) })).filter((k) => k.d);
+  const cop1d = contourPath(1);
+  // anchor the bold COP-1 label near the left/cold end of the line
+  const cop1lbl = (() => {
+    for (let o = HHX.min; o <= HHX.max; o += 1) {
+      const w = heroContourW(1, o);
+      if (w != null && w >= HY.min + 6 && w <= HY.max - 6) return { x: X(o), y: Y(w) };
+    }
+    return null;
+  })();
 
   const maxN = Math.max(...bins.map((b) => b[2]));
   const envTop = xs.map((o) => `${X(o).toFixed(1)},${Y(hiF(o)).toFixed(1)}`);
@@ -123,9 +170,22 @@ function CurveField({
   );
 
   const hp1 = history.meta.asfound.hp1_setpoint_f, hp2 = history.meta.asfound.hp2_setpoint_f;
+  const cellW = X(HHX.min + CELL) - X(HHX.min), cellH = Y(HY.min) - Y(HY.min + CELL);
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/430" }}>
+      {/* COP EFFICIENCY FIELD — first, behind everything */}
+      {field.map((f, i) => (
+        <g key={`f${i}`}>
+          <rect x={X(f.o - CELL / 2)} y={Y(f.w + CELL / 2)} width={cellW + 0.6} height={cellH + 0.6}
+            fill={heroColor(f.c)} fillOpacity={0.55} vectorEffect="non-scaling-stroke" />
+          {f.c < 1 && (
+            <rect x={X(f.o - CELL / 2)} y={Y(f.w + CELL / 2)} width={cellW + 0.6} height={cellH + 0.6}
+              fill="#e0584a" fillOpacity={0.16} vectorEffect="non-scaling-stroke" />
+          )}
+        </g>
+      ))}
+
       {/* axes */}
       {[90, 110, 130, 150, 170].map((t) => (
         <g key={`y${t}`}>
@@ -133,22 +193,21 @@ function CurveField({
           <text x={4} y={Y(t) + 4} fill="#8b98a5" fontSize={12}>{t}°</text>
         </g>
       ))}
-      {[0, 20, 40, 60, 80, 100].map((o) => (
+      {[-10, 0, 20, 40, 60, 80, 100].map((o) => (
         <text key={`x${o}`} x={X(o)} y={H - 8} fill="#8b98a5" fontSize={12} textAnchor="middle">{o}°F out</text>
       ))}
       <line x1={X(5)} x2={X(5)} y1={pad.t + 6} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.4} strokeDasharray="3 5" vectorEffect="non-scaling-stroke" />
       <Note x={X(5) + 5} y={Y(91)} color="#8b7355" size={11} weight={500}>design day 5°F</Note>
 
-      {/* iso-COP arcs */}
-      {contours.map(({ c, pts, lx, ly, angle }) => (
+      {/* faint reference iso-COP contours 2/3/4 */}
+      {faint.map(({ c, d, lbl }) => (
         <g key={`c${c}`}>
-          <path
-            d={pts.map((p, j) => `${j ? "L" : "M"}${X(p.o).toFixed(1)},${Y(p.w).toFixed(1)}`).join("")}
-            fill="none" stroke="#5d6c7b" strokeWidth={1.2} strokeDasharray="2 5" vectorEffect="non-scaling-stroke"
-          />
-          <text x={lx} y={ly - 5} fill="#8b98a5" fontSize={12} fontWeight={600} textAnchor="middle"
-            transform={`rotate(${angle.toFixed(1)} ${lx.toFixed(1)} ${(ly - 5).toFixed(1)})`}
-            paintOrder="stroke" stroke="#0f1419" strokeWidth={4} strokeLinejoin="round">COP {c} →</text>
+          <path d={d} fill="none" stroke="#e6ecf5" strokeOpacity={0.28} strokeWidth={1.1}
+            strokeDasharray="5 5" vectorEffect="non-scaling-stroke" />
+          {lbl && (
+            <text x={lbl.x - 4} y={lbl.y - 6} fill="#e6ecf5" fillOpacity={0.5} fontSize={11.5} fontWeight={600} textAnchor="end"
+              paintOrder="stroke" stroke="#0f1419" strokeWidth={3} strokeLinejoin="round">COP {c}</text>
+          )}
         </g>
       ))}
 
@@ -162,16 +221,24 @@ function CurveField({
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(curveF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#ffd666" strokeWidth={2.2} strokeDasharray="6 4" vectorEffect="non-scaling-stroke" />
       {[hp1, hp2].map((sp) => (
-        <line key={sp} x1={X(HX.min)} x2={X(HX.max)} y1={Y(sp)} y2={Y(sp)}
+        <line key={sp} x1={X(HHX.min)} x2={X(HHX.max)} y1={Y(sp)} y2={Y(sp)}
           stroke="#8b98a5" strokeWidth={1.1} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
       ))}
 
-      {/* AFTER: optimizer envelope */}
+      {/* summer / DHW-only permission band (violet) */}
       <path d={`M${envTop.join("L")}L${envBot.join("L")}Z`} fill="#e599f7" fillOpacity={0.12} vectorEffect="non-scaling-stroke" />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(hiF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#e599f7" strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
       <path d={xs.map((o, j) => `${j ? "L" : "M"}${X(o).toFixed(1)},${Y(loF(o)).toFixed(1)}`).join("")}
         fill="none" stroke="#e599f7" strokeWidth={1.6} vectorEffect="non-scaling-stroke" />
+
+      {/* BOLD red COP 1 crossover — below it the resistive backup element is cheaper */}
+      <path d={cop1d} fill="none" stroke="#e0584a" strokeWidth={3} vectorEffect="non-scaling-stroke" />
+      {cop1lbl && (
+        <Note x={cop1lbl.x + 6} y={cop1lbl.y - 8} color="#e0584a" size={12.5} weight={700}>
+          COP 1 · backup cheaper ⤴
+        </Note>
+      )}
 
       {/* live: hourly means, last 24 h + current point */}
       {live.map((p, i) => (
@@ -184,16 +251,8 @@ function CurveField({
         </g>
       )}
 
-      {/* today's plan blocks */}
-      {blocks.map((b, i) => (
-        <circle key={`p${i}`} cx={X(b.outdoor_f)} cy={Y(b.tank_target_f)} r={4}
-          fill="#e599f7" stroke={b.reason.includes("sanitize") ? "#ffd666" : "#0f1419"} strokeWidth={1.4} vectorEffect="non-scaling-stroke">
-          <title>{`${fmtTime(new Date(b.ts))} → ${b.tank_target_f}°F · ${b.reason} · modeled COP ${copAt(b.outdoor_f, b.tank_target_f).toFixed(2)}`}</title>
-        </circle>
-      ))}
-
       {/* direct labels — read the chart without the legend */}
-      <Note x={X(34)} y={Y(171)} anchor="middle" color="#7cc0f5" size={13.5}>
+      <Note x={X(38)} y={Y(171)} anchor="middle" color="#7cc0f5" size={13.5}>
         BEFORE — tank held 150–165° in every season
       </Note>
       <Note x={X(104)} y={Y(hp2) + 15} anchor="end" color="#98a5b3" size={12} weight={550}>
@@ -202,14 +261,11 @@ function CurveField({
       <Note x={X(104)} y={Y(curveF(104)) - 8} anchor="end" color="#ffd666" size={12} weight={550}>
         HBX target curve (as-found)
       </Note>
-      <Note x={X(27)} y={Y(114)} anchor="middle" color="#eeb7fb" size={13.5}>
-        AFTER — where the planner MAY command (95–135° by outdoor)
+      <Note x={X(6)} y={Y(169)} color="#e8b25a" size={12} weight={600}>
+        winter + baseboard → 160–180° (up near the old curve)
       </Note>
-      <Note x={X(27)} y={Y(109)} anchor="middle" color="#a984b5" size={11.5} weight={550}>
-        bottom edge = permission floor, not a target — the plan itself runs 110–131°
-      </Note>
-      <Note x={X(84)} y={Y(106)} anchor="middle" color="#eeb7fb" size={12} weight={550}>
-        today’s plan, hour by hour
+      <Note x={X(30)} y={Y(112)} anchor="middle" color="#eeb7fb" size={13}>
+        summer / DHW-only band
       </Note>
     </svg>
   );
@@ -366,13 +422,10 @@ function SeasonTemps({ daily }: { daily: Daily[] }) {
 
 // ---- page ------------------------------------------------------------------------------
 type SlxRow = { ts: number; tank_f: number | null; outdoor_f: number | null };
-type ShadowBlock = { ts: string; outdoor_f: number; tank_target_f: number; hp1_setpoint_f: number; reason: string };
 
 export default async function CurvePage() {
   let live: { x: number; y: number }[] = [];
   let now: { o: number; t: number } | null = null;
-  let blocks: ShadowBlock[] = [];
-  let shadowAt: number | null = null;
   let liveCop: { o: number; cop: number; q: number | null }[] = [];
   try {
     const slx = (await sql<SlxRow>`
@@ -390,8 +443,6 @@ export default async function CurvePage() {
     live = [...byHour.values()].map((a) => ({ x: a.sx / a.n, y: a.sy / a.n }));
     const last = pts[pts.length - 1];
     if (last && Date.now() / 1000 - last.ts < 1200) now = { o: last.outdoor_f as number, t: last.tank_f as number };
-    const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
-    if (sp.rowCount) { blocks = sp.rows[0].plan as ShadowBlock[]; shadowAt = sp.rows[0].t as number; }
     // Live COP surface: the planner's incremental feed from TempIQ /cop-measurements — now
     // de-flattened per TempIQ#1503 — stored in a2w Neon. The honest current COP, not the frozen bake.
     const cp = await sql`
@@ -477,22 +528,26 @@ export default async function CurvePage() {
 
       <div className="chart-block">
         <h3>
-          Where the tank lives — blue = the old regime, purple = the planner
+          Where efficiency lives — the base-system COP map
           <span className="dim"> (outdoor °F across, tank °F up)</span>
         </h3>
         <div className="chart">
-          <CurveField bins={history.bins_tank} live={live} blocks={blocks} now={now} />
+          <CurveField bins={history.bins_tank} live={live} now={now} />
         </div>
         <div className="legend">
+          <span><i style={{ background: "hsl(65 30% 30%)" }} />shading = modeled COP: green cheap → red dear</span>
+          <span><i style={{ background: "#e0584a" }} />COP 1 — backup cheaper below (red line)</span>
           <span><i style={{ background: "#4dabf7", opacity: 0.6 }} />each blue square = hours spent there, {era}</span>
-          <span><i style={{ background: "#e599f7" }} />purple dots = today&apos;s plan{shadowAt ? ` (computed ${fmtTime(shadowAt)})` : ""} — hover for the why</span>
+          <span><i style={{ background: "#e599f7" }} />summer / DHW band (violet)</span>
           <span><i style={{ background: "#e6edf3" }} />white = live, last 24 h</span>
         </div>
         <div className="meta">
-          Lower is cheaper: each dotted arc is a line of constant modeled COP, so a tank run 20–40° cooler in mild
-          weather lands on a much better arc. For eight months every hour sat in the blue cloud — 150–165° water
-          whether it was 10° or 90° outside. The purple band is where the planner commands the same service instead
-          (COP 3–4+ in mild weather). The white trail is still riding the old curve — Phase B isn&apos;t enabled yet.
+          The ceiling isn&apos;t one number — how low the tank can go depends on demand. Slide <b>down</b> (cooler
+          tank) or <b>right</b> (milder day) and every step lands on a cheaper COP. When only hot water is owed —
+          most of the year here — the planner works down in the violet summer/DHW band. But when baseboard zones
+          call in the cold the tank must ride back up near the old HBX curve (≈160–180°) to actually heat the house,
+          and the band doesn&apos;t apply. Below the bold red <b>COP 1</b> line the tank&apos;s own resistive element
+          makes the same hot water for less — only in deep cold with a hot tank (the red sliver, far left).
         </div>
       </div>
 
@@ -549,25 +604,6 @@ export default async function CurvePage() {
           zone demand feeds in, winter targets ride each day&apos;s actual binding-zone need instead of a fixed cap.
         </div>
       </div>
-
-      {blocks.length > 0 && (
-        <div className="chart-block">
-          <h3>Today’s plan — 24 blocks <span className="dim">(tile shade = modeled COP · hover for the reason)</span></h3>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(60px, 1fr))", gap: 4 }}>
-            {blocks.map((b, i) => {
-              const c = copAt(b.outdoor_f, b.tank_target_f);
-              return (
-                <div key={i} title={`${fmtTime(new Date(b.ts))} · ${b.reason} · outdoor ${b.outdoor_f.toFixed(0)}°F · modeled COP ${c.toFixed(2)}`}
-                  style={{ background: `hsl(${copHue(c)} 45% 20%)`, border: "1px solid #2c3640", borderRadius: 8, padding: "6px 4px", textAlign: "center" }}>
-                  <div style={{ fontSize: 10.5, color: "#8b98a5" }}>{fmtTime(new Date(b.ts)).replace(/:\d\d /, " ")}</div>
-                  <div style={{ fontSize: 15, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>{b.tank_target_f}°</div>
-                  <div style={{ fontSize: 10, color: "#8b98a5" }}>COP {c >= 5.95 ? "6+" : c.toFixed(1)}</div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
       <div className="chart-block">
         <h3>Honesty notes</h3>

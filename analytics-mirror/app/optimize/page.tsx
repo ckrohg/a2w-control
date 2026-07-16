@@ -1,10 +1,13 @@
-// @purpose Server wrapper for the Optimize page — the interim, guided savings surface.
-// Renders the shared I1 conflict banner (server component, Neon query) above the
-// client-side OptimizeClient, which polls /api/planner/target and drives the single
-// guarded "set tank target to 131°F" apply through the same planner guardrails the
-// Control page's HbxTargetCard uses.
+// @purpose Server wrapper for the Plan page (route still /optimize) — today's hour-by-hour
+// planner schedule + an autonomy preview. Renders the shared I1 conflict banner (server
+// component, Neon query) and reads the latest shadow_plans row server-side (same query the
+// Curve page uses), passing the 24 ShadowBlocks + computed_at down to the client PlanClient.
+// The client draws the timeline canvas, previews the autonomy modes and Boost (NONE of which
+// execute — Phase B is off and the HBX write path is a no-op), and keeps the old guarded
+// 131°F summer recommendation + Restore in a compact card at the bottom (apply stays DISABLED).
+import { sql } from "@vercel/postgres";
 import { I1Banner } from "../i1-banner";
-import OptimizeClient from "./optimize-client";
+import OptimizeClient, { type ShadowBlock } from "./optimize-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,18 +18,31 @@ export const fetchCache = "force-no-store"; // the I1 banner's queries are param
 const RATE = Number(process.env.ELECTRIC_RATE_USD_KWH ?? "0.30");
 const DAILY_KWH = Number(process.env.DAILY_KWH_BASELINE ?? "11.8");
 
-export default function OptimizePage() {
+export default async function OptimizePage() {
+  // Latest plan, same pattern as curve/page.tsx — wrapped so the page still renders if Neon is down.
+  let blocks: ShadowBlock[] = [];
+  let computedAt: number | null = null;
+  try {
+    const sp = await sql`SELECT plan, EXTRACT(EPOCH FROM computed_at)::float8 AS t FROM shadow_plans ORDER BY id DESC LIMIT 1`;
+    if (sp.rowCount) {
+      blocks = sp.rows[0].plan as ShadowBlock[];
+      computedAt = sp.rows[0].t as number;
+    }
+  } catch {
+    /* page still renders without Neon — the client shows a graceful empty chart state */
+  }
+
   return (
     <>
       <I1Banner />
       <header>
-        <h1>Optimize</h1>
+        <h1>Plan</h1>
         <p className="dim">
-          The interim, guided savings surface — one caution-first, fully reversible
-          summer setting that runs the tank cooler for a higher COP.
+          Today&apos;s plan, hour by hour — what the planner wants each hour, and how much
+          autonomy you grant it, from just watching to fully hands-off.
         </p>
       </header>
-      <OptimizeClient rate={RATE} dailyKwh={DAILY_KWH} />
+      <OptimizeClient rate={RATE} dailyKwh={DAILY_KWH} blocks={blocks} computedAt={computedAt} />
     </>
   );
 }
