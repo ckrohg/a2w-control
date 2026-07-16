@@ -1,19 +1,17 @@
 "use client";
-// @purpose Plan page client (route /optimize). Rebuilt from the "Optimize" surface into the
-// "Plan" surface per the approved redesign. TOP of page is a PREVIEW of the planner's
-// hour-by-hour schedule and how much autonomy you grant it:
-//   1. Autonomy switch (Off · Set & forget · Request · Armed) — VIEW/INTENT ONLY: this switch does
-//      not control actuation. Live reality (stated in the status line): Phase B HP-setpoint tracking
-//      is ON (planner flag, ~5-min cadence), the HBX tank-target write is still a no-op. Mode changes
-//      only re-render the timeline chart + copy.
+// @purpose Plan page client (route /optimize). TOP of page shows the planner's hour-by-hour
+// schedule and the REAL autonomy state, read from the planner's controller_status heartbeat:
+//   1. "Running now" — data-driven from the heartbeat (auto-pilot + Phase B: off / shadow / live,
+//      plus a reporting/stale indicator). This is ground truth and CANNOT drift from the planner.
+//      The Off·Set·Request·Armed switch below it is a PREVIEW of the modes only — it re-renders the
+//      chart/copy, it does not actuate (actuation is the planner's AUTOPILOT_/PHASE_B_ flags).
 //   2. Boost card — presets + a Custom… reveal + a capacity readout. PREVIEW ONLY: it overlays a
-//      raised segment on the chart and never calls /api/planner/boost.
-//   3. The timeline chart — a devicePixelRatio-aware canvas that redraws on [blocks, mode, boost]
-//      and on resize. Ports the mockup's drawPlan/stepLine/cop model + hover tooltip.
+//      raised segment on the chart; it does not call the planner's boost endpoint yet.
+//   3. The timeline chart — a devicePixelRatio-aware canvas; ports the mockup's drawPlan/cop model.
 //   4. "How it reacts to demand" copy card.
-// BOTTOM keeps the ORIGINAL guarded 131°F summer recommendation + Restore, still polling
-// /api/planner/target — the Apply button stays DISABLED exactly as before (the HBX write path
-// is a no-op; this build does not change that safety posture and introduces NO new writes).
+// Both levers are live-capable: the HP setpoint (Modbus) and the buffer-tank target (the HBX cloud
+// reset-curve dial — proven; it adopts on the next reheat cycle), both through the guarded writer.
+// BOTTOM keeps the guarded 131°F summer recommendation + Restore (Apply is live, same I4/I1 guards).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
@@ -30,6 +28,22 @@ export type ShadowBlock = {
   hp1_setpoint_f: number;
   reason: string;
 };
+
+// Real controller state, read server-side from the planner's controller_status heartbeat.
+export type ControllerState = { enabled: boolean; dryRun: boolean; result: string | null; targetF?: number | null };
+export type Autonomy = {
+  reporting: boolean; // heartbeat fresh (< 15 min old)
+  ageMin: number | null; // minutes since the planner last reported (server-computed → no hydration drift)
+  autopilot: ControllerState;
+  phaseb: ControllerState;
+} | null;
+
+// off (flag not set) / shadow (on, dry-run — logs but writes nothing) / live (on, writing).
+function ctrlState(c: ControllerState): { label: string; cls: string } {
+  if (!c.enabled) return { label: "off", cls: "st-off" };
+  if (c.dryRun) return { label: "shadow · dry-run", cls: "st-shadow" };
+  return { label: "live", cls: "st-live" };
+}
 
 type HbxStatus = {
   tank_f: number | null;
@@ -457,11 +471,13 @@ export default function OptimizeClient({
   dailyKwh,
   blocks,
   computedAt,
+  autonomy,
 }: {
   rate: number;
   dailyKwh: number;
   blocks: ShadowBlock[];
   computedAt: number | null;
+  autonomy: Autonomy;
 }) {
   // ---- autonomy + boost view state (NONE of this executes) ----------------------------
   const [mode, setMode] = useState<Mode>("off");
@@ -475,6 +491,19 @@ export default function OptimizeClient({
 
   const hasPlan = blocks.length > 0;
   const copyM = COPY[mode];
+
+  // Real controller badges from the heartbeat (null until the planner first reports).
+  const apS = autonomy ? ctrlState(autonomy.autopilot) : null;
+  const pbS = autonomy ? ctrlState(autonomy.phaseb) : null;
+  const bothShadow =
+    !!autonomy &&
+    autonomy.autopilot.enabled && autonomy.autopilot.dryRun &&
+    autonomy.phaseb.enabled && autonomy.phaseb.dryRun;
+  const anyLive =
+    !!autonomy &&
+    ((autonomy.autopilot.enabled && !autonomy.autopilot.dryRun) ||
+      (autonomy.phaseb.enabled && !autonomy.phaseb.dryRun));
+  const bothOff = !!autonomy && !autonomy.autopilot.enabled && !autonomy.phaseb.enabled;
 
   // HP setpoint changes across the day → the Request-mode chips row (display-only).
   const changeHours = useMemo(() => {
@@ -611,12 +640,73 @@ export default function OptimizeClient({
             </p>
           </div>
 
-          {/* honest live-state status — always visible under the switch */}
-          <div className="plan-honest-status">
-            <b>Phase B is LIVE</b> — the planner is autonomously driving each HP setpoint to
-            (tank target + 5&deg;F), re-asserted every 5&nbsp;min. The tank-target write is still
-            down, so the deeper plan savings aren&apos;t active yet. This switch is a preview — it
-            does <b>not</b> control the live tracking (that&apos;s a planner flag).
+          {/* REAL live state — read from the planner's controller_status heartbeat (ground truth,
+              cannot drift). The switch above only previews the modes; THIS is what's actually running. */}
+          <div className="plan-live">
+            <div className="plan-live-head">
+              <span className="pl-eyebrow2">Running now</span>
+              {autonomy ? (
+                autonomy.reporting ? (
+                  <span className="pl-beat ok">planner reporting</span>
+                ) : (
+                  <span className="pl-beat stale">
+                    planner quiet{autonomy.ageMin != null ? ` · ${autonomy.ageMin} min ago` : ""}
+                  </span>
+                )
+              ) : (
+                <span className="pl-beat stale">no report yet</span>
+              )}
+            </div>
+
+            {autonomy && apS && pbS ? (
+              <>
+                <div className="pl-ctrl">
+                  <span className="pl-ctrl-name">
+                    Auto-pilot <em>· buffer target</em>
+                  </span>
+                  <span className={`pl-badge ${apS.cls}`}>{apS.label}</span>
+                  <span className="pl-ctrl-detail">
+                    {!autonomy.autopilot.enabled
+                      ? "not running"
+                      : autonomy.autopilot.dryRun
+                        ? `would set ${autonomy.autopilot.targetF ?? "…"}°F — writing nothing`
+                        : "driving the buffer target to the plan"}
+                  </span>
+                </div>
+                <div className="pl-ctrl">
+                  <span className="pl-ctrl-name">
+                    Phase B <em>· HP setpoints</em>
+                  </span>
+                  <span className={`pl-badge ${pbS.cls}`}>{pbS.label}</span>
+                  <span className="pl-ctrl-detail">
+                    {!autonomy.phaseb.enabled
+                      ? "not running"
+                      : autonomy.phaseb.dryRun
+                        ? "would track setpoints to (target + 5°F) — writing nothing"
+                        : "driving each HP setpoint to (target + 5°F), leased"}
+                  </span>
+                </div>
+                <p className="pl-summary">
+                  {bothOff
+                    ? "Both controllers are off — nothing moves on its own; you set everything by hand."
+                    : bothShadow
+                      ? "Both controllers are in shadow — they compute the plan and log what they’d do, but write nothing. The buffer and setpoints only move when you move them."
+                      : anyLive
+                        ? "At least one controller is live — it is actively driving the system, inside the I4/I1 guardrails."
+                        : "Mixed state — see each controller above."}
+                </p>
+              </>
+            ) : (
+              <p className="pl-summary">
+                Waiting for the planner’s first status heartbeat. Until it reports, treat the switch
+                above as a preview only.
+              </p>
+            )}
+
+            <p className="pl-note">
+              The switch above is a <b>preview of the modes</b> — it doesn’t actuate. What’s live is
+              set by the planner’s flags and reported here.
+            </p>
           </div>
 
           {/* Request mode: display-only "changes waiting" chips */}
@@ -661,17 +751,20 @@ export default function OptimizeClient({
           {/* Armed mode: acting note */}
           {mode === "arm" && (
             <div className="plan-armnote">
-              The planner would assert these HP setpoints every 15 min. A human write (here or at the
-              wall) always preempts it. (Not executing in this build.)
+              Armed = the planner asserts these HP setpoints itself every cycle; a human write (here
+              or at the wall) always preempts it. This switch only previews it — the live state is in
+              “Running now” above, set by the planner’s dry-run flag.
             </div>
           )}
         </div>
 
         <div className="plan-honest">
-          <div className="ph-h">⚠ Only the HP setpoint would execute</div>
-          Arming drives the <b>heat-pump setpoint</b> (Modbus — proven, and the biggest mild-day COP
-          lever). The <b>buffer-tank target</b> line is <b>advisory</b>: the remote write to the HBX
-          is dead, so set those at the wall controller. Both are drawn so the two never cross.
+          <div className="ph-h">Two levers, both wired</div>
+          The planner moves two things: the <b>heat-pump setpoint</b> (Modbus — the biggest mild-day
+          COP lever) and the <b>buffer-tank target</b> (the HBX cloud reset-curve dial — <b>proven</b>;
+          it adopts on the next reheat cycle). Both route through the guarded writer (I4 envelope, I1
+          cross-check, sanitize floor, rate limit), and the two lines are drawn so they can never
+          cross. Whether either is <em>actually writing</em> right now is shown in “Running now”.
         </div>
       </div>
 
@@ -747,7 +840,7 @@ export default function OptimizeClient({
         <p className="pb-note">
           Tell the planner about a draw it can&apos;t forecast. It lifts the floor for the window,
           then automatically falls back to the plan — even in <b style={{ color: "#4bbd77" }}>Armed</b>.{" "}
-          <b>Preview — applies once the write path is restored.</b>
+          <b>Preview — these buttons don&apos;t call the planner yet (the write path itself is live).</b>
         </p>
       </div>
 
@@ -770,11 +863,11 @@ export default function OptimizeClient({
           <div className="plan-legend">
             <span className="pl-grp">
               <span className="pl-line" style={{ borderTop: "3px solid #b48cff" }} />
-              HP setpoint <span className="dim3">(would execute)</span>
+              HP setpoint <span className="dim3">(Phase B tracks)</span>
             </span>
             <span className="pl-grp">
               <span className="pl-line" style={{ borderTop: "2px dashed #7d61c4" }} />
-              tank target <span className="dim3">(advisory)</span>
+              tank target <span className="dim3">(auto-pilot tracks)</span>
             </span>
             <span className="pl-grp">
               <span className="pl-line" style={{ borderTop: "2px solid #5a8fca" }} />
@@ -1029,15 +1122,110 @@ export default function OptimizeClient({
         .plan-tradeoff :global(b) {
           color: #e0b24d;
         }
-        .plan-honest-status {
+        /* ---- "Running now" — real controller state from the heartbeat ---- */
+        .plan-live {
           margin-top: 14px;
-          padding: 10px 12px;
-          background: rgba(224, 88, 74, 0.07);
-          border: 1px solid rgba(224, 88, 74, 0.24);
-          border-radius: 10px;
+          padding: 12px 13px;
+          background: #0b0e15;
+          border: 1px solid #232c40;
+          border-radius: 11px;
+        }
+        .plan-live-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 10px;
+        }
+        .pl-eyebrow2 {
+          font-family: ui-monospace, "SF Mono", Menlo, monospace;
+          font-size: 11px;
+          letter-spacing: 0.16em;
+          text-transform: uppercase;
+          color: #e7ebf3;
+          font-weight: 600;
+        }
+        .pl-beat {
+          font-family: ui-monospace, "SF Mono", Menlo, monospace;
+          font-size: 10.5px;
+          letter-spacing: 0.06em;
+          padding: 3px 9px;
+          border-radius: 999px;
+          white-space: nowrap;
+        }
+        .pl-beat.ok {
+          background: rgba(75, 189, 119, 0.15);
+          color: #4bbd77;
+        }
+        .pl-beat.stale {
+          background: rgba(224, 178, 77, 0.15);
+          color: #e0b24d;
+        }
+        .pl-ctrl {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          flex-wrap: wrap;
+          padding: 7px 0;
+          border-top: 1px solid #161d2e;
+          font-size: 13px;
+          color: #aab4c8;
+        }
+        .pl-ctrl:first-of-type {
+          border-top: 0;
+        }
+        .pl-ctrl-name {
+          font-weight: 600;
+          color: #e7ebf3;
+          min-width: 150px;
+        }
+        .pl-ctrl-name em {
+          font-style: normal;
+          font-weight: 400;
+          color: #71809a;
+        }
+        .pl-badge {
+          font-family: ui-monospace, "SF Mono", Menlo, monospace;
+          font-size: 10.5px;
+          letter-spacing: 0.05em;
+          text-transform: uppercase;
+          padding: 3px 9px;
+          border-radius: 999px;
+          font-weight: 600;
+        }
+        .st-off {
+          background: rgba(113, 128, 154, 0.16);
+          color: #aab4c8;
+        }
+        .st-shadow {
+          background: rgba(127, 227, 227, 0.14);
+          color: #7fe3e3;
+        }
+        .st-live {
+          background: rgba(75, 189, 119, 0.18);
+          color: #4bbd77;
+        }
+        .pl-ctrl-detail {
+          color: #71809a;
+          font-size: 12.5px;
+          font-variant-numeric: tabular-nums;
+        }
+        .pl-summary {
+          margin: 10px 0 0;
+          padding-top: 10px;
+          border-top: 1px solid #161d2e;
           font-size: 12.5px;
           color: #aab4c8;
           line-height: 1.5;
+        }
+        .pl-note {
+          margin: 8px 0 0;
+          font-size: 11.5px;
+          color: #71809a;
+          line-height: 1.5;
+        }
+        .pl-note :global(b) {
+          color: #aab4c8;
         }
         /* ---- request-mode chips rail ---- */
         .plan-rail {
@@ -1117,10 +1305,10 @@ export default function OptimizeClient({
           font-size: 12.5px;
           color: #71809a;
         }
-        /* ---- honest posture card ---- */
+        /* ---- mechanism card (informational, not a warning) ---- */
         .plan-honest {
-          background: rgba(224, 88, 74, 0.07);
-          border: 1px solid rgba(224, 88, 74, 0.24);
+          background: rgba(90, 143, 202, 0.06);
+          border: 1px solid rgba(90, 143, 202, 0.22);
           border-radius: 14px;
           padding: 14px 16px;
           font-size: 13px;

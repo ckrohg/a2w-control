@@ -1,13 +1,12 @@
-// @purpose Server wrapper for the Plan page (route still /optimize) — today's hour-by-hour
-// planner schedule + an autonomy preview. Renders the shared I1 conflict banner (server
-// component, Neon query) and reads the latest shadow_plans row server-side (same query the
-// Curve page uses), passing the 24 ShadowBlocks + computed_at down to the client PlanClient.
-// The client draws the timeline canvas, previews the autonomy modes and Boost (NONE of which
-// execute — Phase B is off and the HBX write path is a no-op), and keeps the old guarded
-// 131°F summer recommendation + Restore in a compact card at the bottom (apply stays DISABLED).
+// @purpose Server wrapper for the Plan page (route /optimize) — today's hour-by-hour planner
+// schedule + the REAL autonomy state. Renders the shared I1 conflict banner and reads, server-side
+// from Neon: the latest shadow_plans row (24 ShadowBlocks + computed_at) AND the planner's
+// controller_status heartbeat (the actual auto-pilot + Phase B flags), so the client shows
+// ground-truth autonomy instead of hardcoded copy that can drift. The client draws the timeline,
+// previews the autonomy modes + Boost (preview only), and keeps the guarded 131°F rec + Restore.
 import { sql } from "@vercel/postgres";
 import { I1Banner } from "../i1-banner";
-import OptimizeClient, { type ShadowBlock } from "./optimize-client";
+import OptimizeClient, { type ShadowBlock, type Autonomy } from "./optimize-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +31,32 @@ export default async function OptimizePage() {
     /* page still renders without Neon — the client shows a graceful empty chart state */
   }
 
+  // Real controller state from the planner's heartbeat. Own try/catch — controller_status isn't
+  // created until the planner deploys + runs ensureSchema, and a missing table must not break the
+  // page. ageMin is computed server-side so the "N min ago" text can't cause a hydration mismatch.
+  let autonomy: Autonomy = null;
+  try {
+    const cs = await sql<{
+      t: number; ae: boolean; adr: boolean; ares: string | null; atf: number | null;
+      pe: boolean; pdr: boolean; pres: string | null;
+    }>`SELECT EXTRACT(EPOCH FROM updated_at)::float8 AS t,
+              autopilot_enabled AS ae, autopilot_dry_run AS adr, autopilot_result AS ares, autopilot_target_f AS atf,
+              phaseb_enabled AS pe, phaseb_dry_run AS pdr, phaseb_result AS pres
+       FROM controller_status WHERE id = 1`;
+    if (cs.rowCount) {
+      const r = cs.rows[0];
+      const ageMin = Math.round(Date.now() / 1000 / 60 - r.t / 60);
+      autonomy = {
+        reporting: ageMin < 15,
+        ageMin,
+        autopilot: { enabled: r.ae, dryRun: r.adr, result: r.ares, targetF: r.atf },
+        phaseb: { enabled: r.pe, dryRun: r.pdr, result: r.pres },
+      };
+    }
+  } catch {
+    /* controller_status not created yet — the client shows a graceful "no report yet" state */
+  }
+
   return (
     <>
       <I1Banner />
@@ -42,7 +67,13 @@ export default async function OptimizePage() {
           autonomy you grant it, from just watching to fully hands-off.
         </p>
       </header>
-      <OptimizeClient rate={RATE} dailyKwh={DAILY_KWH} blocks={blocks} computedAt={computedAt} />
+      <OptimizeClient
+        rate={RATE}
+        dailyKwh={DAILY_KWH}
+        blocks={blocks}
+        computedAt={computedAt}
+        autonomy={autonomy}
+      />
     </>
   );
 }

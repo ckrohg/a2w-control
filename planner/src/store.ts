@@ -121,6 +121,21 @@ export class Store {
         value_c  real,
         result   text
       );
+      -- Single-row heartbeat of the planner's ACTUAL controller flags, upserted every poll.
+      -- The dashboard reads this instead of hardcoding autonomy copy, so the page can never
+      -- drift from reality. Distinct from autopilot_log/phase_b_log (decision history, dedup'd):
+      -- updated_at IS a heartbeat (stale row ⇒ planner down ⇒ "not reporting").
+      CREATE TABLE IF NOT EXISTS controller_status (
+        id                 integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        updated_at         timestamptz NOT NULL DEFAULT now(),
+        autopilot_enabled  boolean NOT NULL,
+        autopilot_dry_run  boolean NOT NULL,
+        autopilot_result   text,
+        autopilot_target_f real,
+        phaseb_enabled     boolean NOT NULL,
+        phaseb_dry_run     boolean NOT NULL,
+        phaseb_result      text
+      );
       CREATE TABLE IF NOT EXISTS tempiq_zone_physics (
         zone_id            text PRIMARY KEY,
         name               text,
@@ -218,6 +233,30 @@ export class Store {
     if (!r.rowCount) return null;
     const x = r.rows[0];
     return { ts: new Date(x.ts), targetF: x.target_f, reason: x.reason, result: x.result, dryRun: x.dry_run };
+  }
+
+  /** Heartbeat the planner's real controller flags each poll so the dashboard shows ground truth. */
+  async upsertControllerStatus(s: {
+    autopilotEnabled: boolean; autopilotDryRun: boolean; autopilotResult: string | null; autopilotTargetF: number | null;
+    phasebEnabled: boolean; phasebDryRun: boolean; phasebResult: string | null;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO controller_status
+         (id, updated_at, autopilot_enabled, autopilot_dry_run, autopilot_result, autopilot_target_f,
+          phaseb_enabled, phaseb_dry_run, phaseb_result)
+       VALUES (1, now(), $1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET
+         updated_at = now(),
+         autopilot_enabled = EXCLUDED.autopilot_enabled,
+         autopilot_dry_run = EXCLUDED.autopilot_dry_run,
+         autopilot_result = EXCLUDED.autopilot_result,
+         autopilot_target_f = EXCLUDED.autopilot_target_f,
+         phaseb_enabled = EXCLUDED.phaseb_enabled,
+         phaseb_dry_run = EXCLUDED.phaseb_dry_run,
+         phaseb_result = EXCLUDED.phaseb_result`,
+      [s.autopilotEnabled, s.autopilotDryRun, s.autopilotResult, s.autopilotTargetF,
+       s.phasebEnabled, s.phasebDryRun, s.phasebResult],
+    );
   }
 
   /** Latest learned per-zone physics from TempIQ (§6.7: consumed, never re-derived). */

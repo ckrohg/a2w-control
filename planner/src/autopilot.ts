@@ -18,6 +18,7 @@ const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this 
 export class AutoPilot {
   public lastRunAt: string | null = null;
   public lastResult = "not run yet";
+  public lastTargetF: number | null = null; // most recent decided target — surfaced in the heartbeat
   private lastLogged: string | null = null;
 
   constructor(
@@ -30,6 +31,7 @@ export class AutoPilot {
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
   private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {
     this.lastResult = verbose;
+    this.lastTargetF = target;
     const key = `${result}|${target}`;
     if (key !== this.lastLogged) {
       this.lastLogged = key;

@@ -563,6 +563,18 @@ async function pollOnce(): Promise<void> {
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
 
+  // Heartbeat the planner's ACTUAL controller flags so the dashboard shows ground truth (the
+  // Plan page reads this row instead of hardcoded copy — a stale updated_at ⇒ planner down).
+  await store.upsertControllerStatus({
+    autopilotEnabled: AUTOPILOT_ENABLED,
+    autopilotDryRun: AUTOPILOT_DRY_RUN,
+    autopilotResult: autopilot ? autopilot.lastResult : null,
+    autopilotTargetF: autopilot ? autopilot.lastTargetF : null,
+    phasebEnabled: PHASE_B_ENABLED,
+    phasebDryRun: PHASE_B_DRY_RUN,
+    phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
+  }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
+
   const config = extractConfig(dev);
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
   const prev = await store.latestConfig();
