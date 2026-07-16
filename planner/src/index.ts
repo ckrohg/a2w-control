@@ -27,6 +27,7 @@ import {
   StormState,
 } from "./storm";
 import { DemandFeed } from "./demand";
+import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
 import { PhaseB } from "./phaseb";
@@ -110,6 +111,11 @@ const demandFeed = WINTER_SOLVER_SHADOW && TEMPIQ_SURFACE_TOKEN
   ? new DemandFeed(TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
 if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but TEMPIQ_SURFACE_TOKEN missing — winter solver shadow disabled");
+
+// Adjacency-aware setback shadow (#33). SHADOW ONLY: logs what the tank floor WOULD be if warm-adjacent
+// zones borrowed heat (deeper-setback savings), on top of the winter-solver floor. Never changes the
+// live floor/setpoint. Flag off = no behavior change and no extra fetch.
+const ADJACENCY_SETBACK_SHADOW = process.env.ADJACENCY_SETBACK_SHADOW === "1";
 if (PHASE_B_ENABLED && !hub) console.warn("PHASE_B_ENABLED but no hub configured — tracking disabled");
 if (phaseB) console.log(`PHASE B ${PHASE_B_DRY_RUN ? "DRY-RUN" : "ACTIVE"} for ${PHASE_B_PUMPS.join(", ")} (target + ${5}°F, leased)`);
 
@@ -403,6 +409,11 @@ async function shadowOnce(): Promise<void> {
     const latest = await store.getLatestSlx().catch(() => null);
     const outdoorF = latest?.outdoorF ?? forecast[0]?.outdoorF ?? null;
     const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF) : null;
+    // SHADOW (#33): what would the floor be if warm-adjacent zones borrowed heat? Logs only; the live
+    // `demandFloor` below is untouched. Never throws / blocks the cycle.
+    if (floor && ADJACENCY_SETBACK_SHADOW && TEMPIQ_SURFACE_TOKEN) {
+      await logAdjacencyShadowFloor(floor, demandFeed.callingZoneIds(), TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
+    }
     if (floor) {
       // "insights+calls" = call-driven (only HEATING zones bind); "insights" = the
       // conservative all-zones fallback when /calls is stale. Lets the /hbx card show
