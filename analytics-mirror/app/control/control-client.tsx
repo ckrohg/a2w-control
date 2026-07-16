@@ -424,7 +424,7 @@ function HbxTargetCard() {
             type="button"
             disabled={busy || target == null}
             onClick={() => act("/api/planner/target", { target_f: target },
-              `Set the HBX tank target to ${target}°F? This flattens the reset curve until you restore it. Pump setpoints must stay ${st.i1_margin_f}°F above it (checked).`,
+              `Set the HBX tank target to ${target}°F? This writes a near-flat reset curve the buffer adopts on the next reheat cycle, until you restore it. Pump setpoints must stay ${st.i1_margin_f}°F above it (checked).`,
               "Set HBX tank target")}
             style={{ flex: "0 0 auto" }}
           >

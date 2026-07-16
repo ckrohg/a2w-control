@@ -92,6 +92,82 @@ outdoor, then `getDevice` and check: (a) did `dbt/mbt` stick (device accepted th
 With Fix #1 hardening the write, this test is *self-protecting*: if it's a no-op, the write fails
 loudly and auto-restores the config — no silent drift, no setpoint conflict.
 
+## Test result (2026-07-15) — DEFINITIVE: remote target control is not possible via this path
+
+Ran the controlled test (valid shifted curve `dbt=132 / mbt=130`, self-restoring):
+- **Config stuck:** yes — after 15s the device reported `dbt=132, mbt=130`. So the SensorLinx
+  PATCH *does* reach the device's config.
+- **Operative target moved:** **NO** — `temps.temp1.target` stayed at **145°F** the entire time
+  (baseline 145 → shifted 145 → restored 145). It didn't follow the curve, `dbt`, or `mbt`.
+
+So the hypothesis (valid curve works, flatten was the bug) is **disproven.** The device **accepts
+curve-config writes but never recomputes the target it actually drives to.** `temp1.target` is set
+device-side (wall controller / local logic, likely with `permHD=1` holding it), decoupled from API
+config writes. Also noted: `temp1.target=145` = `mbt`, not the curve output (~153 at 72°F) — the
+operative target isn't even the reset-curve output. Config restored to as-found; system safe.
+
+**Conclusion: the HBX tank target cannot be changed remotely via the SensorLinx API.** The
+reset-curve config is writable but inert w.r.t. the operative target.
+
+## Patient re-test + field hunt (2026-07-15, decisive) — and what's still unexhausted
+
+The 15s window above was a fair objection (temp1.target is device-reported telemetry; the field map
+says app changes appear "within one 5-min cycle"). So we re-ran it patiently:
+
+- **11-minute observation** (`scratchpad/hbx-observe.mjs`): wrote a valid `dbt=140 / mbt=130`, left
+  it in place, sampled `temp1.target` every 60s for 11 minutes (two full poll cycles). Result:
+  **flat at 145°F every single sample (Δ0.0)**, config retained at 140/130 the whole time. So the
+  no-op is NOT a too-short-read artifact — a valid curve held for 11 min genuinely does not move the
+  operative target. Restored 165/145 (confirmed by immediate PATCH echo).
+- **Full device dump** (`scratchpad/hbx-dump.mjs`, 108 fields): the ONLY tank-temperature-range
+  writable fields are `dbt`/`mbt`. `temps.temp1.target` is a computed display object
+  (`title:"TANK"` + color/status), not a config input. There is **no manual-setpoint / demand-target
+  field** to write instead. On this device the hot-tank target = the outdoor-reset curve, period.
+
+**So via the cloud REST config API, the operative target cannot be moved — confirmed properly.** But
+the SensorLinx *app* controls this device over the same host, so *an* API/WiFi path exists. Two
+avenues remain untested, both of which keep the WiFi approach alive:
+
+1. **Longer device-pull latency.** The "5-min cycle" in the field map was config→old-host telemetry
+   (cloud-to-cloud), NOT the physical device ingesting cloud config. The controller may pull cloud
+   config only hourly / on reconnect. Test: leave a SAFE valid curve (e.g. `mbt=135`, target stays
+   ≥135 > sanitize; setpoints 167/159.8 clear it) in place ~1–2h and watch for a late move.
+2. **The app uses an extra channel.** The A-3 capture only grabbed a REST section-save PATCH and
+   never verified it moved `temp1.target`. The app may push via socket.io
+   (`wss://api.sensorlinx.co/socket.io`) or an "apply" call. Decisive test: change the target in the
+   app while watching our API poll + capturing WebSocket frames (Proxyman with WS enabled). Either it
+   reveals the mechanism to replicate, or it proves even the app can't move it remotely.
+
+## App-capture + 44-min watch (2026-07-16) — the mechanism, settled
+
+Owner changed **Min Tank Temp 145→135 in the SensorLinx iOS app** with a fresh Proxyman HAR, while
+we watched the live API for 44 min (`scratchpad/hbx-watch.mjs`, `hbx-device.json`, HAR analysis):
+
+- **The app has no secret mechanism.** Its save is the *same* REST PATCH we implement:
+  `PATCH /buildings/{id}/devices/AECO-2036` body `{"htDif":4,"dbt":165,"mbt":135}`. The socket.io
+  WebSocket (`wss://api.sensorlinx.co/socket.io`) is **receive-only** — every meaningful frame is a
+  server→app `device:update` telemetry push (`tB1:["TANK",actual,target,status]`); the app's only
+  sent frames are protocol housekeeping (`2probe`/`5`/`3`/close). No command/apply frame.
+  `POST /account/me/devices` just registers the iOS push token. Nothing to replicate.
+- **The app's own write did not move the operative target.** mbt→135 reached the cloud
+  (`changeSource:"api"`), but `temp1.target` **held 154.5°F for the full 44 min** — through the rest
+  of the active call, the tank rising past 154.5 to 157.7°F, and a ~28-min satisfied plateau (no new
+  call started — no draw at that hour).
+- **`temp1.target` is device-computed from the LOCAL curve, not the cloud mirror.** This also explains
+  the 145-vs-154.5 puzzle: idle → target shows `mbt`; active call → shows the interpolated curve
+  output; both derived from the device's *own* 165/145 curve. Cloud PATCHes (app or API) update only
+  a cloud mirror the controller does not adopt for operation.
+
+**Settled conclusion:** remote target control over the SensorLinx cloud is not possible on this
+ECO-0600 (fw 2.08) — not because we write it wrong (we write exactly what the app writes), but
+because the device runs from its local curve. Curve/config restored to 165/145 after the test.
+
+**Unfalsified long-shot + clean resolver:** we never saw a device reboot / WiFi reconnect in-window,
+so config-ingestion-on-reconnect isn't strictly ruled out. Definitive answer = a **vendor question
+to SensorLinx/HBX**: does the ECO-0600 apply remote cloud config to operation, or is cloud
+read/telemetry-only, and is there a firmware/setting to enable remote-write? That is the only
+remaining fully-API/WiFi avenue.
+
 ## Implication for savings
 The tank can't be lowered via this path, and pump setpoints can't be safely lowered without first
 lowering the tank (I1). **So there is no working savings lever until the HBX write path is fixed**

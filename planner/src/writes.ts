@@ -1,14 +1,18 @@
 /**
- * @purpose The guarded HBX write path (plan §5.2) — HUMAN-TRIGGERED ONLY in this phase
- * (source=dashboard via the mirror's server-side proxy; Phase C autonomy is a separate,
- * gated decision). Mechanism: with outdoor reset ON, a fixed target is commanded by
- * flattening the curve (PATCH dbt=mbt=T — both fields verified writable in the A-3
- * capture); restore re-applies the as-found endpoints from the seed config version.
- * Guardrails, in order: I4 envelope clamp (bandFor, outdoor-indexed) → I1 cross-check
- * against live pump setpoints from the hub → rate limit (restore exempt: reverting to
- * baseline must never be blocked) → PATCH with response-echo verify → self-recorded
- * config version (so the drift detector doesn't re-alert our own write) → audit row for
- * EVERY attempt, accepted or rejected → ntfy on success.
+ * @purpose The guarded HBX write path (plan §5.2). Mechanism (CORRECTED 2026-07-16): a target
+ * is commanded by PATCHing a VALID near-flat reset curve (dbt=T+2 / mbt=T-2 — a real curve,
+ * dbt > mbt). The device latches its curve mid-reheat and re-reads the cloud curve at the START
+ * of the next reheat cycle, so the buffer ADOPTS the new band on the next cycle (proven live;
+ * see memory hbx-remote-target-uncontrollable). Adoption is asynchronous — we do NOT synchronously
+ * verify the operative target (the old dbt==mbt flatten + 8 s temp1.target check was the bug: the
+ * device ignores a degenerate curve and only recomputes on the next cycle anyway). Restore
+ * re-applies the as-found endpoints from the seed config version.
+ * Guardrails, in order: I4 envelope clamp (bandFor, outdoor-indexed) → I1 cross-check against live
+ * pump setpoints from the hub → rate limit (restore exempt: reverting to baseline must never be
+ * blocked) → PATCH with response-echo verify (proves the API accepted dbt/mbt) → self-recorded
+ * config version (so the drift detector doesn't re-alert our own write) → audit row for EVERY
+ * attempt, accepted or rejected → ntfy on success. Adoption then shows up in the 5-min poll loop
+ * as temp1.target moves onto the new band; status() reports commanded-vs-operative.
  */
 
 import { SensorLinxClient } from "./sensorlinx";
@@ -52,15 +56,24 @@ export class HbxWriter {
     ]);
     const outdoor = latest?.outdoorF ?? null;
     const band = outdoor != null ? bandFor(outdoor, cfg, DEFAULT_OPTS.strictCapF) : null;
-    const flattened = cfg != null && baseline != null &&
+    const overridden = cfg != null && baseline != null &&
       (cfg.dbt !== baseline.dbt || cfg.mbt !== baseline.mbt);
+    // Commanded target = midpoint of the current curve band we wrote; operative = temp1.target
+    // the device is actually driving to. They differ during the adoption lag (until the next
+    // reheat cycle) — surface both so the UI shows "commanded X, adopts next cycle" rather than
+    // looking stuck.
+    const commanded = cfg != null ? Math.round(((cfg.dbt as number) + (cfg.mbt as number)) / 2) : null;
+    const operative = latest?.targetF ?? null;
+    const adoptionPending = commanded != null && operative != null && Math.abs(commanded - operative) > 3;
     const boost = await this.store.activeBoost();
     return {
       tank_f: latest?.tankF ?? null,
-      target_f: latest?.targetF ?? null,
+      target_f: operative,
+      commanded_target_f: commanded,
+      adoption_pending: adoptionPending,
       outdoor_f: outdoor,
       band: band ? { lo: Math.round(band.lo), hi: Math.round(band.hi) } : null,
-      curve_overridden: flattened,
+      curve_overridden: overridden,
       baseline: baseline ? { dbt: baseline.dbt, mbt: baseline.mbt } : null,
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
@@ -110,38 +123,24 @@ export class HbxWriter {
       await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
     }
 
-    const result = await this.patch({ dbt: targetF, mbt: targetF }, source, "set_target",
-      `target fixed at ${targetF}°F (curve flattened)`);
-
-    // OPERATIVE-target verification (setTarget ONLY — this is a flatten, so the expected
-    // operative target == targetF; restore leaves dbt≠mbt where the target is the curve
-    // output, so this must NOT run there). The config-echo check inside patch() only proves
-    // the API accepted dbt/mbt — it does NOT prove the device recomputed the target it's
-    // actually driving to. The read the planner trusts is dev.temps.temp1.target
-    // (index.ts:155). If that didn't move, the write silently no-op'd on hardware and lowering
-    // pump setpoints against the unmoved target manufactures an I1 deadlock (the 2026-07-15
-    // incident — see hbx-target-write-noop-diagnosis.md).
-    await new Promise((r) => setTimeout(r, 8000)); // let the device recompute + report up
-    const dev = await this.slx.getDevice(this.buildingId, this.syncCode);
-    const op = dev?.temps?.temp1?.target as number | null | undefined;
-    if (op == null || Math.abs(op - targetF) > 2) {
-      await this.store.insertHbxWrite({
-        source,
-        action: "set_target",
-        requested: { target_f: targetF },
-        result: "verify_mismatch",
-        detail: `device did not apply target: operative temp1.target=${op}°F, wanted ${targetF}°F (HBX write no-op — see hbx-target-write-noop-diagnosis.md)`,
-      });
-      // Roll the CLOUD config back so curve_overridden doesn't drift on a write that never
-      // reached the device. Best-effort — the throw below is what the caller must see.
-      await this.restore(`${source}:noop-rollback`).catch(() => {});
-      throw new WriteError(
-        502,
-        `HBX target write did not take effect on the device (operative target still ${op}°F). See hbx-target-write-noop-diagnosis.md.`,
-      );
-    }
-
-    return result;
+    // Write a VALID near-flat curve (dbt > mbt) centered on the target — NOT a degenerate
+    // flatten (dbt == mbt), which the device silently ignores. The controller re-reads the
+    // cloud curve at the START of the next reheat cycle and adopts it (proven live 2026-07-16;
+    // see memory hbx-remote-target-uncontrollable + hbx-target-write-noop-diagnosis.md).
+    // Adoption is ASYNCHRONOUS (minutes / next cycle), so we do NOT synchronously verify
+    // temp1.target here — that was the old bug (an 8 s check that always failed because the
+    // operative target only moves on the next cycle). The config-echo inside patch() proves the
+    // API accepted the write; the 5-min poll loop then records the operative target as it lands
+    // on the new band, and status() surfaces commanded-vs-operative so the UI shows the pending
+    // adoption. CAVEAT for Phase C: any pump-setpoint reduction must gate on the OPERATIVE
+    // target (temp1.target), never this commanded value, or the adoption lag can manufacture an
+    // I1 stall (the 2026-07-15 incident).
+    return this.patch(
+      { dbt: targetF + 2, mbt: targetF - 2 },
+      source,
+      "set_target",
+      `target ${targetF}°F commanded (curve ${targetF + 2}/${targetF - 2}; adopts on the next reheat cycle)`,
+    );
   }
 
   /**

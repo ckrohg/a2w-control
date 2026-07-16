@@ -823,14 +823,7 @@ export default function OptimizeClient({
         </p>
       </div>
 
-      {/* ============ SUMMER FLOOR RECOMMENDATION (bottom, guarded, apply DISABLED) ============ */}
-      <div className="card banner" style={{ marginTop: 4 }}>
-        ⚠ <b>Tank-target control is temporarily disabled</b> — the HBX write path does not currently
-        reach the device (it silently no-op&apos;d; diagnosis in{" "}
-        <code>hbx-target-write-noop-diagnosis.md</code>). The recommendation below is informational
-        only until the write path is fixed.
-      </div>
-
+      {/* ============ SUMMER FLOOR RECOMMENDATION (bottom, guarded, apply LIVE) ============ */}
       <div className="card plan-rec">
         <span className="pr-num">{SAFE_FLOOR_F}°</span>
         <div className="pr-txt">
@@ -865,18 +858,18 @@ export default function OptimizeClient({
         <div className="pr-actions">
           <button
             type="button"
-            disabled
+            disabled={busy || !st || !canRecommend}
             onClick={() =>
               st &&
               act(
                 "/api/planner/target",
                 { target_f: SAFE_FLOOR_F },
-                `Set the HBX tank target to ${SAFE_FLOOR_F}°F? This runs the tank ~22°F cooler while staying sanitized. Reversible via Restore curve. Pump setpoints must stay ≥${SAFE_FLOOR_F + (st?.i1_margin_f ?? 0)}°F, which is checked.`,
+                `Set the HBX tank target to ${SAFE_FLOOR_F}°F? This runs the tank ~22°F cooler while staying sanitized, and adopts on the next reheat cycle. Reversible via Restore curve. Pump setpoints must stay ≥${SAFE_FLOOR_F + (st?.i1_margin_f ?? 0)}°F, which is checked.`,
               )
             }
-            title="HBX write path is down"
+            title="Command the buffer target (adopts on the next reheat cycle)"
           >
-            {alreadyApplied ? "Already applied ✓" : "Apply — paused (write no-op)"}
+            {alreadyApplied ? "Already applied ✓" : `Apply — floor to ${SAFE_FLOOR_F}°F`}
           </button>
           <button
             type="button"
