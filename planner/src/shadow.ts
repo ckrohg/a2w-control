@@ -37,8 +37,9 @@ export interface ShadowOpts {
   hpMinF: number; // unattended winter floor, 45 °C
   hpMaxF: number; // reg-2027 cap, 55 °C
   winterGuardF: number;
-  sanitizeF: number; // I8: daily thermal-hygiene excursion target (≥131 °F = 55 °C)
-  strictCapF: number; // I4: hard ceiling until Phase B actively manages HP setpoints
+  sanitizeF: number; // I8: daily thermal-hygiene excursion target (140 °F = 60 °C pasteurization)
+  strictCapF: number; // I4: everyday hard ceiling until Phase B actively manages HP setpoints
+  sanitizeCapF: number; // I8: the daily sanitize excursion may exceed strictCapF up to here (I1 still guards)
 }
 
 export const DEFAULT_OPTS: ShadowOpts = {
@@ -53,8 +54,12 @@ export const DEFAULT_OPTS: ShadowOpts = {
   hpMinF: 113,
   hpMaxF: 131,
   winterGuardF: 50,
-  sanitizeF: 131,
+  // 140 °F = 60 °C: Legionella die in ~32 min vs ~5–6 h at 131 °F/55 °C — the daily soak is a REAL
+  // pasteurization of the DHW coil's potable slug. Exceeds the everyday strictCap (135), so it uses
+  // sanitizeCapF below; I1 still requires the pump setpoints to cover it (setpoint ≥ target + margin).
+  sanitizeF: 140,
   strictCapF: 135,
+  sanitizeCapF: 145, // hard ceiling for the 140 °F soak (bypasses curve+3); < the 154 °F the hardware ran as-found
 };
 
 /**
@@ -67,12 +72,18 @@ export const DEFAULT_OPTS: ShadowOpts = {
 export function bandFor(
   outdoorF: number,
   hbxConfig: Record<string, any> | null,
-  strictCapF: number,
+  capF: number,
+  sanitize = false,
 ): { lo: number; hi: number } {
   const t = Math.min(Math.max(outdoorF, 5), 55);
   const lo = 95 + ((55 - t) / 50) * 40; // 55°F→95, 5°F→135
+  // The daily sanitize is a deliberate hygiene excursion ABOVE the everyday regime, so its ceiling is
+  // capF (sanitizeCapF) directly — NOT the as-found curve+3 comfort limit (which, at the warmest hour
+  // where the sanitize is scheduled, is at its lowest and would clamp 140 back down). Still bounded
+  // well under the 154°F the hardware ran as-found, and I1 always requires setpoints to cover it.
+  if (sanitize) return { lo, hi: Math.max(capF, lo) };
   const curve = hbxConfig ? curveTargetF(hbxConfig, outdoorF) : null;
-  const hi = Math.min(curve != null ? curve + 3 : strictCapF, strictCapF);
+  const hi = Math.min(curve != null ? curve + 3 : capF, capF);
   return { lo, hi: Math.max(hi, lo) };
 }
 
@@ -95,7 +106,7 @@ export function computeShadowPlan(
   const hours = forecast.slice(0, 24);
   const inWindow = (h: number) => opts.dhwWindows.some(([a, b]) => h >= a && h < b);
 
-  type Draft = { f: ForecastHour; localH: number; target: number; reason: string };
+  type Draft = { f: ForecastHour; localH: number; target: number; reason: string; sani?: boolean };
   const draft: Draft[] = hours.map((f) => {
     const localH = f.ts.getHours(); // TZ env makes this local time
     // Off-window still holds the DHW-ready floor — draws are unpredictable and happen year-round,
@@ -132,7 +143,8 @@ export function computeShadowPlan(
     if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
     const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
     warmest.target = opts.sanitizeF;
-    warmest.reason = `daily sanitize boost to ${opts.sanitizeF}°F (I8 thermal hygiene, warmest hour)`;
+    warmest.sani = true;
+    warmest.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, warmest hour)`;
   }
 
   return draft.map((d) => {
@@ -150,9 +162,16 @@ export function computeShadowPlan(
         }
       }
     }
-    const band = bandFor(d.f.outdoorF, hbxConfig, opts.strictCapF);
+    // The daily sanitize excursion may exceed the everyday strictCap (up to sanitizeCapF); every
+    // other hour stays clamped to strictCap. I1 (below, and in the writer) still requires the pump
+    // setpoints to cover whatever target this yields — the higher ceiling never bypasses that.
+    const cap = d.sani ? opts.sanitizeCapF : opts.strictCapF;
+    const band = bandFor(d.f.outdoorF, hbxConfig, cap, d.sani);
     target = clamp(target, band.lo, band.hi);
-    const hp1 = clamp(target + opts.i1MarginF, opts.hpMinF, opts.hpMaxF);
+    // Advisory HP line must cover the target (setpoints lead it up — Phase B does this live), so the
+    // sanitize hour is allowed a higher HP cap; otherwise the plan would draw setpoint < target.
+    const hpCapF = d.sani ? opts.sanitizeCapF + opts.i1MarginF : opts.hpMaxF;
+    const hp1 = clamp(target + opts.i1MarginF, opts.hpMinF, hpCapF);
     return {
       ts: d.f.ts.toISOString(),
       outdoor_f: d.f.outdoorF,

@@ -82,7 +82,11 @@ export class HbxWriter {
     };
   }
 
-  async setTarget(targetF: number, source: string): Promise<Record<string, unknown>> {
+  // capF is the I4 upper ceiling for THIS write. Defaults to the everyday strictCap; the daily
+  // sanitize passes DEFAULT_OPTS.sanitizeCapF so its 140°F soak isn't clamped to 135. This only
+  // raises the envelope ceiling — the I1 cross-check below is unchanged, so a higher target still
+  // requires the pump setpoints to cover it (setpoint ≥ target + margin) or the write is rejected.
+  async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
     const reject = async (status: number, detail: string) => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
       throw new WriteError(status, detail);
@@ -96,7 +100,10 @@ export class HbxWriter {
       await reject(503, "no fresh SensorLinx reading — cannot evaluate the outdoor-indexed envelope");
     }
     const cfg = await this.store.latestConfig();
-    const band = bandFor(latest!.outdoorF as number, cfg, DEFAULT_OPTS.strictCapF);
+    // A cap above the everyday strictCap marks a sanitize excursion, which is allowed above the
+    // curve+3 comfort ceiling (bounded by capF); I1 below still requires setpoints to cover it.
+    const sanitize = capF > DEFAULT_OPTS.strictCapF;
+    const band = bandFor(latest!.outdoorF as number, cfg, capF, sanitize);
     if (targetF < band.lo || targetF > band.hi) {
       await reject(422, `target ${targetF}°F outside the I4 envelope [${Math.round(band.lo)}–${Math.round(band.hi)}]°F at ${latest!.outdoorF}°F outdoor`);
     }
@@ -164,12 +171,12 @@ export class HbxWriter {
    * built early in human-triggered form). All setTarget guardrails apply to the boost;
    * the restore is exempt (reverting to baseline is never blocked).
    */
-  async boost(targetF: number, minutes: number, source: string): Promise<Record<string, unknown>> {
+  async boost(targetF: number, minutes: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
     if (!Number.isFinite(minutes) || minutes < 15 || minutes > 120) {
       await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "rejected", detail: "minutes must be 15–120" });
       throw new WriteError(422, "minutes must be 15–120");
     }
-    const result = await this.setTarget(targetF, source); // envelope + I1 + rate limit
+    const result = await this.setTarget(targetF, source, capF); // envelope (capF) + I1 + rate limit
     const restoreAt = new Date(Date.now() + minutes * 60_000);
     await this.store.insertBoost(targetF, restoreAt);
     return { ...result, boost_restore_at: restoreAt.toISOString() };

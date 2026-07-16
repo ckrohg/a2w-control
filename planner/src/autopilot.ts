@@ -12,6 +12,7 @@
 
 import { Store } from "./store";
 import { HbxWriter, WriteError } from "./writes";
+import { DEFAULT_OPTS } from "./shadow";
 
 const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this of the commanded
 
@@ -73,7 +74,10 @@ export class AutoPilot {
     }
 
     try {
-      await this.writer.setTarget(target, "autopilot");
+      // A plan target above the everyday strictCap is the daily sanitize excursion — allow it up to
+      // sanitizeCapF (only sanitize produces >strictCap in the plan). I1 in setTarget still guards it.
+      const capF = target > DEFAULT_OPTS.strictCapF ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
+      await this.writer.setTarget(target, "autopilot", capF);
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
       console.log(`[autopilot] ${this.lastResult}`);
     } catch (e) {

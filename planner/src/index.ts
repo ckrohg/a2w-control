@@ -214,50 +214,77 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   }
 }
 
-/** I8 thermal hygiene (plan §5.1): page if a rolling 26 h passes without the tank
- *  spending time ≥131 °F — the DHW coil's potable slug must get its daily hot soak.
- *  Checked hourly alongside the shadow loop; edge-alerted with a clear once satisfied.
- *  Trivially satisfied under as-found temps; load-bearing once optimized targets run. */
+// I8 hygiene = a REAL pasteurizing DWELL, not a momentary touch. Legionella die in ~32 min at
+// 60°C/140°F but need ~5–6 h at 55°C/131°F — so "the tank hit 131°F once" (the old bar) is not a
+// disinfection. We require the tank to have HELD ≥ SANITIZE_VERIFY_F for ≥ SANITIZE_DWELL_MIN
+// continuous minutes. VERIFY_F (134) sits a few °F under the 140°F aim to tolerate sensor slop while
+// still confirming the soak substantially reached temp; the current continuous-135°F regime clears
+// it, so this doesn't false-alarm before the cool-tank plan goes live.
+const SANITIZE_VERIFY_F = 134;
+const SANITIZE_DWELL_MIN = 30;
+
+/** Longest continuous span (minutes) the tank held ≥ minF, from the ascending reading series. */
+function longestDwellMin(series: { ts: Date; tankF: number | null }[], minF: number): number {
+  let best = 0;
+  let runStart: Date | null = null;
+  let runLast: Date | null = null;
+  for (const r of series) {
+    if (r.tankF != null && r.tankF >= minF) {
+      if (runStart == null) runStart = r.ts;
+      runLast = r.ts;
+    } else if (runStart && runLast) {
+      best = Math.max(best, (runLast.getTime() - runStart.getTime()) / 60000);
+      runStart = runLast = null;
+    }
+  }
+  if (runStart && runLast) best = Math.max(best, (runLast.getTime() - runStart.getTime()) / 60000);
+  return best;
+}
+
+/** I8 thermal hygiene (plan §5.1): page if a rolling 26 h passes without a real pasteurizing dwell
+ *  (≥SANITIZE_VERIFY_F for ≥SANITIZE_DWELL_MIN continuous min) — the DHW coil's potable slug must get
+ *  its daily hot soak. Checked hourly; edge-alerted with a clear once satisfied. Trivially satisfied
+ *  under as-found/current temps; load-bearing once the cool-tank optimized targets run. */
 let i8Alerted = false;
 async function checkI8(): Promise<void> {
   const res = await store.getRecentSeries(26);
-  const hot = res.some((r) => r.tankF != null && r.tankF >= 131);
-  const overdue = !hot && res.length > 200; // require a mostly-complete window
+  const dwellMin = longestDwellMin(res, SANITIZE_VERIFY_F);
+  const satisfied = dwellMin >= SANITIZE_DWELL_MIN;
+  const overdue = !satisfied && res.length > 200; // require a mostly-complete window
 
-  // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE
-  // durable/guarded boost to 131°F for 60 min before alerting. Idempotency guard: skip
-  // if a boost is already active (prevents a double-fire during the tank's ramp to 131 —
-  // the soak stays unsatisfied for several polls while the water heats). The boost reuses
-  // the existing human-triggered write primitive verbatim (setTarget's I4 envelope + I1
-  // cross-check + rate limit + read-back + audit all apply). Fail-safe: if setTarget
-  // rejects (e.g. I1 — a pump setpoint is below 136°F), do NOT retry; fall through to the
-  // existing overdue-soak alert so the owner is still notified and nothing is forced.
+  // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE durable/guarded
+  // boost to the 140°F sanitize target (sanitizeCapF so it isn't clamped to 135; I1 still guards) for
+  // long enough to reach temp AND hold the dwell. Idempotency guard: skip if a boost is already active
+  // (the soak stays unsatisfied for several polls while the water heats). The boost reuses the
+  // human-triggered write primitive verbatim (envelope + I1 + rate limit + read-back + audit all
+  // apply). Fail-safe: if setTarget rejects (e.g. I1 — a pump setpoint below target+margin), do NOT
+  // retry; fall through to the overdue-soak alert so the owner is notified and nothing is forced.
   if (overdue && AUTO_SANITIZE_ENABLED) {
     const active = await store.activeBoost().catch(() => null);
     if (!active) {
       try {
-        await writer.boost(131, 60, "auto-sanitize");
-        await ntfy("Auto-sanitize", "Daily 131°F soak triggered automatically.");
+        await writer.boost(DEFAULT_OPTS.sanitizeF, 120, "auto-sanitize", DEFAULT_OPTS.sanitizeCapF);
+        await ntfy("Auto-sanitize", `Daily ${DEFAULT_OPTS.sanitizeF}°F soak triggered automatically.`);
         return; // boost placed; the soak will satisfy within ~24h — don't also alert
       } catch (e) {
         // Rejected (guardrail) or write failure — let the overdue alert below fire.
         console.warn("auto-sanitize boost rejected/failed:", (e as Error).message);
       }
     } else {
-      return; // boost already running toward 131 — soak is in progress, don't alert
+      return; // boost already running toward the soak — in progress, don't alert
     }
   }
 
   if (overdue && !i8Alerted) {
     i8Alerted = true;
     await ntfy(
-      "I8 hygiene: no 131°F tank excursion in 26h",
-      "The DHW coil's potable slug hasn't had its daily hot soak. Boost the tank target to 131°F+ for an hour (Control → HBX card), or check why the planner's sanitize boost didn't run.",
+      `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in 26h`,
+      `The DHW coil's potable slug hasn't held a pasteurizing soak (needs ≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min; best in the window: ${Math.round(dwellMin)} min). Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card), or check why the planner's sanitize didn't run.`,
       "high",
     );
-  } else if (hot && i8Alerted) {
+  } else if (satisfied && i8Alerted) {
     i8Alerted = false;
-    await ntfy("I8 hygiene satisfied", "Tank reached ≥131°F — daily soak requirement met.");
+    await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`);
   }
 }
 

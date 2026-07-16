@@ -69,13 +69,37 @@ export class PhaseB {
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
   ) {}
 
+  /** Current-hour tank target from the latest shadow plan — setpoints must LEAD the plan up (esp.
+   *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan. */
+  private async currentPlanTarget(): Promise<number | null> {
+    try {
+      const plans = await this.store.recentPlans(6);
+      const latest = plans.at(-1);
+      if (!latest || !Array.isArray(latest.plan) || latest.plan.length === 0) return null;
+      const now = Date.now();
+      const block =
+        latest.plan.filter((b: { ts: string }) => new Date(b.ts).getTime() <= now).at(-1) ?? latest.plan[0];
+      const t = Number(block?.tank_target_f);
+      return Number.isFinite(t) ? t : null;
+    } catch {
+      return null;
+    }
+  }
+
   async runOnce(): Promise<void> {
     const latest = await this.store.getLatestSlx();
     if (!latest || latest.targetF == null || Date.now() - latest.ts.getTime() > SLX_FRESH_MS) {
       this.lastResults = { _skip: "no fresh HBX target — not tracking on stale data" };
       return;
     }
-    const decisions = computeTracking(latest.targetF, this.pumpIds);
+    // Track the HIGHER of the operative target and the planned current-hour target so the setpoints
+    // LEAD an upward move (the daily sanitize to 140°F): the pump can serve the new target the instant
+    // the auto-pilot commands it, instead of a target-up / setpoint-lagging I1 deadlock. max() never
+    // drops the setpoint below tracking the operative target, so I1 is only ever strengthened.
+    const opTarget = latest.targetF;
+    const planTarget = await this.currentPlanTarget();
+    const effectiveTarget = planTarget != null ? Math.max(opTarget, planTarget) : opTarget;
+    const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();
 
     for (const d of decisions) {
