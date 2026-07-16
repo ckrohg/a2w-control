@@ -43,7 +43,11 @@ export function computeTracking(
   marginF: number = DEFAULT_OPTS.i1MarginF,
 ): TrackDecision[] {
   const requiredF = targetF + marginF;
-  const raw = Math.round(fToC(requiredF));
+  // CEIL, not round: setpoints are sent as whole °C, and round-to-nearest can land the setpoint
+  // ~0.2°F BELOW target+margin (e.g. 140.2°F → 60.1°C → round 60°C = 140.0°F < 140.2), tripping the
+  // I1 monitor for a phantom shortfall. Ceil sends the smallest whole °C that still covers
+  // target+margin — I1 guaranteed, minimal COP cost (≤1.8°F above the ideal setpoint).
+  const raw = Math.ceil(fToC(requiredF));
   const value = Math.min(Math.max(raw, FLOOR_C), CAP_C);
   const note =
     raw > CAP_C ? ` (required ${raw}°C exceeds cap ${CAP_C} — sending cap; I1 monitor will flag)` :
