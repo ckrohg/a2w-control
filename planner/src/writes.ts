@@ -110,8 +110,38 @@ export class HbxWriter {
       await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
     }
 
-    return this.patch({ dbt: targetF, mbt: targetF }, source, "set_target",
+    const result = await this.patch({ dbt: targetF, mbt: targetF }, source, "set_target",
       `target fixed at ${targetF}°F (curve flattened)`);
+
+    // OPERATIVE-target verification (setTarget ONLY — this is a flatten, so the expected
+    // operative target == targetF; restore leaves dbt≠mbt where the target is the curve
+    // output, so this must NOT run there). The config-echo check inside patch() only proves
+    // the API accepted dbt/mbt — it does NOT prove the device recomputed the target it's
+    // actually driving to. The read the planner trusts is dev.temps.temp1.target
+    // (index.ts:155). If that didn't move, the write silently no-op'd on hardware and lowering
+    // pump setpoints against the unmoved target manufactures an I1 deadlock (the 2026-07-15
+    // incident — see hbx-target-write-noop-diagnosis.md).
+    await new Promise((r) => setTimeout(r, 8000)); // let the device recompute + report up
+    const dev = await this.slx.getDevice(this.buildingId, this.syncCode);
+    const op = dev?.temps?.temp1?.target as number | null | undefined;
+    if (op == null || Math.abs(op - targetF) > 2) {
+      await this.store.insertHbxWrite({
+        source,
+        action: "set_target",
+        requested: { target_f: targetF },
+        result: "verify_mismatch",
+        detail: `device did not apply target: operative temp1.target=${op}°F, wanted ${targetF}°F (HBX write no-op — see hbx-target-write-noop-diagnosis.md)`,
+      });
+      // Roll the CLOUD config back so curve_overridden doesn't drift on a write that never
+      // reached the device. Best-effort — the throw below is what the caller must see.
+      await this.restore(`${source}:noop-rollback`).catch(() => {});
+      throw new WriteError(
+        502,
+        `HBX target write did not take effect on the device (operative target still ${op}°F). See hbx-target-write-noop-diagnosis.md.`,
+      );
+    }
+
+    return result;
   }
 
   /**

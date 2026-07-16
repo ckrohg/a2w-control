@@ -123,6 +123,14 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
 
   return (
     <div className="cards" style={{ marginTop: 4 }}>
+      {/* Write path disabled — the HBX target write is currently a no-op on the device */}
+      <div className="card banner" style={{ gridColumn: "1 / -1" }}>
+        ⚠ <b>Tank-target control is temporarily disabled</b> — the HBX write path does not
+        currently reach the device (it silently no-op&apos;d; diagnosis in
+        {" "}<code>hbx-target-write-noop-diagnosis.md</code>). The recommendation below is
+        informational only until the write path is fixed.
+      </div>
+
       {/* Recommended summer setting */}
       <div className="card" style={{ gridColumn: "1 / -1" }}>
         <h2>
@@ -165,7 +173,7 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
         <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
           <button
             type="button"
-            disabled={busy || alreadyApplied}
+            disabled
             onClick={() =>
               act(
                 "/api/planner/target",
@@ -175,7 +183,7 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
             }
             style={{ flex: "0 0 auto" }}
           >
-            {alreadyApplied ? "Already applied ✓" : busy ? "…" : `Apply — set tank target to ${SAFE_FLOOR_F}°F`}
+            {alreadyApplied ? "Already applied ✓" : `Apply — disabled (write no-op)`}
           </button>
           <button
             type="button"
@@ -229,7 +237,7 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
             <div className="temps" style={{ alignItems: "center", marginTop: 10 }}>
               <button
                 type="button"
-                disabled={busy || deeperApplied}
+                disabled
                 onClick={() =>
                   act(
                     "/api/planner/target",
@@ -239,7 +247,7 @@ export default function OptimizeClient({ rate, dailyKwh }: { rate: number; daily
                 }
                 style={{ flex: "0 0 auto" }}
               >
-                {deeperApplied ? "Already applied ✓" : busy ? "…" : `Apply — set tank target to ${DEEPER_CUT_F}°F`}
+                {deeperApplied ? "Already applied ✓" : `Apply — disabled (write no-op)`}
               </button>
             </div>
             {msg ? (
