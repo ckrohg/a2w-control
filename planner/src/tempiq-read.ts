@@ -23,6 +23,7 @@
  */
 
 import type { Store } from "./store";
+import { fetchInsightSpatialGraph, summarizeWarmAdjacency } from "./spatial";
 
 const COP_BACKFILL_MS = 7 * 24 * 60 * 60 * 1000; // first fetch reaches back 7 days
 const COP_PAGE_LIMIT = 2000;
@@ -106,6 +107,13 @@ export class TempiqReader {
       failed++;
       results.push(`zone-energy error: ${e instanceof Error ? e.message : String(e)}`);
     }
+    // ADVISORY (#33): spatial world-model. NOT one of the 3 critical endpoints — a hiccup logs but
+    // must not inflate the failure streak / alerting, so it never touches `failed`.
+    try {
+      results.push(await this.fetchSpatialGraph());
+    } catch (e) {
+      results.push(`spatial error: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     if (failed < 3) this.lastFetchAt = new Date().toISOString();
     this.lastResult = results.join(", ");
@@ -176,6 +184,16 @@ export class TempiqReader {
     const body = await this.get<Record<string, unknown>>("/api/insights/zone-energy");
     await this.store.upsertTempiqZoneEnergy(body);
     return "zone-energy: snapshot";
+  }
+
+  /** ADVISORY (TempIQv2#1600 / kanban a2w-control#33): pull the spatial world-model and LOG the
+   * "which zones share warmth" adjacency signal for safe-setback reasoning. Read-only observability —
+   * it does NOT touch the demand-floor / buffer-control decision (that integration is a separate,
+   * owner-reviewed step). Consumes GET /api/insights/spatial-graph (TempIQv2#1651). */
+  private async fetchSpatialGraph(): Promise<string> {
+    const graph = await fetchInsightSpatialGraph(this.baseUrl, this.token);
+    console.log(`[tempiq-read] warm-adjacency (advisory): ${summarizeWarmAdjacency(graph)}`);
+    return `spatial: ${graph.edges.length} edges`;
   }
 }
 
