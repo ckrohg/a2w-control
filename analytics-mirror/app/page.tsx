@@ -34,6 +34,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   const hours = searchParams.hours === "168" ? 168 : 24;
   let rows: Reading[] = [];
   let slx: SlxLatest | null = null;
+  let commandedTargetF: number | null = null;
   let shadow: ShadowBlock[] | null = null;
   let driftAt: number | null = null;
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
@@ -48,6 +49,12 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                hd_active, stages_called, backup_called, connected
         FROM slx_readings ORDER BY ts DESC LIMIT 1`;
       slx = s.rowCount ? s.rows[0] : null;
+      // Commanded target = midpoint of the latest reset-curve we wrote. Differs from the
+      // operative (slx.tank_target_f) during the adoption lag (until the next reheat cycle).
+      const cc = await sql<{ dbt: number; mbt: number }>`
+        SELECT (config->>'dbt')::float8 AS dbt, (config->>'mbt')::float8 AS mbt
+        FROM hbx_config_versions ORDER BY id DESC LIMIT 1`;
+      commandedTargetF = cc.rowCount ? Math.round((cc.rows[0].dbt + cc.rows[0].mbt) / 2) : null;
       const sp = await sql`SELECT plan FROM shadow_plans ORDER BY id DESC LIMIT 1`;
       shadow = sp.rowCount ? (sp.rows[0].plan as ShadowBlock[]) : null;
       const d = await sql`
@@ -156,7 +163,14 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               </h2>
               <div className="temps">
                 <div className="temp"><div className="v">{fmt(slx?.tank_f, 1)}°</div><div className="l">Tank</div></div>
-                <div className="temp"><div className="v">{fmt(slx?.tank_target_f, 1)}°</div><div className="l">Target</div></div>
+                <div className="temp">
+                  <div className="v">{commandedTargetF != null ? commandedTargetF : fmt(slx?.tank_target_f, 1)}°</div>
+                  <div className="l">
+                    {commandedTargetF != null && slx?.tank_target_f != null && Math.abs(commandedTargetF - slx.tank_target_f) > 3
+                      ? `Target · adopting (${fmt(slx.tank_target_f, 0)}°)`
+                      : "Target"}
+                  </div>
+                </div>
                 <div className="temp"><div className="v">{fmt(slx?.outdoor_f, 1)}°</div><div className="l">Outdoor</div></div>
               </div>
               <div className="meta">

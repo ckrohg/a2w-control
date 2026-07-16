@@ -337,6 +337,7 @@ export default function ControlClient() {
 
 type HbxStatus = {
   tank_f: number | null; target_f: number | null; outdoor_f: number | null;
+  commanded_target_f?: number | null; adoption_pending?: boolean;
   band: { lo: number; hi: number } | null;
   curve_overridden: boolean; baseline: { dbt: number; mbt: number } | null;
   last_write_at: string | null; i1_margin_f: number;
@@ -404,12 +405,21 @@ function HbxTargetCard() {
       <div className="card">
         <h2>
           HBX tank target
-          <span className={`chip ${st.curve_overridden ? "warn" : "ok"}`}>
-            {st.curve_overridden ? "curve overridden" : "as-found curve"}
+          <span className={`chip ${st.adoption_pending ? "warn" : st.curve_overridden ? "ok" : "ok"}`}>
+            {st.adoption_pending ? "adopting next cycle" : st.curve_overridden ? "curve set" : "as-found curve"}
           </span>
         </h2>
         <div className="temps">
-          <div className="temp"><div className="v">{st.target_f == null ? "—" : st.target_f.toFixed(1)}°</div><div className="l">Live target</div></div>
+          <div className="temp">
+            <div className="v">
+              {st.commanded_target_f != null ? st.commanded_target_f : st.target_f == null ? "—" : st.target_f.toFixed(0)}°
+            </div>
+            <div className="l">
+              {st.adoption_pending && st.target_f != null
+                ? `Commanded · adopting (now ${st.target_f.toFixed(0)}°)`
+                : "Target"}
+            </div>
+          </div>
           <div className="temp"><div className="v">{st.tank_f == null ? "—" : st.tank_f.toFixed(1)}°</div><div className="l">Tank</div></div>
           <div className="temp"><div className="v">{band ? `${band.lo}–${band.hi}` : "—"}</div><div className="l">Allowed °F (I4)</div></div>
         </div>
