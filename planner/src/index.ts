@@ -333,30 +333,69 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
 /**
  * Adoption monitor: a commanded HBX target (the reset-curve midpoint) only takes effect on the
  * device at the START of the next reheat cycle (proven 2026-07-16 — the device re-reads the cloud
- * curve when a call begins). So if a stage is CALLING (a reheat is running) yet the operative
- * target (temp1.target) still doesn't match the commanded curve, the cloud write did NOT take —
- * the dial silently failed. Edge-triggered high alert; clears on convergence. No alert while
- * merely satisfied/coasting with no reheat — that's the normal adoption lag, not a failure.
+ * curve when a call begins). A write that "took" shows up as the operative target (temp1.target)
+ * converging onto the commanded midpoint; a silent failure leaves them diverged.
+ *
+ * We raise the edge-triggered high alert on EITHER signal that the write did not land:
+ *   (a) a reheat has RUN while still diverged — the device got its chance to re-read the curve and
+ *       didn't adopt. LATCHED across polls (`reheatSeenWhileOff`), so a short reheat that starts and
+ *       ends between two 5-min samples still counts. The old `off && reheating` check only fired if
+ *       we happened to sample mid-call, so in a low-call (warm) season a real failure could slip by.
+ *   (b) the divergence has persisted past ADOPTION_STALE_MS with no convergence — covers the RAISE
+ *       case, where the device is satisfied at its old (lower) target and will never call on its
+ *       own, so signal (a) can never arrive.
+ * A fresh command restarts the clock. Clears on convergence. A brief post-write divergence with no
+ * reheat yet is the normal adoption lag, not a failure — neither signal fires until a reheat runs or
+ * the backstop elapses.
  */
+const ADOPTION_STALE_MS = 2 * 60 * 60 * 1000; // 2 h: a command unrealized this long is a failure
 let adoptionAlerted = false;
+let adoptionOffSince: number | null = null;
+let adoptionReheatSeenWhileOff = false;
+let adoptionLastCommanded: number | null = null;
 async function checkAdoption(reading: SlxReading, config: Record<string, number>): Promise<void> {
   const operative = reading.tankTargetF;
   const dbt = config.dbt, mbt = config.mbt;
   if (operative == null || dbt == null || mbt == null) return;
   const commanded = (dbt + mbt) / 2;
+
+  // A new command restarts adoption tracking: fresh grace period, fresh reheat observation, and a
+  // clean alert slate so the previous command's verdict never bleeds onto this one.
+  if (adoptionLastCommanded == null || Math.abs(commanded - adoptionLastCommanded) > 0.5) {
+    adoptionLastCommanded = commanded;
+    adoptionOffSince = null;
+    adoptionReheatSeenWhileOff = false;
+    adoptionAlerted = false;
+  }
+
   const off = Math.abs(commanded - operative) > 3;
-  const reheating = reading.stagesCalled?.some(Boolean) === true;
-  if (off && reheating && !adoptionAlerted) {
+  if (!off) {
+    // Converged (or never diverged): reset the off-stretch and clear any standing alert.
+    adoptionOffSince = null;
+    adoptionReheatSeenWhileOff = false;
+    if (adoptionAlerted) {
+      adoptionAlerted = false;
+      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`);
+    }
+    return;
+  }
+
+  // Diverged: track how long, and whether a reheat has had a chance to re-read the curve.
+  if (adoptionOffSince == null) adoptionOffSince = Date.now();
+  if (reading.stagesCalled?.some(Boolean) === true) adoptionReheatSeenWhileOff = true;
+  const offForMs = Date.now() - adoptionOffSince;
+
+  if ((adoptionReheatSeenWhileOff || offForMs > ADOPTION_STALE_MS) && !adoptionAlerted) {
     adoptionAlerted = true;
-    console.warn(`ADOPTION FAILED: commanded ${commanded.toFixed(1)}°F, reheat running at operative ${operative.toFixed(1)}°F`);
+    const why = adoptionReheatSeenWhileOff
+      ? "a reheat has run but the operative target never moved onto it"
+      : `it has stayed diverged for ${Math.round(offForMs / 60000)} min with no adopting reheat`;
+    console.warn(`ADOPTION FAILED: commanded ${commanded.toFixed(1)}°F, operative ${operative.toFixed(1)}°F — ${why}`);
     await ntfy(
       "HBX target not adopting",
-      `Commanded ${commanded.toFixed(1)}°F but a reheat is running at operative ${operative.toFixed(1)}°F — the cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
+      `Commanded ${commanded.toFixed(1)}°F but operative is ${operative.toFixed(1)}°F — ${why}. The cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
       "high",
     );
-  } else if (!off && adoptionAlerted) {
-    adoptionAlerted = false;
-    await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`);
   }
 }
 
