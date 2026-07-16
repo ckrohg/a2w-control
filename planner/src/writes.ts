@@ -135,11 +135,25 @@ export class HbxWriter {
     // adoption. CAVEAT for Phase C: any pump-setpoint reduction must gate on the OPERATIVE
     // target (temp1.target), never this commanded value, or the adoption lag can manufacture an
     // I1 stall (the 2026-07-15 incident).
+    // Emulate a FIXED target with a valid near-flat reset curve, computed so the curve's OUTPUT
+    // at the CURRENT outdoor equals targetF exactly. A naive dbt=T+2/mbt=T-2 centers the band on T
+    // but the reset-curve output sits near mbt at warm outdoor (and near dbt when cold), so the
+    // operative target reads ~1°F off. Solving for the outdoor removes that bias: with slope point
+    // f = (outdoor-dot)/(wwsd-dot) and spread s, set mbt = T - s(1-f), dbt = T + s·f  ⇒
+    // output(outdoor) = T, while dbt-mbt = s (a valid, non-degenerate curve; the device ignores
+    // dbt==mbt). Drift as outdoor moves is bounded by s over the whole 5–125°F range (~±0.7°F/day).
+    const cc = cfg as { dot?: number; wwsd?: number } | null;
+    const dot = cc?.dot ?? 5;
+    const wwsd = cc?.wwsd ?? 125;
+    const f = Math.max(0, Math.min(1, ((latest!.outdoorF as number) - dot) / (wwsd - dot)));
+    const SPREAD = 4;
+    const dbt = Math.round(targetF + SPREAD * f);
+    const mbt = Math.round(targetF - SPREAD * (1 - f));
     return this.patch(
-      { dbt: targetF + 2, mbt: targetF - 2 },
+      { dbt, mbt },
       source,
       "set_target",
-      `target ${targetF}°F commanded (curve ${targetF + 2}/${targetF - 2}; adopts on the next reheat cycle)`,
+      `target ${targetF}°F commanded (curve ${dbt}/${mbt} → ${targetF}°F output at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
     );
   }
 
