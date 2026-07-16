@@ -2,8 +2,9 @@
 // @purpose Plan page client (route /optimize). Rebuilt from the "Optimize" surface into the
 // "Plan" surface per the approved redesign. TOP of page is a PREVIEW of the planner's
 // hour-by-hour schedule and how much autonomy you grant it:
-//   1. Autonomy switch (Off · Set & forget · Request · Armed) — VIEW/INTENT ONLY. Nothing here
-//      executes: Phase B autonomous drive is off AND the HBX write path is a no-op. Mode changes
+//   1. Autonomy switch (Off · Set & forget · Request · Armed) — VIEW/INTENT ONLY: this switch does
+//      not control actuation. Live reality (stated in the status line): Phase B HP-setpoint tracking
+//      is ON (planner flag, ~5-min cadence), the HBX tank-target write is still a no-op. Mode changes
 //      only re-render the timeline chart + copy.
 //   2. Boost card — presets + a Custom… reveal + a capacity readout. PREVIEW ONLY: it overlays a
 //      raised segment on the chart and never calls /api/planner/boost.
@@ -610,10 +611,12 @@ export default function OptimizeClient({
             </p>
           </div>
 
-          {/* honest "not executing yet" status — always visible under the switch */}
+          {/* honest live-state status — always visible under the switch */}
           <div className="plan-honest-status">
-            Currently shadow — autonomous execution isn&apos;t enabled yet (Phase B is off and the
-            HBX write path is down). This switch previews each mode.
+            <b>Phase B is LIVE</b> — the planner is autonomously driving each HP setpoint to
+            (tank target + 5&deg;F), re-asserted every 5&nbsp;min. The tank-target write is still
+            down, so the deeper plan savings aren&apos;t active yet. This switch is a preview — it
+            does <b>not</b> control the live tracking (that&apos;s a planner flag).
           </div>
 
           {/* Request mode: display-only "changes waiting" chips */}
