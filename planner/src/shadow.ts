@@ -43,8 +43,11 @@ export interface ShadowOpts {
 
 export const DEFAULT_OPTS: ShadowOpts = {
   dhwWindows: [[6, 9], [17, 22]],
-  dhwFloorF: 120,
-  idleF: 110,
+  dhwFloorF: 120, // minimum DHW-ready buffer temp — below this an unexpected draw is lukewarm
+  // Off-window target. The buffer feeds DHW and draws are unpredictable / year-round, so we never
+  // coast below DHW-ready — a cold shower isn't worth the trivial standby saving of a 110°F idle.
+  // Enforced ≥ dhwFloorF at the use site; raise this only to bank EXTRA capacity, never below it.
+  idleF: 120,
   prechargeLookbackH: 3,
   i1MarginF: 5, // A-4-measured 2026-07-14: tank sensor terminated at +3.1°F; 5 keeps a cushion
   hpMinF: 113,
@@ -95,9 +98,11 @@ export function computeShadowPlan(
   type Draft = { f: ForecastHour; localH: number; target: number; reason: string };
   const draft: Draft[] = hours.map((f) => {
     const localH = f.ts.getHours(); // TZ env makes this local time
+    // Off-window still holds the DHW-ready floor — draws are unpredictable and happen year-round,
+    // so the buffer can never coast below what a hot-water tap needs (Math.max makes that structural).
     return inWindow(localH)
       ? { f, localH, target: opts.dhwFloorF, reason: "DHW window floor" }
-      : { f, localH, target: opts.idleF, reason: "idle (no draws expected)" };
+      : { f, localH, target: Math.max(opts.idleF, opts.dhwFloorF), reason: "off-window DHW-ready floor (draws possible any hour)" };
   });
 
   // Pre-charge: for each window start present in the horizon, pick the warmest of the
