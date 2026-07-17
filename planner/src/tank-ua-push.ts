@@ -3,10 +3,13 @@
  * single standby UA (°F/hr per °F ΔT) and push it to TempIQ's POST /api/insights/tank-standby-ua.
  *
  * The planner fits UA under genuinely quiet conditions (HP off, no draw, no charge-rise —
- * decay.ts), which TempIQ's own opportunistic "slowest-segment" estimator can't reproduce: on
- * this always-on-circulator buffer the slowest declines are the most pump-heat-biased, so TempIQ
- * reads UA ~4× LOW (~0.006 vs the deliberate-coast ~0.028). TempIQ's hydronic COP standby resolver
- * prefers this pushed value (TempIQv2 PR #1689, behind A2W_TANK_UA_ENABLED).
+ * decay.ts). CORRECTED (gtm#1367): the earlier claim that TempIQ "reads ~4× LOW ~0.006" via
+ * circulator pump-heat was WRONG — the circulator is ~14W (negligible). TempIQ actually read
+ * HIGH (~0.043) because its detector folded zone/DHW DRAW declines into "standby"; with that
+ * fixed (draw-exclusion, TempIQv2 #1718) TempIQ's own quiet-fit and this one AGREE (~0.017), and
+ * both sit below the deliberate full-coast anchor (~0.026 — the detectors' slowest-window
+ * selection is a survivorship low-floor). So this push is a clean cross-check, not a rescue.
+ * TempIQ's COP standby resolver prefers it when fresh (TempIQv2 #1689, behind A2W_TANK_UA_ENABLED).
  *
  * Fail-soft: a push failure NEVER touches the control loop (mirrors tempiq.ts). Flag-gated via the
  * same TEMPIQ_PUSH_ENABLED + TEMPIQ_SURFACE_TOKEN env as the readings pusher.
