@@ -179,6 +179,13 @@ export class Store {
         tank_target_f  real,
         source         text
       );
+      -- One row per live planner process (hostname:pid), heartbeated every poll. The
+      -- single-writer guard (README §Single-writer invariant, #36) uses it to detect a SECOND
+      -- planner running against the shared DB. Detection only — never gates a write.
+      CREATE TABLE IF NOT EXISTS planner_instances (
+        instance_id  text PRIMARY KEY,
+        heartbeat_at timestamptz NOT NULL DEFAULT now()
+      );
     `);
   }
 
@@ -570,6 +577,26 @@ export class Store {
       `INSERT INTO hbx_config_versions (changed_fields, config) VALUES ($1, $2)`,
       [changedFields === null ? null : JSON.stringify(changedFields), JSON.stringify(config)],
     );
+  }
+
+  /**
+   * Heartbeat THIS planner instance and return the ids of OTHER instances seen alive within
+   * freshMs. Non-blocking single-writer guard (#36): a non-empty result means a second planner
+   * is running against the shared DB and could collide on writes. Prunes rows dead > 1 h so the
+   * table can't grow across redeploys.
+   */
+  async heartbeatInstance(instanceId: string, freshMs: number): Promise<string[]> {
+    await this.pool.query(
+      `INSERT INTO planner_instances (instance_id, heartbeat_at) VALUES ($1, now())
+       ON CONFLICT (instance_id) DO UPDATE SET heartbeat_at = now()`,
+      [instanceId],
+    );
+    await this.pool.query(`DELETE FROM planner_instances WHERE heartbeat_at < now() - interval '1 hour'`);
+    const res = await this.pool.query(
+      `SELECT instance_id FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2`,
+      [instanceId, new Date(Date.now() - freshMs)],
+    );
+    return res.rows.map((r) => r.instance_id as string);
   }
 
   async close(): Promise<void> {

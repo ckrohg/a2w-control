@@ -75,10 +75,16 @@ the planner records its *own* writes with a `_source` tag and therefore never se
 - **48-hour surface** — the dashboard chip runs the acceptance query
   `changed_fields IS NOT NULL AND changed_fields->>'_source' IS NULL` over the last 48 h.
 
-*Not* auto-prevented: a rogue second planner instance (it also `_source`-tags, so neither
-instance pages). Today's mitigation is operational — one deployed writer. A DB-backed
-single-writer **lease** (a blocking guard in `patch()`) is the optional defense-in-depth in
-#36; it is deliberately deferred rather than added to the live write path mid-autopilot-rollout.
+- **Second instance** — each planner heartbeats an id (`hostname:pid`) into `planner_instances`
+  every poll; if a *second* live instance persists across two polls (the 2-poll grace absorbs a
+  rolling redeploy's container overlap) the planner pages **"⚠ Second planner instance detected
+  — single-writer at risk"** (high) and clears when solo again. This is **non-blocking** — it
+  can never wedge the real writer. `/health.instance` exposes the current id + peers.
+
+A DB-backed single-writer **lease** — a *blocking* guard in `patch()` that stops a second
+instance from writing at all — remains the optional defense-in-depth in #36; it is deliberately
+deferred rather than bolted onto the live write path mid-autopilot-rollout (a stale-lease bug
+could wedge the sole writer, a worse failure than the gap it closes).
 
 ## Environment variables
 

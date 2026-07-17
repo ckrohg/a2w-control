@@ -2,7 +2,8 @@
  * @purpose A2W planner service — Phase A-2: the SensorLinx reader. Polls the ECO-0600
  * every POLL_SECONDS via api.sensorlinx.co, stores narrow readings in Neon, versions any
  * config drift (curve/staging/backup edits) with an ntfy alert, and exposes /health.
- * Read-only: this service never writes to SensorLinx (write adapter = Phase C, plan §5.2).
+ * Also the SOLE guarded writer of the HBX curve (writes.ts; README §Single-writer invariant):
+ * any FOREIGN (non-planner) curve write is detected + paged, and a second live instance flagged.
  * Edge-triggered offline alerting after OFFLINE_AFTER_FAILURES consecutive poll failures.
  */
 
@@ -11,6 +12,7 @@ import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
 import crypto from "node:crypto";
+import os from "node:os";
 import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
@@ -426,6 +428,40 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
   }
 }
 
+// Non-blocking single-writer guard (#36): heartbeat this instance every poll and page if a
+// SECOND planner instance is ever live against the shared DB (only one may write the HBX). It
+// NEVER blocks a write — a blocking lease is the deferred defense-in-depth. A rolling Railway
+// redeploy briefly overlaps two containers, so we require a peer to persist across TWO polls
+// before paging; the alert clears when this is the only instance again.
+const INSTANCE_ID = `${os.hostname()}:${process.pid}`;
+const INSTANCE_FRESH_MS = 12 * 60 * 1000; // > 2× the 5-min poll, so a slow poll isn't "dead"
+let instancePrevPeers = new Set<string>();
+let multiInstanceAlerted = false;
+async function checkSingleWriter(): Promise<void> {
+  let peers: string[];
+  try {
+    peers = await store.heartbeatInstance(INSTANCE_ID, INSTANCE_FRESH_MS);
+  } catch (e) {
+    console.error("single-writer heartbeat failed:", (e as Error).message);
+    return;
+  }
+  const peerSet = new Set(peers);
+  // Count only peers seen on BOTH this poll and the last — filters a redeploy's brief overlap.
+  const sustained = peers.filter((id) => instancePrevPeers.has(id));
+  instancePrevPeers = peerSet;
+  if (sustained.length && !multiInstanceAlerted) {
+    multiInstanceAlerted = true;
+    await ntfy(
+      "⚠ Second planner instance detected — single-writer at risk",
+      `This planner (${INSTANCE_ID}) sees another live instance for ≥2 polls: ${sustained.join(", ")}. Only ONE planner may write the HBX (README §Single-writer invariant, #36) — a second writer bypasses the guardrails and can collide. Shut the extra instance down, or set its AUTOPILOT_DRY_RUN=1 / PHASE_B_DRY_RUN=1.`,
+      "high",
+    );
+  } else if (multiInstanceAlerted && !peerSet.size) {
+    multiInstanceAlerted = false;
+    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`);
+  }
+}
+
 /**
  * Adoption monitor: a commanded HBX target (the reset-curve midpoint) only takes effect on the
  * device at the START of the next reheat cycle (proven 2026-07-16 — the device re-reads the cloud
@@ -705,6 +741,7 @@ async function pollOnce(): Promise<void> {
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
+  await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
@@ -827,6 +864,7 @@ async function main(): Promise<void> {
           const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+            instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",

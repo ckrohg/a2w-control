@@ -348,10 +348,12 @@ I4-clamped, I1-checked, rate-limited, read-back-verified, self-recorded with a
 - **Detection (two layers):** the poll loop diffs the device against the last-recorded config
   *captured before its own writes*, so any diff is a foreign writer — a foreign curve
   (`dbt`/`mbt`) change pages "⚠ Foreign HBX curve write — single-writer invariant" (high); the
-  dashboard also surfaces a 48 h `_source IS NULL` chip. The one gap left un-blocked (a second
-  planner instance, which also `_source`-tags) is covered by operational discipline; the
-  optional DB-backed **blocking lease** in `patch()` is deferred (not added to the live write
-  path mid-autopilot-rollout). Full write-path doc: `planner/README.md` §Single-writer invariant.
+  dashboard also surfaces a 48 h `_source IS NULL` chip. A second planner instance (which also
+  `_source`-tags, so the drift path can't see it) is caught by a **non-blocking** heartbeat guard
+  (`planner_instances`): if two instances are live for ≥2 polls, the planner pages "⚠ Second
+  planner instance detected". Only a *blocking* DB-backed **lease** in `patch()` would prevent
+  (vs. detect) it — deferred as optional defense-in-depth (a stale-lease bug could wedge the sole
+  writer). Full write-path doc: `planner/README.md` §Single-writer invariant.
 
 ### 5.3 What we deliberately do NOT do
 
