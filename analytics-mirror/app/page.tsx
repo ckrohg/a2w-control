@@ -40,6 +40,10 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let driftAt: number | null = null;
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
   let calls: { ts: number; any_call: boolean }[] = [];
+  // Backup shadow-test: with the 16.5 kW element's SPAN breaker physically OFF, backup_called
+  // still reflects the HBX's DECISION to call it — so this counts how often our settings would
+  // have fired the element over 7 days (cost-free while the breaker is off). 0 = settings clean.
+  let backupShadow: { episodes7d: number; lastCalled: number | null } | null = null;
   let dbError = false;
   try {
     await ensureSchema();
@@ -80,6 +84,17 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                (backup_called OR EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s)) AS any_call
         FROM slx_readings WHERE ts >= now() - (${hours} || ' hours')::interval
         ORDER BY ts ASC`).rows as { ts: number; any_call: boolean }[];
+      const bs = await sql`
+        WITH b AS (
+          SELECT ts, backup_called, lag(backup_called) OVER (ORDER BY ts) AS prev
+          FROM slx_readings WHERE ts >= now() - interval '7 days')
+        SELECT COUNT(*) FILTER (WHERE backup_called AND NOT COALESCE(prev, false)) AS episodes,
+               EXTRACT(EPOCH FROM MAX(ts) FILTER (WHERE backup_called))::float8 AS last_called
+        FROM b`;
+      backupShadow = {
+        episodes7d: Number(bs.rows[0].episodes) || 0,
+        lastCalled: bs.rows[0].last_called != null ? Number(bs.rows[0].last_called) : null,
+      };
       const fs = await sql`
         SELECT pump_id, name, ts, snapshot->'active_faults' AS faults FROM pump_snapshots
         WHERE jsonb_array_length(snapshot->'active_faults') > 0`;
@@ -188,6 +203,29 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <div className="meta">
                 Stages: {stagesTxt} · Backup: {slx?.backup_called ? "CALLED" : "off"} · <a href="/hbx" style={{ color: "#4dabf7" }}>details →</a>
               </div>
+              {backupShadow && (
+                <div className="meta" style={{ marginTop: 4 }}>
+                  <span
+                    className={`chip ${backupShadow.episodes7d === 0 && !slx?.backup_called ? "ok" : "warn"}`}
+                    style={{ marginRight: 6 }}
+                  >
+                    backup shadow-test
+                  </span>
+                  {backupShadow.episodes7d === 0 && !slx?.backup_called
+                    ? "HBX hasn't called the backup in 7 days ✓ — breaker off, settings clean"
+                    : `HBX called the backup ${backupShadow.episodes7d}× in 7 days${
+                        backupShadow.lastCalled
+                          ? ` · last ${new Date(backupShadow.lastCalled * 1000).toLocaleString("en-US", {
+                              month: "short",
+                              day: "numeric",
+                              hour: "numeric",
+                              minute: "2-digit",
+                              timeZone: "America/New_York",
+                            })}`
+                          : ""
+                      } — investigate (a setting may be triggering it)`}
+                </div>
+              )}
               {autopilot && (
                 <div className="meta" style={{ marginTop: 4 }}>
                   <span className={`chip ${autopilot.dryRun ? "warn" : "ok"}`} style={{ marginRight: 6 }}>
