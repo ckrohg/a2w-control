@@ -4,7 +4,8 @@ The planner service from `knowledge/reference/cross-system-optimization-plan.md`
 **Phase A-2: the SensorLinx reader** — later phases add the shadow planner (A-5), the
 day-plan solver (§6.2), and the guarded HBX write adapter (Phase C, §5.2).
 
-What it does now (READ-ONLY — this service never writes to SensorLinx):
+What it does now (it both **reads** the HBX and — through one guarded path — is the **sole
+writer** of the reset curve; see [§Single-writer invariant](#single-writer-invariant) below):
 
 - Polls the HBX ECO-0600 through **`api.sensorlinx.co`** (the app's host — richer than
   the legacy `mobile.` host TempIQ uses) every `POLL_SECONDS` (default 300).
@@ -19,6 +20,66 @@ What it does now (READ-ONLY — this service never writes to SensorLinx):
   consecutive poll failures, and recovery. Same topic the Pi/hub use.
 - `GET /health` → `{ok, lastPollAt, lastDriftAt, consecutiveFailures}` (503 when failing).
 
+## Single-writer invariant
+
+**The deployed Railway planner (`a2w-hub` → service `a2w-planner`) is the SOLE authorized
+writer of the HBX reset curve.** Every write to `api.sensorlinx.co` goes through one guarded
+code path, so every write is envelope-clamped, cross-checked, rate-limited, verified, and
+audited. This is the invariant that makes automation safe on a live heat pump (kanban #36).
+
+**One code path — no exceptions:**
+
+```
+sensorlinx.ts  patchDevice()        ← the ONLY method that PATCHes the device
+      ▲  (called by nothing else)
+writes.ts      HbxWriter            ← the ONLY caller: setTarget / boost / restore
+      ▲
+callers:  • auto-sanitize (index.ts, flag-gated daily soak)
+          • autopilot.ts (applies the shadow-plan target, flag-gated)
+          • POST /api/hbx/{target,restore,boost}  (bearer-gated HTTP API)
+```
+
+Every accepted write, in order: **I4** outdoor-indexed envelope clamp → **I1** cross-check
+(each online pump must clear target + margin, or the write is rejected) → 15-min rate limit
+(restore exempt) → PATCH with read-back verify → a self-recorded `hbx_config_versions` row
+tagged `changed_fields._source` → an audit row in `hbx_writes` for **every** attempt
+(accepted *or* rejected). Adoption is asynchronous (next reheat cycle); `status()` reports
+commanded-vs-operative.
+
+**Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
+planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
+integration) MUST call the planner so the guardrails apply:
+
+```
+POST /api/hbx/target   {"target_f": 128}     Authorization: Bearer $PLANNER_API_TOKEN
+POST /api/hbx/boost    {"target_f": 140, "minutes": 90}
+POST /api/hbx/restore
+GET  /api/hbx/target                          → writer.status()
+```
+
+**Forbidden (these break the invariant):**
+- **Any direct-to-SensorLinx script.** The overnight target-write agent that authenticated to
+  `api.sensorlinx.co` and PATCHed the curve directly is **RETIRED** — its mechanism is folded
+  into `writes.ts` and its function lives in `autopilot.ts` + the API above. Re-running such a
+  script bypasses every guardrail (it collided with a planner write 0.4 s apart on 2026-07-16).
+- **A second planner instance that writes.** Never run a local/parallel planner with
+  `AUTOPILOT_DRY_RUN=0` or `PHASE_B_DRY_RUN=0` against the shared Neon DB. Exactly one instance
+  writes; everything else must stay shadow/dry-run.
+
+**Detection.** A foreign write (any writer that isn't this planner) is caught two ways, because
+the planner records its *own* writes with a `_source` tag and therefore never self-alerts:
+- **Real-time** — the poll loop diffs the device against the last-recorded config *captured
+  before this cycle's own writes*; a foreign change to the curve (`dbt`/`mbt`) pages
+  **"⚠ Foreign HBX curve write — single-writer invariant"** (high); other foreign edits page
+  "HBX config changed (outside the planner)".
+- **48-hour surface** — the dashboard chip runs the acceptance query
+  `changed_fields IS NOT NULL AND changed_fields->>'_source' IS NULL` over the last 48 h.
+
+*Not* auto-prevented: a rogue second planner instance (it also `_source`-tags, so neither
+instance pages). Today's mitigation is operational — one deployed writer. A DB-backed
+single-writer **lease** (a blocking guard in `patch()`) is the optional defense-in-depth in
+#36; it is deliberately deferred rather than added to the live write path mid-autopilot-rollout.
+
 ## Environment variables
 
 | Var | Required | Notes |
@@ -29,6 +90,7 @@ What it does now (READ-ONLY — this service never writes to SensorLinx):
 | `SLX_SYNC_CODE` | no | default `AECO-2036` |
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
+| `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
@@ -56,7 +118,8 @@ hbx_config_versions(id pk, observed_at, changed_fields jsonb, config jsonb)
 ```
 
 Canonical as-found baseline: `knowledge/reference/hbx-config-asfound-20260713.json`.
-Write API (Phase C, not used here): `knowledge/reference/hbx-write-api.md`.
+Write API (now LIVE — the single guarded writer): `knowledge/reference/hbx-write-api.md`.
+See [§Single-writer invariant](#single-writer-invariant).
 
 Deliberate omissions for now: gap backfill via the minute-history endpoint
 (`POST .../history/minutes`) and the socket.io push channel — add if 5-min polling ever

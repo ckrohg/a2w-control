@@ -691,6 +691,15 @@ async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
   await store.insertReading(reading);
+  // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
+  // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
+  // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
+  // so diffing the poll-time device config against the last-recorded config taken HERE means a
+  // FOREIGN writer moved the curve — one that bypassed I4/I1/rate-limit/audit. (Reading the
+  // baseline AFTER autopilot writes — the old placement — would false-flag autopilot's OWN
+  // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
+  const config = extractConfig(dev);
+  const prevConfig = await store.latestConfig();
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
@@ -712,22 +721,36 @@ async function pollOnce(): Promise<void> {
     phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
   }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
 
-  const config = extractConfig(dev);
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
-  const prev = await store.latestConfig();
-  if (prev === null) {
+  if (prevConfig === null) {
     await store.insertConfigVersion(config, null);
     console.log("seeded initial hbx_config_versions row");
   } else {
-    const changes = diffConfig(prev, config);
+    // prevConfig was read at the TOP of this poll, before our own writes — so any diff is a
+    // FOREIGN writer (the planner records its own writes separately, via writes.ts patch()).
+    const changes = diffConfig(prevConfig, config);
     if (changes) {
       await store.insertConfigVersion(config, changes);
       lastDriftAt = new Date().toISOString();
       const summary = Object.entries(changes)
         .map(([k, c]) => `${k}: ${c.old} -> ${c.new}`)
         .join("\n");
-      console.warn(`HBX CONFIG DRIFT:\n${summary}`);
-      await ntfy("HBX config changed", summary, "high");
+      // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
+      // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
+      // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
+      // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
+      const curveViolation = "dbt" in changes || "mbt" in changes;
+      if (curveViolation) {
+        console.warn(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${summary}`);
+        await ntfy(
+          "⚠ Foreign HBX curve write — single-writer invariant",
+          `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${summary}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).`,
+          "high",
+        );
+      } else {
+        console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
+        await ntfy("HBX config changed (outside the planner)", summary, "high");
+      }
     }
   }
 }
