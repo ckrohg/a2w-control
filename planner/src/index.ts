@@ -358,6 +358,60 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
   }
 }
 
+/** DHW-comfort shortfall (owner ask 2026-07-16, load-bearing now that autopilot holds a low buffer):
+ *  the buffer sits BELOW the DHW-ready floor for a SUSTAINED period — the HPs can't hold hot-water temp
+ *  (a big draw, a genuine capacity shortfall, or a stuck-low autopilot target). This is the gap I8 does
+ *  NOT cover: I8 verifies a daily HOT soak; this catches the opposite — the tank running too COLD to
+ *  shower. Detection + high-priority page only (the HBX's own bkLag escalates to the element on a real
+ *  drawn-down call, breaker permitting; auto-raising the target here would fight autopilot's rate-limit).
+ *  Edge-triggered both ways. */
+const DHW_SHORTFALL_F = 113;   // below the 45 °C unattended floor → clearly cold for delivery (normal cycle bottoms ~117°F)
+const DHW_SHORTFALL_POLLS = 4; // ~20 min sustained at the 5-min poll — not a transient draw dip
+let dhwShortfallStreak = 0;
+let dhwShortfallAlerted = false;
+async function checkDHWShortfall(reading: SlxReading): Promise<void> {
+  if (reading.tankF == null) return;
+  if (reading.tankF >= DHW_SHORTFALL_F) {
+    dhwShortfallStreak = 0;
+    if (dhwShortfallAlerted) {
+      dhwShortfallAlerted = false;
+      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`);
+    }
+    return;
+  }
+  dhwShortfallStreak++;
+  if (dhwShortfallStreak >= DHW_SHORTFALL_POLLS && !dhwShortfallAlerted) {
+    dhwShortfallAlerted = true;
+    await ntfy(
+      "⚠ DHW comfort shortfall — buffer running cold",
+      `Buffer ${reading.tankF.toFixed(0)}°F, below the ${Math.round(DEFAULT_OPTS.dhwFloorF)}°F DHW-ready floor for ~${dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
+      "high",
+    );
+  }
+}
+
+/** Freeze-risk advisory (owner ask 2026-07-16): deep cold AND a low buffer at the same time. The HBX
+ *  P17 anti-freeze is the hard device-side backstop; this is planner visibility so the owner knows to
+ *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only); edge-triggered. */
+const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
+const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
+let freezeRiskAlerted = false;
+async function checkFreezeRisk(reading: SlxReading): Promise<void> {
+  if (reading.outdoorF == null || reading.tankF == null) return;
+  const risk = reading.outdoorF <= FREEZE_OUTDOOR_F && reading.tankF < FREEZE_TANK_F;
+  if (risk && !freezeRiskAlerted) {
+    freezeRiskAlerted = true;
+    await ntfy(
+      "⚠ Freeze-risk advisory",
+      `Outdoor ${reading.outdoorF.toFixed(0)}°F with the buffer only ${reading.tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
+      "high",
+    );
+  } else if (!risk && freezeRiskAlerted) {
+    freezeRiskAlerted = false;
+    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`);
+  }
+}
+
 /**
  * Adoption monitor: a commanded HBX target (the reset-curve midpoint) only takes effect on the
  * device at the START of the next reheat cycle (proven 2026-07-16 — the device re-reads the cloud
@@ -626,6 +680,8 @@ async function pollOnce(): Promise<void> {
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
+  await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
+  await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
