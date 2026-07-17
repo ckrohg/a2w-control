@@ -36,6 +36,19 @@ assert.equal(aggregateTankUa([]), null);
   assert.equal(agg!.windowEndMs, new Date("2026-07-14T00:00:00Z").getTime());
 }
 
+// 3b. Even count → average the two middle UAs (codex #37 P2), not the upper-middle.
+{
+  // UAs: 1/(149−65)=0.011905 and 3/(151.5−65)=0.034682 → median = mean = 0.023293.
+  const agg = aggregateTankUa([
+    fit(150, 148, 2, -1.0, "2026-07-10T00:00:00Z"),
+    fit(153, 150, 1.5, -3.0, "2026-07-11T00:00:00Z"),
+  ]);
+  assert.ok(agg);
+  assert.equal(agg!.nWindows, 2);
+  const expected = (1 / (149 - 65) + 3 / (151.5 - 65)) / 2;
+  assert.ok(Math.abs(agg!.ua - expected) < 1e-4, `even-median ua ${agg!.ua} vs ${expected}`);
+}
+
 // 4. Reject a near-ambient window (ΔT ≤ 10) and an out-of-band UA; keep the good one.
 {
   const agg = aggregateTankUa([

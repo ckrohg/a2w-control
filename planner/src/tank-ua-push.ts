@@ -56,7 +56,10 @@ export function aggregateTankUa(fits: DecayFitRow[]): TankUaAgg | null {
   }
   if (uas.length === 0) return null;
   uas.sort((a, b) => a - b);
-  const median = uas[Math.floor(uas.length / 2)];
+  // True median: average the two middle values for an even count (else the upper-middle
+  // biases the pushed UA slightly high). codex #37 P2.
+  const mid = Math.floor(uas.length / 2);
+  const median = uas.length % 2 === 0 ? (uas[mid - 1] + uas[mid]) / 2 : uas[mid];
   return {
     ua: Math.round(median * 100000) / 100000,
     nWindows: uas.length,
