@@ -157,21 +157,25 @@ Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow
 ## SPAN backup-element power alarm (`spanwatch.ts`, FLAG-OFF)
 
 Independent safety net for the 16.5 kW backup element: the HBX's `backup_called` flag reports the
-controller's *decision* to fire (breaker-independent); this watches the element's *actual* SPAN
-circuit power and pages high-priority the moment it draws real watts. **Dormant until `SPAN_URL` is
-set** — deploying it changes nothing.
+controller's *decision* to fire (breaker-independent); this confirms the element's *actual* draw via
+the **SPAN cloud API** (SRP login — same path TempIQ uses, **no tunnel**). **Dormant until
+`SPAN_USERNAME` is set** — deploying it changes nothing.
 
 | Env | Meaning |
 |---|---|
-| `SPAN_URL` | SPAN panel base URL. The planner is on Railway (cloud) and SPAN's API is LAN-local, so expose the panel via a **Cloudflare Tunnel** (the project's existing pattern) and point this at the tunnel. Unset = alarm off. |
-| `SPAN_TOKEN` | SPAN local-API bearer token |
-| `SPAN_BACKUP_CIRCUIT` | case-insensitive name substring of the element's circuit (default `backup`) |
-| `SPAN_BACKUP_ALARM_W` | watts above which it pages (default `100`) |
+| `SPAN_USERNAME` | SPAN app login (email). Unset = alarm off. |
+| `SPAN_PASSWORD` | SPAN app password. SRP auth via `amazon-cognito-identity-js`. |
+| `SPAN_BACKUP_CIRCUIT` | case-insensitive name substring of the element's circuit (default `backup`); if it doesn't match, the first poll logs the available circuit names |
+| `SPAN_BACKUP_ALARM_KWH` | this-hour energy above which it pages (default `0.3`; a 16.5 kW element hits 0.3 kWh in ~65 s, an idle circuit reads ~0) |
+| `SPAN_BUILDING_ID` | optional; auto-discovered from the account if unset |
 | `SPAN_POLL_SECONDS` | poll cadence, own timer (default `60`) |
 
-Reads `GET {SPAN_URL}/api/v1/circuits`, matches the circuit by name, edge-alerts on
-`instantPowerW > SPAN_BACKUP_ALARM_W`. A read failure never alarms (a tunnel hiccup ≠ the element
-running); `backup_called` is the redundant net. This is what makes re-energizing the breaker safe.
+Auths with Cognito, polls each circuit's current-hour energy (`GET_CURRENT_HOUR_ENERGY`), edge-alerts
+when the backup circuit's this-hour kWh exceeds the threshold. **~1 h detection latency** (SPAN's
+hourly energy aggregation) — fine here: the element runs for hours, and `backup_called` is the instant
+signal. A read/auth failure never alarms (transient); `backup_called` is the redundant net. This is
+what makes re-energizing the breaker safe. Standalone — A2W's own SPAN login (pattern copied from
+TempIQ's `span-cloud.ts`, no runtime coupling).
 
 ## Winter solver — shadow (W0, FLAG-OFF; plan §6.9)
 
