@@ -350,6 +350,27 @@ export class Store {
     );
   }
 
+  /** gtm#1328: recent quiet-window decay fits, for aggregating the standby UA we push to TempIQ. */
+  async getRecentDecayFits(hours: number): Promise<
+    { windowStart: Date; windowEnd: Date; tStartF: number; tEndF: number; hours: number; slopeFPerH: number }[]
+  > {
+    const res = await this.pool.query(
+      `SELECT window_start, window_end, t_start_f, t_end_f, hours, slope_f_per_h
+       FROM tank_decay_fits
+       WHERE window_end >= now() - ($1 || ' hours')::interval
+       ORDER BY window_end ASC`,
+      [hours],
+    );
+    return res.rows.map((r) => ({
+      windowStart: new Date(r.window_start),
+      windowEnd: new Date(r.window_end),
+      tStartF: Number(r.t_start_f),
+      tEndF: Number(r.t_end_f),
+      hours: Number(r.hours),
+      slopeFPerH: Number(r.slope_f_per_h),
+    }));
+  }
+
   async openUnservedEpisode(detail: string): Promise<void> {
     await this.pool.query(`INSERT INTO unserved_call_episodes (detail) VALUES ($1)`, [detail]);
   }

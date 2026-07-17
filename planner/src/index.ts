@@ -33,6 +33,7 @@ import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
+import { pushTankUa } from "./tank-ua-push";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -700,6 +701,7 @@ async function main(): Promise<void> {
     await shadowOnce();
     await scoreOnce();
     await decayScanOnce(store);
+    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
     if (tempiq) await tempiq.tick();
     if (tempiqRead) await tempiqRead.tick();
     console.log("POLL_ONCE ok");
@@ -806,6 +808,9 @@ async function main(): Promise<void> {
     shadowOnce()
       .then(() => scoreOnce())
       .then(() => decayScanOnce(store).then(() => {}))
+      .then(() => (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN
+        ? pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
+        : undefined))
       .then(() => checkI8())
       .catch((e) => console.error("shadow/score/decay/i8 failed:", (e as Error).message));
   await shadowLoop();
