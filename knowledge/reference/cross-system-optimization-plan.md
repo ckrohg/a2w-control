@@ -351,9 +351,11 @@ I4-clamped, I1-checked, rate-limited, read-back-verified, self-recorded with a
   dashboard also surfaces a 48 h `_source IS NULL` chip. A second planner instance (which also
   `_source`-tags, so the drift path can't see it) is caught by a **non-blocking** heartbeat guard
   (`planner_instances`): if two instances are live for ≥2 polls, the planner pages "⚠ Second
-  planner instance detected". Only a *blocking* DB-backed **lease** in `patch()` would prevent
-  (vs. detect) it — deferred as optional defense-in-depth (a stale-lease bug could wedge the sole
-  writer). Full write-path doc: `planner/README.md` §Single-writer invariant.
+  planner instance detected". A *blocking* DB-backed **lease** in `patch()` that PREVENTS (vs.
+  detects) a second writer is built and flag-gated (`WRITER_LEASE_ENABLED`, default off): it
+  refuses writes with `423` unless the instance holds a fresh `hbx_writer_lease` (takeover on
+  stale). It ships off because a stale-lease bug could wedge the sole writer — arm it deliberately
+  at go-live. Full write-path doc: `planner/README.md` §Single-writer invariant.
 
 ### 5.3 What we deliberately do NOT do
 

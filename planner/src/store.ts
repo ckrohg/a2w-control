@@ -186,6 +186,14 @@ export class Store {
         instance_id  text PRIMARY KEY,
         heartbeat_at timestamptz NOT NULL DEFAULT now()
       );
+      -- Singleton single-writer LEASE (flag-gated by WRITER_LEASE_ENABLED). When enabled, only
+      -- the instance holding a FRESH lease may write the HBX; a second instance is refused in
+      -- writes.ts patch(). Takeover-on-stale lets a redeployed planner reclaim it. #36.
+      CREATE TABLE IF NOT EXISTS hbx_writer_lease (
+        id           integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        holder       text,
+        heartbeat_at timestamptz NOT NULL DEFAULT now()
+      );
     `);
   }
 
@@ -597,6 +605,36 @@ export class Store {
       [instanceId, new Date(Date.now() - freshMs)],
     );
     return res.rows.map((r) => r.instance_id as string);
+  }
+
+  /**
+   * Renew the single-writer lease if this instance holds it, or CLAIM it if it's unheld or
+   * stale (takeover after a crash/redeploy). Atomic via ON CONFLICT ... WHERE; all times come
+   * from the DB clock, so there is no client-clock dependency. Returns whether this instance now
+   * holds it. Flag-gated caller (WRITER_LEASE_ENABLED); #36 optional defense-in-depth.
+   */
+  async renewOrClaimLease(instanceId: string, staleMs: number): Promise<{ held: boolean; holder: string | null }> {
+    await this.pool.query(
+      `INSERT INTO hbx_writer_lease (id, holder, heartbeat_at) VALUES (1, $1, now())
+       ON CONFLICT (id) DO UPDATE SET holder = excluded.holder, heartbeat_at = now()
+         WHERE hbx_writer_lease.holder = $1
+            OR hbx_writer_lease.holder IS NULL
+            OR hbx_writer_lease.heartbeat_at < now() - ($2 * interval '1 millisecond')`,
+      [instanceId, staleMs],
+    );
+    const res = await this.pool.query(`SELECT holder FROM hbx_writer_lease WHERE id = 1`);
+    const holder = res.rowCount ? (res.rows[0].holder as string | null) : null;
+    return { held: holder === instanceId, holder };
+  }
+
+  /** True iff this instance currently holds a FRESH single-writer lease (the write-path gate). */
+  async holdsWriterLease(instanceId: string, staleMs: number): Promise<boolean> {
+    const res = await this.pool.query(
+      `SELECT 1 FROM hbx_writer_lease
+       WHERE id = 1 AND holder = $1 AND heartbeat_at > now() - ($2 * interval '1 millisecond')`,
+      [instanceId, staleMs],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   async close(): Promise<void> {

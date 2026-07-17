@@ -437,6 +437,11 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
 // before paging; the alert clears when this is the only instance again.
 const INSTANCE_ID = `${os.hostname()}:${process.pid}`;
 const INSTANCE_FRESH_MS = 12 * 60 * 1000; // > 2× the 5-min poll, so a slow poll isn't "dead"
+// Flag-gated single-writer LEASE (#36 defense-in-depth). OFF by default — enabling it makes a
+// second planner instance's writes get refused (423) in writes.ts. Reuses the instance id +
+// freshness. Enable deliberately at go-live and confirm takeover on the first redeploy.
+const WRITER_LEASE_ENABLED = process.env.WRITER_LEASE_ENABLED === "1";
+let writerLeaseState: { held: boolean; holder: string | null } | null = null;
 let instancePrevPeers = new Set<string>();
 let multiInstanceAlerted = false;
 async function checkSingleWriter(): Promise<void> {
@@ -722,7 +727,8 @@ async function scoreOnce(): Promise<void> {
 }
 
 // Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
-const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED);
+const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED,
+  WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
 async function pollOnce(): Promise<void> {
@@ -744,6 +750,11 @@ async function pollOnce(): Promise<void> {
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
+  if (WRITER_LEASE_ENABLED) {
+    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease.
+    try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
+    catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
+  }
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
@@ -867,6 +878,7 @@ async function main(): Promise<void> {
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
+            writer_lease: WRITER_LEASE_ENABLED ? (writerLeaseState ?? "pending") : "off",
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",

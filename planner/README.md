@@ -82,9 +82,12 @@ the planner records its *own* writes with a `_source` tag and therefore never se
   can never wedge the real writer. `/health.instance` exposes the current id + peers.
 
 A DB-backed single-writer **lease** — a *blocking* guard in `patch()` that stops a second
-instance from writing at all — remains the optional defense-in-depth in #36; it is deliberately
-deferred rather than bolted onto the live write path mid-autopilot-rollout (a stale-lease bug
-could wedge the sole writer, a worse failure than the gap it closes).
+instance from writing at all — is **built and flag-gated (`WRITER_LEASE_ENABLED`, default off).**
+When enabled, each poll the planner renews or claims a singleton `hbx_writer_lease` row (takeover
+on stale, so a redeploy reclaims it), and `patch()` refuses any write (`423`) unless this instance
+holds a fresh lease. It ships **off** because a stale-lease bug could wedge the sole writer — arm
+it deliberately (ideally at the #34 go-live) and confirm takeover works on the first redeploy.
+`/health.writer_lease` shows the current holder.
 
 ## Environment variables
 
@@ -97,6 +100,7 @@ could wedge the sole writer, a worse failure than the gap it closes).
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
 | `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
