@@ -16,6 +16,7 @@ import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
 import { AutoPilot } from "./autopilot";
+import { SpanWatch } from "./spanwatch";
 import {
   fetchNwsAlerts,
   fetchStormForecast,
@@ -91,6 +92,19 @@ const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").ma
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
   : null;
+
+// SPAN circuit-power alarm for the 16.5 kW backup element — an INDEPENDENT net (vs the HBX's own
+// backup_called decision flag) that pages when the element draws REAL watts. Dormant unless SPAN_URL
+// is set. The planner is cloud and SPAN's API is LAN-local, so point SPAN_URL at the panel via a
+// Cloudflare Tunnel or reachable proxy. See spanwatch.ts.
+const SPAN_URL = process.env.SPAN_URL;
+const SPAN_TOKEN = process.env.SPAN_TOKEN ?? "";
+const SPAN_BACKUP_CIRCUIT = process.env.SPAN_BACKUP_CIRCUIT ?? "backup";
+const SPAN_BACKUP_ALARM_W = Number(process.env.SPAN_BACKUP_ALARM_W ?? "100");
+const SPAN_POLL_SECONDS = Number(process.env.SPAN_POLL_SECONDS ?? "60");
+const spanWatch = SPAN_URL ? new SpanWatch(SPAN_URL, SPAN_TOKEN, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_W, ntfy) : null;
+if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_W}W every ${SPAN_POLL_SECONDS}s`);
+else console.log("SPAN backup watch OFF (set SPAN_URL to enable the element power alarm)");
 
 // TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.
 const TEMPIQ_PUSH_ENABLED = process.env.TEMPIQ_PUSH_ENABLED === "1";
@@ -849,6 +863,13 @@ async function main(): Promise<void> {
   // (inside loop) already sees fresh NWS/OpenMeteo triggers.
   await stormTriggerPoll();
   setInterval(() => void stormTriggerPoll(), 30 * 60 * 1000);
+
+  // SPAN backup-element power alarm on its own tight cadence (default 60s) — independent of the
+  // 5-min main loop so a running element is caught fast. No-op unless SPAN_URL is configured.
+  if (spanWatch) {
+    void spanWatch.tick().catch((e) => console.error("spanwatch failed:", (e as Error).message));
+    setInterval(() => void spanWatch.tick().catch((e) => console.error("spanwatch failed:", (e as Error).message)), SPAN_POLL_SECONDS * 1000);
+  }
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);

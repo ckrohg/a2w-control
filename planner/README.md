@@ -85,6 +85,25 @@ lease, never a stale value. Renewals are free on the Pi (renew-without-rewrite).
 Rollback = unset `PHASE_B_ENABLED` → leases lapse → Pi reverts to `baseline_setpoint_c`.
 Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow record.
 
+## SPAN backup-element power alarm (`spanwatch.ts`, FLAG-OFF)
+
+Independent safety net for the 16.5 kW backup element: the HBX's `backup_called` flag reports the
+controller's *decision* to fire (breaker-independent); this watches the element's *actual* SPAN
+circuit power and pages high-priority the moment it draws real watts. **Dormant until `SPAN_URL` is
+set** — deploying it changes nothing.
+
+| Env | Meaning |
+|---|---|
+| `SPAN_URL` | SPAN panel base URL. The planner is on Railway (cloud) and SPAN's API is LAN-local, so expose the panel via a **Cloudflare Tunnel** (the project's existing pattern) and point this at the tunnel. Unset = alarm off. |
+| `SPAN_TOKEN` | SPAN local-API bearer token |
+| `SPAN_BACKUP_CIRCUIT` | case-insensitive name substring of the element's circuit (default `backup`) |
+| `SPAN_BACKUP_ALARM_W` | watts above which it pages (default `100`) |
+| `SPAN_POLL_SECONDS` | poll cadence, own timer (default `60`) |
+
+Reads `GET {SPAN_URL}/api/v1/circuits`, matches the circuit by name, edge-alerts on
+`instantPowerW > SPAN_BACKUP_ALARM_W`. A read failure never alarms (a tunnel hiccup ≠ the element
+running); `backup_called` is the redundant net. This is what makes re-energizing the breaker safe.
+
 ## Winter solver — shadow (W0, FLAG-OFF; plan §6.9)
 
 Demand-driven service floors: TempIQ `/api/insights/zones` → per-zone required water
