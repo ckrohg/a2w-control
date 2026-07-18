@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS span_samples (
     power_w REAL                 -- instantPowerW from SPAN's LAN-local API
 );
 CREATE INDEX IF NOT EXISTS idx_span_name_ts ON span_samples(name, ts);
+
+CREATE TABLE IF NOT EXISTS span_arm_events (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    circuit_id TEXT,
+    relay_state TEXT,            -- OPEN | CLOSED at decision time
+    armed INTEGER,              -- owner intent (1=armed)
+    live INTEGER,               -- 0=shadow (logged only), 1=actually acted
+    action TEXT NOT NULL,        -- would_arm | armed | arm_failed
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_span_arm_ts ON span_arm_events(ts);
 """
 
 
@@ -132,6 +144,20 @@ class Store:
         exactly the durable-cursor pattern the exporter uses for events."""
         return await self._query(
             "SELECT id, ts, circuit_id, name, power_w FROM span_samples"
+            " WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
+
+    async def add_span_arm_event(self, ts: float, circuit_id: str | None, relay_state: str | None,
+                                 armed: bool, live: bool, action: str, detail: str | None = None) -> None:
+        await self._exec(
+            "INSERT INTO span_arm_events (ts, circuit_id, relay_state, armed, live, action, detail)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (ts, circuit_id, relay_state, int(armed), int(live), action, detail),
+        )
+
+    async def get_span_arm_since(self, after_id: int, limit: int) -> list[dict]:
+        """New span_arm_events (shadow/live decisions) for the analytics export — durable cursor."""
+        return await self._query(
+            "SELECT id, ts, circuit_id, relay_state, armed, live, action, detail FROM span_arm_events"
             " WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
 
     async def add_comm_snapshot(self, pump_id: str, stats: dict) -> None:

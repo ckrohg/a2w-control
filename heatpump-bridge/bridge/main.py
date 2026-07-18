@@ -69,7 +69,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await notify.ntfy(cfg.notifications, title=title, message=message, priority=priority)
         span_poller = SpanLocalPoller(
             cfg.span, store, notify=span_notify,
-            token_path=str(Path(cfg.db_path).resolve().parent / "span-local-token"))
+            token_path=str(Path(cfg.db_path).resolve().parent / "span-local-token"),
+            arm_state_path=str(Path(cfg.db_path).resolve().parent / "span-arm.json"))
         span_poller.start()
         app.state.span_poller = span_poller
 

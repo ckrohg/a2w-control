@@ -159,6 +159,36 @@ class SpanClient:
     async def fetch_circuits(self) -> dict:
         return await asyncio.to_thread(self._fetch_sync)
 
+    # --- writes: CLOSE-ONLY relay control (the safety keystone) ----------------
+    def _set_relay_sync(self, circuit_id: str, want: str) -> str:
+        # HARD invariant: A2W may only CLOSE a circuit (make the backup element AVAILABLE), never
+        # OPEN it. This single property is what makes backup-element control safe — it can never
+        # disable the failsafe, and never switches a live load off. Enforced here so NO caller can
+        # bypass it. (See knowledge/reference/span-backup-arm-spec.md.)
+        if want != "CLOSED":
+            raise ValueError(f"set_relay is CLOSE-ONLY — refused '{want}'")
+        if not self._token:
+            self._token = self._register_sync()
+        body = {"relayStateIn": want}
+        last_err = "no reachable base"
+        for base in self._candidates():
+            for attempt in (1, 2):  # one transparent re-auth on an auth failure
+                try:
+                    status, payload = self._request(
+                        base, f"/api/v1/circuits/{circuit_id}", method="POST", body=body, token=self._token)
+                except (urllib.error.URLError, OSError, TimeoutError) as e:
+                    last_err = f"{base}: {e}"; break
+                if status == 200:
+                    self._base = base
+                    return (payload or {}).get("relayState", want)
+                if status in (401, 403, 412) and attempt == 1:
+                    self._token = self._register_sync(); continue
+                last_err = f"{base}: HTTP {status}"; break
+        raise ConnectionError(f"set_relay: {last_err}")
+
+    async def set_relay(self, circuit_id: str, want: str = "CLOSED") -> str:
+        return await asyncio.to_thread(self._set_relay_sync, circuit_id, want)
+
 
 def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
     """Pick the named circuits out of a /circuits response → [{circuit_id, name, power_w}]."""
@@ -172,19 +202,56 @@ def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
     return out
 
 
+def extract_relay(circuits: dict, name: str) -> dict | None:
+    """Find the named circuit's relay state → {circuit_id, name, relay_state, controllable, power_w}."""
+    for c in circuits.values():
+        if (c.get("name") or "").strip() == name:
+            return {"circuit_id": c.get("id"), "name": name,
+                    "relay_state": c.get("relayState"),  # "OPEN" (off) | "CLOSED" (available)
+                    "controllable": bool(c.get("isUserControllable")),
+                    "power_w": float(c.get("instantPowerW") or 0.0)}
+    return None
+
+
+# --- arm intent: owner-set, persisted on the bridge (default DISARMED) --------
+def read_arm_intent(path: str | None, default: bool) -> bool:
+    """Read the owner's ARM intent. Missing/unreadable file → the config default (fail-safe:
+    the bridge never 'wakes up armed' on its own — default is DISARMED)."""
+    if not path:
+        return default
+    try:
+        return bool(json.loads(Path(path).read_text()).get("armed", default))
+    except (OSError, ValueError):
+        return default
+
+
+def write_arm_intent(path: str, armed: bool) -> None:
+    tmp = Path(path).with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump({"armed": bool(armed)}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 class SpanLocalPoller:
     """Polls the configured circuits' instantPowerW every ~interval and persists each to the
     store. Never raises into the event loop; tracks last-success for a down-alert."""
 
-    def __init__(self, cfg, store, *, notify=None, token_path: str | None = None):
+    def __init__(self, cfg, store, *, notify=None, token_path: str | None = None,
+                 arm_state_path: str | None = None):
         self.cfg = cfg
         self.store = store
         self.notify = notify
         self.client = SpanClient(cfg.host, cfg.passphrase, ip_fallback=cfg.ip_fallback,
                                  token_path=token_path)
+        self.arm_state_path = arm_state_path
         self._task: asyncio.Task | None = None
         self._last_ok = 0.0
         self._down_alerted = False
+        self._last_arm_action = 0.0
+        # Latest arm/relay snapshot for the exporter + /api/span/arm (in-memory; cheap).
+        self.latest_arm: dict = {}
 
     def start(self) -> None:
         if self.cfg and self.cfg.host and self.cfg.passphrase:
@@ -204,12 +271,55 @@ class SpanLocalPoller:
         ts = time.time()
         for r in rows:
             await self.store.add_span_sample(ts, r["circuit_id"], r["name"], r["power_w"])
+        await self._evaluate_arm(circuits, ts)
         self._last_ok = ts
         if self._down_alerted:
             self._down_alerted = False
             if self.notify:
                 await self.notify("SPAN local recovered", "Instant circuit power logging is back.")
         return rows
+
+    async def _evaluate_arm(self, circuits: dict, ts: float) -> None:
+        """Backup-element ARM decision. Phase 1 = SHADOW (logs would-arm, toggles NOTHING).
+        CLOSE-ONLY and DISARMED-by-default; never opens, never acts against the owner's intent."""
+        name = getattr(self.cfg, "arm_circuit", None) or ""
+        circ = extract_relay(circuits, name) if name else None
+        armed = read_arm_intent(self.arm_state_path, bool(getattr(self.cfg, "arm", False)))
+        live = bool(getattr(self.cfg, "arm_live", False))
+        self.latest_arm = {
+            "circuit": name, "circuit_id": circ["circuit_id"] if circ else None,
+            "relay_state": circ["relay_state"] if circ else None,
+            "controllable": circ["controllable"] if circ else None,
+            "armed": armed, "live": live, "ts": ts,
+        }
+        # Nothing to do unless ARMED and the element is currently OPEN (unavailable).
+        if not circ or not circ["circuit_id"] or not armed or circ["relay_state"] != "OPEN":
+            return
+        # Anti-flap: at most one arm action per cooldown (a toggle war can't thrash the relay).
+        if ts - self._last_arm_action < float(getattr(self.cfg, "arm_cooldown_s", 300.0)):
+            return
+        self._last_arm_action = ts
+        if not live:  # SHADOW — record what we WOULD do; touch nothing on SPAN.
+            await self.store.add_span_arm_event(
+                ts, circ["circuit_id"], circ["relay_state"], armed, False, "would_arm",
+                "armed + backup-element relay OPEN → WOULD close it to make the failsafe available (shadow)")
+            log.info("span-arm SHADOW: would close '%s' (relay OPEN, armed)", name)
+            return
+        # LIVE (Phase 2): close-only.
+        try:
+            new = await self.client.set_relay(circ["circuit_id"], "CLOSED")
+            await self.store.add_span_arm_event(
+                ts, circ["circuit_id"], new, armed, True, "armed",
+                f"closed backup-element relay → {new} (was OPEN)")
+            if self.notify:
+                await self.notify(
+                    "A2W armed the backup element",
+                    "Closed the SPAN backup-element relay — the element is now AVAILABLE (the HBX still "
+                    "decides when it runs). Disarm in the a2w portal if you meant to keep it off.", "high")
+        except Exception as e:  # noqa: BLE001 — an arm failure must never break the poller
+            await self.store.add_span_arm_event(
+                ts, circ["circuit_id"], circ["relay_state"], armed, True, "arm_failed", f"set_relay failed: {e}")
+            log.warning("span-arm live close failed: %s", e)
 
     async def _run(self) -> None:
         while True:

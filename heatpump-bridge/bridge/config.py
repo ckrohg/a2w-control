@@ -193,6 +193,15 @@ class SpanConfig(BaseModel):
     circuits: list[str] = ["Buffer Tank", "Air-Water 1", "Air-Water 2"]  # circuit NAMES to log
     poll_interval_s: float = 25.0
     down_alert_after_s: float = 4 * 3600.0  # alert once if logging has been down this long
+    # Backup-element ARM control (see knowledge/reference/span-backup-arm-spec.md). A2W may CLOSE-ONLY
+    # the arm_circuit's relay (make the failsafe AVAILABLE) when the owner has ARMED it — never opens.
+    # `arm` is the config DEFAULT for the owner intent; the live intent is the persisted state file
+    # bridge-data/span-arm.json (owner-set via /api/span/arm + the portal). Default DISARMED so the
+    # bridge never wakes up armed. `arm_live=False` = SHADOW (Phase 1: log would-arm, toggle nothing).
+    arm_circuit: str = "Buffer Tank"
+    arm: bool = False           # default owner intent = DISARMED
+    arm_live: bool = False      # False = shadow (no SPAN relay writes); True = live (Phase 2)
+    arm_cooldown_s: float = 300.0  # anti-flap: min gap between arm actions
 
 
 class AppConfig(BaseModel):
