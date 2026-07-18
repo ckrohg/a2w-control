@@ -27,6 +27,13 @@ export const CUTOVER = "2026-07-16"; // first day of the cooler regime — savin
 export const ASFOUND_CFG = { dot: 5, dbt: 165, wwsd: 125, mbt: 145 };
 export const ASFOUND_SINK_F = 163; // avg of the frozen hp1/hp2 setpoints (167 / 159.8)
 
+// PROVISIONAL pump max deliverable buffer temp — above this the buffer's 16.5 kW resistive element
+// (COP 1) bridges the gap. Used for the element credit; pending the pumps' real spec from Winnie.
+export const PUMP_MAX_BUFFER_F = 145;
+// A plausible "just hardcode a colder temp" static setting a user might pick instead of smart autonomy
+// (safe DHW margin, cooler than as-found but not as aggressive as the plan's 120°F idle floor).
+export const FIXED_COOL_BUFFER_F = 130;
+
 // Reconstruct the as-found buffer target from the frozen reset curve at a real outdoor temp.
 // (Mirror of shadow.ts curveTargetF, inlined so this module is self-contained + unit-testable.)
 export function asfoundBufferF(outdoorF: number): number {
@@ -63,12 +70,15 @@ export interface DayInputs {
 
 export interface RealizedDay {
   day: string;
-  actualElecKwh: number;
-  cfElecKwh: number;
-  savedUsd: number;
-  copUsd: number;           // the COP (cooler-water) portion of the saving
+  actualElecKwh: number;    // measured (what we spent, running smart/autopilot)
+  cfElecKwh: number;        // as-found counterfactual (the hot regime)
+  fixedElecKwh: number;     // "hardcoded a colder temp" counterfactual (static cool setting)
+  savedUsd: number;         // smart (actual) vs as-found — the realized saving
+  fixedSavedUsd: number;    // hardcoded-cool vs as-found — what a static cool setting alone would save
+  smartPremiumUsd: number;  // savedUsd − fixedSavedUsd — what smart autonomy adds over hardcoding cool
+  copUsd: number;           // the COP (cooler-water) portion of the smart saving
   standbyUsd: number;       // the standby (less-runtime) portion
-  elementCreditUsd: number; // reduced resistive-backup use (0 until pump max-temp confirmed)
+  elementCreditUsd: number; // resistive-backup (COP 1) the hotter as-found setpoints would have forced
   avgOutdoorF: number;
   copNow: number;
   copOld: number;
@@ -85,43 +95,63 @@ export interface RealizedParams {
   dailyKwhFallback: number; // SPAN daily baseline, used only when a day has no measured sessions
 }
 
-/** Pure per-day counterfactual. Deterministic; unit-tested. */
+/** Pure per-day counterfactual. Deterministic; unit-tested.
+ *  Energy basis is the SPAN daily total (dailyKwhFallback × coverage) — consistent full-day, unlike
+ *  the incomplete charge-session sums in tempiq_cop_points, which we use ONLY for the measured COP.
+ *  Each alternative regime's cost is computed as a robust DELTA from actual: the delivered heat at
+ *  that regime's (Carnot-scaled measured) COP, plus its standby change, with the 16.5 kW element
+ *  (COP 1) covering any buffer band above the pump's max temp. */
 export function computeDayRealized(d: DayInputs, p: RealizedParams): RealizedDay {
-  const oldBufferF = Math.max(asfoundBufferF(d.avgOutdoorF), d.nowBufferF); // as-found ran hotter
-  const nowSinkF = d.measured?.sinkF ?? d.nowBufferF + 10;                  // leaving water ≈ buffer + approach
+  const out = d.avgOutdoorF;
+  const nowSinkF = d.measured?.sinkF ?? d.nowBufferF + 10; // leaving water ≈ buffer + approach
+  const copNow = d.measured?.cop ?? modelCop(out, nowSinkF); // measured efficiency (energy-weighted)
+  const eDaily = p.dailyKwhFallback * d.coverage;            // full-day electricity (SPAN baseline)
+
+  // COP at any sink temp: Carnot-scaled from the measured COP at the real outdoor temp. Cooler water
+  // ⇒ higher COP; hotter ⇒ lower. Clamped to a sane band (≥1 resistive floor; ≤6 validity clamp).
+  const copAt = (sinkF: number) => clamp(copNow * (carnotFactor(sinkF, out) / carnotFactor(nowSinkF, out)), 1, 6);
+  const stdKwh = (deltaF: number) => (p.uaBtuHrF * deltaF * 24 * d.coverage) / 3412; // standby for a ΔT band
+
+  // Extra electricity of running regime (bufF, sinkF) INSTEAD of the actual (nowBuffer, nowSink).
+  // Positive ⇒ that regime costs more than what we actually run. Split the standby band at the pump's
+  // max temp so the element (COP 1) portion is costed correctly.
+  const deltaElec = (bufF: number, sinkF: number) => {
+    const copR = copAt(sinkF);
+    const copTerm = eDaily * (copNow / copR - 1);                                  // delivered heat at regime COP
+    const pumpDelta = stdKwh(Math.min(bufF, PUMP_MAX_BUFFER_F) - d.nowBufferF);    // pump-served standby change (signed)
+    const elemStd = stdKwh(Math.max(0, bufF - Math.max(d.nowBufferF, PUMP_MAX_BUFFER_F))); // element-served (≥0)
+    return { dElec: copTerm + pumpDelta / copR + elemStd, copTerm, elemStd, copR };
+  };
+
+  const oldBufferF = Math.max(asfoundBufferF(out), d.nowBufferF); // as-found ran hotter
   const oldSinkF = Math.max(ASFOUND_SINK_F, nowSinkF);
+  const af = deltaElec(oldBufferF, oldSinkF);                       // as-found vs actual
+  const fx = deltaElec(FIXED_COOL_BUFFER_F, FIXED_COOL_BUFFER_F + 10); // hardcoded-cool vs actual
 
-  const copNow = d.measured?.cop ?? modelCop(d.avgOutdoorF, nowSinkF);
-  // Old regime ran hotter water → lower COP. Carnot-scaled from the measured COP, floored at 1
-  // (below COP 1 the resistive element is the rational choice — captured by element credit later)
-  // and capped at copNow (the counterfactual can never be MORE efficient than what we run now).
-  const copOld = clamp(copNow * (carnotFactor(oldSinkF, d.avgOutdoorF) / carnotFactor(nowSinkF, d.avgOutdoorF)), 1, copNow);
+  const savedUsd = af.dElec * p.rateUsdKwh;                 // as-found − actual (smart/autopilot saving)
+  const fixedSavedUsd = (af.dElec - fx.dElec) * p.rateUsdKwh; // as-found − fixed (hardcoded-cool saving)
+  const smartPremiumUsd = fx.dElec * p.rateUsdKwh;           // fixed − actual (smart beats fixed if >0)
 
-  const eActual = d.measured?.elecKwh ?? p.dailyKwhFallback * d.coverage;
-  const qDelivered = eActual * copNow; // self-consistent heat delivered (E × COP)
-  const standbyKwh = (p.uaBtuHrF * Math.max(0, oldBufferF - d.nowBufferF) * 24 * d.coverage) / 3412;
-
-  const eCf = (qDelivered + standbyKwh) / copOld;
-  const copKwh = eActual * (copNow / copOld - 1); // COP portion
-  const standbyElecKwh = standbyKwh / copOld;     // standby portion (in electricity)
-
-  const elementCreditUsd = 0; // TODO: credit resistive backup the hotter as-found setpoints tripped,
-                              // once the pumps' max leaving-water temp is confirmed (Winnie).
-  const savedUsd = (eCf - eActual) * p.rateUsdKwh + elementCreditUsd;
+  const elementCreditUsd = af.elemStd * (1 - 1 / af.copR) * p.rateUsdKwh; // element premium in as-found
+  const copUsd = af.copTerm * p.rateUsdKwh;                               // COP portion of the saving
+  const standbyUsd = savedUsd - copUsd - elementCreditUsd;                // standby portion (remainder)
 
   return {
     day: d.day,
-    actualElecKwh: round1(eActual),
-    cfElecKwh: round1(eCf),
+    actualElecKwh: round1(eDaily),
+    cfElecKwh: round1(eDaily + af.dElec),
+    fixedElecKwh: round1(eDaily + fx.dElec),
     savedUsd: round2(savedUsd),
-    copUsd: round2(copKwh * p.rateUsdKwh),
-    standbyUsd: round2(standbyElecKwh * p.rateUsdKwh),
+    fixedSavedUsd: round2(fixedSavedUsd),
+    smartPremiumUsd: round2(smartPremiumUsd),
+    copUsd: round2(copUsd),
+    standbyUsd: round2(standbyUsd),
     elementCreditUsd: round2(elementCreditUsd),
-    avgOutdoorF: round1(d.avgOutdoorF),
+    avgOutdoorF: round1(out),
     copNow: round2(copNow),
-    copOld: round2(copOld),
+    copOld: round2(af.copR),
     oldBufferF: round1(oldBufferF),
-    standbyKwh: round1(standbyKwh),
+    standbyKwh: round1(stdKwh(oldBufferF - d.nowBufferF)),
     sessions: d.measured?.sessions ?? 0,
     confidence: d.measured ? "measured" : "modeled",
   };
