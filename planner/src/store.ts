@@ -206,8 +206,97 @@ export class Store {
         updated_at        timestamptz NOT NULL DEFAULT now(),
         updated_by        text
       );
+      -- Per-day REALIZED savings ledger (realized.ts engine). One row per operating day since the
+      -- cutover: the measured counterfactual (as-found regime vs actual metered energy). The dashboard
+      -- reads + cumulatively charts this instead of the old three-constant static guess.
+      CREATE TABLE IF NOT EXISTS realized_savings (
+        day                date PRIMARY KEY,
+        actual_elec_kwh    real,
+        cf_elec_kwh        real,
+        saved_usd          real,
+        cop_usd            real,
+        standby_usd        real,
+        element_credit_usd real,
+        avg_outdoor_f      real,
+        cop_now            real,
+        cop_old            real,
+        old_buffer_f       real,
+        standby_kwh        real,
+        sessions           integer,
+        confidence         text,
+        computed_at        timestamptz NOT NULL DEFAULT now()
+      );
     `);
   }
+
+  /** Per-day inputs for the realized-savings engine: real outdoor + current buffer target from
+   *  slx_readings, joined to quality-filtered measured COP sessions from tempiq_cop_points. One row
+   *  per operating day from the cutover forward (or the lookback window, whichever is later). */
+  async getRealizedDayInputs(cutover: string, lookbackDays: number): Promise<{
+    day: string; avgOutdoorF: number; nowBufferF: number; coverage: number;
+    measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
+  }[]> {
+    const res = await this.pool.query(
+      `WITH days AS (
+         SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                avg(outdoor_f) AS out_f, avg(tank_target_f) AS now_buf, count(*) AS n
+         FROM slx_readings
+         WHERE ts >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         GROUP BY 1
+       ),
+       cop AS (
+         -- energy-weighted day COP (sum thermal / sum electrical) — more robust than avg-of-sessions,
+         -- and makes eActual·copNow == measured thermal exactly.
+         SELECT to_char(date_trunc('day', measured_at AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                sum(electrical_kwh) AS e, sum(thermal_kwh) AS q,
+                sum(thermal_kwh) / NULLIF(sum(electrical_kwh), 0) AS cop, avg(sink_temp_f) AS sink, count(*) AS sess
+         FROM tempiq_cop_points
+         WHERE measured_at >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+           AND cop BETWEEN 1 AND 6 AND thermal_kwh > 0 AND electrical_kwh > 0
+           AND sink_temp_f BETWEEN 110 AND 175 AND outdoor_temp_f IS NOT NULL
+           AND outdoor_temp_f < sink_temp_f - 20
+           AND (quality_score IS NULL OR quality_score >= 0.3)
+         GROUP BY 1
+       )
+       SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess
+       FROM days d LEFT JOIN cop c USING (day)
+       WHERE d.out_f IS NOT NULL AND d.now_buf IS NOT NULL
+       ORDER BY d.day`,
+      [cutover, lookbackDays],
+    );
+    return res.rows.map((r) => ({
+      day: r.day,
+      avgOutdoorF: Number(r.out_f),
+      nowBufferF: Number(r.now_buf),
+      coverage: Math.min(1, Number(r.n) / 288),
+      measured: r.sess && Number(r.sess) > 0
+        ? { elecKwh: Number(r.e), thermalKwh: Number(r.q), cop: Number(r.cop), sinkF: Number(r.sink), sessions: Number(r.sess) }
+        : null,
+    }));
+  }
+
+  async upsertRealizedDay(r: {
+    day: string; actualElecKwh: number; cfElecKwh: number; savedUsd: number; copUsd: number;
+    standbyUsd: number; elementCreditUsd: number; avgOutdoorF: number; copNow: number; copOld: number;
+    oldBufferF: number; standbyKwh: number; sessions: number; confidence: string;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO realized_savings
+         (day, actual_elec_kwh, cf_elec_kwh, saved_usd, cop_usd, standby_usd, element_credit_usd,
+          avg_outdoor_f, cop_now, cop_old, old_buffer_f, standby_kwh, sessions, confidence, computed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
+       ON CONFLICT (day) DO UPDATE SET
+         actual_elec_kwh = EXCLUDED.actual_elec_kwh, cf_elec_kwh = EXCLUDED.cf_elec_kwh,
+         saved_usd = EXCLUDED.saved_usd, cop_usd = EXCLUDED.cop_usd, standby_usd = EXCLUDED.standby_usd,
+         element_credit_usd = EXCLUDED.element_credit_usd, avg_outdoor_f = EXCLUDED.avg_outdoor_f,
+         cop_now = EXCLUDED.cop_now, cop_old = EXCLUDED.cop_old, old_buffer_f = EXCLUDED.old_buffer_f,
+         standby_kwh = EXCLUDED.standby_kwh, sessions = EXCLUDED.sessions,
+         confidence = EXCLUDED.confidence, computed_at = now()`,
+      [r.day, r.actualElecKwh, r.cfElecKwh, r.savedUsd, r.copUsd, r.standbyUsd, r.elementCreditUsd,
+       r.avgOutdoorF, r.copNow, r.copOld, r.oldBufferF, r.standbyKwh, r.sessions, r.confidence],
+    );
+  }
+
 
   /** Seed the runtime autonomy row from the env defaults IF it doesn't exist yet (first boot only).
    *  After that the DB row is authoritative and env changes don't clobber a live choice. */

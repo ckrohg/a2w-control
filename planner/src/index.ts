@@ -37,6 +37,7 @@ import { HbxWriter, WriteError } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
+import { RealizedSavings } from "./realized";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -64,6 +65,12 @@ const LAT = process.env.LAT ?? "42.63";
 const LON = process.env.LON ?? "-70.87";
 const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
 
+// Realized-savings engine inputs (realized.ts). Same defaults the dashboard used, now the source
+// of truth: the planner computes the measured per-day ledger and the dashboard just reads it.
+const ELECTRIC_RATE_USD_KWH = Number(process.env.ELECTRIC_RATE_USD_KWH ?? "0.30");
+const DAILY_KWH_BASELINE = Number(process.env.DAILY_KWH_BASELINE ?? "11.8");
+const STANDBY_UA_BTU = Number(process.env.STANDBY_UA_BTU ?? "25");
+
 const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
 
 // Storm mode (§6.11, W0-5). Notify-first: triggers always page the owner, but the plan
@@ -74,6 +81,9 @@ const OUTAGEWATCH_URL = process.env.OUTAGEWATCH_URL ?? "https://victorious-light
 
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
 const store = new Store(DATABASE_URL);
+const realized = new RealizedSavings(store, {
+  rateUsdKwh: ELECTRIC_RATE_USD_KWH, uaBtuHrF: STANDBY_UA_BTU, ambientF: 70, dailyKwhFallback: DAILY_KWH_BASELINE,
+});
 const hub = HUB_URL && HUB_CLIENT_TOKEN ? new HubClient(HUB_URL, HUB_CLIENT_TOKEN) : null;
 if (!hub) console.warn("HUB_URL/HUB_CLIENT_TOKEN not set — I1 monitor disabled");
 if (!PLANNER_API_TOKEN) console.warn("PLANNER_API_TOKEN not set — write API disabled");
@@ -867,6 +877,7 @@ async function main(): Promise<void> {
     await shadowOnce();
     await scoreOnce();
     await decayScanOnce(store);
+    await realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message));
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
     if (tempiq) await tempiq.tick();
     if (tempiqRead) await tempiqRead.tick();
@@ -1022,6 +1033,7 @@ async function main(): Promise<void> {
         ? pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
         : undefined))
       .then(() => checkI8())
+      .then(() => realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message)))
       .catch((e) => console.error("shadow/score/decay/i8 failed:", (e as Error).message));
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);

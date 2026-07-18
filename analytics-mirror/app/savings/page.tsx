@@ -62,31 +62,37 @@ const STBY_ELEC_KWH_DAY = STBY_THERMAL_KWH_DAY / COP_AFTER;
 const CUTOVER = "2026-07-16"; // the day the buffer target + setpoints dropped (start of the ledger)
 const BASELINE_DAY_USD = DAILY_KWH * RATE; // what the OLD regime (HBX default curve + 75°C/160°F) cost/day
 
-// ── Cumulative "saved to date vs HBX-default + 75°C baseline" chart (owner ask 2026-07-18 #1) ──
-// One clear picture: the money the current regime has kept versus running as the pumps were found
-// (HBX default reset curve + 75°C/160°F setpoints). Accrued over REAL operating days (SPAN/Modbus
-// coverage from slx_readings), so an offline day doesn't invent savings. Same measured basis as the
-// Realized card (UA coast-down, A-4 COP, SPAN kWh) — labeled modeled, not metered, until the pump
-// power registers are calibrated. A dashed projection continues at the full daily rate to day 30.
-function CumulativeSavings({ days, savedLabel }: { days: { d: string; frac: number }[]; savedLabel: string }) {
+// ── Cumulative "saved to date vs the as-found regime" chart (owner ask 2026-07-18) ──
+// Fed by the planner's MEASURED per-day realized_savings ledger (realized.ts): for each day, the
+// as-found counterfactual (HBX default reset curve → old buffer target at the day's REAL outdoor
+// temp, old ~163°F setpoints, + the extra standby the hotter tank bleeds) costed against actual
+// metered pump electricity & measured COP. `daily` carries per-day baseline (as-found) vs actual
+// $; the chart accrues them cumulatively, then projects the recent daily rate forward to day 30.
+// Falls back to the static model only until the planner first populates the ledger.
+function CumulativeSavings({
+  daily, projDaily, savedLabel,
+}: {
+  daily: { label: string; baselineUsd: number; actualUsd: number }[];
+  projDaily: { baselineUsd: number; actualUsd: number };
+  savedLabel: string;
+}) {
   const W = 900, H = 260, pad = { l: 46, r: 16, t: 14, b: 34 };
-  // Build cumulative baseline / actual / saved over the real operating days, then a 30-day projection.
   type Pt = { i: number; label: string; baseline: number; actual: number; projected: boolean };
   const pts: Pt[] = [];
-  let cumBase = 0, cumSaved = 0;
-  days.forEach((o, i) => {
-    cumBase += BASELINE_DAY_USD * o.frac;
-    cumSaved += REALIZED_DAY_USD * o.frac;
-    pts.push({ i, label: o.d.slice(5), baseline: cumBase, actual: cumBase - cumSaved, projected: false });
+  let cumBase = 0, cumActual = 0;
+  daily.forEach((o, i) => {
+    cumBase += o.baselineUsd;
+    cumActual += o.actualUsd;
+    pts.push({ i, label: o.label, baseline: cumBase, actual: cumActual, projected: false });
   });
   const realN = pts.length;
-  const savedToDate = cumSaved;
-  // Projection: continue at the full daily rate to fill out a 30-day horizon (clearly dashed).
+  const savedToDate = cumBase - cumActual;
+  // Projection: continue at the recent daily rate to fill out a 30-day horizon (clearly dashed).
   const horizon = Math.max(30, realN);
   for (let k = realN; k < horizon; k++) {
-    cumBase += BASELINE_DAY_USD;
-    cumSaved += REALIZED_DAY_USD;
-    pts.push({ i: k, label: "", baseline: cumBase, actual: cumBase - cumSaved, projected: true });
+    cumBase += projDaily.baselineUsd;
+    cumActual += projDaily.actualUsd;
+    pts.push({ i: k, label: "", baseline: cumBase, actual: cumActual, projected: true });
   }
   const maxUsd = Math.max(1, pts[pts.length - 1].baseline);
   const X = (i: number) => pad.l + (horizon <= 1 ? 0 : (i / (horizon - 1)) * (W - pad.l - pad.r));
@@ -158,6 +164,10 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
   let writes: { ts: number; source: string; action: string; result: string; detail: string }[] = [];
   let episodes: { s: number; c: number | null; detail: string }[] = [];
   let opDays: { d: string; frac: number }[] = [];
+  let realized: {
+    day: string; savedUsd: number; actualElecKwh: number; cfElecKwh: number;
+    copNow: number; copOld: number; avgOutdoorF: number; sessions: number; confidence: string;
+  }[] = [];
   let dbError = false;
 
   try {
@@ -199,6 +209,24 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                  count(*)::int AS n
           FROM slx_readings WHERE ts >= ${CUTOVER} GROUP BY 1 ORDER BY 1`;
     opDays = (od.rows as any[]).map((r) => ({ d: r.d, frac: Math.min(1, Number(r.n) / 288) }));
+
+    // The planner's MEASURED per-day realized-savings ledger (realized_savings) — the source of
+    // truth. Own try/catch: the table only exists once the planner deploys + runs ensureSchema, and
+    // a missing table must fall back to the static model, not blank the page.
+    try {
+      const rs = winInterval
+        ? await sql`SELECT to_char(day,'YYYY-MM-DD') AS day, saved_usd, actual_elec_kwh, cf_elec_kwh,
+                           cop_now, cop_old, avg_outdoor_f, sessions, confidence
+                    FROM realized_savings WHERE day >= (now() - (${winInterval})::interval)::date ORDER BY day`
+        : await sql`SELECT to_char(day,'YYYY-MM-DD') AS day, saved_usd, actual_elec_kwh, cf_elec_kwh,
+                           cop_now, cop_old, avg_outdoor_f, sessions, confidence
+                    FROM realized_savings ORDER BY day`;
+      realized = (rs.rows as any[]).map((r) => ({
+        day: r.day, savedUsd: Number(r.saved_usd), actualElecKwh: Number(r.actual_elec_kwh),
+        cfElecKwh: Number(r.cf_elec_kwh), copNow: Number(r.cop_now), copOld: Number(r.cop_old),
+        avgOutdoorF: Number(r.avg_outdoor_f), sessions: Number(r.sessions), confidence: r.confidence,
+      }));
+    } catch { /* realized_savings not created yet — fall back to the static model below */ }
 
     writes = (await sql`
       SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, source, action, result, detail
@@ -247,20 +275,44 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
   const hygieneOk = hygieneHoursAgo != null && hygieneHoursAgo <= 26;
 
   // ── Window summary (owner ask 2026-07-18): Spent / Saved / Missed for the selected window. ──
-  //   Spent  = what the pumps cost this window (SPAN-baseline kWh × rate) — the actual outlay.
-  //   Saved  = what the cutover already kept vs the as-found HBX-default + 75 °C regime (realized).
+  //   Spent  = actual metered pump electricity this window × rate — the real outlay.
+  //   Saved  = the planner's MEASURED realized ledger vs the as-found regime (real, per-day).
   //   Missed = what the planner could STILL save if the plan were fully followed — the gap on the
   //            table (the would-have-saved ledger's full-plan figure; shrinks as autopilot closes it).
-  // Spent/Saved accrue over REAL operating days (opDays, already windowed); Missed reuses the
-  // gap-based ledger (also windowed), so all three answer the same window the toggle picks.
-  const opDaySum = opDays.reduce((s, o) => s + o.frac, 0); // effective operating days in window
-  const winSpentUsd = DAILY_KWH * opDaySum * RATE;
-  const winSavedUsd = REALIZED_DAY_USD * opDaySum;
+  // Prefer the measured realized_savings ledger; fall back to the static model only until it fills.
+  const haveReal = realized.length > 0;
+  const opDaySum = opDays.reduce((s, o) => s + o.frac, 0); // effective operating days in window (fallback)
+  const winSpentUsd = haveReal
+    ? realized.reduce((s, r) => s + r.actualElecKwh * RATE, 0)
+    : DAILY_KWH * opDaySum * RATE;
+  const winSavedUsd = haveReal
+    ? realized.reduce((s, r) => s + r.savedUsd, 0)
+    : REALIZED_DAY_USD * opDaySum;
   const winMissedUsd = scenarios[0]?.saved ?? null; // full-plan would-have-saved, this window
+
+  // Per-day (baseline as-found $ vs actual $) feeding the cumulative chart — measured or fallback.
+  const chartDaily = haveReal
+    ? realized.map((r) => ({ label: r.day.slice(5), baselineUsd: r.cfElecKwh * RATE, actualUsd: r.actualElecKwh * RATE }))
+    : opDays.map((o) => ({ label: o.d.slice(5), baselineUsd: BASELINE_DAY_USD * o.frac, actualUsd: (BASELINE_DAY_USD - REALIZED_DAY_USD) * o.frac }));
+  // Projection = recent daily rate (avg of the last up-to-3 measured days), so the dashed tail
+  // reflects how the system is actually running now, not a stale constant.
+  const recent = chartDaily.slice(-3);
+  const projDaily = recent.length
+    ? { baselineUsd: recent.reduce((s, d) => s + d.baselineUsd, 0) / recent.length, actualUsd: recent.reduce((s, d) => s + d.actualUsd, 0) / recent.length }
+    : { baselineUsd: BASELINE_DAY_USD, actualUsd: BASELINE_DAY_USD - REALIZED_DAY_USD };
+
   const savedLabel = win === "all" ? "saved to date" : `saved · last ${WINDOWS[win].label}`;
-  const chartSubtitle = win === "all"
-    ? `cumulative $, since the ${CUTOVER} cutover`
-    : `cumulative $, last ${WINDOWS[win].label} (from the ${CUTOVER} cutover)`;
+  const chartSubtitle = `${win === "all" ? "cumulative $, since the " + CUTOVER + " cutover" : "cumulative $, last " + WINDOWS[win].label}${haveReal ? " · measured per-day" : " · modeled (ledger filling)"}`;
+
+  // Real per-day ledger rollups for the "Realized" card (when the measured ledger exists).
+  const realDaysN = realized.length;
+  const realAvgSavedDayUsd = realDaysN ? winSavedUsd / realDaysN : null;
+  const realPerMonthUsd = realAvgSavedDayUsd != null ? realAvgSavedDayUsd * 30 : null;
+  const realKwhSavedDay = realDaysN ? realized.reduce((s, r) => s + (r.cfElecKwh - r.actualElecKwh), 0) / realDaysN : null;
+  const realCopNow = realDaysN ? realized.reduce((s, r) => s + r.copNow, 0) / realDaysN : null;
+  const realCopOld = realDaysN ? realized.reduce((s, r) => s + r.copOld, 0) / realDaysN : null;
+  const realOutdoor = realDaysN ? realized.reduce((s, r) => s + r.avgOutdoorF, 0) / realDaysN : null;
+  const realMeasuredDays = realized.filter((r) => r.confidence === "measured").length;
 
   return (
     <>
@@ -284,14 +336,14 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
         <>
           <div className="chart-block">
             <h3>Saved to date — current setup vs. HBX defaults + 75&nbsp;°C setpoints <span className="dim">({chartSubtitle})</span></h3>
-            {opDays.length === 0 ? (
+            {chartDaily.length === 0 ? (
               <div className="meta">
                 No operating days recorded in this window yet — savings accrue from the {CUTOVER} cutover.
                 Try a wider window (7d / 30d / all).
               </div>
             ) : (
               <>
-                <CumulativeSavings days={opDays} savedLabel={savedLabel} />
+                <CumulativeSavings daily={chartDaily} projDaily={projDaily} savedLabel={savedLabel} />
                 {/* Window summary — the toggle's headline effect: what you spent, kept, and left on the table. */}
                 <div className="temps" style={{ marginTop: 10 }}>
                   <div className="temp"><div className="v">${winSpentUsd.toFixed(2)}</div><div className="l">spent · {WINDOWS[win].label}</div></div>
@@ -300,13 +352,19 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                 </div>
                 <div className="meta" style={{ marginTop: 8 }}>
                   <span style={{ color: "#ff6b6b" }}>■</span> what the pumps <b>as found</b> (HBX default
-                  curve + 75&nbsp;°C / 160&nbsp;°F setpoints) would have cost ·{" "}
+                  curve → old buffer target at the day&apos;s <b>real outdoor temp</b>, old ~163&nbsp;°F setpoints)
+                  would have cost ·{" "}
                   <span style={{ color: "#4dabf7" }}>■</span> what the <b>current</b> cooler-tank regime
-                  costs · <span style={{ color: "#63e6be" }}>■</span> the gap is money kept. Accrued over
-                  the days the system actually reported, modeled from measured parameters (UA coast-down,
-                  A-4 COP, SPAN kWh) — same basis as the Realized card below; metered confirmation from the
-                  pump COP telemetry replaces the model as it accrues. The dashed tail projects the current
-                  daily rate forward — summer / hot-water-only; winter runs larger.
+                  actually cost · <span style={{ color: "#63e6be" }}>■</span> the gap is money kept.{" "}
+                  {haveReal ? (
+                    <>Computed <b>per day from measured data</b> — the pumps&apos; metered electricity and measured
+                    COP ({realCopNow?.toFixed(2)} now vs ~{realCopOld?.toFixed(2)} at the old hotter water), plus the
+                    extra standby the hotter as-found tank would bleed (measured UA ≈ {UA_BTU} BTU/hr·°F).
+                    {realMeasuredDays < realDaysN ? ` ${realMeasuredDays}/${realDaysN} days are metered; the rest use the COP model until telemetry lands.` : ""}</>
+                  ) : (
+                    <>Interim static estimate while the planner&apos;s measured per-day ledger fills in — it takes over automatically.</>
+                  )}{" "}
+                  The dashed tail projects the recent daily rate forward — summer / hot-water-only; winter runs larger.
                 </div>
                 <div className="meta" style={{ marginTop: 6 }}>
                   <b>Spent</b> = the pumps&apos; cost this window · <b style={{ color: "#63e6be" }}>Saved</b> =
@@ -320,22 +378,39 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
 
           <div className="cards">
             <div className="card" style={{ gridColumn: "1 / -1" }}>
-              <h2>Realized — since today&apos;s cutover<span className="chip ok">live · measured params</span></h2>
-              <div className="temps">
-                <div className="temp"><div className="v">${REALIZED_MO_USD.toFixed(0)}</div><div className="l">≈ saved / month</div></div>
-                <div className="temp"><div className="v">{REALIZED_KWH_DAY.toFixed(1)} kWh</div><div className="l">≈ saved / day</div></div>
-                <div className="temp"><div className="v">154→135 · 160→145</div><div className="l">buffer · setpoints °F</div></div>
-              </div>
-              <div className="meta">
-                Today the buffer target dropped <b>154→135°F</b> and both pump setpoints <b>160→145°F</b> — two
-                compounding wins. Cooler leaving water raises efficiency (≈ <b>{COP_PCT}% less electricity</b> for
-                the same hot water, COP ~{COP_BEFORE.toFixed(1)}→{COP_AFTER.toFixed(1)}), and the cooler tank bleeds
-                ≈ <b>{STBY_ELEC_KWH_DAY.toFixed(1)} kWh/day</b> less standby heat (measured UA ≈ {UA_BTU} BTU/hr·°F).
-                Combined ≈ <b>{REALIZED_KWH_DAY.toFixed(1)} kWh/day (${REALIZED_DAY_USD.toFixed(2)}/day, ${REALIZED_MO_USD.toFixed(0)}/mo)</b>
-                {" "}at ${RATE.toFixed(2)}/kWh. Model-based on measured parameters (UA from the coast-down, COP from the
-                A-4 test, {fmt(DAILY_KWH, 1)} kWh/day from SPAN); metered confirmation from the pumps&apos; COP telemetry
-                accrues over the coming days. Summer / hot-water-only figure — winter is larger.
-              </div>
+              <h2>Realized — measured vs. the as-found regime<span className={`chip ${haveReal ? "ok" : "warn"}`}>{haveReal ? "live · per-day metered" : "ledger filling"}</span></h2>
+              {haveReal ? (
+                <>
+                  <div className="temps">
+                    <div className="temp"><div className="v">${realPerMonthUsd == null ? "—" : realPerMonthUsd.toFixed(0)}</div><div className="l">≈ saved / month (at this rate)</div></div>
+                    <div className="temp"><div className="v">${realAvgSavedDayUsd == null ? "—" : realAvgSavedDayUsd.toFixed(2)}</div><div className="l">avg saved / day</div></div>
+                    <div className="temp"><div className="v">{realCopNow?.toFixed(2)} → {realCopOld?.toFixed(2)}</div><div className="l">COP now vs. as-found</div></div>
+                  </div>
+                  <div className="meta">
+                    Computed <b>per day from measured data</b>, not a static guess. Over {realDaysN} day{realDaysN === 1 ? "" : "s"}
+                    {" "}({realMeasuredDays} metered) at avg <b>{realOutdoor?.toFixed(0)}°F</b> outdoor, the current cooler-tank
+                    regime saved ≈ <b>${winSavedUsd.toFixed(2)}</b> vs. running the original HBX default curve + ~163°F setpoints
+                    — that&apos;s the pumps&apos; measured COP ({realCopNow?.toFixed(2)}) beating the old hotter-water COP
+                    (~{realCopOld?.toFixed(2)}) on the heat actually delivered, plus ≈ <b>{realKwhSavedDay?.toFixed(1)} kWh/day</b>
+                    of extra pump-work the hotter as-found tank&apos;s standby would have demanded. At ${RATE.toFixed(2)}/kWh.
+                    Summer / hot-water-only — winter runs larger. (Resistive-backup credit not yet included — pending the pumps&apos;
+                    max water-temp spec.)
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="temps">
+                    <div className="temp"><div className="v">${REALIZED_MO_USD.toFixed(0)}</div><div className="l">≈ saved / month</div></div>
+                    <div className="temp"><div className="v">{REALIZED_KWH_DAY.toFixed(1)} kWh</div><div className="l">≈ saved / day</div></div>
+                    <div className="temp"><div className="v">154→135 · 160→145</div><div className="l">buffer · setpoints °F</div></div>
+                  </div>
+                  <div className="meta">
+                    Interim static estimate: buffer <b>154→135°F</b>, setpoints <b>160→145°F</b> — cooler water raises COP
+                    (≈ <b>{COP_PCT}% less electricity</b>) and the cooler tank bleeds ≈ <b>{STBY_ELEC_KWH_DAY.toFixed(1)} kWh/day</b>
+                    less standby. The planner&apos;s <b>measured per-day ledger</b> replaces this the moment it populates.
+                  </div>
+                </>
+              )}
             </div>
 
             <div className="card" style={{ gridColumn: "1 / -1" }}>
