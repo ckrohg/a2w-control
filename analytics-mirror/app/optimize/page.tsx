@@ -57,6 +57,26 @@ export default async function OptimizePage() {
     /* controller_status not created yet — the client shows a graceful "no report yet" state */
   }
 
+  // W2-B: seed the Off/Armed switch from the planner's RUNTIME autonomy row (controller_flags),
+  // which updates the instant the switch POSTs — so a refresh right after a flip shows the new
+  // position (the controller_status heartbeat lags one poll). 'custom' (a mixed env-seed, e.g.
+  // autopilot live + Phase B shadow) resolves to Armed when the primary lever (autopilot) is live,
+  // so the switch can never read "Off" while the system is actually driving.
+  let initialMode: "off" | "arm" | "set" | "req" = "off";
+  try {
+    const cf = await sql<{ mode: string }>`SELECT mode FROM controller_flags WHERE id = 1`;
+    if (cf.rowCount) {
+      const m = cf.rows[0].mode;
+      initialMode = m === "arm" || m === "off" || m === "set" || m === "req"
+        ? m
+        : autonomy?.autopilot.enabled && !autonomy.autopilot.dryRun ? "arm" : "off"; // 'custom'/unknown
+    } else if (autonomy?.autopilot.enabled && !autonomy.autopilot.dryRun) {
+      initialMode = "arm"; // flags row not seeded yet, but autopilot is already live
+    }
+  } catch {
+    /* controller_flags not created yet — default the switch to Off */
+  }
+
   return (
     <>
       <I1Banner />
@@ -73,6 +93,7 @@ export default async function OptimizePage() {
         blocks={blocks}
         computedAt={computedAt}
         autonomy={autonomy}
+        initialMode={initialMode}
       />
     </>
   );

@@ -194,7 +194,58 @@ export class Store {
         holder       text,
         heartbeat_at timestamptz NOT NULL DEFAULT now()
       );
+      -- Single-row RUNTIME autonomy override (W2-A). Env flags (AUTOPILOT_DRY_RUN/PHASE_B_DRY_RUN)
+      -- only SEED this on first boot; thereafter the dashboard's Off/Armed switch writes the row and
+      -- the planner reads it at the top of every poll. Lets autonomy be flipped live with no redeploy.
+      -- mode: 'off' (both shadow / dry-run) | 'arm' (both live). set/req are future modes (F/G).
+      CREATE TABLE IF NOT EXISTS controller_flags (
+        id                integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        mode              text NOT NULL,
+        autopilot_dry_run boolean NOT NULL,
+        phaseb_dry_run    boolean NOT NULL,
+        updated_at        timestamptz NOT NULL DEFAULT now(),
+        updated_by        text
+      );
     `);
+  }
+
+  /** Seed the runtime autonomy row from the env defaults IF it doesn't exist yet (first boot only).
+   *  After that the DB row is authoritative and env changes don't clobber a live choice. */
+  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_by)
+       VALUES (1, $1, $2, $3, 'env-seed')
+       ON CONFLICT (id) DO NOTHING`,
+      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun],
+    );
+  }
+
+  /** The current effective autonomy flags (runtime override). null before the row is seeded. */
+  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean } | null> {
+    const r = await this.pool.query(
+      `SELECT mode, autopilot_dry_run, phaseb_dry_run FROM controller_flags WHERE id = 1`,
+    );
+    if (!r.rowCount) return null;
+    const x = r.rows[0];
+    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run };
+  }
+
+  /** Set the runtime autonomy mode (dashboard Off/Armed switch). Returns the stored row. */
+  async setControllerFlags(s: {
+    mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; updatedBy: string;
+  }): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }> {
+    await this.pool.query(
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_at, updated_by)
+       VALUES (1, $1, $2, $3, now(), $4)
+       ON CONFLICT (id) DO UPDATE SET
+         mode = EXCLUDED.mode,
+         autopilot_dry_run = EXCLUDED.autopilot_dry_run,
+         phaseb_dry_run = EXCLUDED.phaseb_dry_run,
+         updated_at = now(),
+         updated_by = EXCLUDED.updated_by`,
+      [s.mode, s.autopilotDryRun, s.phasebDryRun, s.updatedBy],
+    );
+    return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun };
   }
 
   async insertBoost(targetF: number, restoreAt: Date): Promise<void> {

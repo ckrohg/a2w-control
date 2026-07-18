@@ -756,18 +756,30 @@ async function pollOnce(): Promise<void> {
     catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
   }
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
+
+  // W2-A: pull the runtime autonomy override and apply it per-tick BEFORE the controllers run, so
+  // the dashboard Off/Armed switch takes effect within one poll with no redeploy. Falls back to the
+  // env-seeded values if the row is somehow unreadable. This governs ONLY dry-run (actuate vs
+  // shadow) — the I4/I1 guardrails, single-writer invariant (#36), and rate limits are untouched.
+  const flags = (await store.getControllerFlags().catch(() => null))
+    ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN };
+  if (autopilot) autopilot.setDryRun(flags.autopilotDryRun);
+  if (phaseB) phaseB.setDryRun(flags.phasebDryRun);
+
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
 
-  // Heartbeat the planner's ACTUAL controller flags so the dashboard shows ground truth (the
-  // Plan page reads this row instead of hardcoded copy — a stale updated_at ⇒ planner down).
+  // Heartbeat the planner's ACTUAL (effective, runtime) controller flags so the dashboard shows
+  // ground truth (the Plan page reads this row instead of hardcoded copy — a stale updated_at ⇒
+  // planner down). Sourced from the live controller state, NOT the boot-time env const, so it
+  // reflects a mid-run switch flip.
   await store.upsertControllerStatus({
     autopilotEnabled: AUTOPILOT_ENABLED,
-    autopilotDryRun: AUTOPILOT_DRY_RUN,
+    autopilotDryRun: autopilot ? autopilot.isDryRun : AUTOPILOT_DRY_RUN,
     autopilotResult: autopilot ? autopilot.lastResult : null,
     autopilotTargetF: autopilot ? autopilot.lastTargetF : null,
     phasebEnabled: PHASE_B_ENABLED,
-    phasebDryRun: PHASE_B_DRY_RUN,
+    phasebDryRun: phaseB ? phaseB.isDryRun : PHASE_B_DRY_RUN,
     phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
   }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
 
@@ -838,6 +850,17 @@ async function loop(): Promise<void> {
 
 async function main(): Promise<void> {
   await store.ensureSchema();
+
+  // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
+  // preserving the EXACT current per-controller state so deploying this changes nothing until the
+  // dashboard Off/Armed switch is used. Thereafter the controller_flags row is authoritative and
+  // env changes don't clobber a live choice. mode is cosmetic ('arm' both-live / 'off' both-shadow /
+  // 'custom' mixed); the two dry-run booleans are what actually govern actuation.
+  const seedMode = !AUTOPILOT_DRY_RUN && !PHASE_B_DRY_RUN ? "arm"
+    : AUTOPILOT_DRY_RUN && PHASE_B_DRY_RUN ? "off" : "custom";
+  await store.seedControllerFlags({
+    mode: seedMode, autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN,
+  }).catch((e) => console.error("controller_flags seed failed:", (e as Error).message));
 
   if (process.env.POLL_ONCE === "1") {
     await pollOnce();
@@ -924,6 +947,41 @@ async function main(): Promise<void> {
           }
           await stormEvaluate(null); // manual wins in the machine — no need to wait on OutageWatch
           return json(res, 200, { state: stormState });
+        }
+        if (req.url === "/api/autonomy") {
+          // W2-A: the dashboard Off/Armed switch. Same bearer gate as the other write routes; the
+          // dashboard proxy holds the token server-side. Writes the runtime controller_flags row and
+          // applies it to the in-memory controllers immediately (next poll would also pick it up).
+          // off → both shadow (dry-run); arm → both live. set/req are future modes → 501.
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          if (req.method === "GET") {
+            const f = await store.getControllerFlags();
+            return json(res, 200, f ?? { mode: "off", autopilotDryRun: true, phasebDryRun: true });
+          }
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          const body = JSON.parse((await readBody(req)) || "{}");
+          const mode = String(body.mode ?? "");
+          if (mode !== "off" && mode !== "arm") {
+            const future = mode === "set" || mode === "req";
+            return json(res, future ? 501 : 400, {
+              error: future
+                ? `mode '${mode}' is not implemented yet (fast-follow) — only 'off' and 'arm' actuate today`
+                : "mode must be 'off' or 'arm'",
+            });
+          }
+          const dry = mode === "off"; // off = shadow (compute + log, write nothing)
+          const stored = await store.setControllerFlags({
+            mode, autopilotDryRun: dry, phasebDryRun: dry, updatedBy: "dashboard",
+          });
+          if (autopilot) autopilot.setDryRun(stored.autopilotDryRun);
+          if (phaseB) phaseB.setDryRun(stored.phasebDryRun);
+          await ntfy(
+            "Autonomy mode changed",
+            `→ ${mode.toUpperCase()} (autopilot ${dry ? "shadow" : "LIVE"}, phase-b ${dry ? "shadow" : "LIVE"}) via dashboard`,
+            mode === "arm" ? "high" : "default",
+          );
+          console.log(`[autonomy] mode → ${mode} (dry-run ${dry}) via dashboard`);
+          return json(res, 200, { ok: true, ...stored });
         }
         res.writeHead(404).end();
       } catch (e) {

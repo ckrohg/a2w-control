@@ -59,6 +59,81 @@ const REALIZED_KWH_DAY = Math.max(0, DAILY_KWH - ELEC_AFTER);
 const REALIZED_DAY_USD = REALIZED_KWH_DAY * RATE;
 const REALIZED_MO_USD = REALIZED_DAY_USD * 30;
 const STBY_ELEC_KWH_DAY = STBY_THERMAL_KWH_DAY / COP_AFTER;
+const CUTOVER = "2026-07-16"; // the day the buffer target + setpoints dropped (start of the ledger)
+const BASELINE_DAY_USD = DAILY_KWH * RATE; // what the OLD regime (HBX default curve + 75°C/160°F) cost/day
+
+// ── Cumulative "saved to date vs HBX-default + 75°C baseline" chart (owner ask 2026-07-18 #1) ──
+// One clear picture: the money the current regime has kept versus running as the pumps were found
+// (HBX default reset curve + 75°C/160°F setpoints). Accrued over REAL operating days (SPAN/Modbus
+// coverage from slx_readings), so an offline day doesn't invent savings. Same measured basis as the
+// Realized card (UA coast-down, A-4 COP, SPAN kWh) — labeled modeled, not metered, until the pump
+// power registers are calibrated. A dashed projection continues at the full daily rate to day 30.
+function CumulativeSavings({ days }: { days: { d: string; frac: number }[] }) {
+  const W = 900, H = 260, pad = { l: 46, r: 16, t: 14, b: 34 };
+  // Build cumulative baseline / actual / saved over the real operating days, then a 30-day projection.
+  type Pt = { i: number; label: string; baseline: number; actual: number; projected: boolean };
+  const pts: Pt[] = [];
+  let cumBase = 0, cumSaved = 0;
+  days.forEach((o, i) => {
+    cumBase += BASELINE_DAY_USD * o.frac;
+    cumSaved += REALIZED_DAY_USD * o.frac;
+    pts.push({ i, label: o.d.slice(5), baseline: cumBase, actual: cumBase - cumSaved, projected: false });
+  });
+  const realN = pts.length;
+  const savedToDate = cumSaved;
+  // Projection: continue at the full daily rate to fill out a 30-day horizon (clearly dashed).
+  const horizon = Math.max(30, realN);
+  for (let k = realN; k < horizon; k++) {
+    cumBase += BASELINE_DAY_USD;
+    cumSaved += REALIZED_DAY_USD;
+    pts.push({ i: k, label: "", baseline: cumBase, actual: cumBase - cumSaved, projected: true });
+  }
+  const maxUsd = Math.max(1, pts[pts.length - 1].baseline);
+  const X = (i: number) => pad.l + (horizon <= 1 ? 0 : (i / (horizon - 1)) * (W - pad.l - pad.r));
+  const Y = (v: number) => pad.t + (1 - v / maxUsd) * (H - pad.t - pad.b);
+  const realPts = pts.slice(0, realN);
+  const line = (sel: (p: Pt) => number, arr: Pt[]) =>
+    arr.map((p, j) => `${j ? "L" : "M"}${X(p.i).toFixed(1)},${Y(sel(p)).toFixed(1)}`).join("");
+  // Saved band (between baseline and actual) over the REAL days only — the honest "already saved".
+  const band = realN
+    ? `M${realPts.map((p) => `${X(p.i).toFixed(1)},${Y(p.baseline).toFixed(1)}`).join("L")}` +
+      `L${[...realPts].reverse().map((p) => `${X(p.i).toFixed(1)},${Y(p.actual).toFixed(1)}`).join("L")}Z`
+    : "";
+  const yTicks = [0, 0.5, 1].map((f) => f * maxUsd);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/260" }}>
+      {yTicks.map((v, i) => (
+        <g key={i}>
+          <line x1={pad.l} x2={W - pad.r} y1={Y(v)} y2={Y(v)} stroke="#2c3640" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />
+          <text x={6} y={Y(v) + 4} fill="#8b98a5" fontSize={12}>${v.toFixed(0)}</text>
+        </g>
+      ))}
+      {/* boundary between measured-to-date and projection */}
+      {realN > 0 && realN < horizon && (
+        <line x1={X(realN - 1)} x2={X(realN - 1)} y1={pad.t} y2={H - pad.b} stroke="#3d3222" strokeWidth={1.2} strokeDasharray="3 5" vectorEffect="non-scaling-stroke" />
+      )}
+      {band && <path d={band} fill="#63e6be" fillOpacity={0.16} vectorEffect="non-scaling-stroke" />}
+      {/* baseline (what HBX-default + 75°C would cost) and actual (current regime), real + projected */}
+      <path d={line((p) => p.baseline, realPts)} fill="none" stroke="#ff6b6b" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+      <path d={line((p) => p.actual, realPts)} fill="none" stroke="#4dabf7" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+      <path d={line((p) => p.baseline, pts.slice(Math.max(0, realN - 1)))} fill="none" stroke="#ff6b6b" strokeOpacity={0.5} strokeWidth={1.6} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
+      <path d={line((p) => p.actual, pts.slice(Math.max(0, realN - 1)))} fill="none" stroke="#4dabf7" strokeOpacity={0.5} strokeWidth={1.6} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
+      {/* running total callout at the last real day */}
+      {realN > 0 && (
+        <g>
+          <circle cx={X(realN - 1)} cy={Y(realPts[realN - 1].actual)} r={3} fill="#63e6be" />
+          <text x={X(realN - 1) + 8} y={Y(realPts[realN - 1].actual) - 6} fill="#63e6be" fontSize={12.5} fontWeight={700}>
+            ${savedToDate.toFixed(2)} saved to date
+          </text>
+        </g>
+      )}
+      {/* x labels: first, boundary, last */}
+      {realN > 0 && <text x={X(0)} y={H - 10} fill="#8b98a5" fontSize={11.5}>{realPts[0].label}</text>}
+      {realN > 0 && <text x={X(realN - 1)} y={H - 10} fill="#8b98a5" fontSize={11.5} textAnchor="middle">{realPts[realN - 1].label}</text>}
+      <text x={X(horizon - 1)} y={H - 10} fill="#8b98a5" fontSize={11.5} textAnchor="end">+{horizon - realN}d projected</text>
+    </svg>
+  );
+}
 
 const WINDOWS: Record<string, { label: string; interval: string | null }> = {
   "24h": { label: "24h", interval: "24 hours" },
@@ -82,6 +157,7 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
   let hygieneHoursAgo: number | null = null;
   let writes: { ts: number; source: string; action: string; result: string; detail: string }[] = [];
   let episodes: { s: number; c: number | null; detail: string }[] = [];
+  let opDays: { d: string; frac: number }[] = [];
   let dbError = false;
 
   try {
@@ -106,6 +182,14 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
     const h = await sql`SELECT EXTRACT(EPOCH FROM (now() - max(ts)))::float8 / 3600 AS hrs
                         FROM slx_readings WHERE tank_f >= 131`;
     hygieneHoursAgo = h.rows[0]?.hrs == null ? null : Number(h.rows[0].hrs);
+
+    // Real operating coverage per day since the cutover — 288 = 5-min samples in a full day, so
+    // frac is the share of the day the system actually reported (an offline day accrues no savings).
+    const od = await sql`
+      SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS d,
+             count(*)::int AS n
+      FROM slx_readings WHERE ts >= ${CUTOVER} GROUP BY 1 ORDER BY 1`;
+    opDays = (od.rows as any[]).map((r) => ({ d: r.d, frac: Math.min(1, Number(r.n) / 288) }));
 
     writes = (await sql`
       SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, source, action, result, detail
@@ -173,6 +257,30 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
         <div className="empty">Database not reachable.</div>
       ) : (
         <>
+          <div className="chart-block">
+            <h3>Saved to date — current setup vs. HBX defaults + 75&nbsp;°C setpoints <span className="dim">(cumulative $, since the {CUTOVER} cutover)</span></h3>
+            {opDays.length === 0 ? (
+              <div className="meta">
+                The ledger starts accruing from the {CUTOVER} cutover — once a full day of operation is
+                recorded here, this fills in. (No operating days logged in that range yet.)
+              </div>
+            ) : (
+              <>
+                <CumulativeSavings days={opDays} />
+                <div className="meta" style={{ marginTop: 8 }}>
+                  <span style={{ color: "#ff6b6b" }}>■</span> what the pumps <b>as found</b> (HBX default
+                  curve + 75&nbsp;°C / 160&nbsp;°F setpoints) would have cost ·{" "}
+                  <span style={{ color: "#4dabf7" }}>■</span> what the <b>current</b> cooler-tank regime
+                  costs · <span style={{ color: "#63e6be" }}>■</span> the gap is money kept. Accrued over
+                  the days the system actually reported, modeled from measured parameters (UA coast-down,
+                  A-4 COP, SPAN kWh) — same basis as the Realized card below; metered confirmation from the
+                  pump COP telemetry replaces the model as it accrues. The dashed tail projects the current
+                  daily rate forward — summer / hot-water-only; winter runs larger.
+                </div>
+              </>
+            )}
+          </div>
+
           <div className="cards">
             <div className="card" style={{ gridColumn: "1 / -1" }}>
               <h2>Realized — since today&apos;s cutover<span className="chip ok">live · measured params</span></h2>
