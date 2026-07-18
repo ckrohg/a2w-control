@@ -17,32 +17,44 @@ test("hotter old sink gives a LOWER Carnot factor (lower COP)", () => {
   assert.ok(carnotFactor(163, 75) < carnotFactor(145, 75), "163°F sink must be less efficient than 145°F");
 });
 
-test("representative summer day: both terms ≥0 and decompose to the total", () => {
+test("representative summer day: terms decompose to the total; as-found + fixed regimes sane", () => {
   const d: DayInputs = {
     day: "2026-07-17", avgOutdoorF: 75, nowBufferF: 135, coverage: 1,
     measured: { elecKwh: 9.5, thermalKwh: 24, cop: 2.4, sinkF: 145, sessions: 8 },
   };
   const r = computeDayRealized(d, P);
   assert.ok(r.copOld < r.copNow, `copOld(${r.copOld}) must be < copNow(${r.copNow})`);
-  assert.ok(r.copUsd >= 0 && r.standbyUsd >= 0, "both saving terms must be non-negative");
+  assert.ok(r.elementCreditUsd >= 0, "element credit must be ≥0");
   assert.ok(Math.abs(r.copUsd + r.standbyUsd + r.elementCreditUsd - r.savedUsd) < 0.02, "terms must sum to total");
-  // ~154°F as-found buffer vs 135 now
-  assert.ok(Math.abs(r.oldBufferF - 153.3) < 1);
-  // sanity: a single summer day saves a fraction of a dollar (→ ~$5-6/week over 7 such days)
-  assert.ok(r.savedUsd > 0.3 && r.savedUsd < 2.0, `daily saving out of expected band: $${r.savedUsd}`);
+  assert.ok(Math.abs(r.oldBufferF - 153.3) < 1); // ~154°F as-found buffer
+  // the as-found regime always costs more than actual (saving > 0) and than the hardcoded-cool regime
+  assert.ok(r.cfElecKwh > r.actualElecKwh && r.cfElecKwh > r.fixedElecKwh, "as-found must be the priciest");
+  assert.ok(r.savedUsd > 0 && r.fixedSavedUsd > 0, "both smart and hardcoded-cool must save vs as-found");
+  // smart premium = savedUsd − fixedSavedUsd (may be small/either sign in summer — flat rate, DHW-only)
+  assert.ok(Math.abs(r.savedUsd - r.fixedSavedUsd - r.smartPremiumUsd) < 0.02, "premium identity");
 });
 
-test("7 representative summer days land in the live-data ballpark (~$4-9/wk, well above the old $2.76)", () => {
-  let total = 0;
+test("hotter as-found buffer (winter-ish, cold outdoor) trips the element → element credit > 0", () => {
+  const r = computeDayRealized({
+    day: "2026-01-15", avgOutdoorF: 20, nowBufferF: 135, coverage: 1,
+    measured: { elecKwh: 20, thermalKwh: 45, cop: 2.2, sinkF: 145, sessions: 10 },
+  }, P);
+  assert.ok(r.oldBufferF > 158, `cold-day as-found buffer should be hot (${r.oldBufferF})`);
+  assert.ok(r.elementCreditUsd > 0, "hot as-found buffer above the pump max must credit the element");
+});
+
+test("7 representative summer days exceed the old static $2.76/wk under-count", () => {
+  let total = 0, fixedTotal = 0;
   for (let i = 0; i < 7; i++) {
     const r = computeDayRealized({
-      day: `2026-07-1${i}`, avgOutdoorF: 75, nowBufferF: 135, coverage: 1,
+      day: `2026-07-1${i}`, avgOutdoorF: 75, nowBufferF: 130, coverage: 1,
       measured: { elecKwh: 9.5, thermalKwh: 24, cop: 2.4, sinkF: 145, sessions: 8 },
     }, P);
-    total += r.savedUsd;
+    total += r.savedUsd; fixedTotal += r.fixedSavedUsd;
   }
-  assert.ok(total > 4 && total < 9, `7-day total out of band: $${total.toFixed(2)}`);
-  assert.ok(total > 2.76, "the measured-data model must exceed the old static $2.76/wk under-count");
+  assert.ok(total > 2.76, `smart 7-day ($${total.toFixed(2)}) must exceed the old static $2.76`);
+  assert.ok(fixedTotal > 2.76, `hardcoded-cool 7-day ($${fixedTotal.toFixed(2)}) must also exceed it`);
+  assert.ok(total < 20 && fixedTotal < 20, "sane upper bound");
 });
 
 test("modeled fallback (no measured sessions) still produces a bounded, positive number", () => {

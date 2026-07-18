@@ -213,7 +213,10 @@ export class Store {
         day                date PRIMARY KEY,
         actual_elec_kwh    real,
         cf_elec_kwh        real,
+        cf_fixed_elec_kwh  real,
         saved_usd          real,
+        fixed_saved_usd    real,
+        smart_premium_usd  real,
         cop_usd            real,
         standby_usd        real,
         element_credit_usd real,
@@ -226,6 +229,10 @@ export class Store {
         confidence         text,
         computed_at        timestamptz NOT NULL DEFAULT now()
       );
+      -- v2 columns (fixed-cool + smart-premium) for tables created before they existed.
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS cf_fixed_elec_kwh real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS fixed_saved_usd   real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS smart_premium_usd real;
     `);
   }
 
@@ -276,24 +283,29 @@ export class Store {
   }
 
   async upsertRealizedDay(r: {
-    day: string; actualElecKwh: number; cfElecKwh: number; savedUsd: number; copUsd: number;
-    standbyUsd: number; elementCreditUsd: number; avgOutdoorF: number; copNow: number; copOld: number;
+    day: string; actualElecKwh: number; cfElecKwh: number; fixedElecKwh: number; savedUsd: number;
+    fixedSavedUsd: number; smartPremiumUsd: number; copUsd: number; standbyUsd: number;
+    elementCreditUsd: number; avgOutdoorF: number; copNow: number; copOld: number;
     oldBufferF: number; standbyKwh: number; sessions: number; confidence: string;
   }): Promise<void> {
     await this.pool.query(
       `INSERT INTO realized_savings
-         (day, actual_elec_kwh, cf_elec_kwh, saved_usd, cop_usd, standby_usd, element_credit_usd,
-          avg_outdoor_f, cop_now, cop_old, old_buffer_f, standby_kwh, sessions, confidence, computed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
+         (day, actual_elec_kwh, cf_elec_kwh, cf_fixed_elec_kwh, saved_usd, fixed_saved_usd,
+          smart_premium_usd, cop_usd, standby_usd, element_credit_usd, avg_outdoor_f, cop_now, cop_old,
+          old_buffer_f, standby_kwh, sessions, confidence, computed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, now())
        ON CONFLICT (day) DO UPDATE SET
          actual_elec_kwh = EXCLUDED.actual_elec_kwh, cf_elec_kwh = EXCLUDED.cf_elec_kwh,
-         saved_usd = EXCLUDED.saved_usd, cop_usd = EXCLUDED.cop_usd, standby_usd = EXCLUDED.standby_usd,
+         cf_fixed_elec_kwh = EXCLUDED.cf_fixed_elec_kwh, saved_usd = EXCLUDED.saved_usd,
+         fixed_saved_usd = EXCLUDED.fixed_saved_usd, smart_premium_usd = EXCLUDED.smart_premium_usd,
+         cop_usd = EXCLUDED.cop_usd, standby_usd = EXCLUDED.standby_usd,
          element_credit_usd = EXCLUDED.element_credit_usd, avg_outdoor_f = EXCLUDED.avg_outdoor_f,
          cop_now = EXCLUDED.cop_now, cop_old = EXCLUDED.cop_old, old_buffer_f = EXCLUDED.old_buffer_f,
          standby_kwh = EXCLUDED.standby_kwh, sessions = EXCLUDED.sessions,
          confidence = EXCLUDED.confidence, computed_at = now()`,
-      [r.day, r.actualElecKwh, r.cfElecKwh, r.savedUsd, r.copUsd, r.standbyUsd, r.elementCreditUsd,
-       r.avgOutdoorF, r.copNow, r.copOld, r.oldBufferF, r.standbyKwh, r.sessions, r.confidence],
+      [r.day, r.actualElecKwh, r.cfElecKwh, r.fixedElecKwh, r.savedUsd, r.fixedSavedUsd,
+       r.smartPremiumUsd, r.copUsd, r.standbyUsd, r.elementCreditUsd, r.avgOutdoorF, r.copNow, r.copOld,
+       r.oldBufferF, r.standbyKwh, r.sessions, r.confidence],
     );
   }
 
