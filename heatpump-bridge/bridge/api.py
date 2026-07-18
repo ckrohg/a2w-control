@@ -379,6 +379,10 @@ async def health(request: Request, response: Response):
         "pumps_total": len(pollers),
         "healthy": not blind,
         "auth_mode": request.app.state.config.auth.protect,
+        # whether push alerts (ntfy) / the dead-man heartbeat are wired — lets an operator
+        # confirm the health-alert path can actually deliver without exposing the topic/URL.
+        "notify_configured": bool(request.app.state.config.notifications.ntfy_topic),
+        "heartbeat_configured": bool(request.app.state.config.notifications.heartbeat_url),
     }
 
 
