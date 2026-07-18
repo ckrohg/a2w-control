@@ -68,7 +68,7 @@ const BASELINE_DAY_USD = DAILY_KWH * RATE; // what the OLD regime (HBX default c
 // coverage from slx_readings), so an offline day doesn't invent savings. Same measured basis as the
 // Realized card (UA coast-down, A-4 COP, SPAN kWh) — labeled modeled, not metered, until the pump
 // power registers are calibrated. A dashed projection continues at the full daily rate to day 30.
-function CumulativeSavings({ days }: { days: { d: string; frac: number }[] }) {
+function CumulativeSavings({ days, savedLabel }: { days: { d: string; frac: number }[]; savedLabel: string }) {
   const W = 900, H = 260, pad = { l: 46, r: 16, t: 14, b: 34 };
   // Build cumulative baseline / actual / saved over the real operating days, then a 30-day projection.
   type Pt = { i: number; label: string; baseline: number; actual: number; projected: boolean };
@@ -123,7 +123,7 @@ function CumulativeSavings({ days }: { days: { d: string; frac: number }[] }) {
         <g>
           <circle cx={X(realN - 1)} cy={Y(realPts[realN - 1].actual)} r={3} fill="#63e6be" />
           <text x={X(realN - 1) + 8} y={Y(realPts[realN - 1].actual) - 6} fill="#63e6be" fontSize={12.5} fontWeight={700}>
-            ${savedToDate.toFixed(2)} saved to date
+            ${savedToDate.toFixed(2)} {savedLabel}
           </text>
         </g>
       )}
@@ -143,7 +143,7 @@ const WINDOWS: Record<string, { label: string; interval: string | null }> = {
 };
 
 export default async function SavingsPage({ searchParams }: { searchParams: { window?: string } }) {
-  const win = WINDOWS[searchParams.window ?? "24h"] ? (searchParams.window ?? "24h") : "24h";
+  const win = WINDOWS[searchParams.window ?? "7d"] ? (searchParams.window ?? "7d") : "7d";
   const winInterval = WINDOWS[win].interval;
 
   let gapAvg: number | null = null;
@@ -183,12 +183,21 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                         FROM slx_readings WHERE tank_f >= 131`;
     hygieneHoursAgo = h.rows[0]?.hrs == null ? null : Number(h.rows[0].hrs);
 
-    // Real operating coverage per day since the cutover — 288 = 5-min samples in a full day, so
-    // frac is the share of the day the system actually reported (an offline day accrues no savings).
-    const od = await sql`
-      SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS d,
-             count(*)::int AS n
-      FROM slx_readings WHERE ts >= ${CUTOVER} GROUP BY 1 ORDER BY 1`;
+    // Real operating coverage per day, within the SELECTED window (never before the cutover — that's
+    // when savings began). 288 = 5-min samples in a full day, so frac is the share of the day the
+    // system actually reported (an offline day accrues no savings). The window drives this chart AND
+    // the summary card below, so the toggle is live end-to-end.
+    const od = winInterval
+      ? await sql`
+          SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS d,
+                 count(*)::int AS n
+          FROM slx_readings
+          WHERE ts >= GREATEST(${CUTOVER}::timestamptz, now() - (${winInterval})::interval)
+          GROUP BY 1 ORDER BY 1`
+      : await sql`
+          SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS d,
+                 count(*)::int AS n
+          FROM slx_readings WHERE ts >= ${CUTOVER} GROUP BY 1 ORDER BY 1`;
     opDays = (od.rows as any[]).map((r) => ({ d: r.d, frac: Math.min(1, Number(r.n) / 288) }));
 
     writes = (await sql`
@@ -237,6 +246,22 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
 
   const hygieneOk = hygieneHoursAgo != null && hygieneHoursAgo <= 26;
 
+  // ── Window summary (owner ask 2026-07-18): Spent / Saved / Missed for the selected window. ──
+  //   Spent  = what the pumps cost this window (SPAN-baseline kWh × rate) — the actual outlay.
+  //   Saved  = what the cutover already kept vs the as-found HBX-default + 75 °C regime (realized).
+  //   Missed = what the planner could STILL save if the plan were fully followed — the gap on the
+  //            table (the would-have-saved ledger's full-plan figure; shrinks as autopilot closes it).
+  // Spent/Saved accrue over REAL operating days (opDays, already windowed); Missed reuses the
+  // gap-based ledger (also windowed), so all three answer the same window the toggle picks.
+  const opDaySum = opDays.reduce((s, o) => s + o.frac, 0); // effective operating days in window
+  const winSpentUsd = DAILY_KWH * opDaySum * RATE;
+  const winSavedUsd = REALIZED_DAY_USD * opDaySum;
+  const winMissedUsd = scenarios[0]?.saved ?? null; // full-plan would-have-saved, this window
+  const savedLabel = win === "all" ? "saved to date" : `saved · last ${WINDOWS[win].label}`;
+  const chartSubtitle = win === "all"
+    ? `cumulative $, since the ${CUTOVER} cutover`
+    : `cumulative $, last ${WINDOWS[win].label} (from the ${CUTOVER} cutover)`;
+
   return (
     <>
       <I1Banner />
@@ -249,7 +274,7 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
           ))}
         </div>
         <span className="dim" style={{ alignSelf: "center", fontSize: 12 }}>
-          would-have-saved ledger window · accumulating since Jul 14
+          time window · drives the chart, the summary, and the ledger below
         </span>
       </div>
 
@@ -258,15 +283,21 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
       ) : (
         <>
           <div className="chart-block">
-            <h3>Saved to date — current setup vs. HBX defaults + 75&nbsp;°C setpoints <span className="dim">(cumulative $, since the {CUTOVER} cutover)</span></h3>
+            <h3>Saved to date — current setup vs. HBX defaults + 75&nbsp;°C setpoints <span className="dim">({chartSubtitle})</span></h3>
             {opDays.length === 0 ? (
               <div className="meta">
-                The ledger starts accruing from the {CUTOVER} cutover — once a full day of operation is
-                recorded here, this fills in. (No operating days logged in that range yet.)
+                No operating days recorded in this window yet — savings accrue from the {CUTOVER} cutover.
+                Try a wider window (7d / 30d / all).
               </div>
             ) : (
               <>
-                <CumulativeSavings days={opDays} />
+                <CumulativeSavings days={opDays} savedLabel={savedLabel} />
+                {/* Window summary — the toggle's headline effect: what you spent, kept, and left on the table. */}
+                <div className="temps" style={{ marginTop: 10 }}>
+                  <div className="temp"><div className="v">${winSpentUsd.toFixed(2)}</div><div className="l">spent · {WINDOWS[win].label}</div></div>
+                  <div className="temp"><div className="v" style={{ color: "#63e6be" }}>${winSavedUsd.toFixed(2)}</div><div className="l">saved vs. as-found</div></div>
+                  <div className="temp"><div className="v" style={{ color: "#ffd666" }}>{winMissedUsd == null ? "—" : `$${winMissedUsd.toFixed(2)}`}</div><div className="l">still on the table</div></div>
+                </div>
                 <div className="meta" style={{ marginTop: 8 }}>
                   <span style={{ color: "#ff6b6b" }}>■</span> what the pumps <b>as found</b> (HBX default
                   curve + 75&nbsp;°C / 160&nbsp;°F setpoints) would have cost ·{" "}
@@ -276,6 +307,12 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                   A-4 COP, SPAN kWh) — same basis as the Realized card below; metered confirmation from the
                   pump COP telemetry replaces the model as it accrues. The dashed tail projects the current
                   daily rate forward — summer / hot-water-only; winter runs larger.
+                </div>
+                <div className="meta" style={{ marginTop: 6 }}>
+                  <b>Spent</b> = the pumps&apos; cost this window · <b style={{ color: "#63e6be" }}>Saved</b> =
+                  kept vs. the as-found HBX-default + 75&nbsp;°C setup · <b style={{ color: "#ffd666" }}>Still
+                  on the table</b> = what the planner could yet save if the plan were fully followed — it
+                  shrinks as autopilot closes the gap.
                 </div>
               </>
             )}
