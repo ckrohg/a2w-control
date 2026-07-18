@@ -2,7 +2,8 @@
  * @purpose A2W planner service — Phase A-2: the SensorLinx reader. Polls the ECO-0600
  * every POLL_SECONDS via api.sensorlinx.co, stores narrow readings in Neon, versions any
  * config drift (curve/staging/backup edits) with an ntfy alert, and exposes /health.
- * Read-only: this service never writes to SensorLinx (write adapter = Phase C, plan §5.2).
+ * Also the SOLE guarded writer of the HBX curve (writes.ts; README §Single-writer invariant):
+ * any FOREIGN (non-planner) curve write is detected + paged, and a second live instance flagged.
  * Edge-triggered offline alerting after OFFLINE_AFTER_FAILURES consecutive poll failures.
  */
 
@@ -11,11 +12,13 @@ import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, diffConfig } from "./drift";
 import crypto from "node:crypto";
+import os from "node:os";
 import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
 import { AutoPilot } from "./autopilot";
+import { SpanWatch } from "./spanwatch";
 import {
   fetchNwsAlerts,
   fetchStormForecast,
@@ -91,6 +94,21 @@ const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").ma
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
   : null;
+
+// SPAN backup-element power alarm — an INDEPENDENT net (vs the HBX's own backup_called decision
+// flag) that pages when the 16.5 kW element draws REAL energy. Uses the SPAN CLOUD API (SRP login,
+// no tunnel — the same path TempIQ uses). Dormant unless SPAN_USERNAME is set. See spanwatch.ts.
+const SPAN_USERNAME = process.env.SPAN_USERNAME;
+const SPAN_PASSWORD = process.env.SPAN_PASSWORD ?? "";
+const SPAN_BACKUP_CIRCUIT = process.env.SPAN_BACKUP_CIRCUIT ?? "backup";
+const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // 16.5kW hits 0.3kWh in ~65s
+const SPAN_BUILDING_ID = process.env.SPAN_BUILDING_ID; // optional; auto-discovered if unset
+const SPAN_POLL_SECONDS = Number(process.env.SPAN_POLL_SECONDS ?? "60");
+const spanWatch = SPAN_USERNAME
+  ? new SpanWatch(SPAN_USERNAME, SPAN_PASSWORD, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_KWH, ntfy, SPAN_BUILDING_ID)
+  : null;
+if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH}kWh/hr every ${SPAN_POLL_SECONDS}s`);
+else console.log("SPAN backup watch OFF (set SPAN_USERNAME to enable the element power alarm)");
 
 // TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.
 const TEMPIQ_PUSH_ENABLED = process.env.TEMPIQ_PUSH_ENABLED === "1";
@@ -412,6 +430,45 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
   }
 }
 
+// Non-blocking single-writer guard (#36): heartbeat this instance every poll and page if a
+// SECOND planner instance is ever live against the shared DB (only one may write the HBX). It
+// NEVER blocks a write — a blocking lease is the deferred defense-in-depth. A rolling Railway
+// redeploy briefly overlaps two containers, so we require a peer to persist across TWO polls
+// before paging; the alert clears when this is the only instance again.
+const INSTANCE_ID = `${os.hostname()}:${process.pid}`;
+const INSTANCE_FRESH_MS = 12 * 60 * 1000; // > 2× the 5-min poll, so a slow poll isn't "dead"
+// Flag-gated single-writer LEASE (#36 defense-in-depth). OFF by default — enabling it makes a
+// second planner instance's writes get refused (423) in writes.ts. Reuses the instance id +
+// freshness. Enable deliberately at go-live and confirm takeover on the first redeploy.
+const WRITER_LEASE_ENABLED = process.env.WRITER_LEASE_ENABLED === "1";
+let writerLeaseState: { held: boolean; holder: string | null } | null = null;
+let instancePrevPeers = new Set<string>();
+let multiInstanceAlerted = false;
+async function checkSingleWriter(): Promise<void> {
+  let peers: string[];
+  try {
+    peers = await store.heartbeatInstance(INSTANCE_ID, INSTANCE_FRESH_MS);
+  } catch (e) {
+    console.error("single-writer heartbeat failed:", (e as Error).message);
+    return;
+  }
+  const peerSet = new Set(peers);
+  // Count only peers seen on BOTH this poll and the last — filters a redeploy's brief overlap.
+  const sustained = peers.filter((id) => instancePrevPeers.has(id));
+  instancePrevPeers = peerSet;
+  if (sustained.length && !multiInstanceAlerted) {
+    multiInstanceAlerted = true;
+    await ntfy(
+      "⚠ Second planner instance detected — single-writer at risk",
+      `This planner (${INSTANCE_ID}) sees another live instance for ≥2 polls: ${sustained.join(", ")}. Only ONE planner may write the HBX (README §Single-writer invariant, #36) — a second writer bypasses the guardrails and can collide. Shut the extra instance down, or set its AUTOPILOT_DRY_RUN=1 / PHASE_B_DRY_RUN=1.`,
+      "high",
+    );
+  } else if (multiInstanceAlerted && !peerSet.size) {
+    multiInstanceAlerted = false;
+    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`);
+  }
+}
+
 /**
  * Adoption monitor: a commanded HBX target (the reset-curve midpoint) only takes effect on the
  * device at the START of the next reheat cycle (proven 2026-07-16 — the device re-reads the cloud
@@ -670,18 +727,34 @@ async function scoreOnce(): Promise<void> {
 }
 
 // Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
-const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED);
+const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED,
+  WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
   await store.insertReading(reading);
+  // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
+  // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
+  // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
+  // so diffing the poll-time device config against the last-recorded config taken HERE means a
+  // FOREIGN writer moved the curve — one that bypassed I4/I1/rate-limit/audit. (Reading the
+  // baseline AFTER autopilot writes — the old placement — would false-flag autopilot's OWN
+  // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
+  const config = extractConfig(dev);
+  const prevConfig = await store.latestConfig();
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
+  await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
+  if (WRITER_LEASE_ENABLED) {
+    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease.
+    try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
+    catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
+  }
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
@@ -698,22 +771,36 @@ async function pollOnce(): Promise<void> {
     phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
   }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
 
-  const config = extractConfig(dev);
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
-  const prev = await store.latestConfig();
-  if (prev === null) {
+  if (prevConfig === null) {
     await store.insertConfigVersion(config, null);
     console.log("seeded initial hbx_config_versions row");
   } else {
-    const changes = diffConfig(prev, config);
+    // prevConfig was read at the TOP of this poll, before our own writes — so any diff is a
+    // FOREIGN writer (the planner records its own writes separately, via writes.ts patch()).
+    const changes = diffConfig(prevConfig, config);
     if (changes) {
       await store.insertConfigVersion(config, changes);
       lastDriftAt = new Date().toISOString();
       const summary = Object.entries(changes)
         .map(([k, c]) => `${k}: ${c.old} -> ${c.new}`)
         .join("\n");
-      console.warn(`HBX CONFIG DRIFT:\n${summary}`);
-      await ntfy("HBX config changed", summary, "high");
+      // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
+      // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
+      // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
+      // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
+      const curveViolation = "dbt" in changes || "mbt" in changes;
+      if (curveViolation) {
+        console.warn(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${summary}`);
+        await ntfy(
+          "⚠ Foreign HBX curve write — single-writer invariant",
+          `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${summary}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).`,
+          "high",
+        );
+      } else {
+        console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
+        await ntfy("HBX config changed (outside the planner)", summary, "high");
+      }
     }
   }
 }
@@ -790,6 +877,8 @@ async function main(): Promise<void> {
           const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+            instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
+            writer_lease: WRITER_LEASE_ENABLED ? (writerLeaseState ?? "pending") : "off",
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
@@ -849,6 +938,13 @@ async function main(): Promise<void> {
   // (inside loop) already sees fresh NWS/OpenMeteo triggers.
   await stormTriggerPoll();
   setInterval(() => void stormTriggerPoll(), 30 * 60 * 1000);
+
+  // SPAN backup-element power alarm on its own tight cadence (default 60s) — independent of the
+  // 5-min main loop so a running element is caught fast. No-op unless SPAN_USERNAME is configured.
+  if (spanWatch) {
+    void spanWatch.tick().catch((e) => console.error("spanwatch failed:", (e as Error).message));
+    setInterval(() => void spanWatch.tick().catch((e) => console.error("spanwatch failed:", (e as Error).message)), SPAN_POLL_SECONDS * 1000);
+  }
 
   await loop();
   setInterval(loop, POLL_SECONDS * 1000);

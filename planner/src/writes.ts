@@ -45,6 +45,10 @@ export class HbxWriter {
     // Phase 3 v2: surfaced in status() so the Optimize UI knows whether the daily
     // auto-sanitize is live (gates the deeper 120°F cut). Does NOT change any write path.
     private readonly autoSanitizeEnabled = false,
+    // #36 optional defense-in-depth (flag-gated by WRITER_LEASE_ENABLED). When set, patch()
+    // refuses to write unless THIS instance holds a fresh single-writer lease, so a second
+    // planner instance can't collide on the live plant. null = disabled (no-op) — the default.
+    private readonly writerLease: { instanceId: string; staleMs: number } | null = null,
   ) {}
 
   /** Current status for the dashboard card: live target, envelope, write state. */
@@ -207,6 +211,16 @@ export class HbxWriter {
     action: string,
     summary: string,
   ): Promise<Record<string, unknown>> {
+    // Single-writer lease gate (flag-gated; null = disabled). If this instance does not hold a
+    // fresh lease, another planner is the active writer — refuse BEFORE touching the device.
+    // Gates EVERY write path (set_target / boost / restore all funnel through here). #36.
+    if (this.writerLease) {
+      const held = await this.store.holdsWriterLease(this.writerLease.instanceId, this.writerLease.staleMs);
+      if (!held) {
+        await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "does not hold the single-writer lease — another planner instance is the active writer" });
+        throw new WriteError(423, "refused: this instance does not hold the single-writer lease (another planner is the active writer). See README §Single-writer invariant, #36.");
+      }
+    }
     let dev: Record<string, any>;
     try {
       dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);

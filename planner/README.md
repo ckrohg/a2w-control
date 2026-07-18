@@ -4,7 +4,8 @@ The planner service from `knowledge/reference/cross-system-optimization-plan.md`
 **Phase A-2: the SensorLinx reader** — later phases add the shadow planner (A-5), the
 day-plan solver (§6.2), and the guarded HBX write adapter (Phase C, §5.2).
 
-What it does now (READ-ONLY — this service never writes to SensorLinx):
+What it does now (it both **reads** the HBX and — through one guarded path — is the **sole
+writer** of the reset curve; see [§Single-writer invariant](#single-writer-invariant) below):
 
 - Polls the HBX ECO-0600 through **`api.sensorlinx.co`** (the app's host — richer than
   the legacy `mobile.` host TempIQ uses) every `POLL_SECONDS` (default 300).
@@ -19,6 +20,75 @@ What it does now (READ-ONLY — this service never writes to SensorLinx):
   consecutive poll failures, and recovery. Same topic the Pi/hub use.
 - `GET /health` → `{ok, lastPollAt, lastDriftAt, consecutiveFailures}` (503 when failing).
 
+## Single-writer invariant
+
+**The deployed Railway planner (`a2w-hub` → service `a2w-planner`) is the SOLE authorized
+writer of the HBX reset curve.** Every write to `api.sensorlinx.co` goes through one guarded
+code path, so every write is envelope-clamped, cross-checked, rate-limited, verified, and
+audited. This is the invariant that makes automation safe on a live heat pump (kanban #36).
+
+**One code path — no exceptions:**
+
+```
+sensorlinx.ts  patchDevice()        ← the ONLY method that PATCHes the device
+      ▲  (called by nothing else)
+writes.ts      HbxWriter            ← the ONLY caller: setTarget / boost / restore
+      ▲
+callers:  • auto-sanitize (index.ts, flag-gated daily soak)
+          • autopilot.ts (applies the shadow-plan target, flag-gated)
+          • POST /api/hbx/{target,restore,boost}  (bearer-gated HTTP API)
+```
+
+Every accepted write, in order: **I4** outdoor-indexed envelope clamp → **I1** cross-check
+(each online pump must clear target + margin, or the write is rejected) → 15-min rate limit
+(restore exempt) → PATCH with read-back verify → a self-recorded `hbx_config_versions` row
+tagged `changed_fields._source` → an audit row in `hbx_writes` for **every** attempt
+(accepted *or* rejected). Adoption is asynchronous (next reheat cycle); `status()` reports
+commanded-vs-operative.
+
+**Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
+planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
+integration) MUST call the planner so the guardrails apply:
+
+```
+POST /api/hbx/target   {"target_f": 128}     Authorization: Bearer $PLANNER_API_TOKEN
+POST /api/hbx/boost    {"target_f": 140, "minutes": 90}
+POST /api/hbx/restore
+GET  /api/hbx/target                          → writer.status()
+```
+
+**Forbidden (these break the invariant):**
+- **Any direct-to-SensorLinx script.** The overnight target-write agent that authenticated to
+  `api.sensorlinx.co` and PATCHed the curve directly is **RETIRED** — its mechanism is folded
+  into `writes.ts` and its function lives in `autopilot.ts` + the API above. Re-running such a
+  script bypasses every guardrail (it collided with a planner write 0.4 s apart on 2026-07-16).
+- **A second planner instance that writes.** Never run a local/parallel planner with
+  `AUTOPILOT_DRY_RUN=0` or `PHASE_B_DRY_RUN=0` against the shared Neon DB. Exactly one instance
+  writes; everything else must stay shadow/dry-run.
+
+**Detection.** A foreign write (any writer that isn't this planner) is caught two ways, because
+the planner records its *own* writes with a `_source` tag and therefore never self-alerts:
+- **Real-time** — the poll loop diffs the device against the last-recorded config *captured
+  before this cycle's own writes*; a foreign change to the curve (`dbt`/`mbt`) pages
+  **"⚠ Foreign HBX curve write — single-writer invariant"** (high); other foreign edits page
+  "HBX config changed (outside the planner)".
+- **48-hour surface** — the dashboard chip runs the acceptance query
+  `changed_fields IS NOT NULL AND changed_fields->>'_source' IS NULL` over the last 48 h.
+
+- **Second instance** — each planner heartbeats an id (`hostname:pid`) into `planner_instances`
+  every poll; if a *second* live instance persists across two polls (the 2-poll grace absorbs a
+  rolling redeploy's container overlap) the planner pages **"⚠ Second planner instance detected
+  — single-writer at risk"** (high) and clears when solo again. This is **non-blocking** — it
+  can never wedge the real writer. `/health.instance` exposes the current id + peers.
+
+A DB-backed single-writer **lease** — a *blocking* guard in `patch()` that stops a second
+instance from writing at all — is **built and flag-gated (`WRITER_LEASE_ENABLED`, default off).**
+When enabled, each poll the planner renews or claims a singleton `hbx_writer_lease` row (takeover
+on stale, so a redeploy reclaims it), and `patch()` refuses any write (`423`) unless this instance
+holds a fresh lease. It ships **off** because a stale-lease bug could wedge the sole writer — arm
+it deliberately (ideally at the #34 go-live) and confirm takeover works on the first redeploy.
+`/health.writer_lease` shows the current holder.
+
 ## Environment variables
 
 | Var | Required | Notes |
@@ -29,6 +99,8 @@ What it does now (READ-ONLY — this service never writes to SensorLinx):
 | `SLX_SYNC_CODE` | no | default `AECO-2036` |
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
+| `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
@@ -56,7 +128,8 @@ hbx_config_versions(id pk, observed_at, changed_fields jsonb, config jsonb)
 ```
 
 Canonical as-found baseline: `knowledge/reference/hbx-config-asfound-20260713.json`.
-Write API (Phase C, not used here): `knowledge/reference/hbx-write-api.md`.
+Write API (now LIVE — the single guarded writer): `knowledge/reference/hbx-write-api.md`.
+See [§Single-writer invariant](#single-writer-invariant).
 
 Deliberate omissions for now: gap backfill via the minute-history endpoint
 (`POST .../history/minutes`) and the socket.io push channel — add if 5-min polling ever
@@ -84,6 +157,29 @@ lease, never a stale value. Renewals are free on the Pi (renew-without-rewrite).
 
 Rollback = unset `PHASE_B_ENABLED` → leases lapse → Pi reverts to `baseline_setpoint_c`.
 Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow record.
+
+## SPAN backup-element power alarm (`spanwatch.ts`, FLAG-OFF)
+
+Independent safety net for the 16.5 kW backup element: the HBX's `backup_called` flag reports the
+controller's *decision* to fire (breaker-independent); this confirms the element's *actual* draw via
+the **SPAN cloud API** (SRP login — same path TempIQ uses, **no tunnel**). **Dormant until
+`SPAN_USERNAME` is set** — deploying it changes nothing.
+
+| Env | Meaning |
+|---|---|
+| `SPAN_USERNAME` | SPAN app login (email). Unset = alarm off. |
+| `SPAN_PASSWORD` | SPAN app password. SRP auth via `amazon-cognito-identity-js`. |
+| `SPAN_BACKUP_CIRCUIT` | case-insensitive name substring of the element's circuit (default `backup`); if it doesn't match, the first poll logs the available circuit names |
+| `SPAN_BACKUP_ALARM_KWH` | this-hour energy above which it pages (default `0.3`; a 16.5 kW element hits 0.3 kWh in ~65 s, an idle circuit reads ~0) |
+| `SPAN_BUILDING_ID` | optional; auto-discovered from the account if unset |
+| `SPAN_POLL_SECONDS` | poll cadence, own timer (default `60`) |
+
+Auths with Cognito, polls each circuit's current-hour energy (`GET_CURRENT_HOUR_ENERGY`), edge-alerts
+when the backup circuit's this-hour kWh exceeds the threshold. **~1 h detection latency** (SPAN's
+hourly energy aggregation) — fine here: the element runs for hours, and `backup_called` is the instant
+signal. A read/auth failure never alarms (transient); `backup_called` is the redundant net. This is
+what makes re-energizing the breaker safe. Standalone — A2W's own SPAN login (pattern copied from
+TempIQ's `span-cloud.ts`, no runtime coupling).
 
 ## Winter solver — shadow (W0, FLAG-OFF; plan §6.9)
 

@@ -326,6 +326,37 @@ Then the adapter gets the reg-2003 treatment, mapped to a cloud API's realities:
 Also record — once, in Phase A — the **complete HBX settings snapshot** as the canonical
 baseline (the thing watchdog-restore restores, and the reference for drift detection).
 
+#### 5.2.1 Single-writer invariant (IMPLEMENTED 2026-07-17, kanban #36)
+
+The adapter above is built (`planner/src/writes.ts` `HbxWriter`) and now carries automation
+(autopilot + auto-sanitize), so the discipline hardens into an **invariant**: *the deployed
+Railway planner is the SOLE authorized writer of the HBX reset curve.* One code path only —
+`sensorlinx.ts patchDevice()` (the only PATCH) ← `HbxWriter` (the only caller) ← {auto-sanitize,
+`autopilot.ts`, the bearer-gated `POST /api/hbx/{target,restore,boost}` API}. Every write is
+I4-clamped, I1-checked, rate-limited, read-back-verified, self-recorded with a
+`changed_fields._source` tag, and audited in `hbx_writes`.
+
+- **External intent goes through the API, never raw SensorLinx:** `POST /api/hbx/target
+  {target_f}` with `Authorization: Bearer $PLANNER_API_TOKEN`. This is how a future TempIQ
+  hand-off, a scheduled agent, or a human commands a target — so the guardrails always apply.
+- **The overnight direct-to-SensorLinx target-write agent is RETIRED.** It authenticated to
+  `api.sensorlinx.co` and PATCHed the curve directly to crack the write mechanism; that
+  mechanism is now folded into `writes.ts`, and its function lives in `autopilot.ts` + the API.
+  It collided with a planner write 0.4 s apart (2026-07-16), which is what motivated #36.
+- **No parallel writers:** never run a second planner instance with `AUTOPILOT_DRY_RUN=0` /
+  `PHASE_B_DRY_RUN=0` against the shared DB. Exactly one instance writes; all else stays shadow.
+- **Detection (two layers):** the poll loop diffs the device against the last-recorded config
+  *captured before its own writes*, so any diff is a foreign writer — a foreign curve
+  (`dbt`/`mbt`) change pages "⚠ Foreign HBX curve write — single-writer invariant" (high); the
+  dashboard also surfaces a 48 h `_source IS NULL` chip. A second planner instance (which also
+  `_source`-tags, so the drift path can't see it) is caught by a **non-blocking** heartbeat guard
+  (`planner_instances`): if two instances are live for ≥2 polls, the planner pages "⚠ Second
+  planner instance detected". A *blocking* DB-backed **lease** in `patch()` that PREVENTS (vs.
+  detects) a second writer is built and flag-gated (`WRITER_LEASE_ENABLED`, default off): it
+  refuses writes with `423` unless the instance holds a fresh `hbx_writer_lease` (takeover on
+  stale). It ships off because a stale-lease bug could wedge the sole writer — arm it deliberately
+  at go-live. Full write-path doc: `planner/README.md` §Single-writer invariant.
+
 ### 5.3 What we deliberately do NOT do
 
 - No faking the HD demand input, no relay interposers, no `Permanent HD` changes — the
