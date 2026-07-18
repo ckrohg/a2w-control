@@ -177,6 +177,20 @@ async def pump_events(request: Request, pump_id: str, days: float = 7,
     return await poller.store.get_events(pump_id, days)
 
 
+@router.get("/system")
+async def system_now(request: Request, _p: Principal = Depends(read)):
+    """Latest Pi health sample (CPU/RAM/temp/disk-on-DB-volume), recorded ~every 60s by the
+    scheduler. Null until the first sample lands after startup."""
+    return await request.app.state.store.get_system_latest()
+
+
+@router.get("/system/history")
+async def system_history(request: Request, hours: float = 24,
+                         _p: Principal = Depends(read)):
+    hours = min(max(hours, 1), 24 * 90)
+    return await request.app.state.store.get_system_history(hours)
+
+
 @router.post("/pumps/{pump_id}/setpoint")
 async def write_setpoint(request: Request, pump_id: str, body: SetpointRequest,
                          principal: Principal = Depends(write)):
@@ -365,6 +379,10 @@ async def health(request: Request, response: Response):
         "pumps_total": len(pollers),
         "healthy": not blind,
         "auth_mode": request.app.state.config.auth.protect,
+        # whether push alerts (ntfy) / the dead-man heartbeat are wired — lets an operator
+        # confirm the health-alert path can actually deliver without exposing the topic/URL.
+        "notify_configured": bool(request.app.state.config.notifications.ntfy_topic),
+        "heartbeat_configured": bool(request.app.state.config.notifications.heartbeat_url),
     }
 
 

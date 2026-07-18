@@ -57,7 +57,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         app.state.persist_gateway = persist_gateway
         for poller in pollers.values():
             await poller.start()
-        scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url)
+        scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url,
+                              notifications=cfg.notifications)
         scheduler.start()
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()

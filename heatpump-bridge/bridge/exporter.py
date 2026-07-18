@@ -176,6 +176,16 @@ class Exporter:
         except (OSError, ValueError):
             pass
 
+        # Pi system health (bridge/sysstat.py, recorded by the scheduler): latest CPU/RAM/
+        # temp/disk row. A single snapshot, not a cursor feed — the mirror keeps its own
+        # 90-day series and just upserts the newest per push.
+        try:
+            sys_latest = await self.store.get_system_latest()
+            if sys_latest:
+                body["system"] = sys_latest
+        except Exception as exc:  # noqa: BLE001 — a sys-stat read must never block the push
+            log.warning("system stat read for export failed: %s", exc)
+
         payload = json.dumps(body).encode("utf-8")
         url, token = self.cfg.endpoint_url, self.cfg.token
 

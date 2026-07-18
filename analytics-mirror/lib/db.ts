@@ -158,3 +158,42 @@ export async function recentEvents({ filter, limit }: { filter: EventFilter; lim
   }
   return rows;
 }
+
+// Pi system-health mirror (bridge/sysstat.py → exporter): CPU%, load, RAM, disk-on-DB-volume,
+// SoC temp, uptime. The Pi attaches its latest row each push; we keep the time series here for
+// the Advanced-page "Pi health" card. Latest-per-push upsert (id=ts) keeps it append-only-ish.
+export async function ensureSystemSchema() {
+  await sql`CREATE TABLE IF NOT EXISTS system_stats (
+    ts DOUBLE PRECISION PRIMARY KEY,
+    cpu_pct REAL, load1 REAL, load5 REAL, load15 REAL, ncpu INT,
+    mem_used_pct REAL, mem_total_mb INT, mem_avail_mb INT,
+    disk_used_pct REAL, disk_free_gb REAL, disk_total_gb REAL,
+    cpu_temp_c REAL, uptime_s REAL
+  )`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_system_stats_ts ON system_stats (ts DESC)`;
+}
+
+export type SystemStat = {
+  ts: number; cpu_pct: number | null; load1: number | null; load5: number | null;
+  load15: number | null; ncpu: number | null; mem_used_pct: number | null;
+  mem_total_mb: number | null; mem_avail_mb: number | null; disk_used_pct: number | null;
+  disk_free_gb: number | null; disk_total_gb: number | null; cpu_temp_c: number | null;
+  uptime_s: number | null;
+};
+
+export async function latestSystemStat(): Promise<SystemStat | null> {
+  const { rows } = await sql<SystemStat>`
+    SELECT ts, cpu_pct, load1, load5, load15, ncpu, mem_used_pct, mem_total_mb,
+           mem_avail_mb, disk_used_pct, disk_free_gb, disk_total_gb, cpu_temp_c, uptime_s
+    FROM system_stats ORDER BY ts DESC LIMIT 1`;
+  return rows[0] ?? null;
+}
+
+export async function recentSystemStats(hours: number): Promise<SystemStat[]> {
+  const since = Date.now() / 1000 - hours * 3600;
+  const { rows } = await sql<SystemStat>`
+    SELECT ts, cpu_pct, load1, load5, load15, ncpu, mem_used_pct, mem_total_mb,
+           mem_avail_mb, disk_used_pct, disk_free_gb, disk_total_gb, cpu_temp_c, uptime_s
+    FROM system_stats WHERE ts >= ${since} ORDER BY ts ASC`;
+  return rows;
+}
