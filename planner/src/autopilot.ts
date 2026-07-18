@@ -25,9 +25,14 @@ export class AutoPilot {
   constructor(
     private readonly store: Store,
     private readonly writer: HbxWriter,
-    private readonly dryRun: boolean,
+    private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
   ) {}
+
+  /** Runtime override of the dry-run flag (W2-A). The env value only seeds the constructor; the
+   *  dashboard Off/Armed switch flips this via the planner's controller_flags row each poll. */
+  setDryRun(v: boolean): void { this.dryRun = v; }
+  get isDryRun(): boolean { return this.dryRun; }
 
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
   private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {

@@ -69,9 +69,14 @@ export class PhaseB {
     private readonly store: Store,
     private readonly hub: HubClient,
     private readonly pumpIds: string[],
-    private readonly dryRun: boolean,
+    private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
   ) {}
+
+  /** Runtime override of the dry-run flag (W2-A) — flipped from the dashboard Off/Armed switch via
+   *  the planner's controller_flags row each poll. The env value only seeds the constructor. */
+  setDryRun(v: boolean): void { this.dryRun = v; }
+  get isDryRun(): boolean { return this.dryRun; }
 
   /** Current-hour tank target from the latest shadow plan — setpoints must LEAD the plan up (esp.
    *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan. */
