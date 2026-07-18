@@ -4,7 +4,9 @@
 // explanatory empty state — the Pi UI over LAN/Funnel remains the break-glass full view.
 import { sql } from "@vercel/postgres";
 import { fmtTime, fmtDateTime } from "@/lib/tz";
-import { recentEvents, type Event, type EventFilter } from "@/lib/db";
+import { recentEvents, latestSystemStat, recentSystemStats,
+  type Event, type EventFilter, type SystemStat } from "@/lib/db";
+import { Chart, type Series } from "../ui/chart";
 import { I1Banner } from "../i1-banner";
 
 export const runtime = "nodejs";
@@ -99,6 +101,90 @@ function KV({ data, degC }: { data: Record<string, unknown> | undefined; degC?: 
   );
 }
 
+// --- Pi health card (bridge/sysstat.py → mirror) ---------------------------------------
+// Thresholds tuned for a Raspberry Pi 5: SoC throttles ~80–85°C; free disk on the SD/NVMe is
+// the one thing that grows; load compared to core count. Green = healthy, amber = watch,
+// red = act. A null metric (Linux-only field off the Pi, or pre-first-delta CPU%) shows grey.
+type Level = "ok" | "warn" | "bad" | "na";
+
+// higher value = worse (temp, cpu, mem, load); pass invert for "lower = worse" (free disk).
+function level(v: number | null | undefined, warn: number, bad: number, invert = false): Level {
+  if (v == null || !isFinite(v)) return "na";
+  const isBad = invert ? v <= bad : v >= bad;
+  const isWarn = invert ? v <= warn : v >= warn;
+  return isBad ? "bad" : isWarn ? "warn" : "ok";
+}
+const chipClass = (l: Level) => (l === "bad" ? "offline" : l === "warn" ? "warn" : l === "ok" ? "heating" : "off");
+
+function Metric({ label, text, lvl }: { label: string; text: string; lvl: Level }) {
+  return (
+    <span>
+      <span className="dim">{label}: </span>
+      <span className={`chip ${chipClass(lvl)}`}>{text}</span>
+    </span>
+  );
+}
+
+function fmtUptime(s: number | null | undefined): string {
+  if (s == null || !isFinite(s)) return "—";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  return d > 0 ? `${d}d ${h}h` : `${h}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+async function PiHealth() {
+  let latest: SystemStat | null = null;
+  let history: SystemStat[] = [];
+  let dbError = false;
+  try {
+    latest = await latestSystemStat();
+    history = await recentSystemStats(24);
+  } catch {
+    dbError = true; // system_stats table appears with the first health push from the Pi
+  }
+  if (dbError || !latest) {
+    return (
+      <div className="chart-block">
+        <h3>Pi health</h3>
+        <div className="empty">
+          Pi CPU, memory, temperature, and free disk appear here once the Pi ships the health
+          feed (next Pi update). Recorded every ~60s and kept 90 days.
+        </div>
+      </div>
+    );
+  }
+  const diskFreePct = latest.disk_used_pct == null ? null : 100 - latest.disk_used_pct;
+  const ncpu = latest.ncpu ?? 4;
+  const tempSeries: Series[] = [
+    { color: "#e0555c", label: "CPU °C", points: history.map((r) => ({ x: r.ts, y: r.cpu_temp_c })) },
+  ];
+  return (
+    <div className="chart-block">
+      <h3>
+        Pi health
+        <span className="dim" style={{ marginLeft: 8 }}>as of {fmtTime(latest.ts)}</span>
+      </h3>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", margin: "8px 0 12px" }}>
+        <Metric label="CPU" text={fmt(latest.cpu_pct, 0, "%")} lvl={level(latest.cpu_pct, 70, 90)} />
+        <Metric
+          label="load"
+          text={`${fmt(latest.load1, 2)} / ${fmt(latest.load5, 2)} / ${fmt(latest.load15, 2)}`}
+          lvl={level(latest.load1, ncpu, ncpu * 2)}
+        />
+        <Metric label="RAM" text={fmt(latest.mem_used_pct, 0, "%")} lvl={level(latest.mem_used_pct, 85, 95)} />
+        <Metric label="CPU temp" text={fmt(latest.cpu_temp_c, 0, "°C")} lvl={level(latest.cpu_temp_c, 70, 80)} />
+        <Metric
+          label="disk free"
+          text={`${fmt(diskFreePct, 0, "%")} (${fmt(latest.disk_free_gb, 0)} GB)`}
+          lvl={level(diskFreePct, 15, 8, true)}
+        />
+        <span><span className="dim">uptime: </span>{fmtUptime(latest.uptime_s)}</span>
+      </div>
+      <div className="meta dim" style={{ marginBottom: 4 }}>CPU temperature — last 24h (°C)</div>
+      <Chart series={tempSeries} hours={24} height={140} />
+    </div>
+  );
+}
+
 export default async function AdvancedPage({ searchParams }: { searchParams: { events?: string } }) {
   let snaps: SnapRow[] = [];
   let dbError = false;
@@ -119,6 +205,8 @@ export default async function AdvancedPage({ searchParams }: { searchParams: { e
   return (
     <>
       <I1Banner />
+
+      <PiHealth />
 
       <EventLog filter={eventFilter} pumpNames={pumpNames} />
 

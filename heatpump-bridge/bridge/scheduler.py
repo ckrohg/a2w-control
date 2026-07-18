@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +14,14 @@ from . import notify
 from .guardrails import GuardrailError
 from .poller import PumpPoller
 from .store import Store
+from .sysstat import SystemStats
 
 log = logging.getLogger(__name__)
 
 CHECK_INTERVAL_S = 20      # < 1 minute so no HH:MM slot is ever skipped
 MAINTENANCE_HHMM = "03:30"  # nightly backup + retention pruning
 BACKUPS_KEEP = 7
+SYSTEM_SAMPLE_S = 60       # Pi health cadence — ~1 row/min, pruned to 90 days
 
 
 class Scheduler:
@@ -29,6 +32,10 @@ class Scheduler:
         self.heartbeat_url = heartbeat_url
         self._task: asyncio.Task | None = None
         self._last_maintenance_date: str | None = None
+        # One sampler for the process lifetime (CPU% is a delta across reads); disk usage is
+        # measured on the volume that holds the DB, which is what actually fills up.
+        self._sysstat = SystemStats(str(Path(store.path).parent))
+        self._last_sysstat = 0.0
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="scheduler")
@@ -45,6 +52,7 @@ class Scheduler:
                 await self.check_once(datetime.now())
             except Exception:
                 log.exception("scheduler check failed")
+            await self._sample_system()
             # external dead-man: ping every cycle so silence (Pi/WiFi/power dead) alarms;
             # drive it to /fail while any pump is offline or in a high/critical fault, so
             # the reliable heartbeat channel doubles as the fault alarm
@@ -87,6 +95,18 @@ class Scheduler:
             except GuardrailError as exc:
                 # already audited by the write path; nothing else to do
                 log.warning("schedule %s failed: %s", rule["id"], exc)
+
+    async def _sample_system(self) -> None:
+        """Record one Pi-health row every ~SYSTEM_SAMPLE_S. Best-effort: a sampling error must
+        never disturb the heat-pump control loop this scheduler also drives."""
+        mono = time.monotonic()
+        if mono - self._last_sysstat < SYSTEM_SAMPLE_S:
+            return
+        self._last_sysstat = mono
+        try:
+            await self.store.add_system_stat(self._sysstat.read())
+        except Exception:
+            log.exception("system stat sample failed")
 
     async def _fire(self, poller: PumpPoller, action: str) -> None:
         """Execute a timer. Under unattended-write restriction (default), the scheduler

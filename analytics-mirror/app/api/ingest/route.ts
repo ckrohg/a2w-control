@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
-import { ensureSchema, ensureEventsSchema, ensureSpanSchema, ensureSpanArmSchema } from "@/lib/db";
+import { ensureSchema, ensureEventsSchema, ensureSpanSchema, ensureSpanArmSchema,
+  ensureSystemSchema } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -136,8 +137,31 @@ export async function POST(req: Request) {
     console.error("span_arm ingest failed (telemetry unaffected):", err);
   }
 
+  // Pi system health (bridge/sysstat.py via exporter): the latest CPU/RAM/temp/disk row.
+  // Single upsert keyed on ts; wrapped so a malformed payload never fails the telemetry above.
+  let systemStored = false;
+  try {
+    const sys = body?.system;
+    if (sys && typeof sys === "object" && Number(sys.ts)) {
+      await ensureSystemSchema();
+      await sql`INSERT INTO system_stats
+        (ts, cpu_pct, load1, load5, load15, ncpu, mem_used_pct, mem_total_mb, mem_avail_mb,
+         disk_used_pct, disk_free_gb, disk_total_gb, cpu_temp_c, uptime_s)
+        VALUES (${Number(sys.ts)}, ${sys.cpu_pct ?? null}, ${sys.load1 ?? null},
+                ${sys.load5 ?? null}, ${sys.load15 ?? null}, ${sys.ncpu ?? null},
+                ${sys.mem_used_pct ?? null}, ${sys.mem_total_mb ?? null}, ${sys.mem_avail_mb ?? null},
+                ${sys.disk_used_pct ?? null}, ${sys.disk_free_gb ?? null}, ${sys.disk_total_gb ?? null},
+                ${sys.cpu_temp_c ?? null}, ${sys.uptime_s ?? null})
+        ON CONFLICT (ts) DO NOTHING`;
+      await sql`DELETE FROM system_stats WHERE ts < ${ts - 90 * 86400}`;
+      systemStored = true;
+    }
+  } catch (err) {
+    console.error("system_stats ingest failed (telemetry unaffected):", err);
+  }
+
   return NextResponse.json({
     ok: true, stored: pumps.length, events: eventsStored, span: spanStored,
-    span_arm: spanArmStored, span_arm_desired: spanArmDesired,
+    span_arm: spanArmStored, span_arm_desired: spanArmDesired, system: systemStored,
   });
 }
