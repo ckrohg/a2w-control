@@ -63,3 +63,52 @@ async def test_store_round_trip_and_prune(tmp_path):
         assert await store.get_system_history(24) == []
     finally:
         await store.close()
+
+
+async def test_health_alerts_latch_clear_and_hysteresis(monkeypatch, tmp_path):
+    from bridge import notify
+    from bridge.config import NotifyConfig
+    from bridge.scheduler import Scheduler
+
+    pushes: list[tuple[str, str]] = []
+
+    async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
+        pushes.append((title, priority))
+
+    async def fake_email(cfg, **kw):
+        pass
+
+    monkeypatch.setattr(notify, "ntfy", fake_ntfy)
+    monkeypatch.setattr(notify, "email", fake_email)
+
+    store = Store(str(tmp_path / "a.db"))
+    await store.open()
+    try:
+        sched = Scheduler(store, {}, notifications=NotifyConfig())
+
+        # cool + roomy → silence
+        await sched._evaluate_health_alerts({"cpu_temp_c": 55, "disk_used_pct": 30})
+        assert pushes == [] and sched._health_alerts == set()
+
+        # crosses hot → exactly one high-priority raise
+        await sched._evaluate_health_alerts({"cpu_temp_c": 83, "disk_used_pct": 30})
+        assert len(pushes) == 1 and pushes[0][1] == "high" and "cpu_temp" in sched._health_alerts
+
+        # still hot but inside the hysteresis gap (75–80) → no repeat push
+        await sched._evaluate_health_alerts({"cpu_temp_c": 78, "disk_used_pct": 30})
+        assert len(pushes) == 1
+
+        # drops below the clear point → one recovery push, latch released
+        await sched._evaluate_health_alerts({"cpu_temp_c": 70, "disk_used_pct": 30})
+        assert len(pushes) == 2 and pushes[1][1] == "default" and "cpu_temp" not in sched._health_alerts
+
+        # disk fills (5% free) → independent raise
+        await sched._evaluate_health_alerts({"cpu_temp_c": 70, "disk_used_pct": 95,
+                                             "disk_free_gb": 2.0})
+        assert len(pushes) == 3 and "disk_low" in sched._health_alerts
+
+        # missing metrics never raise
+        await sched._evaluate_health_alerts({"cpu_temp_c": None, "disk_used_pct": None})
+        assert len(pushes) == 3
+    finally:
+        await store.close()
