@@ -3,7 +3,7 @@
 // drift), the I1 banner, and the per-pump history charts. Mobile-first (kanban card).
 // Deep views: /hbx (tank, curve, plan detail), /control (setpoint writes).
 import { sql } from "@vercel/postgres";
-import { ensureSchema, recentReadings, type Reading } from "@/lib/db";
+import { ensureSchema, recentReadings, recentSpanReadings, type Reading } from "@/lib/db";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
 import { StormBanner } from "./storm-banner";
@@ -40,6 +40,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let driftAt: number | null = null;
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
   let calls: { ts: number; any_call: boolean }[] = [];
+  let spanElement: { x: number; y: number | null }[] = [];
   // Backup shadow-test: with the 16.5 kW element's SPAN breaker physically OFF, backup_called
   // still reflects the HBX's DECISION to call it — so this counts how often our settings would
   // have fired the element over 7 days (cost-free while the breaker is off). 0 = settings clean.
@@ -84,6 +85,12 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                (backup_called OR EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s)) AS any_call
         FROM slx_readings WHERE ts >= now() - (${hours} || ' hours')::interval
         ORDER BY ts ASC`).rows as { ts: number; any_call: boolean }[];
+      try {
+        const spanRows = await recentSpanReadings(hours);
+        spanElement = spanRows
+          .filter((s) => s.name === "Buffer Tank")
+          .map((s) => ({ x: s.ts, y: s.power_w }));
+      } catch { /* span_readings not created until the bridge deploys — ignore */ }
       const bs = await sql`
         WITH b AS (
           SELECT ts, backup_called, lag(backup_called) OVER (ORDER BY ts) AS prev
@@ -333,6 +340,15 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               </div>
             );
           })}
+          <div className="chart-block">
+            <h3>Backup Element (Buffer Tank) — Power W</h3>
+            <div className="chart">
+              <Chart hours={hours} series={[{ color: "#ff6b6b", points: spanElement }]} />
+            </div>
+            <div className="legend">
+              <span><i style={{ background: "#ff6b6b" }} />16.5 kW electric element — SPAN live watts</span>
+            </div>
+          </div>
         </>
       )}
     </>
