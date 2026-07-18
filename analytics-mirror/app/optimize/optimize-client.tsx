@@ -720,7 +720,7 @@ export default function OptimizeClient({
           </div>
 
           {/* REAL live state — read from the planner's controller_status heartbeat (ground truth,
-              cannot drift). The switch above only previews the modes; THIS is what's actually running. */}
+              cannot drift). Off/Armed on the switch actuate; THIS reflects the effective runtime flags. */}
           <div className="plan-live">
             <div className="plan-live-head">
               <span className="pl-eyebrow2">Running now</span>
@@ -830,9 +830,9 @@ export default function OptimizeClient({
           {/* Armed mode: acting note */}
           {mode === "arm" && (
             <div className="plan-armnote">
-              Armed = the planner asserts these HP setpoints itself every cycle; a human write (here
-              or at the wall) always preempts it. This switch only previews it — the live state is in
-              “Running now” above, set by the planner’s dry-run flag.
+              Armed is live: the planner asserts these HP setpoints itself every cycle, inside the
+              I4/I1 guardrails; a human write (here or at the wall) always preempts it. “Running now”
+              above shows what it’s actually doing right now.
             </div>
           )}
         </div>
