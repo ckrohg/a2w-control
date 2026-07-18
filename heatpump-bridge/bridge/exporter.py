@@ -49,6 +49,11 @@ class Exporter:
         self._cursor = self._read_cursor(self._cursor_path)
         self._span_cursor_path = Path(db_path).parent / "exporter-span-cursor"
         self._span_cursor = self._read_cursor(self._span_cursor_path)
+        self._span_arm_cursor_path = Path(db_path).parent / "exporter-span-arm-cursor"
+        self._span_arm_cursor = self._read_cursor(self._span_arm_cursor_path)
+        # backup-element ARM intent files (shared with span_local.py via the DB dir)
+        self._arm_intent_path = Path(db_path).parent / "span-arm.json"
+        self._arm_latest_path = Path(db_path).parent / "span-arm-latest.json"
 
     def _read_cursor(self, path: Path) -> int:
         try:
@@ -152,25 +157,73 @@ class Exporter:
             ]
             span_max = max(s["id"] for s in new_span)
 
+        # backup-element ARM: shadow/live decision events + current live snapshot (spec Phase 1).
+        arm_max = 0
+        try:
+            new_arm = await self.store.get_span_arm_since(self._span_arm_cursor, 200)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("span-arm read for export failed: %s", exc)
+            new_arm = []
+        if new_arm:
+            body["span_arm_events"] = [
+                {"source_id": e["id"], "ts": e["ts"], "circuit_id": e["circuit_id"],
+                 "relay_state": e["relay_state"], "armed": bool(e["armed"]), "live": bool(e["live"]),
+                 "action": e["action"], "detail": e["detail"]}
+                for e in new_arm]
+            arm_max = max(e["id"] for e in new_arm)
+        try:  # current relay+intent snapshot for the portal card
+            body["span_arm"] = json.loads(self._arm_latest_path.read_text())
+        except (OSError, ValueError):
+            pass
+
         payload = json.dumps(body).encode("utf-8")
         url, token = self.cfg.endpoint_url, self.cfg.token
 
-        def _post() -> bool:
+        def _post():
             try:
                 req = urllib.request.Request(
                     url, data=payload, method="POST",
                     headers={"Content-Type": "application/json",
                              "Authorization": f"Bearer {token}"})
-                urllib.request.urlopen(req, timeout=10).read()
-                return True
+                raw = urllib.request.urlopen(req, timeout=10).read()
+                try:
+                    return True, json.loads(raw or b"null")
+                except Exception:  # noqa: BLE001
+                    return True, None
             except Exception as exc:  # noqa: BLE001
                 log.warning("analytics push failed: %s", exc)
-                return False
+                return False, None
 
-        ok = await asyncio.to_thread(_post)
+        ok, resp = await asyncio.to_thread(_post)
         if ok and max_id > self._cursor:
             self._cursor = max_id
             self._write_cursor(self._cursor_path, max_id)
         if ok and span_max > self._span_cursor:
             self._span_cursor = span_max
             self._write_cursor(self._span_cursor_path, span_max)
+        if ok and arm_max > self._span_arm_cursor:
+            self._span_arm_cursor = arm_max
+            self._write_cursor(self._span_arm_cursor_path, arm_max)
+        # Apply the owner's desired ARM intent echoed back by the ingest (portal → Neon → here).
+        # Safe on the analytics path: arm is CLOSE-ONLY, so a bad value can only make the failsafe
+        # AVAILABLE, never disable it — and DISARM persists locally regardless (span-arm.json).
+        if ok and isinstance(resp, dict) and isinstance(resp.get("span_arm_desired"), bool):
+            self._apply_arm_intent(resp["span_arm_desired"])
+
+    def _apply_arm_intent(self, armed: bool) -> None:
+        try:
+            try:
+                cur = bool(json.loads(self._arm_intent_path.read_text()).get("armed"))
+            except (OSError, ValueError):
+                cur = None
+            if cur == armed:
+                return
+            tmp = self._arm_intent_path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump({"armed": bool(armed)}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._arm_intent_path)
+            log.info("span-arm intent updated from portal: armed=%s", armed)
+        except OSError as exc:  # noqa: BLE001
+            log.warning("span-arm intent apply failed: %s", exc)

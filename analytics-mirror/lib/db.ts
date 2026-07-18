@@ -73,6 +73,41 @@ export async function recentSpanReadings(hours: number, name?: string): Promise<
   return rows;
 }
 
+// Backup-element ARM (spec: knowledge/reference/span-backup-arm-spec.md). span_arm_events = the
+// shadow/live decision stream (idempotent on source_id); span_arm_state = single-row current relay+
+// intent snapshot + the owner's desired_armed (the portal toggle writes it; the ingest echoes it to
+// the bridge). Phase 1 is SHADOW — nothing on SPAN is toggled.
+export async function ensureSpanArmSchema() {
+  await sql`CREATE TABLE IF NOT EXISTS span_arm_events (
+    id BIGSERIAL PRIMARY KEY, source_id BIGINT UNIQUE, ts DOUBLE PRECISION NOT NULL,
+    circuit_id TEXT, relay_state TEXT, armed BOOLEAN, live BOOLEAN, action TEXT, detail TEXT
+  )`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_span_arm_events_ts ON span_arm_events (ts DESC)`;
+  await sql`CREATE TABLE IF NOT EXISTS span_arm_state (
+    id INT PRIMARY KEY DEFAULT 1, ts DOUBLE PRECISION, circuit TEXT, relay_state TEXT,
+    controllable BOOLEAN, armed BOOLEAN, live BOOLEAN, desired_armed BOOLEAN,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`;
+}
+export type SpanArmEvent = { ts: number; relay_state: string | null; armed: boolean; live: boolean; action: string; detail: string | null };
+export async function recentSpanArmEvents(hours: number, limit = 100): Promise<SpanArmEvent[]> {
+  const since = Date.now() / 1000 - hours * 3600;
+  const { rows } = await sql<SpanArmEvent>`SELECT ts, relay_state, armed, live, action, detail
+    FROM span_arm_events WHERE ts >= ${since} ORDER BY ts DESC LIMIT ${limit}`;
+  return rows;
+}
+export type SpanArmState = { ts: number | null; circuit: string | null; relay_state: string | null; controllable: boolean | null; armed: boolean | null; live: boolean | null; desired_armed: boolean | null };
+export async function getSpanArmState(): Promise<SpanArmState | null> {
+  const { rows } = await sql<SpanArmState>`SELECT ts, circuit, relay_state, controllable, armed, live, desired_armed
+    FROM span_arm_state WHERE id = 1`;
+  return rows[0] ?? null;
+}
+export async function setSpanArmDesired(desired: boolean): Promise<void> {
+  await ensureSpanArmSchema();
+  await sql`INSERT INTO span_arm_state (id, desired_armed, updated_at) VALUES (1, ${desired}, now())
+    ON CONFLICT (id) DO UPDATE SET desired_armed = ${desired}, updated_at = now()`;
+}
+
 // Cloud mirror of the Pi's local `events` table (bridge/store.py): faults on/off, write
 // audit rows, comm events, and state/runtime edges. The Pi ships new events on each push
 // (bridge/exporter.py) keyed by source_id = the Pi's own event id, so re-sends are idempotent.

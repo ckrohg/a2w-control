@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
-import { ensureSchema, ensureEventsSchema, ensureSpanSchema } from "@/lib/db";
+import { ensureSchema, ensureEventsSchema, ensureSpanSchema, ensureSpanArmSchema } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -102,5 +102,42 @@ export async function POST(req: Request) {
     await sql`DELETE FROM span_readings WHERE ts < ${ts - 90 * 86400}`;
   }
 
-  return NextResponse.json({ ok: true, stored: pumps.length, events: eventsStored, span: spanStored });
+  // Backup-element ARM feed: shadow/live decision events + current relay/intent snapshot. Returns
+  // span_arm_desired (the owner's portal toggle) so the bridge applies it. Same batch-safe pattern.
+  let spanArmStored = 0;
+  let spanArmDesired: boolean | null = null;
+  try {
+    await ensureSpanArmSchema();
+    for (const e of (Array.isArray(body?.span_arm_events) ? body.span_arm_events : []).slice(0, 500)) {
+      try {
+        const eTs = Number(e?.ts);
+        if (!eTs) continue;
+        const sid = e?.source_id == null ? null : Number(e.source_id);
+        await sql`INSERT INTO span_arm_events (source_id, ts, circuit_id, relay_state, armed, live, action, detail)
+          VALUES (${sid}, ${eTs}, ${e?.circuit_id ?? null}, ${e?.relay_state ?? null}, ${!!e?.armed},
+                  ${!!e?.live}, ${e?.action ?? null}, ${e?.detail ?? null})
+          ON CONFLICT (source_id) DO NOTHING`;
+        spanArmStored++;
+      } catch (err) { console.error("span_arm event skipped:", err); }
+    }
+    const st = body?.span_arm;
+    if (st && typeof st === "object") {
+      await sql`INSERT INTO span_arm_state (id, ts, circuit, relay_state, controllable, armed, live, updated_at)
+        VALUES (1, ${Number(st.ts) || null}, ${st.circuit ?? null}, ${st.relay_state ?? null},
+                ${st.controllable ?? null}, ${st.armed ?? null}, ${st.live ?? null}, now())
+        ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts, circuit = EXCLUDED.circuit,
+          relay_state = EXCLUDED.relay_state, controllable = EXCLUDED.controllable,
+          armed = EXCLUDED.armed, live = EXCLUDED.live, updated_at = now()`;
+    }
+    const dr = await sql`SELECT desired_armed FROM span_arm_state WHERE id = 1`;
+    spanArmDesired = dr.rowCount ? (dr.rows[0].desired_armed as boolean | null) : null;
+    await sql`DELETE FROM span_arm_events WHERE ts < ${ts - 90 * 86400}`;
+  } catch (err) {
+    console.error("span_arm ingest failed (telemetry unaffected):", err);
+  }
+
+  return NextResponse.json({
+    ok: true, stored: pumps.length, events: eventsStored, span: spanStored,
+    span_arm: spanArmStored, span_arm_desired: spanArmDesired,
+  });
 }

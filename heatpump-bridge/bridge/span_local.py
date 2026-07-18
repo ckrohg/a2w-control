@@ -292,6 +292,15 @@ class SpanLocalPoller:
             "controllable": circ["controllable"] if circ else None,
             "armed": armed, "live": live, "ts": ts,
         }
+        if self.arm_state_path:  # persist for the exporter/portal (live relay + intent)
+            try:
+                lp = Path(self.arm_state_path).with_name("span-arm-latest.json")
+                tmp = lp.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(self.latest_arm, f); f.flush(); os.fsync(f.fileno())
+                os.replace(tmp, lp)
+            except OSError:
+                pass
         # Nothing to do unless ARMED and the element is currently OPEN (unavailable).
         if not circ or not circ["circuit_id"] or not armed or circ["relay_state"] != "OPEN":
             return

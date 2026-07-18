@@ -3,7 +3,9 @@
 // drift), the I1 banner, and the per-pump history charts. Mobile-first (kanban card).
 // Deep views: /hbx (tank, curve, plan detail), /control (setpoint writes).
 import { sql } from "@vercel/postgres";
-import { ensureSchema, recentReadings, recentSpanReadings, type Reading } from "@/lib/db";
+import { ensureSchema, recentReadings, recentSpanReadings, getSpanArmState, recentSpanArmEvents,
+  type Reading } from "@/lib/db";
+import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
 import { StormBanner } from "./storm-banner";
@@ -41,6 +43,8 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let faults: { pump: string; code: string; message: string; severity: string; since?: number }[] = [];
   let calls: { ts: number; any_call: boolean }[] = [];
   let spanElement: { x: number; y: number | null }[] = [];
+  let spanArm: ArmState | null = null;
+  let spanArmEvents: ArmEvent[] = [];
   // Backup shadow-test: with the 16.5 kW element's SPAN breaker physically OFF, backup_called
   // still reflects the HBX's DECISION to call it — so this counts how often our settings would
   // have fired the element over 7 days (cost-free while the breaker is off). 0 = settings clean.
@@ -91,6 +95,10 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
           .filter((s) => s.name === "Buffer Tank")
           .map((s) => ({ x: s.ts, y: s.power_w }));
       } catch { /* span_readings not created until the bridge deploys — ignore */ }
+      try {
+        spanArm = await getSpanArmState();
+        spanArmEvents = await recentSpanArmEvents(hours, 12);
+      } catch { /* span_arm tables not created until the bridge deploys — ignore */ }
       const bs = await sql`
         WITH b AS (
           SELECT ts, backup_called, lag(backup_called) OVER (ORDER BY ts) AS prev
@@ -349,6 +357,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <span><i style={{ background: "#ff6b6b" }} />16.5 kW electric element — SPAN live watts</span>
             </div>
           </div>
+          <SpanArmCard state={spanArm} events={spanArmEvents} />
         </>
       )}
     </>
