@@ -46,26 +46,28 @@ class Exporter:
         # gateway-overrides.json) so events aren't re-shipped from id 0 after a restart.
         # The cloud dedups on (pump_id, source_id) anyway, but this keeps pushes small.
         self._cursor_path = Path(db_path).parent / "exporter-events-cursor"
-        self._cursor = self._read_cursor()
+        self._cursor = self._read_cursor(self._cursor_path)
+        self._span_cursor_path = Path(db_path).parent / "exporter-span-cursor"
+        self._span_cursor = self._read_cursor(self._span_cursor_path)
 
-    def _read_cursor(self) -> int:
+    def _read_cursor(self, path: Path) -> int:
         try:
-            return int(self._cursor_path.read_text().strip())
+            return int(path.read_text().strip())
         except (OSError, ValueError):
             return 0
 
-    def _write_cursor(self, value: int) -> None:
+    def _write_cursor(self, path: Path, value: int) -> None:
         # atomic write (same discipline as config._write_state) — a half-written cursor at
         # this power-outage-prone site must not corrupt the resume point
-        tmp = self._cursor_path.with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         try:
             with open(tmp, "w") as f:
                 f.write(str(value))
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._cursor_path)
+            os.replace(tmp, path)
         except OSError as exc:  # noqa: BLE001 — cursor persistence must never break a push
-            log.warning("event cursor persist failed: %s", exc)
+            log.warning("cursor persist failed (%s): %s", path.name, exc)
 
     def start(self) -> None:
         if self.cfg.endpoint_url and self.cfg.token:
@@ -135,6 +137,21 @@ class Exporter:
             ]
             max_id = max(e["id"] for e in new_events)
 
+        # New SPAN circuit-power samples since the last pushed id (cloud dedups on source_id).
+        span_max = 0
+        try:
+            new_span = await self.store.get_span_since(self._span_cursor, 500)
+        except Exception as exc:  # noqa: BLE001 — a span read error must never block the push
+            log.warning("span read for export failed: %s", exc)
+            new_span = []
+        if new_span:
+            body["span"] = [
+                {"source_id": s["id"], "ts": s["ts"], "circuit_id": s["circuit_id"],
+                 "name": s["name"], "power_w": s["power_w"]}
+                for s in new_span
+            ]
+            span_max = max(s["id"] for s in new_span)
+
         payload = json.dumps(body).encode("utf-8")
         url, token = self.cfg.endpoint_url, self.cfg.token
 
@@ -153,4 +170,7 @@ class Exporter:
         ok = await asyncio.to_thread(_post)
         if ok and max_id > self._cursor:
             self._cursor = max_id
-            self._write_cursor(max_id)
+            self._write_cursor(self._cursor_path, max_id)
+        if ok and span_max > self._span_cursor:
+            self._span_cursor = span_max
+            self._write_cursor(self._span_cursor_path, span_max)

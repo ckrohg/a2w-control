@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
-import { ensureSchema, ensureEventsSchema } from "@/lib/db";
+import { ensureSchema, ensureEventsSchema, ensureSpanSchema } from "@/lib/db";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,5 +77,30 @@ export async function POST(req: Request) {
     }
   }
 
-  return NextResponse.json({ ok: true, stored: pumps.length, events: eventsStored });
+  // SPAN local circuit-power feed (bridge/span_local.py via exporter): high-res instantPowerW
+  // for the "Buffer Tank" element + the "Air-Water" heat pumps. Same idempotent, batch-safe
+  // pattern as events — dedup on source_id (the Pi's span_samples.id), skip a bad row.
+  let spanStored = 0;
+  const spanRows = Array.isArray(body?.span) ? body.span : [];
+  if (spanRows.length) {
+    try { await ensureSpanSchema(); }
+    catch (err) { console.error("span schema ensure failed (telemetry unaffected):", err); }
+    for (const s of spanRows.slice(0, 1000)) {
+      try {
+        const sTs = Number(s?.ts);
+        const name = s?.name;
+        if (!sTs || !name) continue;
+        const sourceId = s?.source_id == null ? null : Number(s.source_id);
+        await sql`INSERT INTO span_readings (source_id, ts, circuit_id, name, power_w)
+          VALUES (${sourceId}, ${sTs}, ${s?.circuit_id ?? null}, ${String(name)}, ${s?.power_w ?? null})
+          ON CONFLICT (source_id) DO NOTHING`;
+        spanStored++;
+      } catch (err) {
+        console.error("span ingest row skipped:", err);
+      }
+    }
+    await sql`DELETE FROM span_readings WHERE ts < ${ts - 90 * 86400}`;
+  }
+
+  return NextResponse.json({ ok: true, stored: pumps.length, events: eventsStored, span: spanStored });
 }

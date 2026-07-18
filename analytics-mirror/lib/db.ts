@@ -46,6 +46,33 @@ export async function recentReadings(hours: number): Promise<Reading[]> {
   return rows;
 }
 
+// Cloud mirror of the Pi's local `span_samples` (bridge/store.py): high-res instantPowerW per
+// SPAN circuit — the "Buffer Tank" backup element + the "Air-Water" heat pumps. Shipped on each
+// push keyed by source_id = the Pi's span_samples.id, so re-sends are idempotent.
+export async function ensureSpanSchema() {
+  await sql`CREATE TABLE IF NOT EXISTS span_readings (
+    id BIGSERIAL PRIMARY KEY,
+    source_id BIGINT UNIQUE,
+    ts DOUBLE PRECISION NOT NULL,
+    circuit_id TEXT,
+    name TEXT NOT NULL,
+    power_w REAL
+  )`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_span_readings_name_ts ON span_readings (name, ts)`;
+}
+
+export type SpanReading = { ts: number; circuit_id: string | null; name: string; power_w: number | null };
+
+export async function recentSpanReadings(hours: number, name?: string): Promise<SpanReading[]> {
+  const since = Date.now() / 1000 - hours * 3600;
+  const { rows } = name
+    ? await sql<SpanReading>`SELECT ts, circuit_id, name, power_w FROM span_readings
+        WHERE ts >= ${since} AND name = ${name} ORDER BY ts ASC`
+    : await sql<SpanReading>`SELECT ts, circuit_id, name, power_w FROM span_readings
+        WHERE ts >= ${since} ORDER BY ts ASC`;
+  return rows;
+}
+
 // Cloud mirror of the Pi's local `events` table (bridge/store.py): faults on/off, write
 // audit rows, comm events, and state/runtime edges. The Pi ships new events on each push
 // (bridge/exporter.py) keyed by source_id = the Pi's own event id, so re-sends are idempotent.
