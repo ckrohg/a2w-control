@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS schedules (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_fired_date TEXT         -- "YYYY-MM-DD" of most recent firing (once per day)
 );
+
+CREATE TABLE IF NOT EXISTS span_samples (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    circuit_id TEXT,
+    name TEXT NOT NULL,          -- SPAN circuit name, e.g. "Buffer Tank", "Air-Water 1"
+    power_w REAL                 -- instantPowerW from SPAN's LAN-local API
+);
+CREATE INDEX IF NOT EXISTS idx_span_name_ts ON span_samples(name, ts);
 """
 
 
@@ -110,6 +119,20 @@ class Store:
             (pump_id, time.time(), type_, code, severity, message,
              json.dumps(detail) if detail else None),
         )
+
+    async def add_span_sample(self, ts: float, circuit_id: str | None,
+                              name: str, power_w: float) -> None:
+        await self._exec(
+            "INSERT INTO span_samples (ts, circuit_id, name, power_w) VALUES (?,?,?,?)",
+            (ts, circuit_id, name, power_w),
+        )
+
+    async def get_span_since(self, after_id: int, limit: int) -> list[dict]:
+        """New span_samples for the analytics export — cursor = max id already shipped,
+        exactly the durable-cursor pattern the exporter uses for events."""
+        return await self._query(
+            "SELECT id, ts, circuit_id, name, power_w FROM span_samples"
+            " WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
 
     async def add_comm_snapshot(self, pump_id: str, stats: dict) -> None:
         await self._exec(

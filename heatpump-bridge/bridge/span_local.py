@@ -176,12 +176,12 @@ class SpanLocalPoller:
     """Polls the configured circuits' instantPowerW every ~interval and persists each to the
     store. Never raises into the event loop; tracks last-success for a down-alert."""
 
-    def __init__(self, cfg, store, *, notify=None):
+    def __init__(self, cfg, store, *, notify=None, token_path: str | None = None):
         self.cfg = cfg
         self.store = store
         self.notify = notify
         self.client = SpanClient(cfg.host, cfg.passphrase, ip_fallback=cfg.ip_fallback,
-                                 token=cfg.token)
+                                 token_path=token_path)
         self._task: asyncio.Task | None = None
         self._last_ok = 0.0
         self._down_alerted = False
