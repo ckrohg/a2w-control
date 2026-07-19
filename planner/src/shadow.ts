@@ -40,6 +40,9 @@ export interface ShadowOpts {
   sanitizeF: number; // I8: daily thermal-hygiene excursion target (140 °F = 60 °C pasteurization)
   strictCapF: number; // I4: everyday hard ceiling until Phase B actively manages HP setpoints
   sanitizeCapF: number; // I8: the daily sanitize excursion may exceed strictCapF up to here (I1 still guards)
+  autoSanitize: boolean; // when true, the demand-driven checkI8 actuator owns the soak — so the shadow
+  // plan STANDS DOWN its calendar-daily boost (avoids double-soaking + lets the tank stay cool on days a
+  // real pasteurizing dwell already happened). Default false = boost stays (today's autopilot-driven soak).
 }
 
 export const DEFAULT_OPTS: ShadowOpts = {
@@ -60,6 +63,8 @@ export const DEFAULT_OPTS: ShadowOpts = {
   sanitizeF: 140,
   strictCapF: 135,
   sanitizeCapF: 145, // hard ceiling for the 140 °F soak (bypasses curve+3); < the 154 °F the hardware ran as-found
+  autoSanitize: false, // interlock: false = shadow injects the calendar boost (today); set true once the
+  // demand-driven checkI8 auto-sanitize is armed (AUTO_SANITIZE_ENABLED) so exactly one actuator ever runs.
 };
 
 /**
@@ -129,22 +134,27 @@ export function computeShadowPlan(
     warmest.reason = `pre-charge for ${String(start).padStart(2, "0")}:00 window (warmest lead hour, ${warmest.f.outdoorF.toFixed(0)}°F)`;
   }
 
-  // I8 daily thermal hygiene: one block per local day boosted to sanitizeF, in that
-  // day's warmest hour — the coil's potable slug must never sit lukewarm for a full day,
-  // and the warmest hour is the cheapest place to buy the excursion.
-  const byDay = new Map<string, Draft[]>();
-  for (const d of draft) {
-    const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
-    if (!byDay.has(day)) byDay.set(day, []);
-    byDay.get(day)!.push(d);
-  }
-  for (const [, ds] of byDay) {
-    if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
-    if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
-    const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
-    warmest.target = opts.sanitizeF;
-    warmest.sani = true;
-    warmest.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, warmest hour)`;
+  // I8 daily thermal hygiene: one block per local day boosted to sanitizeF, in that day's warmest
+  // hour — the coil's potable slug must never sit lukewarm for a full day, and the warmest hour is
+  // the cheapest place to buy the excursion. INTERLOCK: skipped entirely when opts.autoSanitize is
+  // set, because then the demand-driven checkI8 actuator fires the soak on a MEASURED-overdue basis
+  // (see index.ts). Gating here (rather than deleting) guarantees exactly one actuator at all times:
+  // flag off ⇒ this calendar boost + autopilot; flag on ⇒ checkI8 — never both, never neither.
+  if (!opts.autoSanitize) {
+    const byDay = new Map<string, Draft[]>();
+    for (const d of draft) {
+      const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
+      if (!byDay.has(day)) byDay.set(day, []);
+      byDay.get(day)!.push(d);
+    }
+    for (const [, ds] of byDay) {
+      if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
+      if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
+      const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
+      warmest.target = opts.sanitizeF;
+      warmest.sani = true;
+      warmest.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, warmest hour)`;
+    }
   }
 
   return draft.map((d) => {
