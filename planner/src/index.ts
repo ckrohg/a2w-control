@@ -17,6 +17,7 @@ import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { hygieneVerdict, hygieneIntervalH } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
@@ -100,6 +101,18 @@ const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 // When on, the I8 hygiene check fires one durable/guarded boost(131,60) per overdue
 // soak (see checkI8). Fail-safe: a rejected boost falls through to the existing alert.
 const AUTO_SANITIZE_ENABLED = process.env.AUTO_SANITIZE_ENABLED === "1";
+
+// I8 pasteurization cadence (configurable + season-aware; see hygiene.ts). The interval is the
+// rolling window in which the tank must have held a real ≥SANITIZE_VERIFY_F/≥SANITIZE_DWELL_MIN dwell.
+// Base default 26 h = today's behavior byte-for-byte. HYGIENE_SUMMER_INTERVAL_H (default = base, a
+// no-op) lets the owner relax the cadence in the cool-tank regime (warm outdoor) — coil-only potable
+// volume + 4–6 h Legionella doubling ⇒ a 2–3 day summer cadence still pasteurizes with margin. A hard
+// 72 h ceiling in hygiene.ts caps any value so a bad env can't disable hygiene. Winter is unaffected:
+// the tank runs hot continuously, so the dwell is satisfied for free and the interval never binds.
+const HYGIENE_BASE_INTERVAL_H = Number(process.env.HYGIENE_MAX_INTERVAL_H ?? "26");
+const HYGIENE_SUMMER_INTERVAL_H = Number(process.env.HYGIENE_SUMMER_INTERVAL_H ?? String(HYGIENE_BASE_INTERVAL_H));
+const HYGIENE_SUMMER_OUTDOOR_F = 55; // ≥ this outdoor ⇒ cool-tank regime ⇒ the summer interval applies
+let lastOutdoorF: number | null = null; // freshest outdoor from the poll — the season signal for checkI8
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
@@ -255,34 +268,33 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
 const SANITIZE_VERIFY_F = 134;
 const SANITIZE_DWELL_MIN = 30;
 
-/** Longest continuous span (minutes) the tank held ≥ minF, from the ascending reading series. */
-function longestDwellMin(series: { ts: Date; tankF: number | null }[], minF: number): number {
-  let best = 0;
-  let runStart: Date | null = null;
-  let runLast: Date | null = null;
-  for (const r of series) {
-    if (r.tankF != null && r.tankF >= minF) {
-      if (runStart == null) runStart = r.ts;
-      runLast = r.ts;
-    } else if (runStart && runLast) {
-      best = Math.max(best, (runLast.getTime() - runStart.getTime()) / 60000);
-      runStart = runLast = null;
-    }
-  }
-  if (runStart && runLast) best = Math.max(best, (runLast.getTime() - runStart.getTime()) / 60000);
-  return best;
-}
-
-/** I8 thermal hygiene (plan §5.1): page if a rolling 26 h passes without a real pasteurizing dwell
- *  (≥SANITIZE_VERIFY_F for ≥SANITIZE_DWELL_MIN continuous min) — the DHW coil's potable slug must get
- *  its daily hot soak. Checked hourly; edge-alerted with a clear once satisfied. Trivially satisfied
+/** I8 thermal hygiene (plan §5.1): page (and, when armed, auto-soak) if the season-aware interval
+ *  passes without a real pasteurizing DWELL (≥SANITIZE_VERIFY_F for ≥SANITIZE_DWELL_MIN continuous
+ *  min) — the DHW coil's potable slug must get its hot soak. The dwell decision + interval are pure
+ *  (hygiene.ts) so they're unit-tested. Edge-alerted with a clear once satisfied. Trivially satisfied
  *  under as-found/current temps; load-bearing once the cool-tank optimized targets run. */
 let i8Alerted = false;
+// Last checkI8 verdict, surfaced on /health so go-live is verifiable with one curl (is the actuator
+// armed? what interval is in force? was the last window pasteurized?) — not inferable from __version__.
+let i8LastIntervalH: number | null = null;
+let i8LastDwellMin: number | null = null;
+let i8LastSatisfied: boolean | null = null;
+let i8LastCheckedAt: string | null = null;
 async function checkI8(): Promise<void> {
-  const res = await store.getRecentSeries(26);
-  const dwellMin = longestDwellMin(res, SANITIZE_VERIFY_F);
-  const satisfied = dwellMin >= SANITIZE_DWELL_MIN;
-  const overdue = !satisfied && res.length > 200; // require a mostly-complete window
+  const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
+  const res = await store.getRecentSeries(intervalH);
+  // Completeness gate scales with the window (≈ the original 200-of-26h ≈ 64%), so a sparse history
+  // (planner just started / DB gap) never false-fires the alert or an auto-soak.
+  const minReadings = Math.round((intervalH * 200) / 26);
+  const { dwellMin, satisfied, overdue } = hygieneVerdict(res, {
+    verifyF: SANITIZE_VERIFY_F,
+    dwellMin: SANITIZE_DWELL_MIN,
+    minReadings,
+  });
+  i8LastIntervalH = intervalH;
+  i8LastDwellMin = Math.round(dwellMin);
+  i8LastSatisfied = satisfied;
+  i8LastCheckedAt = new Date().toISOString();
 
   // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE durable/guarded
   // boost to the 140°F sanitize target (sanitizeCapF so it isn't clamped to 135; I1 still guards) for
@@ -310,7 +322,7 @@ async function checkI8(): Promise<void> {
   if (overdue && !i8Alerted) {
     i8Alerted = true;
     await ntfy(
-      `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in 26h`,
+      `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in ${intervalH}h`,
       `The DHW coil's potable slug hasn't held a pasteurizing soak (needs ≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min; best in the window: ${Math.round(dwellMin)} min). Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card), or check why the planner's sanitize didn't run.`,
       "high",
     );
@@ -668,7 +680,9 @@ async function shadowOnce(): Promise<void> {
     }
   }
 
-  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor);
+  // INTERLOCK: hand the shadow planner the actuator state so its calendar sanitize boost stands down
+  // exactly when the demand-driven checkI8 auto-sanitize is armed — one soak actuator, never two/none.
+  const plan = computeShadowPlan(forecast, cfg, { ...opts, autoSanitize: AUTO_SANITIZE_ENABLED }, demandFloor);
   if (!plan.length) throw new Error("empty forecast");
 
   // §6.11 storm shaping — gated on the flag; notify-only mode leaves the plan untouched.
@@ -748,6 +762,7 @@ async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
   await store.insertReading(reading);
+  lastOutdoorF = reading.outdoorF; // season signal for the checkI8 interval (hygiene.ts)
   // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
   // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
   // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
@@ -931,6 +946,18 @@ async function main(): Promise<void> {
               windowEnd: stormState.kind === "idle" ? null : stormState.windowEnd,
               enabled: STORM_MODE_ENABLED,
               lastTriggerPollAt: lastStormPollAt,
+            },
+            // I8 thermal hygiene — runtime ground truth for go-live verification. auto_sanitize=true
+            // means checkI8 owns the soak (shadow boost stood down); effective_interval_h reflects the
+            // current season; last_satisfied=true confirms the coil's potable slug was pasteurized.
+            hygiene: {
+              auto_sanitize: AUTO_SANITIZE_ENABLED,
+              base_interval_h: HYGIENE_BASE_INTERVAL_H,
+              summer_interval_h: HYGIENE_SUMMER_INTERVAL_H,
+              effective_interval_h: i8LastIntervalH,
+              last_dwell_min: i8LastDwellMin,
+              last_satisfied: i8LastSatisfied,
+              last_checked_at: i8LastCheckedAt,
             },
           });
         }
