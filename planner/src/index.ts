@@ -243,6 +243,12 @@ const SANITIZE_DWELL_MIN = 30;
  *  (hygiene.ts) so they're unit-tested. Edge-alerted with a clear once satisfied. Trivially satisfied
  *  under as-found/current temps; load-bearing once the cool-tank optimized targets run. */
 let i8Alerted = false;
+// Last checkI8 verdict, surfaced on /health so go-live is verifiable with one curl (is the actuator
+// armed? what interval is in force? was the last window pasteurized?) — not inferable from __version__.
+let i8LastIntervalH: number | null = null;
+let i8LastDwellMin: number | null = null;
+let i8LastSatisfied: boolean | null = null;
+let i8LastCheckedAt: string | null = null;
 async function checkI8(): Promise<void> {
   const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
   const res = await store.getRecentSeries(intervalH);
@@ -254,6 +260,10 @@ async function checkI8(): Promise<void> {
     dwellMin: SANITIZE_DWELL_MIN,
     minReadings,
   });
+  i8LastIntervalH = intervalH;
+  i8LastDwellMin = Math.round(dwellMin);
+  i8LastSatisfied = satisfied;
+  i8LastCheckedAt = new Date().toISOString();
 
   // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE durable/guarded
   // boost to the 140°F sanitize target (sanitizeCapF so it isn't clamped to 135; I1 still guards) for
@@ -810,6 +820,18 @@ async function main(): Promise<void> {
               windowEnd: stormState.kind === "idle" ? null : stormState.windowEnd,
               enabled: STORM_MODE_ENABLED,
               lastTriggerPollAt: lastStormPollAt,
+            },
+            // I8 thermal hygiene — runtime ground truth for go-live verification. auto_sanitize=true
+            // means checkI8 owns the soak (shadow boost stood down); effective_interval_h reflects the
+            // current season; last_satisfied=true confirms the coil's potable slug was pasteurized.
+            hygiene: {
+              auto_sanitize: AUTO_SANITIZE_ENABLED,
+              base_interval_h: HYGIENE_BASE_INTERVAL_H,
+              summer_interval_h: HYGIENE_SUMMER_INTERVAL_H,
+              effective_interval_h: i8LastIntervalH,
+              last_dwell_min: i8LastDwellMin,
+              last_satisfied: i8LastSatisfied,
+              last_checked_at: i8LastCheckedAt,
             },
           });
         }
