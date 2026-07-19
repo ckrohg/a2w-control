@@ -373,7 +373,8 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                   <span style={{ color: "#4dabf7" }}>■</span> what the <b>current</b> cooler-tank regime
                   actually cost · <span style={{ color: "#63e6be" }}>■</span> the gap is money kept.{" "}
                   {haveReal ? (
-                    <>Energy basis is your <b>SPAN daily total</b>; efficiency is <b>measured COP</b>
+                    <>Energy is <b>metered from SPAN</b> (the Air-Water pump circuits) on days we have it,
+                    else the SPAN daily average; efficiency is <b>measured COP</b>
                     {" "}({realCopNow?.toFixed(2)} now vs ~{realCopOld?.toFixed(2)} at the old hotter water), plus the
                     extra standby the hotter as-found tank would bleed (measured UA ≈ {UA_BTU} BTU/hr·°F) and the
                     resistive backup its ~163°F setpoints would trip{winElementUsd > 0 ? ` (≈ $${winElementUsd.toFixed(2)} of the saving)` : ""}.

@@ -64,6 +64,7 @@ export interface DayInputs {
   avgOutdoorF: number;      // real, from slx_readings
   nowBufferF: number;       // current buffer target that day (real, from slx_readings tank_target_f)
   coverage: number;         // 0..1 share of the day the system actually reported
+  spanKwh?: number | null;  // REAL metered pump electricity (SPAN Air-Water) for the day, if available
   // measured session aggregates from tempiq_cop_points (quality-filtered); null ⇒ modeled fallback
   measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
 }
@@ -85,7 +86,8 @@ export interface RealizedDay {
   oldBufferF: number;
   standbyKwh: number;
   sessions: number;
-  confidence: "measured" | "modeled";
+  confidence: "measured" | "modeled"; // COP source: measured session vs model
+  energyMetered: boolean;             // electricity source: real SPAN meter vs SPAN daily-avg baseline
 }
 
 export interface RealizedParams {
@@ -105,7 +107,10 @@ export function computeDayRealized(d: DayInputs, p: RealizedParams): RealizedDay
   const out = d.avgOutdoorF;
   const nowSinkF = d.measured?.sinkF ?? d.nowBufferF + 10; // leaving water ≈ buffer + approach
   const copNow = d.measured?.cop ?? modelCop(out, nowSinkF); // measured efficiency (energy-weighted)
-  const eDaily = p.dailyKwhFallback * d.coverage;            // full-day electricity (SPAN baseline)
+  // Electricity basis: REAL metered pump energy (SPAN Air-Water) if we have it that day, else the
+  // SPAN daily-average baseline scaled by coverage. energyMetered flags which.
+  const energyMetered = d.spanKwh != null && d.spanKwh > 0;
+  const eDaily = energyMetered ? (d.spanKwh as number) : p.dailyKwhFallback * d.coverage;
 
   // COP at any sink temp: Carnot-scaled from the measured COP at the real outdoor temp. Cooler water
   // ⇒ higher COP; hotter ⇒ lower. Clamped to a sane band (≥1 resistive floor; ≤6 validity clamp).
@@ -154,6 +159,7 @@ export function computeDayRealized(d: DayInputs, p: RealizedParams): RealizedDay
     standbyKwh: round1(stdKwh(oldBufferF - d.nowBufferF)),
     sessions: d.measured?.sessions ?? 0,
     confidence: d.measured ? "measured" : "modeled",
+    energyMetered,
   };
 }
 
