@@ -114,10 +114,13 @@ const SPAN_BACKUP_CIRCUIT = process.env.SPAN_BACKUP_CIRCUIT ?? "backup";
 const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // 16.5kW hits 0.3kWh in ~65s
 const SPAN_BUILDING_ID = process.env.SPAN_BUILDING_ID; // optional; auto-discovered if unset
 const SPAN_POLL_SECONDS = Number(process.env.SPAN_POLL_SECONDS ?? "60");
+// The pump (compressor) circuits on the SPAN panel — summed each poll into span_energy so the
+// realized-savings engine can use REAL metered daily electricity instead of the SPAN daily average.
+const SPAN_PUMP_CIRCUITS = process.env.SPAN_PUMP_CIRCUITS ?? "air-water";
 const spanWatch = SPAN_USERNAME
-  ? new SpanWatch(SPAN_USERNAME, SPAN_PASSWORD, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_KWH, ntfy, SPAN_BUILDING_ID)
+  ? new SpanWatch(SPAN_USERNAME, SPAN_PASSWORD, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_KWH, ntfy, SPAN_BUILDING_ID, store, SPAN_PUMP_CIRCUITS)
   : null;
-if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH}kWh/hr every ${SPAN_POLL_SECONDS}s`);
+if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH}kWh/hr; pump-energy circuits "${SPAN_PUMP_CIRCUITS}" → span_energy, every ${SPAN_POLL_SECONDS}s`);
 else console.log("SPAN backup watch OFF (set SPAN_USERNAME to enable the element power alarm)");
 
 // TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.

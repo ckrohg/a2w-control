@@ -31,6 +31,12 @@ export function Nav() {
         <a href="/control" className={pathname.startsWith("/control") ? "active" : undefined}>
           Control
         </a>
+        <a href="/history" className={pathname.startsWith("/history") ? "active" : undefined}>
+          History
+        </a>
+        <a href="/activity" className={pathname.startsWith("/activity") ? "active" : undefined}>
+          Activity
+        </a>
       </div>
       <a className="nav-more" href="/advanced">
         Advanced →

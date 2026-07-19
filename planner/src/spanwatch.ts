@@ -10,6 +10,7 @@
  * runs for hours, and backup_called is the instant signal.
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
+import type { Store } from "./store";
 
 // Public app identifiers (not secrets) — from TempIQ's HAR extraction.
 const COGNITO = { userPoolId: "us-west-2_xqz9y67ID", clientId: "21vd907gimk5ctc0pop94l2lip" };
@@ -47,6 +48,8 @@ export class SpanWatch {
     private readonly alarmKwh: number,      // page when this hour's energy exceeds this (kWh)
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
     private readonly fixedBuildingId?: string,
+    private readonly store?: Store,         // when set, accumulate pump energy → span_energy
+    private readonly pumpMatch?: string,    // case-insensitive substring for the pump circuits (Air-Water)
   ) {
     if (fixedBuildingId) this.buildingId = fixedBuildingId;
   }
@@ -103,11 +106,22 @@ export class SpanWatch {
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });
       const panels: any[] = d?.data?.building?.multiPanels ?? [];
       let hit: { name: string; kwh: number; unit: string } | null = null;
+      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' current-hour energy
       for (const p of panels) for (const s of p.spaces ?? []) {
-        if ((s.name ?? "").toLowerCase().includes(this.circuitMatch.toLowerCase())) {
+        const name = (s.name ?? "").toLowerCase();
+        if (name.includes(this.circuitMatch.toLowerCase())) {
           const v = Number(s.currentHour?.value);
           hit = { name: s.name ?? this.circuitMatch, kwh: Number.isFinite(v) ? v : 0, unit: s.currentHour?.unit ?? "?" };
         }
+        if (this.pumpMatch && name.includes(this.pumpMatch.toLowerCase())) {
+          const v = Number(s.currentHour?.value);
+          if (Number.isFinite(v)) pumpKwh += v;
+        }
+      }
+      // Accumulate the pumps' metered energy for the current hour (SPAN's per-hour value grows then
+      // resets; upsertSpanEnergyHour keeps the MAX seen). Never fails the alarm path.
+      if (this.store && this.pumpMatch) {
+        await this.store.upsertSpanEnergyHour(new Date(), pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
       }
       if (!hit) {
         const names = panels.flatMap((p) => (p.spaces ?? []).map((s: any) => s.name)).filter(Boolean);

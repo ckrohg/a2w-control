@@ -281,14 +281,28 @@ function ReceiptChart({ points, receipt, mfr }: {
   const y0 = 1, y1 = 6; // top = the model's own validity clamp (TempIQ MAX_VALID_COP)
   const X = (o: number) => pad.l + ((o - HX.min) / (HX.max - HX.min)) * (W - pad.l - pad.r);
   const Y = (c: number) => pad.t + (1 - (Math.min(c, y1) - y0) / (y1 - y0)) * (H - pad.t - pad.b);
-  const line = (key: "measured_v1" | "measured_v3" | "af" | "cur" | "pot") => {
+  const seriesPts = (key: "measured_v1" | "measured_v3" | "af" | "cur" | "pot") =>
     // model lines stop at 65°F out — beyond that lift is tiny, the surface saturates
     // at its validity clamp, and there is no heating load to save on anyway
-    const pts = receipt.filter((r) => r[key] != null &&
+    receipt.filter((r) => r[key] != null &&
       (key === "measured_v1" ? (r.n_v1 ?? 0) >= 3
         : key === "measured_v3" ? (r.n_v3 ?? 0) >= 3
         : r.o <= 65));
-    return pts.map((r, j) => `${j ? "L" : "M"}${X(r.o).toFixed(1)},${Y(r[key] as number).toFixed(1)}`).join("");
+  const line = (key: "measured_v1" | "measured_v3" | "af" | "cur" | "pot") =>
+    seriesPts(key).map((r, j) => `${j ? "L" : "M"}${X(r.o).toFixed(1)},${Y(r[key] as number).toFixed(1)}`).join("");
+  // Owner asked why the measured line looks "bumpy": it's honest per-bin sampling noise (few charges
+  // per outdoor bin). A ±win moving average over the bins draws the underlying TREND without hiding
+  // the raw dots (still plotted). Endpoints shrink the window so the ends aren't distorted.
+  const smoothLine = (key: "measured_v1" | "measured_v3", win = 2) => {
+    const pts = seriesPts(key);
+    return pts
+      .map((r, i) => {
+        let s = 0, w = 0;
+        for (let k = Math.max(0, i - win); k <= Math.min(pts.length - 1, i + win); k++) { s += pts[k][key] as number; w++; }
+        return { o: r.o, v: s / w };
+      })
+      .map((p, j) => `${j ? "L" : "M"}${X(p.o).toFixed(1)},${Y(p.v).toFixed(1)}`)
+      .join("");
   };
   return (
     <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ height: "auto", aspectRatio: "900/280" }}>
@@ -306,8 +320,12 @@ function ReceiptChart({ points, receipt, mfr }: {
           fill={(p.v ?? 0) >= 3 ? "#4dabf7" : "#8b98a5"} fillOpacity={(p.v ?? 0) >= 3 ? 0.32 : 0.22} vectorEffect="non-scaling-stroke" />
       ))}
       <path d={line("af")} fill="none" stroke="#8b98a5" strokeWidth={1.5} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
-      <path d={line("measured_v1")} fill="none" stroke="#ff6b6b" strokeWidth={1.6} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
-      <path d={line("measured_v3")} fill="none" stroke="#4dabf7" strokeWidth={2.6} vectorEffect="non-scaling-stroke" />
+      {/* legacy winter series: raw jagged faint + smoothed trend */}
+      <path d={line("measured_v1")} fill="none" stroke="#ff6b6b" strokeOpacity={0.28} strokeWidth={1} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
+      <path d={smoothLine("measured_v1")} fill="none" stroke="#ff6b6b" strokeWidth={1.6} strokeDasharray="2 4" vectorEffect="non-scaling-stroke" />
+      {/* measured session series: raw shape faint, smoothed TREND bold (calms the sampling noise) */}
+      <path d={line("measured_v3")} fill="none" stroke="#4dabf7" strokeOpacity={0.25} strokeWidth={1} vectorEffect="non-scaling-stroke" />
+      <path d={smoothLine("measured_v3")} fill="none" stroke="#4dabf7" strokeWidth={2.6} vectorEffect="non-scaling-stroke" />
       <path d={line("cur")} fill="none" stroke="#e599f7" strokeWidth={2.2} vectorEffect="non-scaling-stroke" />
       <path d={line("pot")} fill="none" stroke="#e599f7" strokeWidth={1.5} strokeDasharray="5 4" vectorEffect="non-scaling-stroke" />
       {/* manufacturer rated points at W75 — the machine's own ceiling at hot water */}
@@ -557,7 +575,7 @@ export default async function CurvePage() {
           <ReceiptChart points={copPts} receipt={history.receipt} mfr={m.mfr_ratings_w75} />
         </div>
         <div className="legend">
-          <span><i style={{ background: "#4dabf7" }} />measured, session calculator ({cop.v3_n} charges, Mar→Jul)</span>
+          <span><i style={{ background: "#4dabf7" }} />measured, session calculator ({cop.v3_n} charges, Mar→Jul) — dots = raw per-bin, bold = smoothed trend</span>
           <span><i style={{ background: "#ff6b6b" }} />legacy winter calculator ({cop.v1_n} rows) — inflated, beats the spec diamonds</span>
           <span><i style={{ background: "#8b98a5" }} />model at as-found tank temps</span>
           <span><i style={{ background: "#e599f7" }} />model at planner targets (solid = as built, dashed = potential)</span>
@@ -568,9 +586,11 @@ export default async function CurvePage() {
           dotted winter series reads <em>above</em> the yellow spec diamonds — physically impossible, so it&apos;s discarded
           as inflated (unlearned standby credit + survivorship). The blue auditable series rises with outdoor temp as
           physics demands, and is itself a <em>lower bound</em>: 36–67% of warm-weather charge windows had hot water
-          running mid-charge (charges are draw-triggered), which understates thermal. The wedge up to the purple lines
-          is the claim; model lines stop at 65°F out. The $ math never used this curve — it scales measured kWh by
-          model ratios only.
+          running mid-charge (charges are draw-triggered), which understates thermal. The bold blue line is a
+          moving-average <em>trend</em> — the faint dots behind it are the raw per-bin measurements, so the
+          &ldquo;bumpiness&rdquo; (few charges per outdoor bin) stays visible without dominating. The wedge up to the
+          purple lines is the claim; model lines stop at 65°F out. The $ math never used this curve — it scales
+          measured kWh by model ratios only.
         </div>
       </div>
 

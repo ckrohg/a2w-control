@@ -65,6 +65,20 @@ test("modeled fallback (no measured sessions) still produces a bounded, positive
   assert.ok(r.savedUsd >= 0 && r.savedUsd < 3, `fallback saving out of band: $${r.savedUsd}`);
 });
 
+test("real SPAN energy overrides the baseline (energyMetered flips true, actual = span kWh)", () => {
+  const base: DayInputs = {
+    day: "2026-07-20", avgOutdoorF: 75, nowBufferF: 130, coverage: 1,
+    measured: { elecKwh: 9.5, thermalKwh: 24, cop: 2.4, sinkF: 145, sessions: 8 },
+  };
+  const modeled = computeDayRealized(base, P);
+  assert.equal(modeled.energyMetered, false);
+  assert.equal(modeled.actualElecKwh, 11.8); // baseline (dailyKwhFallback × coverage)
+  const metered = computeDayRealized({ ...base, spanKwh: 8.3 }, P);
+  assert.equal(metered.energyMetered, true);
+  assert.equal(metered.actualElecKwh, 8.3); // real SPAN energy
+  assert.ok(metered.savedUsd > 0);
+});
+
 test("zero coverage (offline day) accrues no savings", () => {
   const r = computeDayRealized({
     day: "2026-07-09", avgOutdoorF: 75, nowBufferF: 135, coverage: 0,

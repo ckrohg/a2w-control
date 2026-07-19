@@ -233,14 +233,33 @@ export class Store {
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS cf_fixed_elec_kwh real;
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS fixed_saved_usd   real;
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS smart_premium_usd real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS energy_metered    boolean;
+      -- Per-hour metered pump electricity from SPAN (Air-Water 1 + 2 circuits), accumulated by the
+      -- spanwatch poll. Lets the realized engine use REAL daily energy instead of the SPAN daily avg.
+      -- Value is the hour's cumulative kWh (SPAN resets it each hour) — we keep the max seen per hour.
+      CREATE TABLE IF NOT EXISTS span_energy (
+        hour timestamptz PRIMARY KEY,
+        kwh  real NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
     `);
+  }
+
+  /** Upsert the pump-circuit energy for the current hour, keeping the MAX seen (SPAN's per-hour
+   *  value grows monotonically within the hour, then resets — so the max is the hour's total). */
+  async upsertSpanEnergyHour(hour: Date, kwh: number): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO span_energy (hour, kwh, updated_at) VALUES (date_trunc('hour', $1::timestamptz), $2, now())
+       ON CONFLICT (hour) DO UPDATE SET kwh = GREATEST(span_energy.kwh, EXCLUDED.kwh), updated_at = now()`,
+      [hour, kwh],
+    );
   }
 
   /** Per-day inputs for the realized-savings engine: real outdoor + current buffer target from
    *  slx_readings, joined to quality-filtered measured COP sessions from tempiq_cop_points. One row
    *  per operating day from the cutover forward (or the lookback window, whichever is later). */
   async getRealizedDayInputs(cutover: string, lookbackDays: number): Promise<{
-    day: string; avgOutdoorF: number; nowBufferF: number; coverage: number;
+    day: string; avgOutdoorF: number; nowBufferF: number; coverage: number; spanKwh: number | null;
     measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
   }[]> {
     const res = await this.pool.query(
@@ -264,9 +283,17 @@ export class Store {
            AND outdoor_temp_f < sink_temp_f - 20
            AND (quality_score IS NULL OR quality_score >= 0.3)
          GROUP BY 1
+       ),
+       span AS (
+         -- REAL metered pump electricity per day (SPAN Air-Water circuits), summed from the hourly rows.
+         SELECT to_char(date_trunc('day', hour AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                sum(kwh) AS span_kwh
+         FROM span_energy
+         WHERE hour >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         GROUP BY 1
        )
-       SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess
-       FROM days d LEFT JOIN cop c USING (day)
+       SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess, s.span_kwh
+       FROM days d LEFT JOIN cop c USING (day) LEFT JOIN span s USING (day)
        WHERE d.out_f IS NOT NULL AND d.now_buf IS NOT NULL
        ORDER BY d.day`,
       [cutover, lookbackDays],
@@ -276,6 +303,7 @@ export class Store {
       avgOutdoorF: Number(r.out_f),
       nowBufferF: Number(r.now_buf),
       coverage: Math.min(1, Number(r.n) / 288),
+      spanKwh: r.span_kwh != null ? Number(r.span_kwh) : null,
       measured: r.sess && Number(r.sess) > 0
         ? { elecKwh: Number(r.e), thermalKwh: Number(r.q), cop: Number(r.cop), sinkF: Number(r.sink), sessions: Number(r.sess) }
         : null,
@@ -286,14 +314,14 @@ export class Store {
     day: string; actualElecKwh: number; cfElecKwh: number; fixedElecKwh: number; savedUsd: number;
     fixedSavedUsd: number; smartPremiumUsd: number; copUsd: number; standbyUsd: number;
     elementCreditUsd: number; avgOutdoorF: number; copNow: number; copOld: number;
-    oldBufferF: number; standbyKwh: number; sessions: number; confidence: string;
+    oldBufferF: number; standbyKwh: number; sessions: number; confidence: string; energyMetered: boolean;
   }): Promise<void> {
     await this.pool.query(
       `INSERT INTO realized_savings
          (day, actual_elec_kwh, cf_elec_kwh, cf_fixed_elec_kwh, saved_usd, fixed_saved_usd,
           smart_premium_usd, cop_usd, standby_usd, element_credit_usd, avg_outdoor_f, cop_now, cop_old,
-          old_buffer_f, standby_kwh, sessions, confidence, computed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, now())
+          old_buffer_f, standby_kwh, sessions, confidence, energy_metered, computed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now())
        ON CONFLICT (day) DO UPDATE SET
          actual_elec_kwh = EXCLUDED.actual_elec_kwh, cf_elec_kwh = EXCLUDED.cf_elec_kwh,
          cf_fixed_elec_kwh = EXCLUDED.cf_fixed_elec_kwh, saved_usd = EXCLUDED.saved_usd,
@@ -302,10 +330,10 @@ export class Store {
          element_credit_usd = EXCLUDED.element_credit_usd, avg_outdoor_f = EXCLUDED.avg_outdoor_f,
          cop_now = EXCLUDED.cop_now, cop_old = EXCLUDED.cop_old, old_buffer_f = EXCLUDED.old_buffer_f,
          standby_kwh = EXCLUDED.standby_kwh, sessions = EXCLUDED.sessions,
-         confidence = EXCLUDED.confidence, computed_at = now()`,
+         confidence = EXCLUDED.confidence, energy_metered = EXCLUDED.energy_metered, computed_at = now()`,
       [r.day, r.actualElecKwh, r.cfElecKwh, r.fixedElecKwh, r.savedUsd, r.fixedSavedUsd,
        r.smartPremiumUsd, r.copUsd, r.standbyUsd, r.elementCreditUsd, r.avgOutdoorF, r.copNow, r.copOld,
-       r.oldBufferF, r.standbyKwh, r.sessions, r.confidence],
+       r.oldBufferF, r.standbyKwh, r.sessions, r.confidence, r.energyMetered],
     );
   }
 
