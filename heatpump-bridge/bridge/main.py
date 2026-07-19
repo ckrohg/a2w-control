@@ -17,6 +17,7 @@ from .guardrails import SetpointGuard
 from .hub_client import HubClient
 from .poller import PumpPoller
 from .scheduler import Scheduler
+from .span_local import SpanLocalPoller
 from .store import Store
 
 
@@ -56,13 +57,26 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         app.state.persist_gateway = persist_gateway
         for poller in pollers.values():
             await poller.start()
-        scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url)
+        scheduler = Scheduler(store, pollers, heartbeat_url=cfg.notifications.heartbeat_url,
+                              notifications=cfg.notifications)
         scheduler.start()
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
         hub_client.start()
+
+        async def span_notify(title, message, priority="default"):
+            from . import notify
+            await notify.ntfy(cfg.notifications, title=title, message=message, priority=priority)
+        span_poller = SpanLocalPoller(
+            cfg.span, store, notify=span_notify,
+            token_path=str(Path(cfg.db_path).resolve().parent / "span-local-token"),
+            arm_state_path=str(Path(cfg.db_path).resolve().parent / "span-arm.json"))
+        span_poller.start()
+        app.state.span_poller = span_poller
+
         yield
+        await span_poller.stop()
         await hub_client.stop()
         await exporter.stop()
         await scheduler.stop()

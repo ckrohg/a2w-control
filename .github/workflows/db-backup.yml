@@ -1,0 +1,69 @@
+# @purpose Weekly disaster-recovery backup of the Neon Postgres DB. Runs scripts/backup-db.sh to
+# produce an encrypted dump, then commits it to the orphan `db-backups` branch (created on first
+# run). The LIVE DB already keeps history indefinitely; this guards against losing Neon itself
+# (free-tier PITR ≈ 7 days). Requires two repo secrets: DATABASE_URL and BACKUP_PASSPHRASE.
+name: db-backup
+
+on:
+  schedule:
+    - cron: "17 8 * * 1" # Mondays 08:17 UTC (~04:17 ET) — off-peak, avoids the top of the hour
+  workflow_dispatch: {} # manual "Run workflow" button for on-demand snapshots
+
+permissions:
+  contents: write # push to the db-backups branch
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 client
+        # Neon runs Postgres 17; the runner ships pg_dump 16, which refuses to dump a newer
+        # server ("server version mismatch"). Install the matching client from the PGDG apt repo
+        # so pg_dump >= the Neon server version. pg_wrapper then invokes the newest installed (17).
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          # The runner's /usr/bin/pg_dump stays pinned to ubuntu's 16; the PG17 binaries land in a
+          # versioned dir. Prepend it to PATH for later steps so pg_dump resolves to 17.
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
+
+      - name: Produce encrypted dump
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          if [ -z "${DATABASE_URL:-}" ] || [ -z "${BACKUP_PASSPHRASE:-}" ]; then
+            echo "::error::Set DATABASE_URL and BACKUP_PASSPHRASE repo secrets (Settings → Secrets → Actions)."
+            exit 1
+          fi
+          bash scripts/backup-db.sh
+
+      - name: Commit to db-backups branch
+        run: |
+          set -euo pipefail
+          git config user.name "a2w-backup-bot"
+          git config user.email "actions@users.noreply.github.com"
+          # Track the orphan branch in a scratch worktree, creating it on first run.
+          if git ls-remote --exit-code --heads origin db-backups >/dev/null 2>&1; then
+            git fetch origin db-backups:db-backups
+            git worktree add ../bk db-backups
+          else
+            git worktree add --detach ../bk
+            git -C ../bk checkout --orphan db-backups
+            git -C ../bk rm -rf . >/dev/null 2>&1 || true
+          fi
+          mv "${backup_file}" ../bk/
+          git -C ../bk add "${backup_file}"
+          git -C ../bk commit -m "db backup ${backup_file}"
+          git -C ../bk push origin db-backups
+          echo "Pushed ${backup_file} to db-backups."

@@ -3,8 +3,10 @@
 // schedule and the REAL autonomy state, read from the planner's controller_status heartbeat:
 //   1. "Running now" — data-driven from the heartbeat (auto-pilot + Phase B: off / shadow / live,
 //      plus a reporting/stale indicator). This is ground truth and CANNOT drift from the planner.
-//      The Off·Set·Request·Armed switch below it is a PREVIEW of the modes only — it re-renders the
-//      chart/copy, it does not actuate (actuation is the planner's AUTOPILOT_/PHASE_B_ flags).
+//      The Off·Set·Request·Armed switch below it: Off and Armed ACTUATE (W2-B — they POST to the
+//      planner's guarded /api/autonomy, flipping both controllers shadow↔live via controller_flags);
+//      Set & forget and Request are still PREVIEW ONLY (they re-render the chart, no planner mode
+//      exists for them yet — honest fast-follow). The switch seeds from the planner's runtime row.
 //   2. Boost card — presets + a Custom… reveal + a capacity readout. PREVIEW ONLY: it overlays a
 //      raised segment on the chart; it does not call the planner's boost endpoint yet.
 //   3. The timeline chart — a devicePixelRatio-aware canvas; ports the mockup's drawPlan/cop model.
@@ -13,6 +15,7 @@
 // reset-curve dial — proven; it adopts on the next reheat cycle), both through the guarded writer.
 // BOTTOM keeps the guarded 131°F summer recommendation + Restore (Apply is live, same I4/I1 guards).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
 
@@ -472,15 +475,22 @@ export default function OptimizeClient({
   blocks,
   computedAt,
   autonomy,
+  initialMode = "off",
 }: {
   rate: number;
   dailyKwh: number;
   blocks: ShadowBlock[];
   computedAt: number | null;
   autonomy: Autonomy;
+  initialMode?: Mode;
 }) {
-  // ---- autonomy + boost view state (NONE of this executes) ----------------------------
-  const [mode, setMode] = useState<Mode>("off");
+  const router = useRouter();
+  // ---- autonomy + boost view state --------------------------------------------------
+  // mode seeds from the planner's RUNTIME autonomy row (initialMode). Off/Armed actuate; Set/Request
+  // are chart previews only. (Boost state below is still preview.)
+  const [mode, setMode] = useState<Mode>(initialMode);
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoMsg, setAutoMsg] = useState("");
   const [boost, setBoost] = useState<Boost | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
   const [customDeg, setCustomDeg] = useState(8);
@@ -495,15 +505,23 @@ export default function OptimizeClient({
   // Real controller badges from the heartbeat (null until the planner first reports).
   const apS = autonomy ? ctrlState(autonomy.autopilot) : null;
   const pbS = autonomy ? ctrlState(autonomy.phaseb) : null;
-  const bothShadow =
-    !!autonomy &&
-    autonomy.autopilot.enabled && autonomy.autopilot.dryRun &&
-    autonomy.phaseb.enabled && autonomy.phaseb.dryRun;
   const anyLive =
     !!autonomy &&
     ((autonomy.autopilot.enabled && !autonomy.autopilot.dryRun) ||
       (autonomy.phaseb.enabled && !autonomy.phaseb.dryRun));
   const bothOff = !!autonomy && !autonomy.autopilot.enabled && !autonomy.phaseb.enabled;
+
+  // ONE autonomy concept (owner: "it's just one thing — make it appear that way"). The tank target
+  // and the pump setpoints are two hands of the same motion (the setpoint serves the target, kept
+  // coordinated by the I1 guardrail). systemLive = the system is driving itself. The per-lever badges
+  // survive as under-the-hood DETAIL (transparency — never hide the real runtime state), and the
+  // pump-side write reliability shows as HEALTH, not a second mode.
+  const systemLive = anyLive;
+  const handText = (c: ControllerState) => (!c.enabled ? "off" : c.dryRun ? "advisory" : "live");
+  // Pump-setpoint write health: live but its last result reports a failure ⇒ retrying (not a mode).
+  const pumpRetrying =
+    !!autonomy && autonomy.phaseb.enabled && !autonomy.phaseb.dryRun &&
+    /fail|error|timeout/i.test(autonomy.phaseb.result ?? "");
 
   // HP setpoint changes across the day → the Request-mode chips row (display-only).
   const changeHours = useMemo(() => {
@@ -566,6 +584,56 @@ export default function OptimizeClient({
     return () => clearInterval(id);
   }, [load]);
 
+  // W2-B: the Off/Armed switch actuator. Off and Armed POST to the planner (via the token-holding
+  // proxy) to flip both controllers shadow↔live; Set & forget and Request are chart PREVIEWS only
+  // (no planner mode exists yet) so they just change the local view. Arming is confirmed because it
+  // hands the live heat pumps to the planner — but it's fully reversible (Off restores shadow next
+  // cycle) and a manual write / Boost always preempts. Optimistic UI with revert on failure.
+  async function selectMode(next: Mode) {
+    if (next === mode) return;
+    if (next === "set" || next === "req") {
+      setMode(next); // preview only — re-renders the chart, does not actuate
+      setAutoMsg("");
+      return;
+    }
+    const goLive = next === "arm";
+    if (
+      goLive &&
+      !window.confirm(
+        "Arm autonomy? The planner will drive the buffer target itself (and Phase B setpoints if enabled), inside the I4/I1 guardrails. A manual write or Boost always preempts it, and switching to Off returns everything to advisory. Continue?",
+      )
+    )
+      return;
+    const prev = mode;
+    setMode(next); // optimistic
+    setAutoBusy(true);
+    setAutoMsg("");
+    try {
+      const res = await fetch("/api/planner/autonomy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: next }),
+      });
+      const out: { ok?: boolean; error?: string } = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setAutoMsg(
+          goLive
+            ? "Armed — the planner is now driving, inside the guardrails. Takes effect within one cycle."
+            : "Off — both controllers return to advisory (shadow) on the next cycle. Nothing writes.",
+        );
+        router.refresh(); // re-read the runtime row + heartbeat so "Running now" reflects the flip
+      } else {
+        setMode(prev); // revert — the planner rejected it
+        setAutoMsg(`Couldn't change mode: ${out.error || res.status}`);
+      }
+    } catch {
+      setMode(prev);
+      setAutoMsg("Network error — mode unchanged.");
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
   // Single guarded write / restore — reports the accepted/rejected result exactly like
   // HbxTargetCard's act(). window.confirm gate per spec. (Apply stays DISABLED; Restore live.)
   async function act(path: string, body: unknown | undefined, confirmText: string) {
@@ -612,21 +680,32 @@ export default function OptimizeClient({
       {/* ============ AUTONOMY + honest posture ============ */}
       <div className="plan-top">
         <div className="card">
-          <p className="plan-eyebrow">Autonomy · preview only</p>
+          <p className="plan-eyebrow">Autonomy · Off &amp; Armed are live</p>
           <div className="plan-seg" role="group" aria-label="Autonomy level">
-            {(["off", "set", "req", "arm"] as Mode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                className={`ps-btn ps-${m}`}
-                aria-pressed={mode === m}
-                onClick={() => setMode(m)}
-              >
-                <span className="ps-led" />
-                {m === "off" ? "Off" : m === "set" ? "Set & forget" : m === "req" ? "Request" : "Armed"}
-              </button>
-            ))}
+            {(["off", "set", "req", "arm"] as Mode[]).map((m) => {
+              const preview = m === "set" || m === "req"; // no planner mode yet → chart preview only
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  className={`ps-btn ps-${m}`}
+                  aria-pressed={mode === m}
+                  disabled={autoBusy}
+                  title={preview ? "Preview only — this mode isn't live yet" : undefined}
+                  onClick={() => selectMode(m)}
+                >
+                  <span className="ps-led" />
+                  {m === "off" ? "Off" : m === "set" ? "Set & forget" : m === "req" ? "Request" : "Armed"}
+                  {preview && <span className="ps-soon">soon</span>}
+                </button>
+              );
+            })}
           </div>
+          {autoMsg && (
+            <p className="pm-desc" style={{ color: autoMsg.startsWith("Couldn't") || autoMsg.startsWith("Network") ? "var(--warm)" : "var(--ok)", marginTop: 8 }}>
+              {autoMsg}
+            </p>
+          )}
 
           <div className="plan-mode-copy">
             <div className="pm-state">
@@ -641,7 +720,7 @@ export default function OptimizeClient({
           </div>
 
           {/* REAL live state — read from the planner's controller_status heartbeat (ground truth,
-              cannot drift). The switch above only previews the modes; THIS is what's actually running. */}
+              cannot drift). Off/Armed on the switch actuate; THIS reflects the effective runtime flags. */}
           <div className="plan-live">
             <div className="plan-live-head">
               <span className="pl-eyebrow2">Running now</span>
@@ -660,40 +739,38 @@ export default function OptimizeClient({
 
             {autonomy && apS && pbS ? (
               <>
+                {/* ONE state — the system as a single self-driving thing. */}
                 <div className="pl-ctrl">
-                  <span className="pl-ctrl-name">
-                    Auto-pilot <em>· buffer target</em>
+                  <span className="pl-ctrl-name">Autonomous mode</span>
+                  <span className={`pl-badge ${systemLive ? "st-live" : "st-shadow"}`}>
+                    {systemLive ? "on" : "advisory"}
                   </span>
-                  <span className={`pl-badge ${apS.cls}`}>{apS.label}</span>
                   <span className="pl-ctrl-detail">
-                    {!autonomy.autopilot.enabled
-                      ? "not running"
-                      : autonomy.autopilot.dryRun
-                        ? `would set ${autonomy.autopilot.targetF ?? "…"}°F — writing nothing`
-                        : "driving the buffer target to the plan"}
+                    {systemLive
+                      ? `driving the system to ${autonomy.autopilot.targetF ?? "the plan’s"}°F, inside the guardrails`
+                      : "computing the plan and logging what it would do — writing nothing on its own"}
                   </span>
                 </div>
-                <div className="pl-ctrl">
-                  <span className="pl-ctrl-name">
-                    Phase B <em>· HP setpoints</em>
+
+                {/* Under-the-hood detail: the two coordinated hands of that one motion. Kept visible
+                    for transparency, but framed as detail, not two separate systems to reason about. */}
+                <div className="pl-hands">
+                  <span className="pl-hand">
+                    <span className="pl-hand-dot" /> Tank target <span className="dim">· {handText(autonomy.autopilot)}</span>
                   </span>
-                  <span className={`pl-badge ${pbS.cls}`}>{pbS.label}</span>
-                  <span className="pl-ctrl-detail">
-                    {!autonomy.phaseb.enabled
-                      ? "not running"
-                      : autonomy.phaseb.dryRun
-                        ? "would track setpoints to (target + 5°F) — writing nothing"
-                        : "driving each HP setpoint to (target + 5°F), leased"}
+                  <span className="pl-hand">
+                    <span className="pl-hand-dot" /> Pump setpoints <span className="dim">· {handText(autonomy.phaseb)}</span>
+                    {pumpRetrying && <b style={{ color: "var(--warm)" }}> · retrying</b>}
                   </span>
                 </div>
+
                 <p className="pl-summary">
-                  {bothOff
-                    ? "Both controllers are off — nothing moves on its own; you set everything by hand."
-                    : bothShadow
-                      ? "Both controllers are in shadow — they compute the plan and log what they’d do, but write nothing. The buffer and setpoints only move when you move them."
-                      : anyLive
-                        ? "At least one controller is live — it is actively driving the system, inside the I4/I1 guardrails."
-                        : "Mixed state — see each controller above."}
+                  {systemLive
+                    ? "The system is driving itself — the tank target and the pump setpoints move together (the setpoints serve the target for the best efficiency), always inside the I4/I1 safety guardrails. A manual write or Boost always wins."
+                    : bothOff
+                      ? "Advisory only — nothing moves on its own; you set the temperature yourself."
+                      : "Advisory only — the plan is computed and logged, but nothing is written until you Arm it."}
+                  {pumpRetrying && " The pump-setpoint side is currently retrying its writes; the tank target keeps working meanwhile."}
                 </p>
               </>
             ) : (
@@ -704,8 +781,10 @@ export default function OptimizeClient({
             )}
 
             <p className="pl-note">
-              The switch above is a <b>preview of the modes</b> — it doesn’t actuate. What’s live is
-              set by the planner’s flags and reported here.
+              <b>Off</b> and <b>Armed</b> above take effect on the system — they flip both controllers
+              between advisory (shadow) and live, inside the I4/I1 guardrails, and are reported here on
+              the next cycle. <b>Set &amp; forget</b> and <b>Request</b> are previews of upcoming modes —
+              they change the chart but don’t run yet.
             </p>
           </div>
 
@@ -751,9 +830,9 @@ export default function OptimizeClient({
           {/* Armed mode: acting note */}
           {mode === "arm" && (
             <div className="plan-armnote">
-              Armed = the planner asserts these HP setpoints itself every cycle; a human write (here
-              or at the wall) always preempts it. This switch only previews it — the live state is in
-              “Running now” above, set by the planner’s dry-run flag.
+              Armed is live: the planner asserts these HP setpoints itself every cycle, inside the
+              I4/I1 guardrails; a human write (here or at the wall) always preempts it. “Running now”
+              above shows what it’s actually doing right now.
             </div>
           )}
         </div>
@@ -1039,6 +1118,21 @@ export default function OptimizeClient({
           color: #aab4c8;
           background: none;
         }
+        .ps-btn:disabled {
+          opacity: 0.55;
+          cursor: default;
+        }
+        .ps-soon {
+          font-size: 9.5px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.4px;
+          color: #71809a;
+          border: 1px solid #232c40;
+          border-radius: 5px;
+          padding: 1px 4px;
+          margin-left: 1px;
+        }
         .ps-btn[aria-pressed="true"] {
           color: #e7ebf3;
           background: #161d2e;
@@ -1183,6 +1277,26 @@ export default function OptimizeClient({
           font-style: normal;
           font-weight: 400;
           color: #71809a;
+        }
+        .pl-hands {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px 22px;
+          padding: 4px 0 6px 12px;
+          font-size: 12.5px;
+          color: #8b98a5;
+        }
+        .pl-hand {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+        }
+        .pl-hand-dot {
+          width: 5px;
+          height: 5px;
+          border-radius: 50%;
+          background: #3a4650;
+          flex: none;
         }
         .pl-badge {
           font-family: ui-monospace, "SF Mono", Menlo, monospace;

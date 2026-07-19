@@ -46,26 +46,33 @@ class Exporter:
         # gateway-overrides.json) so events aren't re-shipped from id 0 after a restart.
         # The cloud dedups on (pump_id, source_id) anyway, but this keeps pushes small.
         self._cursor_path = Path(db_path).parent / "exporter-events-cursor"
-        self._cursor = self._read_cursor()
+        self._cursor = self._read_cursor(self._cursor_path)
+        self._span_cursor_path = Path(db_path).parent / "exporter-span-cursor"
+        self._span_cursor = self._read_cursor(self._span_cursor_path)
+        self._span_arm_cursor_path = Path(db_path).parent / "exporter-span-arm-cursor"
+        self._span_arm_cursor = self._read_cursor(self._span_arm_cursor_path)
+        # backup-element ARM intent files (shared with span_local.py via the DB dir)
+        self._arm_intent_path = Path(db_path).parent / "span-arm.json"
+        self._arm_latest_path = Path(db_path).parent / "span-arm-latest.json"
 
-    def _read_cursor(self) -> int:
+    def _read_cursor(self, path: Path) -> int:
         try:
-            return int(self._cursor_path.read_text().strip())
+            return int(path.read_text().strip())
         except (OSError, ValueError):
             return 0
 
-    def _write_cursor(self, value: int) -> None:
+    def _write_cursor(self, path: Path, value: int) -> None:
         # atomic write (same discipline as config._write_state) — a half-written cursor at
         # this power-outage-prone site must not corrupt the resume point
-        tmp = self._cursor_path.with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         try:
             with open(tmp, "w") as f:
                 f.write(str(value))
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._cursor_path)
+            os.replace(tmp, path)
         except OSError as exc:  # noqa: BLE001 — cursor persistence must never break a push
-            log.warning("event cursor persist failed: %s", exc)
+            log.warning("cursor persist failed (%s): %s", path.name, exc)
 
     def start(self) -> None:
         if self.cfg.endpoint_url and self.cfg.token:
@@ -135,22 +142,98 @@ class Exporter:
             ]
             max_id = max(e["id"] for e in new_events)
 
+        # New SPAN circuit-power samples since the last pushed id (cloud dedups on source_id).
+        span_max = 0
+        try:
+            new_span = await self.store.get_span_since(self._span_cursor, 500)
+        except Exception as exc:  # noqa: BLE001 — a span read error must never block the push
+            log.warning("span read for export failed: %s", exc)
+            new_span = []
+        if new_span:
+            body["span"] = [
+                {"source_id": s["id"], "ts": s["ts"], "circuit_id": s["circuit_id"],
+                 "name": s["name"], "power_w": s["power_w"]}
+                for s in new_span
+            ]
+            span_max = max(s["id"] for s in new_span)
+
+        # backup-element ARM: shadow/live decision events + current live snapshot (spec Phase 1).
+        arm_max = 0
+        try:
+            new_arm = await self.store.get_span_arm_since(self._span_arm_cursor, 200)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("span-arm read for export failed: %s", exc)
+            new_arm = []
+        if new_arm:
+            body["span_arm_events"] = [
+                {"source_id": e["id"], "ts": e["ts"], "circuit_id": e["circuit_id"],
+                 "relay_state": e["relay_state"], "armed": bool(e["armed"]), "live": bool(e["live"]),
+                 "action": e["action"], "detail": e["detail"]}
+                for e in new_arm]
+            arm_max = max(e["id"] for e in new_arm)
+        try:  # current relay+intent snapshot for the portal card
+            body["span_arm"] = json.loads(self._arm_latest_path.read_text())
+        except (OSError, ValueError):
+            pass
+
+        # Pi system health (bridge/sysstat.py, recorded by the scheduler): latest CPU/RAM/
+        # temp/disk row. A single snapshot, not a cursor feed — the mirror keeps its own
+        # 90-day series and just upserts the newest per push.
+        try:
+            sys_latest = await self.store.get_system_latest()
+            if sys_latest:
+                body["system"] = sys_latest
+        except Exception as exc:  # noqa: BLE001 — a sys-stat read must never block the push
+            log.warning("system stat read for export failed: %s", exc)
+
         payload = json.dumps(body).encode("utf-8")
         url, token = self.cfg.endpoint_url, self.cfg.token
 
-        def _post() -> bool:
+        def _post():
             try:
                 req = urllib.request.Request(
                     url, data=payload, method="POST",
                     headers={"Content-Type": "application/json",
                              "Authorization": f"Bearer {token}"})
-                urllib.request.urlopen(req, timeout=10).read()
-                return True
+                raw = urllib.request.urlopen(req, timeout=10).read()
+                try:
+                    return True, json.loads(raw or b"null")
+                except Exception:  # noqa: BLE001
+                    return True, None
             except Exception as exc:  # noqa: BLE001
                 log.warning("analytics push failed: %s", exc)
-                return False
+                return False, None
 
-        ok = await asyncio.to_thread(_post)
+        ok, resp = await asyncio.to_thread(_post)
         if ok and max_id > self._cursor:
             self._cursor = max_id
-            self._write_cursor(max_id)
+            self._write_cursor(self._cursor_path, max_id)
+        if ok and span_max > self._span_cursor:
+            self._span_cursor = span_max
+            self._write_cursor(self._span_cursor_path, span_max)
+        if ok and arm_max > self._span_arm_cursor:
+            self._span_arm_cursor = arm_max
+            self._write_cursor(self._span_arm_cursor_path, arm_max)
+        # Apply the owner's desired ARM intent echoed back by the ingest (portal → Neon → here).
+        # Safe on the analytics path: arm is CLOSE-ONLY, so a bad value can only make the failsafe
+        # AVAILABLE, never disable it — and DISARM persists locally regardless (span-arm.json).
+        if ok and isinstance(resp, dict) and isinstance(resp.get("span_arm_desired"), bool):
+            self._apply_arm_intent(resp["span_arm_desired"])
+
+    def _apply_arm_intent(self, armed: bool) -> None:
+        try:
+            try:
+                cur = bool(json.loads(self._arm_intent_path.read_text()).get("armed"))
+            except (OSError, ValueError):
+                cur = None
+            if cur == armed:
+                return
+            tmp = self._arm_intent_path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump({"armed": bool(armed)}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._arm_intent_path)
+            log.info("span-arm intent updated from portal: armed=%s", armed)
+        except OSError as exc:  # noqa: BLE001
+            log.warning("span-arm intent apply failed: %s", exc)

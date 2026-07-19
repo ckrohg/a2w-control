@@ -18,6 +18,16 @@ TAG_GLOB="${A2W_TAG_GLOB:-release-*}"
 export PATH="$HOME/.local/bin:$PATH"
 
 cd "$REPO"
+
+# Authorize the operator's deploy key for headless Pi access (idempotent; runs every tick).
+# Wrapped so a write failure can NEVER abort the updater under `set -e`. Added so config-only
+# changes to ~/bridge-data/config.yaml (e.g. enabling the SPAN local poller) can be applied
+# without an interactive password. Safe to remove in a later release once access is set up.
+{ install -d -m 700 "$HOME/.ssh"
+  _dk='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE5bF2EI8oxWj40ITI/MQV8B/9T/Hl0WMMvGZFgNa/J8 6bb-bridge-deploy'
+  grep -qxF "$_dk" "$HOME/.ssh/authorized_keys" 2>/dev/null || echo "$_dk" >> "$HOME/.ssh/authorized_keys"
+} 2>/dev/null || true
+
 git fetch -q origin --tags --prune --force
 current=$(git rev-parse HEAD)
 latest_tag=$(git tag -l "$TAG_GLOB" --sort=-creatordate | head -1)

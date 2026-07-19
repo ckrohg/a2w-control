@@ -178,6 +178,32 @@ class HubConfig(BaseModel):
     state_interval_s: float = 15.0    # how often to push a state frame while connected
 
 
+class SpanConfig(BaseModel):
+    # SPAN local-API poller (LAN-only instant circuit power) — the high-res half of the hybrid
+    # backup-element logging; spanwatch's hourly cloud (planner side) is the always-there backbone.
+    # Best-effort: a SPAN outage gaps only this series — control and the bridge are unaffected.
+    # Enabled only when BOTH host and passphrase are set. The passphrase is the panel's On-premise
+    # "home-owner passphrase" (SPAN app -> Settings -> On-premise); it lets the poller AUTO-RE-
+    # REGISTER its bearer token headlessly, which is what makes the local link resilient (the manual
+    # On-premise session's re-login was the old fragility). Keep it out of the repo — inject via
+    # pi-bootstrap env like the hub/analytics tokens.
+    host: str | None = None            # mDNS name, e.g. span-nj-2312-003t6.local
+    ip_fallback: str | None = None     # last-known LAN IP, tried if the hostname won't resolve
+    passphrase: str | None = None      # On-premise home-owner passphrase (enables auto-re-register)
+    circuits: list[str] = ["Buffer Tank", "Air-Water 1", "Air-Water 2"]  # circuit NAMES to log
+    poll_interval_s: float = 25.0
+    down_alert_after_s: float = 4 * 3600.0  # alert once if logging has been down this long
+    # Backup-element ARM control (see knowledge/reference/span-backup-arm-spec.md). A2W may CLOSE-ONLY
+    # the arm_circuit's relay (make the failsafe AVAILABLE) when the owner has ARMED it — never opens.
+    # `arm` is the config DEFAULT for the owner intent; the live intent is the persisted state file
+    # bridge-data/span-arm.json (owner-set via /api/span/arm + the portal). Default DISARMED so the
+    # bridge never wakes up armed. `arm_live=False` = SHADOW (Phase 1: log would-arm, toggle nothing).
+    arm_circuit: str = "Buffer Tank"
+    arm: bool = False           # default owner intent = DISARMED
+    arm_live: bool = False      # False = shadow (no SPAN relay writes); True = live (Phase 2)
+    arm_cooldown_s: float = 300.0  # anti-flap: min gap between arm actions
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
@@ -185,11 +211,12 @@ class AppConfig(BaseModel):
     notifications: NotifyConfig = NotifyConfig()
     analytics: AnalyticsConfig = AnalyticsConfig()
     hub: HubConfig = HubConfig()
+    span: SpanConfig = SpanConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
 
-    @field_validator("guardrails", "auth", "notifications", "analytics", "hub", mode="before")
+    @field_validator("guardrails", "auth", "notifications", "analytics", "hub", "span", mode="before")
     @classmethod
     def _empty_section_to_default(cls, v):
         # a YAML section present but with everything commented out parses to null;

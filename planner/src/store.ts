@@ -179,7 +179,202 @@ export class Store {
         tank_target_f  real,
         source         text
       );
+      -- One row per live planner process (hostname:pid), heartbeated every poll. The
+      -- single-writer guard (README §Single-writer invariant, #36) uses it to detect a SECOND
+      -- planner running against the shared DB. Detection only — never gates a write.
+      CREATE TABLE IF NOT EXISTS planner_instances (
+        instance_id  text PRIMARY KEY,
+        heartbeat_at timestamptz NOT NULL DEFAULT now()
+      );
+      -- Singleton single-writer LEASE (flag-gated by WRITER_LEASE_ENABLED). When enabled, only
+      -- the instance holding a FRESH lease may write the HBX; a second instance is refused in
+      -- writes.ts patch(). Takeover-on-stale lets a redeployed planner reclaim it. #36.
+      CREATE TABLE IF NOT EXISTS hbx_writer_lease (
+        id           integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        holder       text,
+        heartbeat_at timestamptz NOT NULL DEFAULT now()
+      );
+      -- Single-row RUNTIME autonomy override (W2-A). Env flags (AUTOPILOT_DRY_RUN/PHASE_B_DRY_RUN)
+      -- only SEED this on first boot; thereafter the dashboard's Off/Armed switch writes the row and
+      -- the planner reads it at the top of every poll. Lets autonomy be flipped live with no redeploy.
+      -- mode: 'off' (both shadow / dry-run) | 'arm' (both live). set/req are future modes (F/G).
+      CREATE TABLE IF NOT EXISTS controller_flags (
+        id                integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        mode              text NOT NULL,
+        autopilot_dry_run boolean NOT NULL,
+        phaseb_dry_run    boolean NOT NULL,
+        updated_at        timestamptz NOT NULL DEFAULT now(),
+        updated_by        text
+      );
+      -- Per-day REALIZED savings ledger (realized.ts engine). One row per operating day since the
+      -- cutover: the measured counterfactual (as-found regime vs actual metered energy). The dashboard
+      -- reads + cumulatively charts this instead of the old three-constant static guess.
+      CREATE TABLE IF NOT EXISTS realized_savings (
+        day                date PRIMARY KEY,
+        actual_elec_kwh    real,
+        cf_elec_kwh        real,
+        cf_fixed_elec_kwh  real,
+        saved_usd          real,
+        fixed_saved_usd    real,
+        smart_premium_usd  real,
+        cop_usd            real,
+        standby_usd        real,
+        element_credit_usd real,
+        avg_outdoor_f      real,
+        cop_now            real,
+        cop_old            real,
+        old_buffer_f       real,
+        standby_kwh        real,
+        sessions           integer,
+        confidence         text,
+        computed_at        timestamptz NOT NULL DEFAULT now()
+      );
+      -- v2 columns (fixed-cool + smart-premium) for tables created before they existed.
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS cf_fixed_elec_kwh real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS fixed_saved_usd   real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS smart_premium_usd real;
+      ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS energy_metered    boolean;
+      -- Per-hour metered pump electricity from SPAN (Air-Water 1 + 2 circuits), accumulated by the
+      -- spanwatch poll. Lets the realized engine use REAL daily energy instead of the SPAN daily avg.
+      -- Value is the hour's cumulative kWh (SPAN resets it each hour) — we keep the max seen per hour.
+      CREATE TABLE IF NOT EXISTS span_energy (
+        hour timestamptz PRIMARY KEY,
+        kwh  real NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
     `);
+  }
+
+  /** Upsert the pump-circuit energy for the current hour, keeping the MAX seen (SPAN's per-hour
+   *  value grows monotonically within the hour, then resets — so the max is the hour's total). */
+  async upsertSpanEnergyHour(hour: Date, kwh: number): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO span_energy (hour, kwh, updated_at) VALUES (date_trunc('hour', $1::timestamptz), $2, now())
+       ON CONFLICT (hour) DO UPDATE SET kwh = GREATEST(span_energy.kwh, EXCLUDED.kwh), updated_at = now()`,
+      [hour, kwh],
+    );
+  }
+
+  /** Per-day inputs for the realized-savings engine: real outdoor + current buffer target from
+   *  slx_readings, joined to quality-filtered measured COP sessions from tempiq_cop_points. One row
+   *  per operating day from the cutover forward (or the lookback window, whichever is later). */
+  async getRealizedDayInputs(cutover: string, lookbackDays: number): Promise<{
+    day: string; avgOutdoorF: number; nowBufferF: number; coverage: number; spanKwh: number | null;
+    measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
+  }[]> {
+    const res = await this.pool.query(
+      `WITH days AS (
+         SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                avg(outdoor_f) AS out_f, avg(tank_target_f) AS now_buf, count(*) AS n
+         FROM slx_readings
+         WHERE ts >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         GROUP BY 1
+       ),
+       cop AS (
+         -- energy-weighted day COP (sum thermal / sum electrical) — more robust than avg-of-sessions,
+         -- and makes eActual·copNow == measured thermal exactly.
+         SELECT to_char(date_trunc('day', measured_at AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                sum(electrical_kwh) AS e, sum(thermal_kwh) AS q,
+                sum(thermal_kwh) / NULLIF(sum(electrical_kwh), 0) AS cop, avg(sink_temp_f) AS sink, count(*) AS sess
+         FROM tempiq_cop_points
+         WHERE measured_at >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+           AND cop BETWEEN 1 AND 6 AND thermal_kwh > 0 AND electrical_kwh > 0
+           AND sink_temp_f BETWEEN 110 AND 175 AND outdoor_temp_f IS NOT NULL
+           AND outdoor_temp_f < sink_temp_f - 20
+           AND (quality_score IS NULL OR quality_score >= 0.3)
+         GROUP BY 1
+       ),
+       span AS (
+         -- REAL metered pump electricity per day (SPAN Air-Water circuits), summed from the hourly rows.
+         SELECT to_char(date_trunc('day', hour AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
+                sum(kwh) AS span_kwh
+         FROM span_energy
+         WHERE hour >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         GROUP BY 1
+       )
+       SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess, s.span_kwh
+       FROM days d LEFT JOIN cop c USING (day) LEFT JOIN span s USING (day)
+       WHERE d.out_f IS NOT NULL AND d.now_buf IS NOT NULL
+       ORDER BY d.day`,
+      [cutover, lookbackDays],
+    );
+    return res.rows.map((r) => ({
+      day: r.day,
+      avgOutdoorF: Number(r.out_f),
+      nowBufferF: Number(r.now_buf),
+      coverage: Math.min(1, Number(r.n) / 288),
+      spanKwh: r.span_kwh != null ? Number(r.span_kwh) : null,
+      measured: r.sess && Number(r.sess) > 0
+        ? { elecKwh: Number(r.e), thermalKwh: Number(r.q), cop: Number(r.cop), sinkF: Number(r.sink), sessions: Number(r.sess) }
+        : null,
+    }));
+  }
+
+  async upsertRealizedDay(r: {
+    day: string; actualElecKwh: number; cfElecKwh: number; fixedElecKwh: number; savedUsd: number;
+    fixedSavedUsd: number; smartPremiumUsd: number; copUsd: number; standbyUsd: number;
+    elementCreditUsd: number; avgOutdoorF: number; copNow: number; copOld: number;
+    oldBufferF: number; standbyKwh: number; sessions: number; confidence: string; energyMetered: boolean;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO realized_savings
+         (day, actual_elec_kwh, cf_elec_kwh, cf_fixed_elec_kwh, saved_usd, fixed_saved_usd,
+          smart_premium_usd, cop_usd, standby_usd, element_credit_usd, avg_outdoor_f, cop_now, cop_old,
+          old_buffer_f, standby_kwh, sessions, confidence, energy_metered, computed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18, now())
+       ON CONFLICT (day) DO UPDATE SET
+         actual_elec_kwh = EXCLUDED.actual_elec_kwh, cf_elec_kwh = EXCLUDED.cf_elec_kwh,
+         cf_fixed_elec_kwh = EXCLUDED.cf_fixed_elec_kwh, saved_usd = EXCLUDED.saved_usd,
+         fixed_saved_usd = EXCLUDED.fixed_saved_usd, smart_premium_usd = EXCLUDED.smart_premium_usd,
+         cop_usd = EXCLUDED.cop_usd, standby_usd = EXCLUDED.standby_usd,
+         element_credit_usd = EXCLUDED.element_credit_usd, avg_outdoor_f = EXCLUDED.avg_outdoor_f,
+         cop_now = EXCLUDED.cop_now, cop_old = EXCLUDED.cop_old, old_buffer_f = EXCLUDED.old_buffer_f,
+         standby_kwh = EXCLUDED.standby_kwh, sessions = EXCLUDED.sessions,
+         confidence = EXCLUDED.confidence, energy_metered = EXCLUDED.energy_metered, computed_at = now()`,
+      [r.day, r.actualElecKwh, r.cfElecKwh, r.fixedElecKwh, r.savedUsd, r.fixedSavedUsd,
+       r.smartPremiumUsd, r.copUsd, r.standbyUsd, r.elementCreditUsd, r.avgOutdoorF, r.copNow, r.copOld,
+       r.oldBufferF, r.standbyKwh, r.sessions, r.confidence, r.energyMetered],
+    );
+  }
+
+
+  /** Seed the runtime autonomy row from the env defaults IF it doesn't exist yet (first boot only).
+   *  After that the DB row is authoritative and env changes don't clobber a live choice. */
+  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_by)
+       VALUES (1, $1, $2, $3, 'env-seed')
+       ON CONFLICT (id) DO NOTHING`,
+      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun],
+    );
+  }
+
+  /** The current effective autonomy flags (runtime override). null before the row is seeded. */
+  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean } | null> {
+    const r = await this.pool.query(
+      `SELECT mode, autopilot_dry_run, phaseb_dry_run FROM controller_flags WHERE id = 1`,
+    );
+    if (!r.rowCount) return null;
+    const x = r.rows[0];
+    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run };
+  }
+
+  /** Set the runtime autonomy mode (dashboard Off/Armed switch). Returns the stored row. */
+  async setControllerFlags(s: {
+    mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; updatedBy: string;
+  }): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }> {
+    await this.pool.query(
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_at, updated_by)
+       VALUES (1, $1, $2, $3, now(), $4)
+       ON CONFLICT (id) DO UPDATE SET
+         mode = EXCLUDED.mode,
+         autopilot_dry_run = EXCLUDED.autopilot_dry_run,
+         phaseb_dry_run = EXCLUDED.phaseb_dry_run,
+         updated_at = now(),
+         updated_by = EXCLUDED.updated_by`,
+      [s.mode, s.autopilotDryRun, s.phasebDryRun, s.updatedBy],
+    );
+    return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun };
   }
 
   async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
@@ -570,6 +765,56 @@ export class Store {
       `INSERT INTO hbx_config_versions (changed_fields, config) VALUES ($1, $2)`,
       [changedFields === null ? null : JSON.stringify(changedFields), JSON.stringify(config)],
     );
+  }
+
+  /**
+   * Heartbeat THIS planner instance and return the ids of OTHER instances seen alive within
+   * freshMs. Non-blocking single-writer guard (#36): a non-empty result means a second planner
+   * is running against the shared DB and could collide on writes. Prunes rows dead > 1 h so the
+   * table can't grow across redeploys.
+   */
+  async heartbeatInstance(instanceId: string, freshMs: number): Promise<string[]> {
+    await this.pool.query(
+      `INSERT INTO planner_instances (instance_id, heartbeat_at) VALUES ($1, now())
+       ON CONFLICT (instance_id) DO UPDATE SET heartbeat_at = now()`,
+      [instanceId],
+    );
+    await this.pool.query(`DELETE FROM planner_instances WHERE heartbeat_at < now() - interval '1 hour'`);
+    const res = await this.pool.query(
+      `SELECT instance_id FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2`,
+      [instanceId, new Date(Date.now() - freshMs)],
+    );
+    return res.rows.map((r) => r.instance_id as string);
+  }
+
+  /**
+   * Renew the single-writer lease if this instance holds it, or CLAIM it if it's unheld or
+   * stale (takeover after a crash/redeploy). Atomic via ON CONFLICT ... WHERE; all times come
+   * from the DB clock, so there is no client-clock dependency. Returns whether this instance now
+   * holds it. Flag-gated caller (WRITER_LEASE_ENABLED); #36 optional defense-in-depth.
+   */
+  async renewOrClaimLease(instanceId: string, staleMs: number): Promise<{ held: boolean; holder: string | null }> {
+    await this.pool.query(
+      `INSERT INTO hbx_writer_lease (id, holder, heartbeat_at) VALUES (1, $1, now())
+       ON CONFLICT (id) DO UPDATE SET holder = excluded.holder, heartbeat_at = now()
+         WHERE hbx_writer_lease.holder = $1
+            OR hbx_writer_lease.holder IS NULL
+            OR hbx_writer_lease.heartbeat_at < now() - ($2 * interval '1 millisecond')`,
+      [instanceId, staleMs],
+    );
+    const res = await this.pool.query(`SELECT holder FROM hbx_writer_lease WHERE id = 1`);
+    const holder = res.rowCount ? (res.rows[0].holder as string | null) : null;
+    return { held: holder === instanceId, holder };
+  }
+
+  /** True iff this instance currently holds a FRESH single-writer lease (the write-path gate). */
+  async holdsWriterLease(instanceId: string, staleMs: number): Promise<boolean> {
+    const res = await this.pool.query(
+      `SELECT 1 FROM hbx_writer_lease
+       WHERE id = 1 AND holder = $1 AND heartbeat_at > now() - ($2 * interval '1 millisecond')`,
+      [instanceId, staleMs],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   async close(): Promise<void> {

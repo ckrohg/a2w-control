@@ -48,7 +48,44 @@ CREATE TABLE IF NOT EXISTS schedules (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_fired_date TEXT         -- "YYYY-MM-DD" of most recent firing (once per day)
 );
+
+CREATE TABLE IF NOT EXISTS span_samples (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    circuit_id TEXT,
+    name TEXT NOT NULL,          -- SPAN circuit name, e.g. "Buffer Tank", "Air-Water 1"
+    power_w REAL                 -- instantPowerW from SPAN's LAN-local API
+);
+CREATE INDEX IF NOT EXISTS idx_span_name_ts ON span_samples(name, ts);
+
+CREATE TABLE IF NOT EXISTS span_arm_events (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    circuit_id TEXT,
+    relay_state TEXT,            -- OPEN | CLOSED at decision time
+    armed INTEGER,              -- owner intent (1=armed)
+    live INTEGER,               -- 0=shadow (logged only), 1=actually acted
+    action TEXT NOT NULL,        -- would_arm | armed | arm_failed
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_span_arm_ts ON span_arm_events(ts);
+
+CREATE TABLE IF NOT EXISTS system_stats (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    cpu_pct REAL, load1 REAL, load5 REAL, load15 REAL, ncpu INTEGER,
+    mem_used_pct REAL, mem_total_mb INTEGER, mem_avail_mb INTEGER,
+    disk_used_pct REAL, disk_free_gb REAL, disk_total_gb REAL,
+    cpu_temp_c REAL, uptime_s REAL   -- all Optional: a missing /proc metric stores NULL
+);
+CREATE INDEX IF NOT EXISTS idx_system_ts ON system_stats(ts);
 """
+
+# system_stats columns in insert/select order — one list keeps the writer, the latest read,
+# and the tests from drifting apart.
+_SYSTEM_COLS = ("ts", "cpu_pct", "load1", "load5", "load15", "ncpu", "mem_used_pct",
+                "mem_total_mb", "mem_avail_mb", "disk_used_pct", "disk_free_gb",
+                "disk_total_gb", "cpu_temp_c", "uptime_s")
 
 
 class Store:
@@ -111,6 +148,34 @@ class Store:
              json.dumps(detail) if detail else None),
         )
 
+    async def add_span_sample(self, ts: float, circuit_id: str | None,
+                              name: str, power_w: float) -> None:
+        await self._exec(
+            "INSERT INTO span_samples (ts, circuit_id, name, power_w) VALUES (?,?,?,?)",
+            (ts, circuit_id, name, power_w),
+        )
+
+    async def get_span_since(self, after_id: int, limit: int) -> list[dict]:
+        """New span_samples for the analytics export — cursor = max id already shipped,
+        exactly the durable-cursor pattern the exporter uses for events."""
+        return await self._query(
+            "SELECT id, ts, circuit_id, name, power_w FROM span_samples"
+            " WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
+
+    async def add_span_arm_event(self, ts: float, circuit_id: str | None, relay_state: str | None,
+                                 armed: bool, live: bool, action: str, detail: str | None = None) -> None:
+        await self._exec(
+            "INSERT INTO span_arm_events (ts, circuit_id, relay_state, armed, live, action, detail)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (ts, circuit_id, relay_state, int(armed), int(live), action, detail),
+        )
+
+    async def get_span_arm_since(self, after_id: int, limit: int) -> list[dict]:
+        """New span_arm_events (shadow/live decisions) for the analytics export — durable cursor."""
+        return await self._query(
+            "SELECT id, ts, circuit_id, relay_state, armed, live, action, detail FROM span_arm_events"
+            " WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit))
+
     async def add_comm_snapshot(self, pump_id: str, stats: dict) -> None:
         await self._exec(
             "INSERT INTO comm_stats (pump_id, ts, ok_polls, error_polls, timeouts,"
@@ -119,6 +184,35 @@ class Store:
              stats["timeouts"], stats["io_errors"], stats["exception_responses"],
              stats["reconnects"]),
         )
+
+    # --- system health (bridge/sysstat.py, sampled ~every 60s by the scheduler) --------
+    async def add_system_stat(self, s: dict) -> None:
+        placeholders = ",".join("?" for _ in _SYSTEM_COLS)
+        await self._exec(
+            f"INSERT INTO system_stats ({','.join(_SYSTEM_COLS)}) VALUES ({placeholders})",
+            tuple(s.get(c) for c in _SYSTEM_COLS),
+        )
+
+    async def get_system_latest(self) -> dict | None:
+        """Most recent health sample — feeds /api/system and the cloud mirror push."""
+        rows = await self._query(
+            f"SELECT {','.join(_SYSTEM_COLS)} FROM system_stats ORDER BY ts DESC LIMIT 1")
+        return rows[0] if rows else None
+
+    async def get_system_history(self, hours: float) -> list[dict]:
+        """Raw samples up to 48h; beyond that, 5-minute bucket averages (same shape as
+        get_history, so the cloud trend chart can reuse it)."""
+        since = time.time() - hours * 3600
+        if hours <= 48:
+            return await self._query(
+                "SELECT ts, cpu_pct, load1, mem_used_pct, disk_used_pct, disk_free_gb,"
+                " cpu_temp_c FROM system_stats WHERE ts>=? ORDER BY ts", (since,))
+        return await self._query(
+            "SELECT CAST(ts/300 AS INTEGER)*300 AS ts, AVG(cpu_pct) AS cpu_pct,"
+            " AVG(load1) AS load1, AVG(mem_used_pct) AS mem_used_pct,"
+            " AVG(disk_used_pct) AS disk_used_pct, AVG(disk_free_gb) AS disk_free_gb,"
+            " AVG(cpu_temp_c) AS cpu_temp_c FROM system_stats WHERE ts>=? GROUP BY 1"
+            " ORDER BY 1", (since,))
 
     # --- reads ----------------------------------------------------------------
     async def get_history(self, pump_id: str, hours: float) -> list[dict]:
@@ -210,11 +304,14 @@ class Store:
                     dst.close()
             await asyncio.to_thread(_run)
 
-    async def prune(self, *, samples_days: float = 365, comm_days: float = 90) -> None:
+    async def prune(self, *, samples_days: float = 365, comm_days: float = 90,
+                    system_days: float = 90) -> None:
         cutoff = time.time() - samples_days * 86400
         await self._exec("DELETE FROM samples WHERE ts < ?", (cutoff,))
         await self._exec("DELETE FROM comm_stats WHERE ts < ?",
                          (time.time() - comm_days * 86400,))
+        await self._exec("DELETE FROM system_stats WHERE ts < ?",
+                         (time.time() - system_days * 86400,))
 
     async def get_open_faults(self, pump_id: str) -> dict[str, float]:
         """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —
