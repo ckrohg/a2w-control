@@ -39,6 +39,7 @@ export type Autonomy = {
   ageMin: number | null; // minutes since the planner last reported (server-computed → no hydration drift)
   autopilot: ControllerState;
   phaseb: ControllerState;
+  autoSanitize: boolean; // I8 auto-sanitize effective runtime state (heartbeat ground truth)
 } | null;
 
 // off (flag not set) / shadow (on, dry-run — logs but writes nothing) / live (on, writing).
@@ -476,6 +477,7 @@ export default function OptimizeClient({
   computedAt,
   autonomy,
   initialMode = "off",
+  initialAutoSanitize = false,
 }: {
   rate: number;
   dailyKwh: number;
@@ -483,6 +485,7 @@ export default function OptimizeClient({
   computedAt: number | null;
   autonomy: Autonomy;
   initialMode?: Mode;
+  initialAutoSanitize?: boolean;
 }) {
   const router = useRouter();
   // ---- autonomy + boost view state --------------------------------------------------
@@ -491,6 +494,10 @@ export default function OptimizeClient({
   const [mode, setMode] = useState<Mode>(initialMode);
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoMsg, setAutoMsg] = useState("");
+  // I8 auto-sanitize toggle — seeds from the RUNTIME controller_flags row; independent of Off/Armed.
+  const [autoSani, setAutoSani] = useState(initialAutoSanitize);
+  const [saniBusy, setSaniBusy] = useState(false);
+  const [saniMsg, setSaniMsg] = useState("");
   const [boost, setBoost] = useState<Boost | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
   const [customDeg, setCustomDeg] = useState(8);
@@ -631,6 +638,48 @@ export default function OptimizeClient({
       setAutoMsg("Network error — mode unchanged.");
     } finally {
       setAutoBusy(false);
+    }
+  }
+
+  // I8 auto-sanitize toggle actuator. POSTs on/off to the planner (token-holding proxy). Arming is
+  // confirmed (it hands the daily pasteurizing soak to the planner) but fully reversible. Optimistic
+  // with revert on failure; router.refresh() re-reads the heartbeat so "Running now" reflects it.
+  async function toggleSanitize() {
+    const next = !autoSani;
+    if (
+      next &&
+      !window.confirm(
+        "Turn auto-sanitize on? The planner will run the daily 140°F pasteurizing soak by itself whenever the tank goes too long without one — at the day's cheapest hour, inside the I4/I1 guardrails. You can turn it off any time. Continue?",
+      )
+    )
+      return;
+    const prev = autoSani;
+    setAutoSani(next); // optimistic
+    setSaniBusy(true);
+    setSaniMsg("");
+    try {
+      const res = await fetch("/api/planner/sanitize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const out: { ok?: boolean; enabled?: boolean; error?: string } = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setSaniMsg(
+          next
+            ? "Auto-sanitize on — the planner will soak automatically when a pasteurization is overdue. Takes effect within one cycle."
+            : "Auto-sanitize off — back to alert-only; you soak by hand or with Boost.",
+        );
+        router.refresh(); // re-read the heartbeat so "Running now" reflects the flip
+      } else {
+        setAutoSani(prev); // revert — the planner rejected it
+        setSaniMsg(`Couldn't change it: ${out.error || res.status}`);
+      }
+    } catch {
+      setAutoSani(prev);
+      setSaniMsg("Network error — nothing changed.");
+    } finally {
+      setSaniBusy(false);
     }
   }
 
@@ -786,6 +835,48 @@ export default function OptimizeClient({
               the next cycle. <b>Set &amp; forget</b> and <b>Request</b> are previews of upcoming modes —
               they change the chart but don’t run yet.
             </p>
+          </div>
+
+          {/* ============ I8 auto-sanitize — independent of the Off/Armed autonomy mode ============ */}
+          <div className="plan-sani">
+            <div className="plan-sani-head">
+              <span className="pl-eyebrow2">Auto-sanitize</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoSani}
+                className={`sani-switch ${autoSani ? "on" : ""}`}
+                disabled={saniBusy}
+                onClick={toggleSanitize}
+              >
+                <span className="sani-knob" />
+                <span className="sani-txt">{autoSani ? "On" : "Off"}</span>
+              </button>
+            </div>
+            <p className="pl-summary" style={{ borderTop: "none", paddingTop: 0, margin: 0 }}>
+              The daily 140°F pasteurizing soak (I8) that keeps the DHW coil legionella-safe. When{" "}
+              <b>on</b>, the planner fires it itself — only when a soak is actually overdue, at the
+              day&apos;s cheapest hour. When <b>off</b>, it just alerts you and you soak by hand or with
+              Boost. Independent of the Armed switch; the same I4/I1 guardrails apply.
+              {autonomy && (
+                <>
+                  {" "}
+                  <span className="dim">Running now:</span>{" "}
+                  <b>{autonomy.autoSanitize ? "auto-sanitize live" : "alert-only"}</b>.
+                </>
+              )}
+            </p>
+            {saniMsg && (
+              <p
+                className="pm-desc"
+                style={{
+                  color: saniMsg.startsWith("Couldn't") || saniMsg.startsWith("Network") ? "var(--warm)" : "var(--ok)",
+                  marginTop: 6,
+                }}
+              >
+                {saniMsg}
+              </p>
+            )}
           </div>
 
           {/* Request mode: display-only "changes waiting" chips */}
@@ -1340,6 +1431,60 @@ export default function OptimizeClient({
         }
         .pl-note :global(b) {
           color: #aab4c8;
+        }
+        /* ---- I8 auto-sanitize toggle ---- */
+        .plan-sani {
+          margin-top: 12px;
+          padding: 12px 13px;
+          background: #0b0e15;
+          border: 1px solid #232c40;
+          border-radius: 11px;
+        }
+        .plan-sani-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 8px;
+        }
+        .sani-switch {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          font: inherit;
+          font-size: 12.5px;
+          font-weight: 560;
+          color: #71809a;
+          background: #161d2e;
+          border: 1px solid #232c40;
+          border-radius: 999px;
+          padding: 4px 12px 4px 5px;
+          cursor: pointer;
+          transition: 0.15s;
+        }
+        .sani-switch:disabled {
+          opacity: 0.55;
+          cursor: default;
+        }
+        .sani-knob {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: #71809a;
+          transition: 0.15s;
+        }
+        .sani-switch.on {
+          color: #4bbd77;
+          background: rgba(75, 189, 119, 0.14);
+          border-color: rgba(75, 189, 119, 0.4);
+        }
+        .sani-switch.on .sani-knob {
+          background: #4bbd77;
+          box-shadow: 0 0 0 3px rgba(75, 189, 119, 0.24);
+        }
+        .sani-txt {
+          min-width: 20px;
+          text-align: left;
         }
         /* ---- request-mode chips rail ---- */
         .plan-rail {

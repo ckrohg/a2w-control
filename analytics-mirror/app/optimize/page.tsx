@@ -34,6 +34,16 @@ export default async function OptimizePage() {
   // Real controller state from the planner's heartbeat. Own try/catch — controller_status isn't
   // created until the planner deploys + runs ensureSchema, and a missing table must not break the
   // page. ageMin is computed server-side so the "N min ago" text can't cause a hydration mismatch.
+  // I8 auto-sanitize ground truth (controller_status.auto_sanitize) — its OWN try/catch so a column
+  // that isn't migrated yet (planner deploy lag) can't blank the whole autonomy card. Defaults false.
+  let autoSaniLive = false;
+  try {
+    const s = await sql<{ v: boolean }>`SELECT auto_sanitize AS v FROM controller_status WHERE id = 1`;
+    if (s.rowCount) autoSaniLive = !!s.rows[0].v;
+  } catch {
+    /* auto_sanitize column not migrated yet — defaults false */
+  }
+
   let autonomy: Autonomy = null;
   try {
     const cs = await sql<{
@@ -51,6 +61,7 @@ export default async function OptimizePage() {
         ageMin,
         autopilot: { enabled: r.ae, dryRun: r.adr, result: r.ares, targetF: r.atf },
         phaseb: { enabled: r.pe, dryRun: r.pdr, result: r.pres },
+        autoSanitize: autoSaniLive,
       };
     }
   } catch {
@@ -77,6 +88,16 @@ export default async function OptimizePage() {
     /* controller_flags not created yet — default the switch to Off */
   }
 
+  // I8 auto-sanitize switch position — from the RUNTIME controller_flags row (own try/catch for the
+  // not-yet-migrated column). Independent of the Off/Armed mode.
+  let initialAutoSanitize = false;
+  try {
+    const s = await sql<{ v: boolean }>`SELECT auto_sanitize AS v FROM controller_flags WHERE id = 1`;
+    if (s.rowCount) initialAutoSanitize = !!s.rows[0].v;
+  } catch {
+    /* auto_sanitize column not migrated yet — default off */
+  }
+
   return (
     <>
       <I1Banner />
@@ -94,6 +115,7 @@ export default async function OptimizePage() {
         computedAt={computedAt}
         autonomy={autonomy}
         initialMode={initialMode}
+        initialAutoSanitize={initialAutoSanitize}
       />
     </>
   );
