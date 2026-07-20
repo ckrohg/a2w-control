@@ -134,8 +134,10 @@ export class Store {
         autopilot_target_f real,
         phaseb_enabled     boolean NOT NULL,
         phaseb_dry_run     boolean NOT NULL,
-        phaseb_result      text
+        phaseb_result      text,
+        auto_sanitize      boolean NOT NULL DEFAULT false
       );
+      ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS auto_sanitize boolean NOT NULL DEFAULT false;
       CREATE TABLE IF NOT EXISTS tempiq_zone_physics (
         zone_id            text PRIMARY KEY,
         name               text,
@@ -203,9 +205,13 @@ export class Store {
         mode              text NOT NULL,
         autopilot_dry_run boolean NOT NULL,
         phaseb_dry_run    boolean NOT NULL,
+        auto_sanitize     boolean NOT NULL DEFAULT false,
         updated_at        timestamptz NOT NULL DEFAULT now(),
         updated_by        text
       );
+      -- I8 auto-sanitize toggle (Optimize-page switch). INDEPENDENT of mode; env AUTO_SANITIZE_ENABLED
+      -- seeds it once, thereafter the switch owns it. ALTER backfills the pre-existing prod row (false).
+      ALTER TABLE controller_flags ADD COLUMN IF NOT EXISTS auto_sanitize boolean NOT NULL DEFAULT false;
       -- Per-day REALIZED savings ledger (realized.ts engine). One row per operating day since the
       -- cutover: the measured counterfactual (as-found regime vs actual metered energy). The dashboard
       -- reads + cumulatively charts this instead of the old three-constant static guess.
@@ -340,41 +346,42 @@ export class Store {
 
   /** Seed the runtime autonomy row from the env defaults IF it doesn't exist yet (first boot only).
    *  After that the DB row is authoritative and env changes don't clobber a live choice. */
-  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }): Promise<void> {
+  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_by)
-       VALUES (1, $1, $2, $3, 'env-seed')
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize, updated_by)
+       VALUES (1, $1, $2, $3, $4, 'env-seed')
        ON CONFLICT (id) DO NOTHING`,
-      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun],
+      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun, seed.autoSanitize],
     );
   }
 
   /** The current effective autonomy flags (runtime override). null before the row is seeded. */
-  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean } | null> {
+  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean } | null> {
     const r = await this.pool.query(
-      `SELECT mode, autopilot_dry_run, phaseb_dry_run FROM controller_flags WHERE id = 1`,
+      `SELECT mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize FROM controller_flags WHERE id = 1`,
     );
     if (!r.rowCount) return null;
     const x = r.rows[0];
-    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run };
+    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run, autoSanitize: x.auto_sanitize };
   }
 
   /** Set the runtime autonomy mode (dashboard Off/Armed switch). Returns the stored row. */
   async setControllerFlags(s: {
-    mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; updatedBy: string;
-  }): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean }> {
+    mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean; updatedBy: string;
+  }): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean }> {
     await this.pool.query(
-      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, updated_at, updated_by)
-       VALUES (1, $1, $2, $3, now(), $4)
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize, updated_at, updated_by)
+       VALUES (1, $1, $2, $3, $4, now(), $5)
        ON CONFLICT (id) DO UPDATE SET
          mode = EXCLUDED.mode,
          autopilot_dry_run = EXCLUDED.autopilot_dry_run,
          phaseb_dry_run = EXCLUDED.phaseb_dry_run,
+         auto_sanitize = EXCLUDED.auto_sanitize,
          updated_at = now(),
          updated_by = EXCLUDED.updated_by`,
-      [s.mode, s.autopilotDryRun, s.phasebDryRun, s.updatedBy],
+      [s.mode, s.autopilotDryRun, s.phasebDryRun, s.autoSanitize, s.updatedBy],
     );
-    return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun };
+    return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun, autoSanitize: s.autoSanitize };
   }
 
   async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
@@ -433,13 +440,13 @@ export class Store {
   /** Heartbeat the planner's real controller flags each poll so the dashboard shows ground truth. */
   async upsertControllerStatus(s: {
     autopilotEnabled: boolean; autopilotDryRun: boolean; autopilotResult: string | null; autopilotTargetF: number | null;
-    phasebEnabled: boolean; phasebDryRun: boolean; phasebResult: string | null;
+    phasebEnabled: boolean; phasebDryRun: boolean; phasebResult: string | null; autoSanitize: boolean;
   }): Promise<void> {
     await this.pool.query(
       `INSERT INTO controller_status
          (id, updated_at, autopilot_enabled, autopilot_dry_run, autopilot_result, autopilot_target_f,
-          phaseb_enabled, phaseb_dry_run, phaseb_result)
-       VALUES (1, now(), $1,$2,$3,$4,$5,$6,$7)
+          phaseb_enabled, phaseb_dry_run, phaseb_result, auto_sanitize)
+       VALUES (1, now(), $1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (id) DO UPDATE SET
          updated_at = now(),
          autopilot_enabled = EXCLUDED.autopilot_enabled,
@@ -448,9 +455,10 @@ export class Store {
          autopilot_target_f = EXCLUDED.autopilot_target_f,
          phaseb_enabled = EXCLUDED.phaseb_enabled,
          phaseb_dry_run = EXCLUDED.phaseb_dry_run,
-         phaseb_result = EXCLUDED.phaseb_result`,
+         phaseb_result = EXCLUDED.phaseb_result,
+         auto_sanitize = EXCLUDED.auto_sanitize`,
       [s.autopilotEnabled, s.autopilotDryRun, s.autopilotResult, s.autopilotTargetF,
-       s.phasebEnabled, s.phasebDryRun, s.phasebResult],
+       s.phasebEnabled, s.phasebDryRun, s.phasebResult, s.autoSanitize],
     );
   }
 

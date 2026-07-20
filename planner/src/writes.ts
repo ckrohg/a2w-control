@@ -42,9 +42,10 @@ export class HbxWriter {
     private readonly buildingId: string,
     private readonly syncCode: string,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
-    // Phase 3 v2: surfaced in status() so the Optimize UI knows whether the daily
-    // auto-sanitize is live (gates the deeper 120°F cut). Does NOT change any write path.
-    private readonly autoSanitizeEnabled = false,
+    // Phase 3 v2: surfaced in status() so the Optimize UI knows whether the daily auto-sanitize is
+    // live. Mutable so the dashboard toggle (controller_flags) keeps it live. Does NOT change any
+    // write path — it only gates whether checkI8 auto-actuates the soak.
+    private autoSanitizeEnabled = false,
     // #36 optional defense-in-depth (flag-gated by WRITER_LEASE_ENABLED). When set, patch()
     // refuses to write unless THIS instance holds a fresh single-writer lease, so a second
     // planner instance can't collide on the live plant. null = disabled (no-op) — the default.
@@ -84,6 +85,11 @@ export class HbxWriter {
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
       auto_sanitize_enabled: this.autoSanitizeEnabled,
     };
+  }
+
+  /** Live-toggle auto-sanitize (dashboard switch → controller_flags → applied each poll). */
+  setAutoSanitize(enabled: boolean): void {
+    this.autoSanitizeEnabled = enabled;
   }
 
   // capF is the I4 upper ceiling for THIS write. Defaults to the everyday strictCap; the daily

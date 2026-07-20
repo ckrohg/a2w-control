@@ -101,6 +101,9 @@ const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 // When on, the I8 hygiene check fires one durable/guarded boost(131,60) per overdue
 // soak (see checkI8). Fail-safe: a rejected boost falls through to the existing alert.
 const AUTO_SANITIZE_ENABLED = process.env.AUTO_SANITIZE_ENABLED === "1";
+// Runtime override of AUTO_SANITIZE_ENABLED: env only SEEDS controller_flags; the Optimize-page toggle
+// owns it thereafter. Refreshed each poll from the row; read by checkI8 + the shadow interlock + /health.
+let autoSanitizeLive = AUTO_SANITIZE_ENABLED;
 
 // I8 pasteurization cadence (configurable + season-aware; see hygiene.ts). The interval is the
 // rolling window in which the tank must have held a real ≥SANITIZE_VERIFY_F/≥SANITIZE_DWELL_MIN dwell.
@@ -303,7 +306,7 @@ async function checkI8(): Promise<void> {
   // human-triggered write primitive verbatim (envelope + I1 + rate limit + read-back + audit all
   // apply). Fail-safe: if setTarget rejects (e.g. I1 — a pump setpoint below target+margin), do NOT
   // retry; fall through to the overdue-soak alert so the owner is notified and nothing is forced.
-  if (overdue && AUTO_SANITIZE_ENABLED) {
+  if (overdue && autoSanitizeLive) {
     const active = await store.activeBoost().catch(() => null);
     if (!active) {
       try {
@@ -682,7 +685,7 @@ async function shadowOnce(): Promise<void> {
 
   // INTERLOCK: hand the shadow planner the actuator state so its calendar sanitize boost stands down
   // exactly when the demand-driven checkI8 auto-sanitize is armed — one soak actuator, never two/none.
-  const plan = computeShadowPlan(forecast, cfg, { ...opts, autoSanitize: AUTO_SANITIZE_ENABLED }, demandFloor);
+  const plan = computeShadowPlan(forecast, cfg, { ...opts, autoSanitize: autoSanitizeLive }, demandFloor);
   if (!plan.length) throw new Error("empty forecast");
 
   // §6.11 storm shaping — gated on the flag; notify-only mode leaves the plan untouched.
@@ -790,9 +793,11 @@ async function pollOnce(): Promise<void> {
   // env-seeded values if the row is somehow unreadable. This governs ONLY dry-run (actuate vs
   // shadow) — the I4/I1 guardrails, single-writer invariant (#36), and rate limits are untouched.
   const flags = (await store.getControllerFlags().catch(() => null))
-    ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN };
+    ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED };
   if (autopilot) autopilot.setDryRun(flags.autopilotDryRun);
   if (phaseB) phaseB.setDryRun(flags.phasebDryRun);
+  autoSanitizeLive = flags.autoSanitize; // dashboard hygiene toggle → checkI8 gate + shadow interlock
+  writer.setAutoSanitize(autoSanitizeLive);
 
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
@@ -809,6 +814,7 @@ async function pollOnce(): Promise<void> {
     phasebEnabled: PHASE_B_ENABLED,
     phasebDryRun: phaseB ? phaseB.isDryRun : PHASE_B_DRY_RUN,
     phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
+    autoSanitize: autoSanitizeLive,
   }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
 
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
@@ -887,7 +893,7 @@ async function main(): Promise<void> {
   const seedMode = !AUTOPILOT_DRY_RUN && !PHASE_B_DRY_RUN ? "arm"
     : AUTOPILOT_DRY_RUN && PHASE_B_DRY_RUN ? "off" : "custom";
   await store.seedControllerFlags({
-    mode: seedMode, autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN,
+    mode: seedMode, autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED,
   }).catch((e) => console.error("controller_flags seed failed:", (e as Error).message));
 
   if (process.env.POLL_ONCE === "1") {
@@ -951,7 +957,7 @@ async function main(): Promise<void> {
             // means checkI8 owns the soak (shadow boost stood down); effective_interval_h reflects the
             // current season; last_satisfied=true confirms the coil's potable slug was pasteurized.
             hygiene: {
-              auto_sanitize: AUTO_SANITIZE_ENABLED,
+              auto_sanitize: autoSanitizeLive,
               base_interval_h: HYGIENE_BASE_INTERVAL_H,
               summer_interval_h: HYGIENE_SUMMER_INTERVAL_H,
               effective_interval_h: i8LastIntervalH,
@@ -1011,8 +1017,10 @@ async function main(): Promise<void> {
             });
           }
           const dry = mode === "off"; // off = shadow (compute + log, write nothing)
+          const curFlags = await store.getControllerFlags(); // preserve the independent auto-sanitize toggle
           const stored = await store.setControllerFlags({
-            mode, autopilotDryRun: dry, phasebDryRun: dry, updatedBy: "dashboard",
+            mode, autopilotDryRun: dry, phasebDryRun: dry,
+            autoSanitize: curFlags?.autoSanitize ?? AUTO_SANITIZE_ENABLED, updatedBy: "dashboard",
           });
           if (autopilot) autopilot.setDryRun(stored.autopilotDryRun);
           if (phaseB) phaseB.setDryRun(stored.phasebDryRun);
@@ -1023,6 +1031,33 @@ async function main(): Promise<void> {
           );
           console.log(`[autonomy] mode → ${mode} (dry-run ${dry}) via dashboard`);
           return json(res, 200, { ok: true, ...stored });
+        }
+        if (req.url === "/api/sanitize") {
+          // Dashboard I8 auto-sanitize toggle. INDEPENDENT of the autonomy mode — flips auto_sanitize in
+          // the same controller_flags row (preserving mode + both dry-runs) and applies it live to the
+          // checkI8 gate + shadow interlock. Same bearer gate as the other write routes.
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          const cur = await store.getControllerFlags();
+          if (req.method === "GET") {
+            return json(res, 200, { enabled: cur?.autoSanitize ?? AUTO_SANITIZE_ENABLED });
+          }
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          const body = JSON.parse((await readBody(req)) || "{}");
+          if (typeof body.enabled !== "boolean") return json(res, 400, { error: "body.enabled must be a boolean" });
+          const base = cur ?? { mode: "off", autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN };
+          const stored = await store.setControllerFlags({
+            mode: base.mode, autopilotDryRun: base.autopilotDryRun, phasebDryRun: base.phasebDryRun,
+            autoSanitize: body.enabled, updatedBy: "dashboard",
+          });
+          autoSanitizeLive = stored.autoSanitize;
+          writer.setAutoSanitize(autoSanitizeLive);
+          await ntfy(
+            `Auto-sanitize ${body.enabled ? "ARMED" : "disarmed"}`,
+            `Daily I8 pasteurization ${body.enabled ? "will now fire automatically when overdue" : "is back to alert-only"} (via dashboard).`,
+            body.enabled ? "high" : "default",
+          );
+          console.log(`[sanitize] auto_sanitize → ${body.enabled} via dashboard`);
+          return json(res, 200, { ok: true, enabled: stored.autoSanitize });
         }
         res.writeHead(404).end();
       } catch (e) {
