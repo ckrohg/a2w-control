@@ -1,8 +1,8 @@
 /**
- * @purpose Assertions for the I8 interlock in computeShadowPlan (shadow.ts). Run locally with:
- * npx tsx planner/src/shadow.test.ts — exits non-zero on failure. Pins the safety-critical property
- * that the calendar sanitize boost appears iff the demand-driven checkI8 actuator is NOT armed, so a
- * rollout never ends up with two soak actuators or (worse) none.
+ * @purpose Assertions for the demand-aware I8 soak block in computeShadowPlan (shadow.ts). Run with:
+ * npx tsx planner/src/shadow.test.ts — exits non-zero on failure. Pins that the 140°F sanitize block
+ * appears iff `sanitizeDue`, so the plan→autopilot→Phase B path (which coordinates the pump-setpoint
+ * lead) runs the soak exactly when the caller says a pasteurization is due — and skips it otherwise.
  */
 import assert from "node:assert/strict";
 import { computeShadowPlan, DEFAULT_OPTS, type ForecastHour } from "./shadow";
@@ -14,30 +14,35 @@ const forecast: ForecastHour[] = Array.from({ length: 24 }, (_, h) => ({
   outdoorF: 70 + h * 0.5, // 70 → 81.5°F, unique warmest hour at h=23
 }));
 
-// 1. Default (autoSanitize:false) → the calendar boost fires: exactly one block reaches sanitizeF (140).
+// 1. sanitizeDue=true (also the default) → exactly one block reaches sanitizeF (140), reason mentions sanitize.
 {
-  const plan = computeShadowPlan(forecast, null, DEFAULT_OPTS);
+  const plan = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, true);
   const boosted = plan.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF);
-  assert.equal(boosted.length, 1, "default plan should have exactly one 140°F sanitize block");
+  assert.equal(boosted.length, 1, "due plan should have exactly one 140°F sanitize block");
   assert.match(boosted[0].reason, /sanitize/i, "boost block reason should mention sanitize");
+  // and its HP setpoint LEADS the target (Phase B follows this so the soak clears I1)
+  assert.ok(boosted[0].hp1_setpoint_f >= boosted[0].tank_target_f + DEFAULT_OPTS.i1MarginF,
+    "sanitize block's hp1 setpoint must lead the target by the I1 margin");
+  // default (no sanitizeDue arg) behaves as due=true
+  const dflt = computeShadowPlan(forecast, null, DEFAULT_OPTS);
+  assert.equal(dflt.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 1, "default arg = due");
 }
 
-// 2. Armed (autoSanitize:true) → boost STANDS DOWN: no block exceeds the everyday strict cap, and no
-//    block is tagged as a sanitize excursion. checkI8 owns the soak in this mode.
+// 2. sanitizeDue=false → NO soak: no block exceeds the everyday strict cap, none tagged sanitize.
 {
-  const plan = computeShadowPlan(forecast, null, { ...DEFAULT_OPTS, autoSanitize: true });
+  const plan = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, false);
   const overCap = plan.filter((b) => b.tank_target_f > DEFAULT_OPTS.strictCapF);
-  assert.equal(overCap.length, 0, "armed plan must never exceed strictCap (no calendar soak)");
-  assert.equal(plan.some((b) => /sanitize/i.test(b.reason)), false, "armed plan has no sanitize block");
+  assert.equal(overCap.length, 0, "not-due plan must never exceed strictCap (no soak)");
+  assert.equal(plan.some((b) => /sanitize/i.test(b.reason)), false, "not-due plan has no sanitize block");
 }
 
-// 3. Both modes agree on every NON-sanitize block — the interlock only removes the soak, nothing else.
+// 3. due vs not-due differ on exactly one hour (the soak) — nothing else changes.
 {
-  const on = computeShadowPlan(forecast, null, DEFAULT_OPTS);
-  const off = computeShadowPlan(forecast, null, { ...DEFAULT_OPTS, autoSanitize: true });
+  const due = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, true);
+  const notDue = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, false);
   let differing = 0;
-  for (let i = 0; i < on.length; i++) if (on[i].tank_target_f !== off[i].tank_target_f) differing++;
-  assert.equal(differing, 1, "exactly one hour (the soak) should differ between the two modes");
+  for (let i = 0; i < due.length; i++) if (due[i].tank_target_f !== notDue[i].tank_target_f) differing++;
+  assert.equal(differing, 1, "exactly one hour (the soak) should differ between due and not-due");
 }
 
 console.log("shadow.test.ts: all assertions passed ✓");

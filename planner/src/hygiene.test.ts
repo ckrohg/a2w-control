@@ -8,6 +8,7 @@ import {
   longestDwellMin,
   hygieneVerdict,
   hygieneIntervalH,
+  lastDwellEnd,
   HYGIENE_HARD_MAX_H,
   type HygieneReading,
 } from "./hygiene";
@@ -51,6 +52,23 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
   assert.equal(hygieneIntervalH(70, 26, 26, 55), 26, "summer===base ⇒ no-op (default)");
   assert.equal(hygieneIntervalH(70, 26, 999, 55), HYGIENE_HARD_MAX_H, "over-cap ⇒ clamped to hard max");
   assert.equal(hygieneIntervalH(55, 26, 60, 55), 60, "exactly at threshold ⇒ summer");
+}
+
+// 4. lastDwellEnd: returns the END ts of the MOST RECENT qualifying (≥dwellMin) dwell, ignores short
+//    touches, null when none — this drives the demand-aware "soak due?" gate.
+{
+  // two qualifying dwells; expect the end of the SECOND (t=200..245, 45 min)
+  const s: HygieneReading[] = [
+    at(0, 120), at(5, 136), at(45, 136), at(50, 120),        // dwell #1: 45 min, ends t=45
+    at(120, 141), at(140, 120),                              // short touch (20 min) → ignored
+    at(200, 135), at(245, 135), at(250, 118),                // dwell #2: 45 min, ends t=245
+  ];
+  const end = lastDwellEnd(s, 134, 30);
+  assert.ok(end, "expected a qualifying dwell end");
+  assert.equal(end!.getTime(), new Date(t0 + 245 * 60000).getTime(), "end = most recent qualifying dwell");
+  // no qualifying dwell (all cool, or only short touches) → null
+  assert.equal(lastDwellEnd([at(0, 120), at(5, 141), at(10, 120)], 134, 30), null, "short touch ⇒ null");
+  assert.equal(lastDwellEnd([at(0, 120), at(30, 120)], 134, 30), null, "never hot ⇒ null");
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

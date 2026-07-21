@@ -649,7 +649,7 @@ export default function OptimizeClient({
     if (
       next &&
       !window.confirm(
-        "Turn auto-sanitize on? The planner will run the daily 140°F pasteurizing soak by itself whenever the tank goes too long without one — at the day's cheapest hour, inside the I4/I1 guardrails. You can turn it off any time. Continue?",
+        "Switch auto-sanitize to demand-aware? The planner will run the 140°F pasteurizing soak only when the tank goes too long without one — at the day's cheapest hour, inside the I4/I1 guardrails. (Off = a conservative daily soak.) You can switch back any time. Continue?",
       )
     )
       return;
@@ -667,8 +667,8 @@ export default function OptimizeClient({
       if (res.ok) {
         setSaniMsg(
           next
-            ? "Auto-sanitize on — the planner will soak automatically when a pasteurization is overdue. Takes effect within one cycle."
-            : "Auto-sanitize off — back to alert-only; you soak by hand or with Boost.",
+            ? "Auto-sanitize on — the planner soaks only when a pasteurization is due (cheapest hour). Takes effect within one cycle."
+            : "Auto-sanitize off — back to a conservative daily soak. Takes effect within one cycle.",
         );
         router.refresh(); // re-read the heartbeat so "Running now" reflects the flip
       } else {
@@ -854,15 +854,16 @@ export default function OptimizeClient({
               </button>
             </div>
             <p className="pl-summary" style={{ borderTop: "none", paddingTop: 0, margin: 0 }}>
-              The daily 140°F pasteurizing soak (I8) that keeps the DHW coil legionella-safe. When{" "}
-              <b>on</b>, the planner fires it itself — only when a soak is actually overdue, at the
-              day&apos;s cheapest hour. When <b>off</b>, it just alerts you and you soak by hand or with
-              Boost. Independent of the Armed switch; the same I4/I1 guardrails apply.
+              The 140°F pasteurizing soak (I8) that keeps the DHW coil legionella-safe. When <b>on</b>,
+              the planner runs it <b>demand-aware</b> — only when a pasteurization is actually due, at
+              the day&apos;s cheapest hour. When <b>off</b>, it runs a conservative soak <b>every day</b>.
+              Either way the planner soaks it itself via the plan (which leads the pump setpoints so the
+              soak clears I1); a manual write or Boost always preempts it.
               {autonomy && (
                 <>
                   {" "}
                   <span className="dim">Running now:</span>{" "}
-                  <b>{autonomy.autoSanitize ? "auto-sanitize live" : "alert-only"}</b>.
+                  <b>{autonomy.autoSanitize ? "smart cadence — soaks when due" : "daily soak"}</b>.
                 </>
               )}
             </p>
