@@ -73,3 +73,26 @@ export function hygieneIntervalH(
   const chosen = outdoorF != null && outdoorF >= summerOutdoorF ? summerH : baseH;
   return Math.min(Math.max(chosen, 1), HYGIENE_HARD_MAX_H);
 }
+
+/** End timestamp of the most recent qualifying dwell (≥dwellMin continuous minutes ≥minF) in the
+ *  ascending series, or null if none. Answers "how long since the coil was last pasteurized" so the
+ *  plan can schedule the next soak BEFORE the hygiene window lapses (demand-aware cadence). */
+export function lastDwellEnd(series: HygieneReading[], minF: number, dwellMin: number): Date | null {
+  let best: Date | null = null;
+  let runStart: Date | null = null;
+  let runLast: Date | null = null;
+  const commit = () => {
+    if (runStart && runLast && (runLast.getTime() - runStart.getTime()) / 60000 >= dwellMin) best = runLast;
+  };
+  for (const r of series) {
+    if (r.tankF != null && r.tankF >= minF) {
+      if (runStart == null) runStart = r.ts;
+      runLast = r.ts;
+    } else {
+      commit();
+      runStart = runLast = null;
+    }
+  }
+  commit();
+  return best;
+}

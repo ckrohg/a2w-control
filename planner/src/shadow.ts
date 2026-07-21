@@ -40,9 +40,6 @@ export interface ShadowOpts {
   sanitizeF: number; // I8: daily thermal-hygiene excursion target (140 °F = 60 °C pasteurization)
   strictCapF: number; // I4: everyday hard ceiling until Phase B actively manages HP setpoints
   sanitizeCapF: number; // I8: the daily sanitize excursion may exceed strictCapF up to here (I1 still guards)
-  autoSanitize: boolean; // when true, the demand-driven checkI8 actuator owns the soak — so the shadow
-  // plan STANDS DOWN its calendar-daily boost (avoids double-soaking + lets the tank stay cool on days a
-  // real pasteurizing dwell already happened). Default false = boost stays (today's autopilot-driven soak).
 }
 
 export const DEFAULT_OPTS: ShadowOpts = {
@@ -63,8 +60,6 @@ export const DEFAULT_OPTS: ShadowOpts = {
   sanitizeF: 140,
   strictCapF: 135,
   sanitizeCapF: 145, // hard ceiling for the 140 °F soak (bypasses curve+3); < the 154 °F the hardware ran as-found
-  autoSanitize: false, // interlock: false = shadow injects the calendar boost (today); set true once the
-  // demand-driven checkI8 auto-sanitize is armed (AUTO_SANITIZE_ENABLED) so exactly one actuator ever runs.
 };
 
 /**
@@ -107,6 +102,7 @@ export function computeShadowPlan(
   hbxConfig: Record<string, any> | null,
   opts: ShadowOpts = DEFAULT_OPTS,
   demandFloor?: DemandFloor | null,
+  sanitizeDue = true,
 ): ShadowBlock[] {
   const hours = forecast.slice(0, 24);
   const inWindow = (h: number) => opts.dhwWindows.some(([a, b]) => h >= a && h < b);
@@ -134,13 +130,13 @@ export function computeShadowPlan(
     warmest.reason = `pre-charge for ${String(start).padStart(2, "0")}:00 window (warmest lead hour, ${warmest.f.outdoorF.toFixed(0)}°F)`;
   }
 
-  // I8 daily thermal hygiene: one block per local day boosted to sanitizeF, in that day's warmest
-  // hour — the coil's potable slug must never sit lukewarm for a full day, and the warmest hour is
-  // the cheapest place to buy the excursion. INTERLOCK: skipped entirely when opts.autoSanitize is
-  // set, because then the demand-driven checkI8 actuator fires the soak on a MEASURED-overdue basis
-  // (see index.ts). Gating here (rather than deleting) guarantees exactly one actuator at all times:
-  // flag off ⇒ this calendar boost + autopilot; flag on ⇒ checkI8 — never both, never neither.
-  if (!opts.autoSanitize) {
+  // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
+  // plan→autopilot→Phase B path — Phase B leads the pump setpoints off THIS block's current-hour target
+  // (phaseb.ts), so the 140°F soak clears I1 instead of deadlocking. Gated on `sanitizeDue`: the caller
+  // passes true for the conservative daily soak (auto-sanitize OFF) or when a pasteurization is actually
+  // due (auto-sanitize ON, demand-aware), and false to skip a redundant soak. checkI8 only alarms; it
+  // never actuates — so the setpoint coordination is never bypassed.
+  if (sanitizeDue) {
     const byDay = new Map<string, Draft[]>();
     for (const d of draft) {
       const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;

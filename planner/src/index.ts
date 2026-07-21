@@ -17,7 +17,7 @@ import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
-import { hygieneVerdict, hygieneIntervalH } from "./hygiene";
+import { hygieneVerdict, hygieneIntervalH, lastDwellEnd } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
@@ -271,6 +271,27 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
 const SANITIZE_VERIFY_F = 134;
 const SANITIZE_DWELL_MIN = 30;
 
+/** Demand-aware sanitize gate (I8): should the plan emit the day's 140°F soak block? Auto-sanitize OFF
+ *  ⇒ always true (conservative daily soak). ON ⇒ true only when the last real pasteurizing dwell is old
+ *  enough that the hygiene window would lapse within a day — so we soak at the plan's warmest (cheapest)
+ *  hour BEFORE it expires, and skip a redundant soak otherwise. Errors ⇒ true (fail safe). The soak runs
+ *  on the plan→autopilot→Phase B path (setpoint-coordinated so it clears I1); checkI8 only alarms. */
+async function sanitizeDueNow(): Promise<boolean> {
+  if (!autoSanitizeLive) return true; // OFF = conservative daily soak
+  try {
+    const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
+    const series = await store.getRecentSeries(intervalH);
+    const lastEnd = lastDwellEnd(series, SANITIZE_VERIFY_F, SANITIZE_DWELL_MIN);
+    const hoursSince = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : Infinity;
+    // Soak ~a day before the window lapses; floor at 3h so the default 26h interval still soaks ~daily
+    // (no behavior change), while a relaxed summer interval (e.g. 60h) skips days between soaks.
+    return hoursSince >= Math.max(intervalH - 24, 3);
+  } catch (e) {
+    console.error("sanitizeDue check failed — defaulting to soak:", (e as Error).message);
+    return true;
+  }
+}
+
 /** I8 thermal hygiene (plan §5.1): page (and, when armed, auto-soak) if the season-aware interval
  *  passes without a real pasteurizing DWELL (≥SANITIZE_VERIFY_F for ≥SANITIZE_DWELL_MIN continuous
  *  min) — the DHW coil's potable slug must get its hot soak. The dwell decision + interval are pure
@@ -299,29 +320,11 @@ async function checkI8(): Promise<void> {
   i8LastSatisfied = satisfied;
   i8LastCheckedAt = new Date().toISOString();
 
-  // Phase 3 v2: auto-sanitize. When the flag is ON and the soak is overdue, fire ONE durable/guarded
-  // boost to the 140°F sanitize target (sanitizeCapF so it isn't clamped to 135; I1 still guards) for
-  // long enough to reach temp AND hold the dwell. Idempotency guard: skip if a boost is already active
-  // (the soak stays unsatisfied for several polls while the water heats). The boost reuses the
-  // human-triggered write primitive verbatim (envelope + I1 + rate limit + read-back + audit all
-  // apply). Fail-safe: if setTarget rejects (e.g. I1 — a pump setpoint below target+margin), do NOT
-  // retry; fall through to the overdue-soak alert so the owner is notified and nothing is forced.
-  if (overdue && autoSanitizeLive) {
-    const active = await store.activeBoost().catch(() => null);
-    if (!active) {
-      try {
-        await writer.boost(DEFAULT_OPTS.sanitizeF, 120, "auto-sanitize", DEFAULT_OPTS.sanitizeCapF);
-        await ntfy("Auto-sanitize", `Daily ${DEFAULT_OPTS.sanitizeF}°F soak triggered automatically.`);
-        return; // boost placed; the soak will satisfy within ~24h — don't also alert
-      } catch (e) {
-        // Rejected (guardrail) or write failure — let the overdue alert below fire.
-        console.warn("auto-sanitize boost rejected/failed:", (e as Error).message);
-      }
-    } else {
-      return; // boost already running toward the soak — in progress, don't alert
-    }
-  }
-
+  // checkI8 is a pure MONITOR/alarm — it never actuates the soak. Actuation is the plan→autopilot→
+  // Phase B path (demand-aware via sanitizeDueNow → computeShadowPlan), which leads the pump setpoints
+  // so the 140°F soak clears I1. (The old checkI8 auto-boost was I1-deadlocked in the cool-tank regime:
+  // it set target 140 against 125°F setpoints with nothing to raise them. Removed.) If a soak is somehow
+  // missed, page the owner.
   if (overdue && !i8Alerted) {
     i8Alerted = true;
     await ntfy(
@@ -685,7 +688,8 @@ async function shadowOnce(): Promise<void> {
 
   // INTERLOCK: hand the shadow planner the actuator state so its calendar sanitize boost stands down
   // exactly when the demand-driven checkI8 auto-sanitize is armed — one soak actuator, never two/none.
-  const plan = computeShadowPlan(forecast, cfg, { ...opts, autoSanitize: autoSanitizeLive }, demandFloor);
+  const sanitizeDue = await sanitizeDueNow();
+  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue);
   if (!plan.length) throw new Error("empty forecast");
 
   // §6.11 storm shaping — gated on the flag; notify-only mode leaves the plan untouched.
@@ -796,7 +800,7 @@ async function pollOnce(): Promise<void> {
     ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED };
   if (autopilot) autopilot.setDryRun(flags.autopilotDryRun);
   if (phaseB) phaseB.setDryRun(flags.phasebDryRun);
-  autoSanitizeLive = flags.autoSanitize; // dashboard hygiene toggle → checkI8 gate + shadow interlock
+  autoSanitizeLive = flags.autoSanitize; // dashboard toggle → demand-aware sanitize cadence (sanitizeDueNow)
   writer.setAutoSanitize(autoSanitizeLive);
 
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
