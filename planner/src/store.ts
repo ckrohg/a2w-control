@@ -165,6 +165,13 @@ export class Store {
         fetched_at timestamptz NOT NULL,
         payload    jsonb NOT NULL
       );
+      -- gtm#1431: latest DHW-vs-space-ISOLATED usage aggregate from TempIQ (/api/insights/dhw-usage).
+      -- Enrichment ONLY — winter DHW-vs-space load separation + observability; never gates control.
+      CREATE TABLE IF NOT EXISTS tempiq_dhw_usage (
+        id         integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        fetched_at timestamptz NOT NULL,
+        payload    jsonb NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS storm_events (
         id         serial PRIMARY KEY,
         started_at timestamptz NOT NULL DEFAULT now(),
@@ -514,6 +521,16 @@ export class Store {
   async upsertTempiqZoneEnergy(payload: unknown): Promise<void> {
     await this.pool.query(
       `INSERT INTO tempiq_zone_energy (id, fetched_at, payload) VALUES (1, now(), $1)
+       ON CONFLICT (id) DO UPDATE SET
+         fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
+      [JSON.stringify(payload)],
+    );
+  }
+
+  /** Latest DHW-vs-space-isolated usage aggregate (gtm#1431) → tempiq_dhw_usage row 1. */
+  async upsertTempiqDhwUsage(payload: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO tempiq_dhw_usage (id, fetched_at, payload) VALUES (1, now(), $1)
        ON CONFLICT (id) DO UPDATE SET
          fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
       [JSON.stringify(payload)],

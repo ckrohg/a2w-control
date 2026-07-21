@@ -12,6 +12,10 @@
  *                                        via ?since=<newest stored point, else 7d>)
  *   GET /api/insights/zone-energy      → tempiq_zone_energy (latest snapshot JSON,
  *                                        single-row upsert — shadow model picks fields)
+ *   GET /api/insights/dhw-usage        → tempiq_dhw_usage (gtm#1431 — DHW-vs-space-ISOLATED
+ *                                        usage aggregate; ADVISORY enrichment, single-row
+ *                                        snapshot. Winter DHW load separation our local
+ *                                        tank-drop inference can't do; NEVER gates control)
  * §6.7 doctrine: TempIQ already learns the zone physics (hydronic-system-learner —
  * effective thermal mass, per-zone loads, envelope UA), so the planner CONSUMES those
  * outputs and never re-derives them; the tank's behavioral model (C_eff, DHW windows,
@@ -64,6 +68,27 @@ interface CopMeasurementsResponse {
   }>;
 }
 
+// gtm#1431 (TempIQv2 PR #1816): DHW-vs-space-isolated usage aggregate. Daily estimate + rolling-rate
+// projection — NOT a per-cycle event stream, and lastUpdatedAt is the estimate's recency, not a literal
+// last-draw time (per-draw timing stays locally mined). `available:false` = no estimate yet.
+interface DhwUsageResponse {
+  propertyId?: string;
+  available?: boolean;
+  dhwVsSpaceApplied?: boolean;
+  estimate?: {
+    source?: string | null;
+    dailyElectricalKwh?: number | null;
+    totalWaterHeatingKwh?: number | null;
+    thermalKwh?: number | null;
+    hydronicCop?: number | null;
+    cycleCount?: number | null;
+    lastUpdatedAt?: string | null;
+    hoursSinceUpdate?: number | null;
+    stale?: boolean | null;
+  } | null;
+  rolling?: { window24hKwh?: number | null; window72hKwh?: number | null; basis?: string | null } | null;
+}
+
 export class TempiqReader {
   private lastFetchAt: string | null = null;
   private lastResult: string | null = null;
@@ -84,7 +109,7 @@ export class TempiqReader {
     };
   }
 
-  /** One read tick: pull all three insight endpoints, persist each. Never throws. */
+  /** One read tick: pull the insight endpoints, persist each. Never throws. */
   async tick(): Promise<void> {
     const results: string[] = [];
     let failed = 0;
@@ -113,6 +138,13 @@ export class TempiqReader {
       results.push(await this.fetchSpatialGraph());
     } catch (e) {
       results.push(`spatial error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // ADVISORY (gtm#1431): DHW-vs-space-isolated usage aggregate. Pure enrichment — a 404 (endpoint not
+    // deployed yet) or available:false must NOT inflate the failure streak, so it lives here, not above.
+    try {
+      results.push(await this.fetchDhwUsage());
+    } catch (e) {
+      results.push(`dhw error: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     if (failed < 3) this.lastFetchAt = new Date().toISOString();
@@ -194,6 +226,22 @@ export class TempiqReader {
     const graph = await fetchInsightSpatialGraph(this.baseUrl, this.token);
     console.log(`[tempiq-read] warm-adjacency (advisory): ${summarizeWarmAdjacency(graph)}`);
     return `spatial: ${graph.edges.length} edges`;
+  }
+
+  /** ADVISORY (gtm#1431): DHW-vs-space-ISOLATED usage aggregate → tempiq_dhw_usage (row-1 snapshot).
+   * TempIQ's #1279 recharge-calorimetry already separates DHW energy from radiant/baseboard — which our
+   * local tank-drop draw inference (dhw.ts) CAN'T do once winter space-heat calls also drop the buffer.
+   * Enrichment + observability ONLY: it never feeds the I8 sanitize decision (that stays thermal) or any
+   * control path. `available:false` (200) = no estimate yet; a 404 = TempIQ hasn't deployed PR #1816 yet
+   * — both are fine (this endpoint is in the advisory tier, so neither inflates the failure streak). */
+  private async fetchDhwUsage(): Promise<string> {
+    const body = await this.get<DhwUsageResponse>("/api/insights/dhw-usage");
+    await this.store.upsertTempiqDhwUsage({ ...body, fetchedAt: new Date().toISOString() });
+    if (body?.available === false) return "dhw: unavailable";
+    const e = body?.estimate ?? null;
+    const daily = numOrNull(e?.dailyElectricalKwh);
+    const cyc = numOrNull(e?.cycleCount);
+    return `dhw: ${daily != null ? `${daily.toFixed(1)}kWh/d` : "?"}${cyc != null ? `, ${cyc} cyc` : ""}${e?.stale ? " (stale)" : ""}`;
   }
 }
 
