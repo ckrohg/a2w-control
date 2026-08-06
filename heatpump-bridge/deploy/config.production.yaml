@@ -78,6 +78,13 @@ notifications:
   #    Resend only delivers to the account owner's address — set resend_to to that.
   # resend_api_key: "re_..."
   # resend_to: "you@example.com"
+  # 4. Comm-loss alert shaping: brief dropouts land in the dashboard/event log only. A page
+  #    (ntfy + email) fires after offline_alert_min of CONTINUOUS silence, or when
+  #    flap_alert_count dropouts occur within flap_window_min (link degrading). A pump that
+  #    has never been online still pages immediately (bench-day miswire). Defaults shown.
+  # offline_alert_min: 10
+  # flap_alert_count: 3
+  # flap_window_min: 60
   # 3. Optional email (Resend) — a sticky second channel for SERIOUS alerts (high/urgent only).
   #    EASIEST: pass A2W_RESEND_API_KEY + A2W_RESEND_TO to pi-bootstrap.sh. Without a verified
   #    sender domain Resend delivers only to your own account email — set resend_to to that.
