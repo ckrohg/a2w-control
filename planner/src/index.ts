@@ -16,7 +16,9 @@ import os from "node:os";
 import { TempiqPusher } from "./tempiq";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
+import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
@@ -31,7 +33,7 @@ import {
   SyntheticTrigger,
   StormState,
 } from "./storm";
-import { DemandFeed } from "./demand";
+import { DemandFeed, requiredAwtF } from "./demand";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows } from "./dhw";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
@@ -108,6 +110,14 @@ const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 // so the day's charge is bought at the best outdoor COP. 0 (default) = off — plans identical
 // to before. Only ever ADDS heat above the DHW floor; clamped to a sane 0–15 °F.
 const BANK_F = Math.min(Math.max(Number(process.env.BANK_F ?? "0") || 0, 0), 15);
+
+// #59 winter DP: the cost-optimal 24 h target trajectory. The solve itself is SHADOW-FIRST —
+// it runs (and lands in plan meta + /health) whenever the horizon dips below the compute
+// threshold, so shoulder season builds a comparison record automatically. Commanded targets
+// change only behind WINTER_DP_ENABLED=1, and then strictly as raises above the floor logic.
+const WINTER_DP_ENABLED = process.env.WINTER_DP_ENABLED === "1";
+const DP_COMPUTE_BELOW_F = 55; // any forecast hour below this → solve (inert in high summer)
+let winterDpState: Record<string, unknown> | null = null; // /health surface
 
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
 // OFF by default — deploying this changes NOTHING until AUTO_SANITIZE_ENABLED=1.
@@ -736,6 +746,69 @@ async function shadowOnce(): Promise<void> {
   const plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue);
   if (!plan.length) throw new Error("empty forecast");
 
+  // #59 winter DP — solve the cost-optimal trajectory over the SAME hard floors the plan
+  // enforces. Always recorded (meta + /health) once the horizon reaches shoulder temps; only
+  // WINTER_DP_ENABLED lets it raise commanded targets (never lower, band-clamped, sanitize
+  // blocks outrank it, storm shaping below still raises on top). A solver failure logs and
+  // leaves the plan untouched — the DP is an optimizer, never a dependency.
+  let dpMeta: Record<string, unknown> | null = null;
+  if (Math.min(...forecast.slice(0, 24).map((f) => f.outdoorF)) < DP_COMPUTE_BELOW_F) {
+    try {
+      const [anchor, fits, latestSlx] = await Promise.all([
+        store.getCopAnchor(60).catch(() => null),
+        store.getRecentDecayFits(30 * 24).catch(() => []),
+        store.getLatestSlx().catch(() => null),
+      ]);
+      const tankUa = aggregateTankUa(fits)?.ua ?? DEFAULT_TANK_UA;
+      const zones = demandFeed?.isHealthy() ? demandFeed.zones() : [];
+      const dpHours: DpHour[] = forecast.slice(0, 24).map((f) => {
+        const o = f.outdoorF;
+        const band = bandFor(o, cfg, opts.strictCapF);
+        // Hard floor: DHW-ready ∨ conservative all-zones demand floor at THIS hour's outdoor
+        // (future calling state is unknown — assume any zone may call) ∨ the as-found curve
+        // mimic when the demand feed is degraded below the winter guard ∨ the I4 lower band.
+        const demandF = demandFeed?.isHealthy() ? demandFeed.proposeFloor(o, null)?.tankTargetF ?? 0 : 0;
+        const mimicF = !demandF && o < opts.winterGuardF && cfg ? curveTargetF(cfg, o) ?? 0 : 0;
+        const floorF = Math.min(opts.strictCapF, Math.max(opts.dhwFloorF, demandF, mimicF, band.lo));
+        const capF = Math.max(floorF, Math.min(opts.strictCapF, band.hi));
+        // Space-heat load forecast: hydronic zones' learned UA × indoor−outdoor. Zones without
+        // a UA contribute nothing (degraded → the DP still guards floors, just banks less).
+        const loadBtu = zones.reduce((s, z) => {
+          if (requiredAwtF(z.deliveryType, o) === null || z.uaBtuHrF == null) return s;
+          return s + z.uaBtuHrF * Math.max(0, 68 - o);
+        }, 0);
+        return { ts: f.ts.toISOString(), outdoorF: o, floorF, capF, loadBtu };
+      });
+      const dp = solveWinterDp(dpHours, { anchor, tankUa, startTankF: latestSlx?.tankF ?? dpHours[0].floorF });
+      if (dp) {
+        winterDpState = {
+          computed_at: new Date().toISOString(), applied: WINTER_DP_ENABLED,
+          saved_pct: dp.savedPct, dp_kwh: dp.totalKwh, floor_kwh: dp.floorKwh,
+          tank_ua: tankUa, cop_anchored: !!anchor,
+          bank_peak_f: Math.max(...dp.blocks.map((b) => b.targetF)),
+        };
+        dpMeta = { ...winterDpState, targets: dp.blocks.map((b) => ({ ts: b.ts, t: b.targetF, c: b.charge })) };
+        if (WINTER_DP_ENABLED) {
+          const byTs = new Map(dp.blocks.map((b) => [b.ts, b]));
+          for (const block of plan) {
+            const d = byTs.get(block.ts);
+            if (!d || /sanitize/i.test(block.reason)) continue;
+            const band = bandFor(block.outdoor_f, cfg, opts.strictCapF);
+            const raised = Math.round(Math.min(Math.max(block.tank_target_f, d.targetF), band.hi));
+            if (raised <= block.tank_target_f) continue;
+            block.tank_target_f = raised;
+            // Same leading-setpoint treatment as bank/sanitize blocks: the advisory HP line
+            // must cover the raised target or the plan draws an I1-violating hour.
+            block.hp1_setpoint_f = Math.round(Math.min(Math.max(raised + opts.i1MarginF, opts.hpMinF), opts.strictCapF + opts.i1MarginF));
+            block.reason = d.reason;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("winter DP failed (plan unaffected):", (e as Error).message);
+    }
+  }
+
   // §6.11 storm shaping — gated on the flag; notify-only mode leaves the plan untouched.
   // Only-raises rule: a storm never lowers a block below what the plan already wanted.
   if (STORM_MODE_ENABLED && (stormState.kind === "armed" || stormState.kind === "active")) {
@@ -760,6 +833,7 @@ async function shadowOnce(): Promise<void> {
     learn_days: learned?.days ?? 0,
     draw_events: learned?.drawEvents ?? 0,
     bank_f: BANK_F,
+    ...(dpMeta ? { winter_dp: dpMeta } : {}),
   });
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);
@@ -995,6 +1069,8 @@ async function main(): Promise<void> {
             winter_solver: demandFeed
               ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
               : "off",
+            // #59: last DP solve (null until the forecast first dips below the compute threshold)
+            winter_dp: winterDpState ?? { mode: "idle", enabled: WINTER_DP_ENABLED },
             storm: {
               state: stormState.kind,
               trigger: stormState.kind === "idle" ? null : stormState.trigger,

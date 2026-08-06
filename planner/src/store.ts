@@ -591,6 +591,26 @@ export class Store {
     }));
   }
 
+  /** #59: energy-weighted COP anchor over quality-filtered points — the same data hygiene as
+   *  getRealizedDayInputs (COP bounds, sane sink−outdoor gap, quality_score). null under 5
+   *  sessions: the winter DP then falls back to its Carnot-fraction model. */
+  async getCopAnchor(days: number): Promise<{ cop: number; sinkF: number; outdoorF: number; sessions: number } | null> {
+    const res = await this.pool.query(
+      `SELECT sum(thermal_kwh)/NULLIF(sum(electrical_kwh),0) AS cop,
+              avg(sink_temp_f) AS sink, avg(outdoor_temp_f) AS outdoor, count(*) AS n
+       FROM tempiq_cop_points
+       WHERE measured_at >= now() - ($1 || ' days')::interval
+         AND cop BETWEEN 1 AND 6 AND thermal_kwh > 0 AND electrical_kwh > 0
+         AND sink_temp_f BETWEEN 110 AND 175 AND outdoor_temp_f IS NOT NULL
+         AND outdoor_temp_f < sink_temp_f - 20
+         AND (quality_score IS NULL OR quality_score >= 0.3)`,
+      [days],
+    );
+    const r = res.rows[0];
+    if (!r || r.cop == null || Number(r.n) < 5) return null;
+    return { cop: Number(r.cop), sinkF: Number(r.sink), outdoorF: Number(r.outdoor), sessions: Number(r.n) };
+  }
+
   async openUnservedEpisode(detail: string): Promise<void> {
     await this.pool.query(`INSERT INTO unserved_call_episodes (detail) VALUES ($1)`, [detail]);
   }
