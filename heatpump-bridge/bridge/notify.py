@@ -57,10 +57,14 @@ async def email(cfg, *, subject: str, body: str, priority: str = "default") -> N
 
     def _post():
         try:
+            # Cloudflare in front of Resend rejects the default Python-urllib browser
+            # signature (403, CF error 1010) — every bridge email silently failed on it
+            # until diagnosed 2026-08-06. Any honest non-urllib UA passes; curl always did.
             req = urllib.request.Request(
                 "https://api.resend.com/emails", data=payload, method="POST",
                 headers={"Authorization": f"Bearer {cfg.resend_api_key}",
-                         "Content-Type": "application/json"})
+                         "Content-Type": "application/json",
+                         "User-Agent": "a2w-bridge/1.0"})
             urllib.request.urlopen(req, timeout=10).read()
         except Exception as exc:  # noqa: BLE001 — alerting must never break the poller
             log.warning("resend email failed: %s", exc)
