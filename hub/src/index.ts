@@ -92,11 +92,17 @@ async function notifyNtfy(title: string, message: string,
     const headers: Record<string, string> = { Title: title.replace(/[^\x00-\xFF]/g, "").trim() };
     if (opts.priority) headers.Priority = opts.priority;
     if (opts.tags) headers.Tags = opts.tags;
-    await fetch(`${NTFY_SERVER.replace(/\/+$/, "")}/${NTFY_TOPIC}`, {
-      method: "POST", headers, body: message,
+    const res = await fetch(`${NTFY_SERVER.replace(/\/+$/, "")}/${NTFY_TOPIC}`, {
+      method: "POST", headers, body: message, signal: AbortSignal.timeout(10_000),
     });
+    if (!res.ok) console.warn(`[hub] ntfy push rejected: HTTP ${res.status}`);
   } catch (err) {
-    console.warn(`[hub] ntfy push failed: ${(err as Error).message}`);
+    // undici wraps the real network error (ETIMEDOUT/ENETUNREACH/DNS/TLS) in .cause and
+    // reports only "fetch failed" — the 2026-08-06 dead-man drill lost its diagnosis to
+    // exactly that (kanban #66). Surface cause + node version.
+    const e = err as Error & { cause?: unknown };
+    console.warn(`[hub] ntfy push failed: ${e.message}`
+      + (e.cause ? ` — cause: ${String(e.cause)}` : "") + ` (node ${process.version})`);
   }
 }
 
@@ -380,6 +386,12 @@ app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) =
 
 const server = app.listen(PORT, () => {
   console.log(`[hub] HTTP + WS listening on :${PORT}`);
+  // ntfy channel self-test on every boot (kanban #66: the dead-man's ntfy leg failed in
+  // the 2026-08-06 drill with its cause swallowed; the email leg delivered). "min"
+  // priority = silent app-list breadcrumb, per the owner's noise policy — its presence
+  // after each deploy is the channel's health record; a failure logs its cause above.
+  void notifyNtfy("A2W hub online", `hub started (node ${process.version}) — ntfy self-test`,
+                  { priority: "min", tags: "white_check_mark" });
 });
 
 if (!NTFY_TOPIC) {
