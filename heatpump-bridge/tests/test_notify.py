@@ -58,6 +58,7 @@ async def test_resend_email_high_priority_sends_correct_request(monkeypatch):
     def fake_urlopen(req, timeout=10):
         captured["url"] = req.full_url
         captured["auth"] = req.get_header("Authorization")
+        captured["ua"] = req.get_header("User-agent")
         captured["body"] = json.loads(req.data)
         return _FakeResp()
 
@@ -67,6 +68,8 @@ async def test_resend_email_high_priority_sends_correct_request(monkeypatch):
 
     assert captured["url"] == "https://api.resend.com/emails"
     assert captured["auth"] == "Bearer re_test"
+    # Cloudflare 403s (error 1010) the default Python-urllib signature — a real UA is load-bearing
+    assert captured["ua"] == "a2w-bridge/1.0"
     assert captured["body"]["to"] == ["me@example.com"]
     assert captured["body"]["subject"] == "⚠ Pump 1 offline"   # emoji fine in JSON subject
     assert captured["body"]["text"] == "down"
