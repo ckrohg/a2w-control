@@ -72,6 +72,26 @@ async function buildDigest() {
     SELECT count(*)::int AS n FROM autopilot_log
     WHERE ts >= now() - interval '7 days'`).rows[0].n);
 
+  // Comm-quality trend: offline edges this week vs the week before, per pump. A rising
+  // dropout count is the earliest hardware-degradation signal we have — HP2's comm board
+  // flapped for days at low grade before dying (2026-08-06).
+  const comm = (await sql<{ pump_id: string; drops: number; prev: number; err: number | null }>`
+    SELECT e.pump_id,
+           coalesce(e.drops, 0) AS drops, coalesce(e.prev, 0) AS prev, r.err
+    FROM (
+      SELECT pump_id,
+             (count(*) FILTER (WHERE ts >= extract(epoch FROM now() - interval '7 days')))::int AS drops,
+             (count(*) FILTER (WHERE ts <  extract(epoch FROM now() - interval '7 days')))::int AS prev
+      FROM pump_events
+      WHERE type = 'comm' AND code = 'offline'
+        AND ts >= extract(epoch FROM now() - interval '14 days')
+      GROUP BY pump_id) e
+    FULL JOIN (
+      SELECT pump_id, (avg(error_rate) * 100)::float8 AS err
+      FROM readings WHERE ts >= extract(epoch FROM now() - interval '7 days')
+      GROUP BY pump_id) r USING (pump_id)
+    ORDER BY pump_id`).rows;
+
   const activeKeys = new Set(active.map((f) => `${f.pump_id}:${f.code}`));
   const backupH = plant.backup_h != null ? Number(plant.backup_h) : 0;
 
@@ -120,6 +140,11 @@ async function buildDigest() {
     <ul style="padding-left:18px;margin:0;font-size:14px">
       <li style="margin:4px 0">Backup element called ${backupH > 0 ? `<b>${fmt(backupH, 1)} h</b>` : "0 h"} this week${backupH > 0 ? " — worth a look" : ""}.</li>
       <li style="margin:4px 0">Autopilot adjusted the tank target ${moves} time${moves === 1 ? "" : "s"}.</li>
+      ${comm.map((c) => {
+        const rising = c.drops > c.prev && c.drops >= 3;
+        const errBit = c.err != null ? ` · ${fmt(Number(c.err), 1)}% comm err` : "";
+        return `<li style="margin:4px 0">${c.pump_id.toUpperCase()} comm: ${c.drops} dropout${c.drops === 1 ? "" : "s"} (prev wk ${c.prev})${errBit}${rising ? " — <b>degrading, keep an eye on it</b>" : ""}.</li>`;
+      }).join("")}
     </ul>
     <div style="margin:24px 0;font-size:13px">
       <a href="${DASH_URL}" style="color:#2563eb">Open the dashboard →</a>
