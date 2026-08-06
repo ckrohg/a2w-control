@@ -156,14 +156,18 @@ class NotifyConfig(BaseModel):
     resend_api_key: str | None = None
     resend_to: str | None = None
     resend_from: str = "A2W Alerts <onboarding@resend.dev>"
-    # Comm-loss alert shaping (owner ask 2026-08-06, after a morning of 20-min WiFi flaps
+    # Comm-loss alert shaping (owner asks 2026-08-06, after a morning of 20-min WiFi flaps
     # each paging individually): brief dropouts are LOGGED (events/dashboard) but not
-    # pushed. A push (ntfy + email) fires only for what's actually actionable:
+    # pushed. An ntfy PAGE fires for what's actionable:
     #   - continuously offline for offline_alert_min minutes (a real outage), or
     #   - flap_alert_count offline edges within flap_window_min (link degrading — the
     #     2026-08-06 pump-2 comm-board wedge announced itself exactly this way).
-    # A pump that has NEVER been online still alerts immediately (bench-day miswire).
+    # EMAIL is reserved for the intervention tier (owner: "equipment errors that require
+    # intervention or a total prolonged outage"): equipment fault codes, a pump that has
+    # NEVER been online (bench-day miswire, immediate), and outages that persist past
+    # offline_email_min minutes. ntfy-paged-but-not-emailed events never hit the inbox.
     offline_alert_min: float = 10
+    offline_email_min: float = 60
     flap_alert_count: int = 3
     flap_window_min: float = 60
 

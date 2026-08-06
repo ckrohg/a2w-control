@@ -58,13 +58,14 @@ const POLL_SECONDS = Number(env("POLL_SECONDS", "300"));
 const PORT = Number(process.env.PORT ?? 8080);
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
-// Email second channel (Resend) for the SERIOUS planner alerts — freeze risk, DHW
-// shortfall, backup element, I1, unserved calls all page at "high" and now also email,
-// mirroring the bridge/hub contract (clears and notices stay push-only).
+// Email second channel (Resend). Owner policy 2026-08-06: email is for INTERVENE-NOW
+// only — planner operational warnings (adoption, I1, unserved calls, config changes,
+// storm, DHW comfort) page ntfy at "high" but stay out of the inbox. Freeze-risk is the
+// one planner condition that threatens the house, so it alone rides "urgent" and emails.
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const RESEND_TO = process.env.RESEND_TO ?? "";
 const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
-const EMAIL_PRIORITIES = new Set(["high", "urgent", "max"]);
+const EMAIL_PRIORITIES = new Set(["urgent", "max"]);
 const OFFLINE_AFTER_FAILURES = 5;
 
 const HUB_URL = process.env.HUB_URL;
@@ -485,7 +486,7 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
     await ntfy(
       "⚠ Freeze-risk advisory",
       `Outdoor ${reading.outdoorF.toFixed(0)}°F with the buffer only ${reading.tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
-      "high",
+      "urgent", // the one planner alert that emails: house-threatening, intervene now
     );
   } else if (!risk && freezeRiskAlerted) {
     freezeRiskAlerted = false;
@@ -543,9 +544,12 @@ async function checkSingleWriter(): Promise<void> {
  *       didn't adopt. LATCHED across polls (`reheatSeenWhileOff`), so a short reheat that starts and
  *       ends between two 5-min samples still counts. The old `off && reheating` check only fired if
  *       we happened to sample mid-call, so in a low-call (warm) season a real failure could slip by.
- *   (b) the divergence has persisted past ADOPTION_STALE_MS with no convergence — covers the RAISE
- *       case, where the device is satisfied at its old (lower) target and will never call on its
- *       own, so signal (a) can never arrive.
+ *   (b) the divergence has persisted past ADOPTION_STALE_MS with no convergence, RAISES ONLY —
+ *       the raise case is the one that can strand (device satisfied at its old lower target will
+ *       never call, so signal (a) can never arrive). For a LOWERING command the stale clock must
+ *       NOT fire: the device's old target is HIGHER, so a warm tank simply hasn't needed a reheat
+ *       yet — that's healthy coasting, not a failed write (owner caught the false page 2026-08-06);
+ *       the next real reheat either adopts (converges) or trips signal (a).
  * A fresh command restarts the clock. Clears on convergence. A brief post-write divergence with no
  * reheat yet is the normal adoption lag, not a failure — neither signal fires until a reheat runs or
  * the backstop elapses.
@@ -587,11 +591,13 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
   if (reading.stagesCalled?.some(Boolean) === true) adoptionReheatSeenWhileOff = true;
   const offForMs = Date.now() - adoptionOffSince;
 
-  if ((adoptionReheatSeenWhileOff || offForMs > ADOPTION_STALE_MS) && !adoptionAlerted) {
+  const commandIsRaise = commanded - operative > 3; // only a raise can strand (see header)
+  if ((adoptionReheatSeenWhileOff || (commandIsRaise && offForMs > ADOPTION_STALE_MS))
+      && !adoptionAlerted) {
     adoptionAlerted = true;
     const why = adoptionReheatSeenWhileOff
       ? "a reheat has run but the operative target never moved onto it"
-      : `it has stayed diverged for ${Math.round(offForMs / 60000)} min with no adopting reheat`;
+      : `the RAISE has stayed diverged for ${Math.round(offForMs / 60000)} min with no adopting reheat`;
     console.warn(`ADOPTION FAILED: commanded ${commanded.toFixed(1)}°F, operative ${operative.toFixed(1)}°F — ${why}`);
     await ntfy(
       "HBX target not adopting",
