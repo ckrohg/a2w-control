@@ -86,6 +86,13 @@ class PumpPoller:
         # snapshot: a pump that has NEVER been online (fresh boot into a dead gateway —
         # exactly the first-bench-day case) must still alert, and must alert only once.
         self._offline_alerted = False
+        # Push shaping (NotifyConfig thresholds): the edge above is logged immediately but
+        # only PUSHED once the outage is sustained (offline_alert_min) or the link is
+        # flapping (flap_alert_count edges inside flap_window_min). _offline_push_sent also
+        # decides whether the recovery closes the loop by email or stays a quiet ntfy ping.
+        self._offline_push_sent = False
+        self._offline_since: float | None = None
+        self._offline_edges: deque[float] = deque()
         # rolling window of recent poll outcomes ("ok" | connect | timeout | io | exception
         # | decode) so the gateway-vs-pump diagnosis is stable on a FLAPPING link — a single
         # most-recent failure is noise when a gateway drops on/off WiFi (see _link_status).
@@ -190,9 +197,20 @@ class PumpPoller:
         if not was_online and (client.stats.ok_polls >= 1 or self._offline_alerted):
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
-            self._push(title=f"✓ {self.cfg.name} back online",
-                       message="Communication restored.", priority="low", tags="white_check_mark")
+            if self._offline_push_sent and self._offline_since is not None:
+                # This outage was paged (sustained/never-online) — close the loop on the
+                # same channels, email included, with the outage duration.
+                mins = max(1, int((time.monotonic() - self._offline_since) / 60))
+                self._push(title=f"✓ {self.cfg.name} back online",
+                           message=f"Communication restored after ~{mins} min offline.",
+                           priority="high", tags="white_check_mark")
+            else:
+                # Brief blip: quiet ntfy breadcrumb only, never email.
+                self._push(title=f"✓ {self.cfg.name} back online",
+                           message="Communication restored.", priority="low", tags="white_check_mark")
         self._offline_alerted = False
+        self._offline_push_sent = False
+        self._offline_since = None
         await self.store.add_sample(self.cfg.id, decoded | {"status_word": regs.get(R.REG_STATUS, 0)})
         await self._maybe_comm_row()
         client.record_poll(ok=True)
@@ -296,6 +314,7 @@ class PumpPoller:
         # case) must alert too, exactly once, with a message that points at the triage table.
         if failures >= threshold and not self._offline_alerted:
             self._offline_alerted = True
+            self._offline_since = time.monotonic()
             never_online = self.client.stats.ok_polls == 0
             self.snapshot = {**self.snapshot, "online": False, "state": "offline",
                              "comm": self.client.stats.as_dict()}
@@ -306,19 +325,56 @@ class PumpPoller:
             await self.store.add_event(
                 self.cfg.id, "comm", code="offline", severity="high",
                 message=message, detail={"category": exc.category})
-            self._push(title=f"⚠ {self.cfg.name} offline",
-                       message=f"No response for {failures} polls ({exc.category}). "
-                               f"Check the gateway / WiFi.", priority="high", tags="warning")
+            if never_online:
+                # Bench-day miswire: nothing to flap against, page immediately.
+                self._offline_push_sent = True
+                self._push(title=f"⚠ {self.cfg.name} offline",
+                           message=f"No response for {failures} polls ({exc.category}). "
+                                   f"Check the gateway / WiFi.", priority="high", tags="warning")
+            else:
+                self._note_offline_edge(exc.category)
         else:
             self.snapshot = {**self.snapshot, "comm": self.client.stats.as_dict()}
             if failures >= threshold:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
+        # Sustained outage: the edge was logged quietly; page once the silence has lasted
+        # long enough to be a real outage rather than a WiFi blip.
+        ncfg = self.app_cfg.notifications
+        if (self._offline_alerted and not self._offline_push_sent
+                and self._offline_since is not None
+                and time.monotonic() - self._offline_since >= ncfg.offline_alert_min * 60):
+            self._offline_push_sent = True
+            mins = int((time.monotonic() - self._offline_since) / 60)
+            self._push(title=f"⚠ {self.cfg.name} offline {mins}+ min",
+                       message=f"No response for {mins} minutes ({exc.category}). "
+                               f"Check the gateway / WiFi / pump comm board.",
+                       priority="high", tags="warning")
         if not self.snapshot.get("online"):
             link, detail = self._link_status()
             self.snapshot["link"] = link
             self.snapshot["link_detail"] = detail
         await self._maybe_comm_row(force=True)
+
+    def _note_offline_edge(self, category: str) -> None:
+        """Flap detector: a single brief dropout is logged, not paged — but
+        flap_alert_count edges inside flap_window_min mean the LINK is the story (WiFi,
+        RS-485, or the pump's comm board wedging progressively — the 2026-08-06 pump-2
+        pattern flapped for 100 min before dying), and that pages once. The window clears
+        after alerting so it re-arms only on a fresh burst."""
+        ncfg = self.app_cfg.notifications
+        now = time.monotonic()
+        self._offline_edges.append(now)
+        while self._offline_edges and now - self._offline_edges[0] > ncfg.flap_window_min * 60:
+            self._offline_edges.popleft()
+        if len(self._offline_edges) >= ncfg.flap_alert_count:
+            n = len(self._offline_edges)
+            self._offline_edges.clear()
+            self._push(
+                title=f"⚠ {self.cfg.name}: link degrading",
+                message=f"{n} comm dropouts within {int(ncfg.flap_window_min)} min "
+                        f"(latest: {category}). Check WiFi / RS-485 / the pump's comm board.",
+                priority="high", tags="warning")
 
     def _link_status(self) -> tuple[str, str]:
         """Which layer is down, in plain language — the question a commissioning operator asks

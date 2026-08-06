@@ -234,6 +234,104 @@ async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
     assert poller._link_status()[0] == "unknown"
 
 
+def _capture_pushes(monkeypatch) -> list[dict]:
+    """Record every ntfy/email push the poller fires (channel + title + priority)."""
+    from bridge import notify
+    pushes: list[dict] = []
+
+    async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
+        pushes.append({"ch": "ntfy", "title": title, "priority": priority})
+
+    async def fake_email(cfg, *, subject, body, priority="default"):
+        # mirror notify.email's own priority gate (unit-tested in test_notify) so an
+        # "email" entry here means an email would actually DELIVER
+        if priority in ("high", "urgent", "max"):
+            pushes.append({"ch": "email", "title": subject, "priority": priority})
+
+    monkeypatch.setattr(notify, "ntfy", fake_ntfy)
+    monkeypatch.setattr(notify, "email", fake_email)
+    return pushes
+
+
+async def test_brief_offline_blip_logs_but_never_pages(rig, monkeypatch):
+    """Owner ask 2026-08-06: a short dropout is DASHBOARD material, not a page. The
+    offline event row still lands (edge behavior unchanged) but no push fires until the
+    outage is sustained (offline_alert_min) — and the recovery from an unpaged blip is a
+    quiet low-priority breadcrumb, never email."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    await poller.poll_once()
+
+    await pump.server.shutdown()
+    for _ in range(3):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert not poller.online
+    events = await store.get_events("p1", 1)
+    assert any(e["code"] == "offline" for e in events)  # logged for the dashboard...
+    assert pushes == []                                 # ...but silent (default 10-min gate)
+
+    await pump.start()
+    await pump.tick()
+    await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert [(p["ch"], p["priority"]) for p in pushes] == [("ntfy", "low")]
+
+
+async def test_sustained_offline_pages_once_and_recovery_closes_by_email(rig, monkeypatch):
+    """Past the sustained threshold the outage pages ntfy+email exactly once, and the
+    recovery closes the loop at the same (email-eligible) priority with the duration."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    poller.app_cfg.notifications.offline_alert_min = 0  # "sustained" immediately, for the test
+    await poller.poll_once()
+
+    await pump.server.shutdown()
+    for _ in range(5):
+        await poller.poll_once()  # edge at 3; sustained push fires once, never repeats
+    await asyncio.sleep(0.01)
+    offline = [p for p in pushes if "offline" in p["title"]]
+    assert {p["ch"] for p in offline} == {"ntfy", "email"}
+    assert all(p["priority"] == "high" for p in offline)
+    assert len([p for p in offline if p["ch"] == "ntfy"]) == 1
+
+    await pump.start()
+    await pump.tick()
+    await poller.poll_once()
+    await asyncio.sleep(0.01)
+    recovery = [p for p in pushes if "back online" in p["title"]]
+    assert {p["ch"] for p in recovery} == {"ntfy", "email"}
+    assert all(p["priority"] == "high" for p in recovery)
+
+
+async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
+    """Repeated brief dropouts (each individually below the sustained gate) must page as a
+    pattern: flap_alert_count offline edges inside flap_window_min -> one 'link degrading'
+    push, email included — the 2026-08-06 pump-2 signature (100 min of 20-min flaps before
+    the comm board died) with no individual outage long enough to page."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    await poller.poll_once()
+
+    for _ in range(3):  # default flap_alert_count=3 within flap_window_min=60
+        await pump.server.shutdown()
+        for _ in range(3):
+            await poller.poll_once()
+        assert not poller.online
+        await pump.start()
+        await pump.tick()
+        await poller.poll_once()
+        assert poller.online
+    await asyncio.sleep(0.01)
+
+    degrading = [p for p in pushes if "link degrading" in p["title"]]
+    assert {p["ch"] for p in degrading} == {"ntfy", "email"}
+    assert all(p["priority"] == "high" for p in degrading)
+    assert len([p for p in degrading if p["ch"] == "ntfy"]) == 1  # window cleared: no re-spam
+    # the individual blips themselves never paged — only low recovery breadcrumbs
+    assert all(p["priority"] == "low" for p in pushes if "back online" in p["title"])
+
+
 async def test_write_enable_toggle_persists_and_composes_with_gateway_overrides(tmp_path):
     """The UI write-enable toggle persists in the bridge-owned state file and survives
     restarts; a later gateway reassignment must NOT clobber it, and a write_enabled-only
