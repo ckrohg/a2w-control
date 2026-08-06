@@ -9,6 +9,7 @@ import {
   hygieneVerdict,
   hygieneIntervalH,
   lastDwellEnd,
+  drawGapStats,
   HYGIENE_HARD_MAX_H,
   type HygieneReading,
 } from "./hygiene";
@@ -69,6 +70,46 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
   // no qualifying dwell (all cool, or only short touches) → null
   assert.equal(lastDwellEnd([at(0, 120), at(5, 141), at(10, 120)], 134, 30), null, "short touch ⇒ null");
   assert.equal(lastDwellEnd([at(0, 120), at(30, 120)], 134, 30), null, "never hot ⇒ null");
+}
+
+// 5. drawGapStats: the stagnation half (OBSERVABILITY ONLY — never gates the soak, issue #51 rule 4).
+{
+  assert.deepEqual(
+    drawGapStats([], 0),
+    { lastDrawAt: null, hoursSinceLastDraw: null, maxGapH: null, eventCount: 0 },
+    "no draws ⇒ all null, count 0",
+  );
+
+  // one event: a gap needs two points, so maxGapH stays null rather than reading as 0 (which would
+  // look like "no quiet time at all" — the opposite of the truth on a single-sample history).
+  const one = new Date("2026-08-01T12:00:00Z");
+  const s1 = drawGapStats([one], Date.parse("2026-08-02T12:00:00Z"));
+  assert.equal(s1.maxGapH, null, "single draw ⇒ no measurable gap");
+  assert.equal(s1.eventCount, 1);
+  assert.equal(s1.hoursSinceLastDraw, 24, "hours-since measured from now, not from the previous draw");
+
+  // REGRESSION — the real 6BB record pulled from TempIQ /api/insights/dhw-usage on 2026-08-06.
+  // The 2.90-day quiet stretch (07-29 14:23Z → 08-01 12:04Z) is why this signal exists: it sits inside
+  // the ~2–5-day time-to-concern band, against a 60h summer soak interval. If a refactor ever makes
+  // this read shorter, the stagnation picture is being under-reported and the number stops being safe.
+  const real = [
+    "2026-07-23T07:01:50Z", "2026-07-23T15:09:27Z", "2026-07-25T14:48:08Z", "2026-07-26T12:46:21Z",
+    "2026-07-26T12:56:21Z", "2026-07-26T17:21:10Z", "2026-07-28T12:28:49Z", "2026-07-29T14:23:27Z",
+    "2026-08-01T12:04:02Z", "2026-08-01T12:32:18Z", "2026-08-03T13:39:54Z", "2026-08-03T18:58:18Z",
+    "2026-08-04T12:02:39Z", "2026-08-04T13:24:47Z", "2026-08-05T12:47:46Z",
+  ].map((s) => new Date(s));
+  const stats = drawGapStats(real, Date.parse("2026-08-06T15:22:00Z"));
+  assert.equal(stats.eventCount, 15, "all 15 events counted");
+  assert.ok(stats.maxGapH != null, "expected a measurable gap");
+  assert.ok(
+    Math.abs(stats.maxGapH! / 24 - 2.90) < 0.01,
+    `longest quiet gap should be ~2.90 days, got ${(stats.maxGapH! / 24).toFixed(2)}`,
+  );
+  assert.ok(
+    Math.abs(stats.hoursSinceLastDraw! - 26.57) < 0.02,
+    `hours since last draw should be ~26.6, got ${stats.hoursSinceLastDraw!.toFixed(2)}`,
+  );
+  assert.equal(stats.lastDrawAt!.toISOString(), "2026-08-05T12:47:46.000Z", "last draw = newest event");
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

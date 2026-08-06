@@ -10,6 +10,7 @@
 
 import { Pool } from "pg";
 import type { HbxConfig, FieldChange } from "./drift";
+import { drawGapStats } from "./hygiene";
 
 export interface SlxReading {
   ts: Date;
@@ -171,6 +172,15 @@ export class Store {
         id         integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         fetched_at timestamptz NOT NULL,
         payload    jsonb NOT NULL
+      );
+      -- gtm#1442: per-draw DHW recharge events from TempIQ (/api/insights/dhw-usage events[]).
+      -- Insert-only history so the QUIET GAPS between draws are observable — the single-row
+      -- tempiq_dhw_usage snapshot above is overwritten each tick and keeps no history. "at" is the
+      -- draw ONSET; energy only, no volume (TempIQ's gallons are post-mix and off the insights seam).
+      CREATE TABLE IF NOT EXISTS tempiq_dhw_events (
+        at             timestamptz PRIMARY KEY,
+        thermal_kwh    real,
+        electrical_kwh real
       );
       CREATE TABLE IF NOT EXISTS storm_events (
         id         serial PRIMARY KEY,
@@ -535,6 +545,37 @@ export class Store {
          fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
       [JSON.stringify(payload)],
     );
+  }
+
+  /** Insert-only per-draw DHW recharge events, deduped on `at`. Returns rows actually inserted.
+   *  TempIQ returns a rolling window (newest-first, max 100) each tick, so re-fetching overlaps. */
+  async insertTempiqDhwEvents(
+    events: Array<{ at: Date; thermalKwh: number | null; electricalKwh: number | null }>,
+  ): Promise<number> {
+    let inserted = 0;
+    for (const e of events) {
+      const res = await this.pool.query(
+        `INSERT INTO tempiq_dhw_events (at, thermal_kwh, electrical_kwh) VALUES ($1,$2,$3)
+         ON CONFLICT (at) DO NOTHING`,
+        [e.at, e.thermalKwh, e.electricalKwh],
+      );
+      inserted += res.rowCount ?? 0;
+    }
+    return inserted;
+  }
+
+  /** DHW draw-gap stats over the last `days` — the STAGNATION picture the I8 interval can't see.
+   *  Legionella risk needs BOTH a cool tank AND days without a draw flushing the coil, and the
+   *  season-aware hygiene interval only knows the temperature half. OBSERVABILITY ONLY today: this
+   *  never gates the soak (issue #51 rule 4 — only a real thermal dwell resets the safety clock).
+   *  `maxGapH` is the longest span between consecutive events; gaps are between RECHARGE events, so
+   *  small draws that never triggered a reheat are invisible and the gap is a pessimistic bound. */
+  async dhwDrawStats(days: number): Promise<ReturnType<typeof drawGapStats>> {
+    const res = await this.pool.query(
+      `SELECT at FROM tempiq_dhw_events WHERE at >= now() - ($1 || ' days')::interval ORDER BY at`,
+      [String(days)],
+    );
+    return drawGapStats(res.rows.map((r) => new Date(r.at)), Date.now());
   }
 
   /** Recent tank series with call flags — for quiet-window (decay) detection. */

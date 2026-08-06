@@ -24,6 +24,43 @@ const DAILY_KWH = Number(process.env.DAILY_KWH_BASELINE ?? "11.8"); // SPAN, Jul
 const fmt = (v: number | null | undefined, d = 1) =>
   v == null || !isFinite(v as number) ? "—" : (v as number).toFixed(d);
 
+// ── I8 bacteria safety: MIRROR the planner, never restate its rules here ──────────────────
+// This card used to hardcode its own thresholds (a "24" deadline, a momentary tank_f>=131 touch,
+// and a separate 26h OK test) while the planner ran a 60h season-aware interval against a
+// 134°F/30-min DWELL — so it displayed three numbers, none of which was the live rule. Every
+// number below now comes from the planner's /health.hygiene block, which is the runtime truth.
+type PlannerHygiene = {
+  auto_sanitize?: boolean;
+  effective_interval_h?: number | null;
+  hours_since_dwell?: number | null;
+  last_satisfied?: boolean | null;
+  last_dwell_min?: number | null;
+  verify_f?: number | null;
+  dwell_min_required?: number | null;
+  sanitize_f?: number | null;
+};
+
+/** Server-side only — PLANNER_API_TOKEN never reaches the browser. /health is public, but we send
+ *  the token when configured to match the other planner proxies. Returns null on any failure so the
+ *  card renders "unknown" rather than inventing a verdict. */
+async function fetchPlannerHygiene(): Promise<PlannerHygiene | null> {
+  const base = process.env.PLANNER_URL?.replace(/\/+$/, "");
+  if (!base) return null;
+  const token = process.env.PLANNER_API_TOKEN;
+  try {
+    const res = await fetch(`${base}/health`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      cache: "no-store",
+      signal: AbortSignal.timeout(5000),
+    });
+    // /health returns 503 while polls are failing, but the hygiene block is still authoritative.
+    const body: { hygiene?: PlannerHygiene } = await res.json().catch(() => ({}));
+    return body?.hygiene ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // COP before/after (from the frozen /curve extract, lib/curve-history.json): measured
 // old-regime vs modeled at planner-cool tanks, n-weighted over the same mild/warm weather.
 const _H = history as any;
@@ -160,7 +197,8 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
   let kwh24: number | null = null;
   let kwh7d: number | null = null;
   let elementCallH7d = 0;
-  let hygieneHoursAgo: number | null = null;
+  let hygiene: PlannerHygiene | null = null;
+  let draws: { hoursSinceLastDraw: number | null; maxGapH: number | null; eventCount: number } | null = null;
   let writes: { ts: number; source: string; action: string; result: string; detail: string }[] = [];
   let episodes: { s: number; c: number | null; detail: string }[] = [];
   let opDays: { d: string; frac: number }[] = [];
@@ -190,9 +228,27 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                         FROM slx_readings WHERE ts >= now() - interval '7 days'`;
     elementCallH7d = Number(e.rows[0].callh ?? 0);
 
-    const h = await sql`SELECT EXTRACT(EPOCH FROM (now() - max(ts)))::float8 / 3600 AS hrs
-                        FROM slx_readings WHERE tank_f >= 131`;
-    hygieneHoursAgo = h.rows[0]?.hrs == null ? null : Number(h.rows[0].hrs);
+    // DHW draw gaps (gtm#1442, via planner tempiq_dhw_events). This is the STAGNATION half of the
+    // Legionella condition — risk needs BOTH a cool tank AND days with no draw flushing the coil, and
+    // the hygiene interval only knows the temperature half. Shown for context; it gates nothing.
+    // Table may not exist yet on an older planner, so this has its own catch.
+    try {
+      const dr = await sql`SELECT EXTRACT(EPOCH FROM (now() - max(at)))::float8 / 3600 AS since,
+                                  count(*)::int AS n
+                           FROM tempiq_dhw_events WHERE at >= now() - interval '14 days'`;
+      const gp = await sql`SELECT max(gap)::float8 AS maxgap FROM (
+                             SELECT EXTRACT(EPOCH FROM (at - lag(at) OVER (ORDER BY at))) / 3600 AS gap
+                             FROM tempiq_dhw_events WHERE at >= now() - interval '14 days'
+                           ) g`;
+      const n = Number(dr.rows[0]?.n ?? 0);
+      if (n > 0) {
+        draws = {
+          hoursSinceLastDraw: dr.rows[0]?.since == null ? null : Number(dr.rows[0].since),
+          maxGapH: gp.rows[0]?.maxgap == null ? null : Number(gp.rows[0].maxgap),
+          eventCount: n,
+        };
+      }
+    } catch { /* planner hasn't created the table yet — card degrades to hygiene-only */ }
 
     // Real operating coverage per day, within the SELECTED window (never before the cutover — that's
     // when savings began). 288 = 5-min samples in a full day, so frac is the share of the day the
@@ -246,6 +302,8 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
     dbError = true;
   }
 
+  hygiene = await fetchPlannerHygiene();
+
   // The headline: what running as hot as today costs vs running the plan's temperatures.
   const wasteFrac = gap24avg != null ? Math.min(gap24avg * COP_SENS_PER_F, 0.5) : null;
   const dailyKwh = kwh24;
@@ -277,7 +335,13 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
     };
   });
 
-  const hygieneOk = hygieneHoursAgo != null && hygieneHoursAgo <= 26;
+  // Bacteria-safety verdict, entirely from the planner's own numbers — no thresholds restated here.
+  // `last_satisfied` IS the runtime verdict; null hygiene = planner unreachable, which must read as
+  // "unknown", never as a green "OK today" (the card previously asserted OK from its own hardcoded
+  // 26h rule and would have kept saying OK with the planner dead).
+  const hygieneOk = hygiene?.last_satisfied === true;
+  const hygieneChip = hygiene == null ? "warn" : hygieneOk ? "ok" : "warn";
+  const hygieneLabel = hygiene == null ? "unknown" : hygieneOk ? "OK" : "check";
 
   // ── Window summary (owner ask 2026-07-18): the full money story on the MEASURED basis. ──
   //   Spent       = actual electricity this window (SPAN daily × coverage) × rate.
@@ -546,16 +610,62 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
             </div>
 
             <div className="card">
-              <h2>Bacteria safety<span className={`chip ${hygieneOk ? "ok" : "warn"}`}>{hygieneOk ? "OK today" : "check"}</span></h2>
+              <h2>Bacteria safety<span className={`chip ${hygieneChip}`}>{hygieneLabel}</span></h2>
               <div className="temps">
-                <div className="temp"><div className="v">{fmt(hygieneHoursAgo, 0)}</div><div className="l">hrs since 131°F+</div></div>
-                <div className="temp"><div className="v">24</div><div className="l">must happen within</div></div>
+                <div className="temp">
+                  <div className="v">{hygiene == null ? "—" : fmt(hygiene.hours_since_dwell, 0)}</div>
+                  <div className="l">hrs since last soak</div>
+                </div>
+                <div className="temp">
+                  <div className="v">{hygiene == null ? "—" : fmt(hygiene.effective_interval_h, 0)}</div>
+                  <div className="l">must happen within</div>
+                </div>
+              </div>
+              <div className="temps">
+                <div className="temp">
+                  <div className="v">{draws == null ? "—" : fmt(draws.hoursSinceLastDraw, 0)}</div>
+                  <div className="l">hrs since hot-water use</div>
+                </div>
+                <div className="temp">
+                  <div className="v">{draws?.maxGapH == null ? "—" : fmt(draws.maxGapH / 24, 1)}</div>
+                  <div className="l">longest quiet gap (14d)</div>
+                </div>
               </div>
               <div className="meta">
-                The hot-water coil must get a daily hot soak (≥131°F for an hour) so nothing grows in
-                it when we run the tank cooler. Today&apos;s system is always hot, so it passes trivially —
-                the planner schedules this automatically once cooler targets go live, always in the
-                cheapest (warmest) hour.
+                {hygiene == null ? (
+                  <>
+                    The planner is unreachable, so this card can&apos;t tell you whether the coil got its
+                    soak. That&apos;s an unknown, not an all-clear — check the planner before assuming.
+                  </>
+                ) : (
+                  <>
+                    The hot-water coil is the only standing potable water in the system, so it has to
+                    get a real hot soak — <b>{fmt(hygiene.sanitize_f, 0)}°F</b>, verified as the tank
+                    holding <b>≥{fmt(hygiene.verify_f, 0)}°F for {fmt(hygiene.dwell_min_required, 0)}
+                    {" "}straight minutes</b> — often enough that nothing can grow while we run the tank
+                    cooler. The deadline is set from the weather ({fmt(hygiene.effective_interval_h, 0)}h
+                    right now): a cool summer tank sits closer to the temperatures bacteria like, a cold-weather
+                    tank runs hot anyway and clears the bar for free.{" "}
+                    {hygiene.auto_sanitize
+                      ? "The planner schedules the soak automatically, in the cheapest (warmest) hour before the deadline."
+                      : "Automatic scheduling is off, so the planner soaks daily rather than on demand."}
+                  </>
+                )}
+              </div>
+              <div className="meta">
+                {draws == null ? (
+                  <>No hot-water draw history yet — the planner starts recording it on its next TempIQ read.</>
+                ) : (
+                  <>
+                    The bottom row is the other half of the risk, and it is <b>context only — it never
+                    lets the system skip a soak</b>. Growth needs a lukewarm tank <i>and</i> days of
+                    nobody using hot water; draws flush the coil but don&apos;t sterilize it, so only heat
+                    resets the clock. Over the last 14 days the longest stretch with no hot water drawn
+                    was <b>{fmt(draws.maxGapH == null ? null : draws.maxGapH / 24, 1)} days</b> across{" "}
+                    {draws.eventCount} draws — worth watching, because that is the condition the
+                    temperature-based deadline above can&apos;t see.
+                  </>
+                )}
               </div>
             </div>
 

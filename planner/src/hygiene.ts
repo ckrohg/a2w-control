@@ -74,6 +74,34 @@ export function hygieneIntervalH(
   return Math.min(Math.max(chosen, 1), HYGIENE_HARD_MAX_H);
 }
 
+/** Draw-gap stats over an ASCENDING list of DHW draw onsets — the STAGNATION half of the Legionella
+ *  condition, which the temperature-indexed interval above cannot see. Growth needs a lukewarm tank
+ *  AND days without a draw; `hygieneIntervalH` only knows the temperature half.
+ *
+ *  OBSERVABILITY ONLY. This must never shorten-circuit or satisfy the safety timer: a draw flushes the
+ *  coil's planktonic slug but leaves biofilm on the wall, so only a real thermal dwell resets the clock
+ *  (issue #51 rule 4). If it is ever wired into the cadence it may only TIGHTEN it, never relax it.
+ *
+ *  Caveat worth keeping in mind when reading maxGapH: these are RECHARGE events, so a draw too small to
+ *  trigger a reheat is invisible and the true quiet gap can only be shorter — never longer. */
+export function drawGapStats(ats: Date[], nowMs: number): {
+  lastDrawAt: Date | null; hoursSinceLastDraw: number | null; maxGapH: number | null; eventCount: number;
+} {
+  if (!ats.length) return { lastDrawAt: null, hoursSinceLastDraw: null, maxGapH: null, eventCount: 0 };
+  let maxGapH: number | null = null;
+  for (let i = 1; i < ats.length; i++) {
+    const gap = (ats[i].getTime() - ats[i - 1].getTime()) / 3_600_000;
+    if (maxGapH == null || gap > maxGapH) maxGapH = gap;
+  }
+  const lastDrawAt = ats[ats.length - 1];
+  return {
+    lastDrawAt,
+    hoursSinceLastDraw: (nowMs - lastDrawAt.getTime()) / 3_600_000,
+    maxGapH, // null when there is only one event — no gap is measurable from a single point
+    eventCount: ats.length,
+  };
+}
+
 /** End timestamp of the most recent qualifying dwell (≥dwellMin continuous minutes ≥minF) in the
  *  ascending series, or null if none. Answers "how long since the coil was last pasteurized" so the
  *  plan can schedule the next soak BEFORE the hygiene window lapses (demand-aware cadence). */

@@ -347,6 +347,10 @@ let i8LastIntervalH: number | null = null;
 let i8LastDwellMin: number | null = null;
 let i8LastSatisfied: boolean | null = null;
 let i8LastCheckedAt: string | null = null;
+// Hours since the END of the last qualifying dwell — the number the dashboard shows. Computed here,
+// off the SAME series and thresholds as the verdict, so the card can never drift from the runtime
+// rule (it used to compute its own "hours since tank_f >= 131", a momentary touch, not a dwell).
+let i8HoursSinceDwell: number | null = null;
 async function checkI8(): Promise<void> {
   const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
   const res = await store.getRecentSeries(intervalH);
@@ -362,6 +366,9 @@ async function checkI8(): Promise<void> {
   i8LastDwellMin = Math.round(dwellMin);
   i8LastSatisfied = satisfied;
   i8LastCheckedAt = new Date().toISOString();
+  const lastEnd = lastDwellEnd(res, SANITIZE_VERIFY_F, SANITIZE_DWELL_MIN);
+  // null = no qualifying dwell anywhere in the window, which is exactly the `overdue` case below.
+  i8HoursSinceDwell = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : null;
 
   // checkI8 is a pure MONITOR/alarm — it never actuates the soak. Actuation is the plan→autopilot→
   // Phase B path (demand-aware via sanitizeDueNow → computeShadowPlan), which leads the pump setpoints
@@ -1089,6 +1096,12 @@ async function main(): Promise<void> {
               last_dwell_min: i8LastDwellMin,
               last_satisfied: i8LastSatisfied,
               last_checked_at: i8LastCheckedAt,
+              // The dwell RULE itself, so the dashboard renders the real bar instead of restating a
+              // hardcoded one. hours_since_dwell null = no qualifying dwell in the whole window.
+              hours_since_dwell: i8HoursSinceDwell == null ? null : Math.round(i8HoursSinceDwell * 10) / 10,
+              verify_f: SANITIZE_VERIFY_F,
+              dwell_min_required: SANITIZE_DWELL_MIN,
+              sanitize_f: DEFAULT_OPTS.sanitizeF,
             },
           });
         }
