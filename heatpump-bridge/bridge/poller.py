@@ -467,8 +467,12 @@ class PumpPoller:
                     self.cfg.id, "fault_on", code=fdef.code, severity=fdef.severity,
                     message=fdef.message, detail={"key": key})
                 log.info("[%s] fault ON %s %s", self.cfg.id, fdef.code, fdef.message)
-                # push only actionable faults — P17 anti-freeze (info) must never page
-                if fdef.severity in (Severity.CRITICAL, Severity.HIGH):
+                # push every real fault, not only high/critical: WARNING covers the
+                # degraded-but-heating states (failed sensors, E21 display comm loss) that
+                # otherwise sit unnoticed for weeks — an E21 lived 2 weeks before the owner
+                # spotted it on the dashboard. "high" priority so the Resend email channel
+                # fires too. P17 anti-freeze (info) must still never page.
+                if fdef.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING):
                     self._push(
                         title=f"⚠ {self.cfg.name}: {fdef.code}",
                         message=fdef.message,

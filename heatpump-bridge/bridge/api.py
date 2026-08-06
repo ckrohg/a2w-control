@@ -383,6 +383,8 @@ async def health(request: Request, response: Response):
         # confirm the health-alert path can actually deliver without exposing the topic/URL.
         "notify_configured": bool(request.app.state.config.notifications.ntfy_topic),
         "heartbeat_configured": bool(request.app.state.config.notifications.heartbeat_url),
+        "email_configured": bool(request.app.state.config.notifications.resend_api_key
+                                 and request.app.state.config.notifications.resend_to),
     }
 
 

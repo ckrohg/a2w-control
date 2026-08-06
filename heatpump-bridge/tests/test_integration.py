@@ -93,6 +93,32 @@ async def test_p17_is_info_and_does_not_set_fault_state(rig):
     assert poller.snapshot["state"] != "fault"  # anti-freeze never alarms the chip
 
 
+async def test_warning_fault_pushes_email_eligible_alert(rig, monkeypatch):
+    """WARNING faults (degraded-but-heating: failed sensors, E21 display comm loss) must
+    page at 'high' priority so the Resend email channel fires too — an E21 once sat
+    unnoticed for two weeks. INFO (P17) keeps its never-page guarantee above."""
+    from bridge import notify
+
+    pushes: list[dict] = []
+
+    async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
+        pushes.append({"ch": "ntfy", "title": title, "priority": priority})
+
+    async def fake_email(cfg, *, subject, body, priority="default"):
+        pushes.append({"ch": "email", "title": subject, "priority": priority})
+
+    monkeypatch.setattr(notify, "ntfy", fake_ntfy)
+    monkeypatch.setattr(notify, "email", fake_email)
+
+    pump, poller, store = rig
+    await pump.inject_fault("E21", on=True)
+    await poller.poll_once()
+    await asyncio.sleep(0.01)  # let the fire-and-forget notify tasks run
+
+    assert {p["ch"] for p in pushes} == {"ntfy", "email"}
+    assert all("E21" in p["title"] and p["priority"] == "high" for p in pushes)
+
+
 async def test_guarded_write_with_readback(rig):
     pump, poller, store = rig
     await poller.poll_once()
