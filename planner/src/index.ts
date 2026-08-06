@@ -19,7 +19,7 @@ import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
-import { hygieneVerdict, hygieneIntervalH, lastDwellEnd } from "./hygiene";
+import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
@@ -35,7 +35,7 @@ import {
 } from "./storm";
 import { DemandFeed, requiredAwtF } from "./demand";
 import { logAdjacencyShadowFloor } from "./spatial";
-import { learnDhwWindows } from "./dhw";
+import { learnDhwWindows, detectDrawTimes } from "./dhw";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -347,6 +347,17 @@ let i8LastIntervalH: number | null = null;
 let i8LastDwellMin: number | null = null;
 let i8LastSatisfied: boolean | null = null;
 let i8LastCheckedAt: string | null = null;
+// Hours since the END of the last qualifying dwell — the number the dashboard shows. Computed here,
+// off the SAME series and thresholds as the verdict, so the card can never drift from the runtime
+// rule (it used to compute its own "hours since tank_f >= 131", a momentary touch, not a dwell).
+let i8HoursSinceDwell: number | null = null;
+
+// DHW draw-gap picture, refreshed each shadow tick off the same 14 d of tank history the window
+// learner already pulls. This is the STAGNATION half of the Legionella condition — the hygiene
+// interval is indexed on outdoor temp and knows only the temperature half. OBSERVABILITY ONLY:
+// nothing here gates the soak (issue #51 rule 4 — only a real thermal dwell resets the clock).
+const DRAW_WINDOW_DAYS = 14;
+let dhwDraws: ReturnType<typeof drawGapStats> | null = null;
 async function checkI8(): Promise<void> {
   const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
   const res = await store.getRecentSeries(intervalH);
@@ -362,6 +373,9 @@ async function checkI8(): Promise<void> {
   i8LastDwellMin = Math.round(dwellMin);
   i8LastSatisfied = satisfied;
   i8LastCheckedAt = new Date().toISOString();
+  const lastEnd = lastDwellEnd(res, SANITIZE_VERIFY_F, SANITIZE_DWELL_MIN);
+  // null = no qualifying dwell anywhere in the window, which is exactly the `overdue` case below.
+  i8HoursSinceDwell = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : null;
 
   // checkI8 is a pure MONITOR/alarm — it never actuates the soak. Actuation is the plan→autopilot→
   // Phase B path (demand-aware via sanitizeDueNow → computeShadowPlan), which leads the pump setpoints
@@ -694,7 +708,10 @@ async function shadowOnce(): Promise<void> {
   // learned DHW windows once ≥5 days of tank history exist; fixed defaults until then
   let learned = null;
   try {
-    learned = learnDhwWindows(await store.getTankHistory(14));
+    const tankHistory = await store.getTankHistory(DRAW_WINDOW_DAYS);
+    learned = learnDhwWindows(tankHistory);
+    // Same rows, no extra query: the draw-gap picture for /health (see dhwDraws).
+    dhwDraws = drawGapStats(detectDrawTimes(tankHistory), Date.now());
   } catch (e) {
     console.warn("dhw learner failed, using default windows:", (e as Error).message);
   }
@@ -1089,6 +1106,24 @@ async function main(): Promise<void> {
               last_dwell_min: i8LastDwellMin,
               last_satisfied: i8LastSatisfied,
               last_checked_at: i8LastCheckedAt,
+              // The dwell RULE itself, so the dashboard renders the real bar instead of restating a
+              // hardcoded one. hours_since_dwell null = no qualifying dwell in the whole window.
+              hours_since_dwell: i8HoursSinceDwell == null ? null : Math.round(i8HoursSinceDwell * 10) / 10,
+              verify_f: SANITIZE_VERIFY_F,
+              dwell_min_required: SANITIZE_DWELL_MIN,
+              sanitize_f: DEFAULT_OPTS.sanitizeF,
+              // Stagnation half — from OUR 5-min tank series (dhw.ts detectDrawTimes), not TempIQ's
+              // recharge stream, which undercounts ~6× and lags a day. Context, never a gate.
+              draws: dhwDraws
+                ? {
+                    window_days: DRAW_WINDOW_DAYS,
+                    event_count: dhwDraws.eventCount,
+                    last_draw_at: dhwDraws.lastDrawAt ? dhwDraws.lastDrawAt.toISOString() : null,
+                    hours_since_last_draw:
+                      dhwDraws.hoursSinceLastDraw == null ? null : Math.round(dhwDraws.hoursSinceLastDraw * 10) / 10,
+                    max_gap_h: dhwDraws.maxGapH == null ? null : Math.round(dhwDraws.maxGapH * 10) / 10,
+                  }
+                : null,
             },
           });
         }

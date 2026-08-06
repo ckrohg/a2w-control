@@ -7,8 +7,33 @@
  * callers keep the fixed defaults until then.
  */
 
-const DROP_F = 1.5; // °F fall between adjacent samples ≤ 12 min apart = a draw
+export const DROP_F = 1.5; // °F fall between adjacent samples ≤ 12 min apart = a draw
 const PAD_H = 1;
+const MAX_SAMPLE_GAP_MIN = 12; // wider than that and the pair isn't adjacent enough to read as one event
+
+/**
+ * Timestamps of detected draws, ascending — the shared primitive behind both the window learner
+ * and the "how long has the coil sat" clock, so there is exactly ONE definition of "a draw".
+ *
+ * Why this threshold discriminates: standby loss moves the tank ~0.2 °F per 5-min sample
+ * (0.65 kW over C_eff ≈ 110 gal ⇒ ~2.4 °F/h), so DROP_F is ~7× the standby rate — a fall this
+ * sharp is water leaving, not the tank cooling. Measured against 14 d of real readings the
+ * detected drops average 4.2 °F (max 16.5), and their hour-of-day histogram is a human pattern.
+ *
+ * Caveat that matters in WINTER: a space-heat call also pulls the buffer down, so off-season these
+ * are "draws or zone calls", not draws alone. In the summer cool-tank regime — the only time the
+ * hygiene interval actually binds — DHW is the sole load, so they are draws.
+ */
+export function detectDrawTimes(rows: { ts: Date; tankF: number }[]): Date[] {
+  const out: Date[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1], cur = rows[i];
+    const dtMin = (cur.ts.getTime() - prev.ts.getTime()) / 60_000;
+    if (dtMin <= 0 || dtMin > MAX_SAMPLE_GAP_MIN) continue;
+    if (prev.tankF - cur.tankF >= DROP_F) out.push(cur.ts);
+  }
+  return out;
+}
 
 export interface LearnedWindows {
   windows: [number, number][]; // [startHour, endHourExclusive] local
@@ -25,18 +50,12 @@ export function learnDhwWindows(
   if (rows.length < 100) return null;
   const daysSeen = new Set<string>();
   const eventDaysByHour: Set<string>[] = Array.from({ length: 24 }, () => new Set());
-  let drawEvents = 0;
 
-  for (let i = 1; i < rows.length; i++) {
-    const prev = rows[i - 1], cur = rows[i];
-    const dtMin = (cur.ts.getTime() - prev.ts.getTime()) / 60_000;
-    const day = cur.ts.toISOString().slice(0, 10);
-    daysSeen.add(day);
-    if (dtMin <= 0 || dtMin > 12) continue;
-    if (prev.tankF - cur.tankF >= DROP_F) {
-      drawEvents++;
-      eventDaysByHour[cur.ts.getHours()].add(day); // TZ env → local hour
-    }
+  for (let i = 1; i < rows.length; i++) daysSeen.add(rows[i].ts.toISOString().slice(0, 10));
+  const drawTimes = detectDrawTimes(rows);
+  const drawEvents = drawTimes.length;
+  for (const ts of drawTimes) {
+    eventDaysByHour[ts.getHours()].add(ts.toISOString().slice(0, 10)); // TZ env → local hour
   }
 
   const days = daysSeen.size;

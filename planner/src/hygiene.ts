@@ -74,6 +74,39 @@ export function hygieneIntervalH(
   return Math.min(Math.max(chosen, 1), HYGIENE_HARD_MAX_H);
 }
 
+/** Draw-gap stats over an ASCENDING list of DHW draw times (from `detectDrawTimes` in dhw.ts) — the
+ *  STAGNATION half of the Legionella condition, which the temperature-indexed interval above cannot
+ *  see. Growth needs a lukewarm tank AND days without a draw; `hygieneIntervalH` only knows the
+ *  temperature half.
+ *
+ *  OBSERVABILITY ONLY. This must never short-circuit or satisfy the safety timer: a draw flushes the
+ *  coil's planktonic slug but leaves biofilm on the wall, so only a real thermal dwell resets the clock
+ *  (issue #51 rule 4). If it is ever wired into the cadence it may only TIGHTEN it, never relax it.
+ *
+ *  Source note: this reads our OWN 5-min tank series, not TempIQ's /api/insights/dhw-usage `events[]`.
+ *  That stream looks like a draw log but is a recharge-confirmed-draw log — a draw the heat pump didn't
+ *  answer with a ≥15-min cycle within 2 h leaves no trace, it is written by a once-daily cron, and its
+ *  events sit outside the endpoint's own staleness gate. Measured over the same 14 days it reported 15
+ *  events and a 2.9-day "quiet gap" where the local series shows 87 draws and a 27.3-hour worst case.
+ *  Use TempIQ's stream for DHW ENERGY and winter DHW-vs-space separation; never as a recency clock. */
+export function drawGapStats(ats: Date[], nowMs: number): {
+  lastDrawAt: Date | null; hoursSinceLastDraw: number | null; maxGapH: number | null; eventCount: number;
+} {
+  if (!ats.length) return { lastDrawAt: null, hoursSinceLastDraw: null, maxGapH: null, eventCount: 0 };
+  let maxGapH: number | null = null;
+  for (let i = 1; i < ats.length; i++) {
+    const gap = (ats[i].getTime() - ats[i - 1].getTime()) / 3_600_000;
+    if (maxGapH == null || gap > maxGapH) maxGapH = gap;
+  }
+  const lastDrawAt = ats[ats.length - 1];
+  return {
+    lastDrawAt,
+    hoursSinceLastDraw: (nowMs - lastDrawAt.getTime()) / 3_600_000,
+    maxGapH, // null when there is only one event — no gap is measurable from a single point
+    eventCount: ats.length,
+  };
+}
+
 /** End timestamp of the most recent qualifying dwell (≥dwellMin continuous minutes ≥minF) in the
  *  ascending series, or null if none. Answers "how long since the coil was last pasteurized" so the
  *  plan can schedule the next soak BEFORE the hygiene window lapses (demand-aware cadence). */
