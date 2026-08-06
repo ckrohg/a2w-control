@@ -74,16 +74,21 @@ export function hygieneIntervalH(
   return Math.min(Math.max(chosen, 1), HYGIENE_HARD_MAX_H);
 }
 
-/** Draw-gap stats over an ASCENDING list of DHW draw onsets — the STAGNATION half of the Legionella
- *  condition, which the temperature-indexed interval above cannot see. Growth needs a lukewarm tank
- *  AND days without a draw; `hygieneIntervalH` only knows the temperature half.
+/** Draw-gap stats over an ASCENDING list of DHW draw times (from `detectDrawTimes` in dhw.ts) — the
+ *  STAGNATION half of the Legionella condition, which the temperature-indexed interval above cannot
+ *  see. Growth needs a lukewarm tank AND days without a draw; `hygieneIntervalH` only knows the
+ *  temperature half.
  *
- *  OBSERVABILITY ONLY. This must never shorten-circuit or satisfy the safety timer: a draw flushes the
+ *  OBSERVABILITY ONLY. This must never short-circuit or satisfy the safety timer: a draw flushes the
  *  coil's planktonic slug but leaves biofilm on the wall, so only a real thermal dwell resets the clock
  *  (issue #51 rule 4). If it is ever wired into the cadence it may only TIGHTEN it, never relax it.
  *
- *  Caveat worth keeping in mind when reading maxGapH: these are RECHARGE events, so a draw too small to
- *  trigger a reheat is invisible and the true quiet gap can only be shorter — never longer. */
+ *  Source note: this reads our OWN 5-min tank series, not TempIQ's /api/insights/dhw-usage `events[]`.
+ *  That stream looks like a draw log but is a recharge-confirmed-draw log — a draw the heat pump didn't
+ *  answer with a ≥15-min cycle within 2 h leaves no trace, it is written by a once-daily cron, and its
+ *  events sit outside the endpoint's own staleness gate. Measured over the same 14 days it reported 15
+ *  events and a 2.9-day "quiet gap" where the local series shows 87 draws and a 27.3-hour worst case.
+ *  Use TempIQ's stream for DHW ENERGY and winter DHW-vs-space separation; never as a recency clock. */
 export function drawGapStats(ats: Date[], nowMs: number): {
   lastDrawAt: Date | null; hoursSinceLastDraw: number | null; maxGapH: number | null; eventCount: number;
 } {

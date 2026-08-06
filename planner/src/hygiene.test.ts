@@ -13,6 +13,7 @@ import {
   HYGIENE_HARD_MAX_H,
   type HygieneReading,
 } from "./hygiene";
+import { detectDrawTimes } from "./dhw";
 
 const t0 = new Date(2026, 6, 15, 12, 0, 0).getTime();
 const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Date(t0 + min * 60000), tankF });
@@ -88,28 +89,49 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
   assert.equal(s1.eventCount, 1);
   assert.equal(s1.hoursSinceLastDraw, 24, "hours-since measured from now, not from the previous draw");
 
-  // REGRESSION — the real 6BB record pulled from TempIQ /api/insights/dhw-usage on 2026-08-06.
-  // The 2.90-day quiet stretch (07-29 14:23Z → 08-01 12:04Z) is why this signal exists: it sits inside
-  // the ~2–5-day time-to-concern band, against a 60h summer soak interval. If a refactor ever makes
-  // this read shorter, the stagnation picture is being under-reported and the number stops being safe.
-  const real = [
-    "2026-07-23T07:01:50Z", "2026-07-23T15:09:27Z", "2026-07-25T14:48:08Z", "2026-07-26T12:46:21Z",
-    "2026-07-26T12:56:21Z", "2026-07-26T17:21:10Z", "2026-07-28T12:28:49Z", "2026-07-29T14:23:27Z",
-    "2026-08-01T12:04:02Z", "2026-08-01T12:32:18Z", "2026-08-03T13:39:54Z", "2026-08-03T18:58:18Z",
-    "2026-08-04T12:02:39Z", "2026-08-04T13:24:47Z", "2026-08-05T12:47:46Z",
-  ].map((s) => new Date(s));
-  const stats = drawGapStats(real, Date.parse("2026-08-06T15:22:00Z"));
-  assert.equal(stats.eventCount, 15, "all 15 events counted");
-  assert.ok(stats.maxGapH != null, "expected a measurable gap");
-  assert.ok(
-    Math.abs(stats.maxGapH! / 24 - 2.90) < 0.01,
-    `longest quiet gap should be ~2.90 days, got ${(stats.maxGapH! / 24).toFixed(2)}`,
+  // Ordinary multi-event case: the gap is the largest span BETWEEN draws, and is unaffected by how
+  // long ago the last one was (that's hoursSinceLastDraw's job — conflating them hides a live quiet
+  // spell behind a stale historical one).
+  const t = (iso: string) => new Date(iso);
+  const stats = drawGapStats(
+    [t("2026-08-01T06:00:00Z"), t("2026-08-01T09:00:00Z"), t("2026-08-03T09:00:00Z"), t("2026-08-03T12:00:00Z")],
+    Date.parse("2026-08-03T18:00:00Z"),
   );
-  assert.ok(
-    Math.abs(stats.hoursSinceLastDraw! - 26.57) < 0.02,
-    `hours since last draw should be ~26.6, got ${stats.hoursSinceLastDraw!.toFixed(2)}`,
-  );
-  assert.equal(stats.lastDrawAt!.toISOString(), "2026-08-05T12:47:46.000Z", "last draw = newest event");
+  assert.equal(stats.eventCount, 4);
+  assert.equal(stats.maxGapH, 48, "longest BETWEEN-draw gap = 48 h (08-01 09:00 → 08-03 09:00)");
+  assert.equal(stats.hoursSinceLastDraw, 6, "hours-since is measured from now, independent of maxGapH");
+}
+
+// 6. detectDrawTimes + drawGapStats on a syntheised 5-min series — the pair that answers "how long has
+//    the coil sat". Pinned because the threshold is the whole discrimination: standby loss moves the
+//    tank ~0.2°F per 5-min sample, so a ≥1.5°F fall is water leaving, not the tank cooling.
+{
+  const start = Date.parse("2026-08-01T00:00:00Z");
+  const rows: { ts: Date; tankF: number }[] = [];
+  // 24 h of 5-min samples coasting down at the STANDBY rate (0.2°F/sample) — must yield zero draws.
+  let tankF = 135;
+  for (let i = 0; i < 288; i++) {
+    rows.push({ ts: new Date(start + i * 5 * 60000), tankF });
+    tankF -= 0.2;
+  }
+  assert.equal(detectDrawTimes(rows).length, 0, "standby coast-down is NOT a draw (0.2°F/sample < 1.5)");
+
+  // Two real draws punched into an otherwise-quiet series, 8 h apart.
+  const drawA = 60, drawB = 156; // sample indices ⇒ 5:00 and 13:00
+  const withDraws = rows.map((r, i) => ({ ...r, tankF: r.tankF - (i >= drawA ? 6 : 0) - (i >= drawB ? 6 : 0) }));
+  const times = detectDrawTimes(withDraws);
+  assert.equal(times.length, 2, "exactly the two sharp falls are draws");
+  assert.equal(times[0].toISOString(), new Date(start + drawA * 5 * 60000).toISOString());
+  assert.equal(times[1].toISOString(), new Date(start + drawB * 5 * 60000).toISOString());
+  assert.equal(drawGapStats(times, start + 288 * 5 * 60000).maxGapH, 8, "gap between the two draws = 8 h");
+
+  // A sample pair further apart than MAX_SAMPLE_GAP_MIN is a DATA GAP, not a draw — a planner restart
+  // or DB outage must never manufacture one (it would falsely reset the quiet-gap clock).
+  const across = [
+    { ts: new Date(start), tankF: 135 },
+    { ts: new Date(start + 60 * 60000), tankF: 120 }, // 1 h apart, 15°F lower
+  ];
+  assert.equal(detectDrawTimes(across).length, 0, "a 15°F fall across a 1 h data gap is not a draw");
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

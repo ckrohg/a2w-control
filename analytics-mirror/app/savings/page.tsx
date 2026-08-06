@@ -38,6 +38,17 @@ type PlannerHygiene = {
   verify_f?: number | null;
   dwell_min_required?: number | null;
   sanitize_f?: number | null;
+  // Stagnation half, mined from the planner's own 5-min tank series. Deliberately NOT TempIQ's
+  // /api/insights/dhw-usage events[]: that stream only records draws the heat pump answered with a
+  // ≥15-min cycle within 2 h, runs off a once-daily cron, and sits outside its own staleness gate —
+  // measured over the same 14 days it showed 15 draws and a 2.9-day "quiet gap" where the local
+  // series shows 87 draws and a 27.3-hour worst case.
+  draws?: {
+    window_days?: number | null;
+    event_count?: number | null;
+    hours_since_last_draw?: number | null;
+    max_gap_h?: number | null;
+  } | null;
 };
 
 /** Server-side only — PLANNER_API_TOKEN never reaches the browser. /health is public, but we send
@@ -198,7 +209,6 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
   let kwh7d: number | null = null;
   let elementCallH7d = 0;
   let hygiene: PlannerHygiene | null = null;
-  let draws: { hoursSinceLastDraw: number | null; maxGapH: number | null; eventCount: number } | null = null;
   let writes: { ts: number; source: string; action: string; result: string; detail: string }[] = [];
   let episodes: { s: number; c: number | null; detail: string }[] = [];
   let opDays: { d: string; frac: number }[] = [];
@@ -228,27 +238,6 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                         FROM slx_readings WHERE ts >= now() - interval '7 days'`;
     elementCallH7d = Number(e.rows[0].callh ?? 0);
 
-    // DHW draw gaps (gtm#1442, via planner tempiq_dhw_events). This is the STAGNATION half of the
-    // Legionella condition — risk needs BOTH a cool tank AND days with no draw flushing the coil, and
-    // the hygiene interval only knows the temperature half. Shown for context; it gates nothing.
-    // Table may not exist yet on an older planner, so this has its own catch.
-    try {
-      const dr = await sql`SELECT EXTRACT(EPOCH FROM (now() - max(at)))::float8 / 3600 AS since,
-                                  count(*)::int AS n
-                           FROM tempiq_dhw_events WHERE at >= now() - interval '14 days'`;
-      const gp = await sql`SELECT max(gap)::float8 AS maxgap FROM (
-                             SELECT EXTRACT(EPOCH FROM (at - lag(at) OVER (ORDER BY at))) / 3600 AS gap
-                             FROM tempiq_dhw_events WHERE at >= now() - interval '14 days'
-                           ) g`;
-      const n = Number(dr.rows[0]?.n ?? 0);
-      if (n > 0) {
-        draws = {
-          hoursSinceLastDraw: dr.rows[0]?.since == null ? null : Number(dr.rows[0].since),
-          maxGapH: gp.rows[0]?.maxgap == null ? null : Number(gp.rows[0].maxgap),
-          eventCount: n,
-        };
-      }
-    } catch { /* planner hasn't created the table yet — card degrades to hygiene-only */ }
 
     // Real operating coverage per day, within the SELECTED window (never before the cutover — that's
     // when savings began). 288 = 5-min samples in a full day, so frac is the share of the day the
@@ -623,12 +612,14 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
               </div>
               <div className="temps">
                 <div className="temp">
-                  <div className="v">{draws == null ? "—" : fmt(draws.hoursSinceLastDraw, 0)}</div>
+                  <div className="v">{fmt(hygiene?.draws?.hours_since_last_draw, 0)}</div>
                   <div className="l">hrs since hot-water use</div>
                 </div>
                 <div className="temp">
-                  <div className="v">{draws?.maxGapH == null ? "—" : fmt(draws.maxGapH / 24, 1)}</div>
-                  <div className="l">longest quiet gap (14d)</div>
+                  <div className="v">
+                    {hygiene?.draws?.max_gap_h == null ? "—" : fmt(hygiene.draws.max_gap_h / 24, 1)}
+                  </div>
+                  <div className="l">longest quiet gap ({fmt(hygiene?.draws?.window_days, 0)}d)</div>
                 </div>
               </div>
               <div className="meta">
@@ -653,17 +644,19 @@ export default async function SavingsPage({ searchParams }: { searchParams: { wi
                 )}
               </div>
               <div className="meta">
-                {draws == null ? (
-                  <>No hot-water draw history yet — the planner starts recording it on its next TempIQ read.</>
+                {hygiene?.draws == null ? (
+                  <>Hot-water usage isn&apos;t being reported yet — it needs a few days of tank history.</>
                 ) : (
                   <>
                     The bottom row is the other half of the risk, and it is <b>context only — it never
                     lets the system skip a soak</b>. Growth needs a lukewarm tank <i>and</i> days of
-                    nobody using hot water; draws flush the coil but don&apos;t sterilize it, so only heat
-                    resets the clock. Over the last 14 days the longest stretch with no hot water drawn
-                    was <b>{fmt(draws.maxGapH == null ? null : draws.maxGapH / 24, 1)} days</b> across{" "}
-                    {draws.eventCount} draws — worth watching, because that is the condition the
-                    temperature-based deadline above can&apos;t see.
+                    nobody using hot water; a draw flushes the coil but doesn&apos;t sterilize it, so only
+                    heat resets the clock. Over the last {fmt(hygiene.draws.window_days, 0)} days the
+                    longest stretch with no hot water drawn was{" "}
+                    <b>{hygiene.draws.max_gap_h == null ? "—" : `${(hygiene.draws.max_gap_h / 24).toFixed(1)} days`}</b>{" "}
+                    across {fmt(hygiene.draws.event_count, 0)} draws — comfortably inside the deadline
+                    above, so stagnation isn&apos;t currently a concern. Measured from the tank&apos;s own
+                    temperature record: a sharp drop is water leaving.
                   </>
                 )}
               </div>

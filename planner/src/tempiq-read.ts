@@ -16,9 +16,6 @@
  *                                        usage aggregate; ADVISORY enrichment, single-row
  *                                        snapshot. Winter DHW load separation our local
  *                                        tank-drop inference can't do; NEVER gates control)
- *                                      → tempiq_dhw_events (gtm#1442 — the per-draw recharge
- *                                        stream on the SAME response; insert-only history so
- *                                        the quiet gaps between draws survive the snapshot)
  * §6.7 doctrine: TempIQ already learns the zone physics (hydronic-system-learner —
  * effective thermal mass, per-zone loads, envelope UA), so the planner CONSUMES those
  * outputs and never re-derives them; the tank's behavioral model (C_eff, DHW windows,
@@ -34,24 +31,12 @@ import { fetchInsightSpatialGraph, summarizeWarmAdjacency } from "./spatial";
 
 const COP_BACKFILL_MS = 7 * 24 * 60 * 60 * 1000; // first fetch reaches back 7 days
 const COP_PAGE_LIMIT = 2000;
-const DHW_DRAW_WINDOW_DAYS = 14; // draw-gap window — long enough to see a multi-day quiet spell
-
-/** DHW draw-gap summary, surfaced on /health so the stagnation half of the Legionella condition is
- *  verifiable with one curl. Observability only — never gates the soak (issue #51 rule 4). */
-export interface DhwDrawStatus {
-  windowDays: number;
-  eventCount: number;
-  lastDrawAt: string | null;
-  hoursSinceLastDraw: number | null;
-  maxGapH: number | null;
-}
 
 export interface TempiqReadStatus {
   enabled: boolean;
   lastFetchAt: string | null;
   lastResult: string | null;
   consecutiveFailures: number;
-  dhwDraws: DhwDrawStatus | null;
 }
 
 interface ZonesResponse {
@@ -102,22 +87,12 @@ interface DhwUsageResponse {
     stale?: boolean | null;
   } | null;
   rolling?: { window24hKwh?: number | null; window72hKwh?: number | null; basis?: string | null } | null;
-  // gtm#1442 (TempIQv2 PR #1827), added AFTER the #1816 aggregate this reader was built for: a real
-  // per-draw recharge stream, newest-first, max 100. `at` is the draw ONSET — the only per-draw timing
-  // on the whole insights surface. Energy only; TempIQ's gallons are post-mix tap volume from the
-  // Streamlabs meter and are not exposed here (and coil-side gallons would need an unmeasured coil
-  // outlet temp, whereas thermalKwh IS the coil-side draw with the mixing-valve term already cancelled).
-  events?: Array<{ at?: string; energyKwh?: number | null; thermalKwh?: number | null }>;
 }
 
 export class TempiqReader {
   private lastFetchAt: string | null = null;
   private lastResult: string | null = null;
   private consecutiveFailures = 0;
-  private dhwDraws: {
-    lastDrawAt: Date | null; hoursSinceLastDraw: number | null;
-    maxGapH: number | null; eventCount: number;
-  } | null = null;
 
   constructor(
     private readonly store: Store,
@@ -126,21 +101,11 @@ export class TempiqReader {
   ) {}
 
   status(): TempiqReadStatus {
-    const d = this.dhwDraws;
     return {
       enabled: true,
       lastFetchAt: this.lastFetchAt,
       lastResult: this.lastResult,
       consecutiveFailures: this.consecutiveFailures,
-      dhwDraws: d
-        ? {
-            windowDays: DHW_DRAW_WINDOW_DAYS,
-            eventCount: d.eventCount,
-            lastDrawAt: d.lastDrawAt ? d.lastDrawAt.toISOString() : null,
-            hoursSinceLastDraw: d.hoursSinceLastDraw == null ? null : Math.round(d.hoursSinceLastDraw * 10) / 10,
-            maxGapH: d.maxGapH == null ? null : Math.round(d.maxGapH * 10) / 10,
-          }
-        : null,
     };
   }
 
@@ -272,34 +237,11 @@ export class TempiqReader {
   private async fetchDhwUsage(): Promise<string> {
     const body = await this.get<DhwUsageResponse>("/api/insights/dhw-usage");
     await this.store.upsertTempiqDhwUsage({ ...body, fetchedAt: new Date().toISOString() });
-    // Per-draw events → insert-only history, so the quiet GAPS between draws survive the single-row
-    // snapshot above. Failing here must not lose the aggregate we just stored, hence the inner catch.
-    let drew = "";
-    const raw = Array.isArray(body?.events) ? body.events : [];
-    const events = raw
-      .map((ev) => ({
-        at: ev?.at ? new Date(ev.at) : null,
-        thermalKwh: numOrNull(ev?.thermalKwh),
-        electricalKwh: numOrNull(ev?.energyKwh),
-      }))
-      .filter((ev): ev is { at: Date; thermalKwh: number | null; electricalKwh: number | null } =>
-        ev.at != null && !isNaN(ev.at.getTime()));
-    if (events.length) {
-      try {
-        const n = await this.store.insertTempiqDhwEvents(events);
-        drew = `, draws +${n}/${events.length - n}dup`;
-      } catch (e) {
-        drew = `, draws failed: ${e instanceof Error ? e.message : String(e)}`;
-      }
-    }
-    try {
-      this.dhwDraws = await this.store.dhwDrawStats(DHW_DRAW_WINDOW_DAYS);
-    } catch { /* observability only — never fail the tick over it */ }
-    if (body?.available === false) return `dhw: unavailable${drew}`;
+    if (body?.available === false) return "dhw: unavailable";
     const e = body?.estimate ?? null;
     const daily = numOrNull(e?.dailyElectricalKwh);
     const cyc = numOrNull(e?.cycleCount);
-    return `dhw: ${daily != null ? `${daily.toFixed(1)}kWh/d` : "?"}${cyc != null ? `, ${cyc} cyc` : ""}${e?.stale ? " (stale)" : ""}${drew}`;
+    return `dhw: ${daily != null ? `${daily.toFixed(1)}kWh/d` : "?"}${cyc != null ? `, ${cyc} cyc` : ""}${e?.stale ? " (stale)" : ""}`;
   }
 }
 
