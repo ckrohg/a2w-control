@@ -10,6 +10,7 @@ import {
   hygieneIntervalH,
   lastDwellEnd,
   drawGapStats,
+  largestSampleGapMin,
   HYGIENE_HARD_MAX_H,
   type HygieneReading,
 } from "./hygiene";
@@ -132,6 +133,48 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
     { ts: new Date(start + 60 * 60000), tankF: 120 }, // 1 h apart, 15°F lower
   ];
   assert.equal(detectDrawTimes(across).length, 0, "a 15°F fall across a 1 h data gap is not a draw");
+}
+
+// 7. BLIND verdict: "can't verify" must be distinguishable from both "fine" and "overdue". This state
+//    was silent before, so a telemetry outage could mute the alarm about the soak it just caused to be
+//    missed (2026-07-31: a 17.75h gap left ~508 readings against a 462 threshold — survived by ~10%).
+{
+  const cool = (min: number) => at(min, 120);
+  // (a) Dense window, no dwell ⇒ OVERDUE (a confident no), not blind.
+  const dense: HygieneReading[] = Array.from({ length: 200 }, (_, i) => cool(i * 5));
+  const vDense = hygieneVerdict(dense, { verifyF: 134, dwellMin: 30, minReadings: 150 });
+  assert.equal(vDense.overdue, true, "dense + no dwell ⇒ overdue");
+  assert.equal(vDense.blind, false, "a complete window is never blind");
+
+  // (b) Sparse because of a HOLE ⇒ BLIND. Two short clusters either side of a 10 h dead stretch.
+  const holed: HygieneReading[] = [
+    ...Array.from({ length: 10 }, (_, i) => cool(i * 5)),
+    ...Array.from({ length: 10 }, (_, i) => cool(600 + i * 5)),
+  ];
+  const vHoled = hygieneVerdict(holed, { verifyF: 134, dwellMin: 30, minReadings: 150 });
+  assert.equal(vHoled.overdue, false, "too sparse to be a confident overdue");
+  assert.equal(vHoled.blind, true, "a real telemetry hole ⇒ blind, NOT silence");
+  assert.ok(Math.abs(vHoled.largestGapMin - 555) < 1, `gap ≈ 555 min, got ${vHoled.largestGapMin}`);
+
+  // (c) Sparse because history is SHORT and contiguous (planner just started) ⇒ quiet. This is the
+  //     false-positive the gap gate exists to prevent — row count alone can't tell (b) from (c).
+  const fresh: HygieneReading[] = Array.from({ length: 20 }, (_, i) => cool(i * 5));
+  const vFresh = hygieneVerdict(fresh, { verifyF: 134, dwellMin: 30, minReadings: 150 });
+  assert.equal(vFresh.blind, false, "short but contiguous history must stay quiet");
+  assert.equal(vFresh.overdue, false, "and must not false-fire overdue either");
+
+  // (d) A hole is irrelevant once a real dwell is confirmed — hygiene is satisfied, nothing to report.
+  const holedButSoaked: HygieneReading[] = [
+    at(0, 136), at(40, 136),                       // a genuine 40-min dwell
+    ...Array.from({ length: 5 }, (_, i) => cool(700 + i * 5)), // then a long gap
+  ];
+  const vSoaked = hygieneVerdict(holedButSoaked, { verifyF: 134, dwellMin: 30, minReadings: 150 });
+  assert.equal(vSoaked.satisfied, true);
+  assert.equal(vSoaked.blind, false, "satisfied ⇒ never blind, however gappy the window");
+
+  // largestSampleGapMin edge cases
+  assert.equal(largestSampleGapMin([]), 0, "empty ⇒ 0");
+  assert.equal(largestSampleGapMin([cool(0)]), 0, "single reading ⇒ 0 (no gap measurable)");
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

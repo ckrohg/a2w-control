@@ -87,4 +87,54 @@ const asFoundCfg = { dot: 5, wwsd: 125, dbt: 165, mbt: 145 };
     "oversized bankF clamps to strictCap");
 }
 
+// 8. DEADLINE BACKSTOP: when the window has LAPSED (sanitizeUrgent), the soak goes in the EARLIEST
+//    hour rather than the day's warmest. Waiting for the cheapest hour has no deadline override, so
+//    lateness compounds — on 2026-07-31 a 17.75h outage plus that wait produced a 75.2h gap between
+//    pasteurizations, past the 72h hard ceiling.
+{
+  // Warmest hour is h=23 (see forecast). Not urgent ⇒ the soak lands there.
+  const relaxed = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, true, false);
+  const relaxedIdx = relaxed.findIndex((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF);
+  assert.equal(relaxedIdx, 23, "not urgent ⇒ soak at the warmest (cheapest) hour");
+
+  // Urgent ⇒ the FIRST hour, price be damned.
+  const urgent = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, true, true);
+  const urgentIdx = urgent.findIndex((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF);
+  assert.equal(urgentIdx, 0, "urgent ⇒ soak at the EARLIEST hour, not the warmest");
+  assert.match(urgent[0].reason, /overdue/i, "urgent block should say why it jumped the queue");
+
+  // Exactly ONE soak — the urgent block must not stack with the per-day warmest-hour block.
+  const urgentBlocks = urgent.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF);
+  assert.equal(urgentBlocks.length, 1, "urgent must not double-soak the same day");
+
+  // The urgent block still LEADS the pump setpoints — otherwise it would be rejected on I1 and the
+  // backstop would achieve nothing (exactly the deadlock #56 fixed).
+  assert.ok(
+    urgent[0].hp1_setpoint_f >= urgent[0].tank_target_f + DEFAULT_OPTS.i1MarginF,
+    "urgent sanitize block must still lead the HP setpoint by the I1 margin",
+  );
+
+  // urgent is meaningless when nothing is due — never soak on a not-due plan.
+  const notDue = computeShadowPlan(forecast, null, DEFAULT_OPTS, null, false, true);
+  assert.equal(
+    notDue.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 0,
+    "urgent must not override sanitizeDue=false",
+  );
+
+  // A short horizon (late in the day) is exactly where the old code deferred ~24h via `ds.length < 6`.
+  // The backstop must still soak.
+  const stub = forecast.slice(0, 3);
+  const late = computeShadowPlan(stub, null, DEFAULT_OPTS, null, true, true);
+  assert.equal(
+    late.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 1,
+    "urgent soaks even on a <6h horizon, where the warmest-hour path skips the day entirely",
+  );
+  // ...and the un-urgent path on that same stub is the deferral this fixes.
+  const lateRelaxed = computeShadowPlan(stub, null, DEFAULT_OPTS, null, true, false);
+  assert.equal(
+    lateRelaxed.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 0,
+    "documents the old behaviour: a short horizon defers the soak (why the backstop is needed)",
+  );
+}
+
 console.log("shadow.test.ts: all assertions passed ✓");

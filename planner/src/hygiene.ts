@@ -46,15 +46,41 @@ export interface HygieneVerdict {
   dwellMin: number; // longest qualifying dwell found in the window
   satisfied: boolean; // a real pasteurizing dwell occurred
   overdue: boolean; // no dwell AND the window is complete enough to trust the verdict
+  /** Can't confirm a soak AND the window is too sparse to call it overdue — the monitor is BLIND,
+   *  which is NOT the same as "fine". Previously this state was silent. */
+  blind: boolean;
+  /** Largest span with no readings at all (minutes) — the telemetry-gap evidence behind `blind`. */
+  largestGapMin: number;
+}
+
+/** Longest span (minutes) between consecutive readings — i.e. how long telemetry went dark. Used to
+ *  tell a HOLE in the window (bridge/planner outage) apart from a merely SHORT history (planner just
+ *  started, fresh DB), which look identical if you only count rows. */
+export function largestSampleGapMin(series: HygieneReading[]): number {
+  let worst = 0;
+  for (let i = 1; i < series.length; i++) {
+    worst = Math.max(worst, (series[i].ts.getTime() - series[i - 1].ts.getTime()) / 60000);
+  }
+  return worst;
 }
 
 /** Decide the I8 verdict for a window. `overdue` stays false on a sparse window (planner just
- *  started / DB gap) so a thin history never false-fires the alert or an auto-soak. */
-export function hygieneVerdict(series: HygieneReading[], p: HygieneParams): HygieneVerdict {
+ *  started / DB gap) so a thin history never false-fires the alert or an auto-soak — but that
+ *  same sparseness used to make the monitor SILENT, so an outage could mute the alarm about the
+ *  soak it just caused to be missed. `blind` names that state so the caller can report it.
+ *
+ *  It is gated on a real telemetry GAP rather than on the row count, so a freshly-started planner
+ *  (short but contiguous history) stays quiet while a genuine hole speaks up. */
+export function hygieneVerdict(
+  series: HygieneReading[],
+  p: HygieneParams & { gapAlertMin?: number },
+): HygieneVerdict {
   const dwellMin = longestDwellMin(series, p.verifyF);
   const satisfied = dwellMin >= p.dwellMin;
   const overdue = !satisfied && series.length >= p.minReadings;
-  return { dwellMin, satisfied, overdue };
+  const largestGapMin = largestSampleGapMin(series);
+  const blind = !satisfied && !overdue && largestGapMin >= (p.gapAlertMin ?? 60);
+  return { dwellMin, satisfied, overdue, blind, largestGapMin };
 }
 
 /** Hard safety ceiling: the pasteurization interval may never exceed this regardless of config,

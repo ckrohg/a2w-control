@@ -110,6 +110,7 @@ export function computeShadowPlan(
   opts: ShadowOpts = DEFAULT_OPTS,
   demandFloor?: DemandFloor | null,
   sanitizeDue = true,
+  sanitizeUrgent = false,
 ): ShadowBlock[] {
   const hours = forecast.slice(0, 24);
   const inWindow = (h: number) => opts.dhwWindows.some(([a, b]) => h >= a && h < b);
@@ -155,6 +156,22 @@ export function computeShadowPlan(
     byDay.get(day)!.push(d);
   }
   if (sanitizeDue) {
+    // DEADLINE BACKSTOP. `sanitizeUrgent` = the hygiene window has actually LAPSED (no qualifying
+    // dwell anywhere in the interval), as opposed to merely approaching. Then price stops mattering:
+    // put the soak in the EARLIEST plannable hour instead of the day's warmest.
+    //
+    // Why this exists: waiting for the cheapest hour has no deadline override, so lateness compounds
+    // instead of self-correcting. On 2026-07-31 a 17.75 h telemetry outage meant no plan and no soak;
+    // on recovery the soak still waited for the next day's warmest hour, and the gap between
+    // pasteurizations reached 75.2 h — past HYGIENE_HARD_MAX_H (72 h). The day-skip below
+    // (`ds.length < 6`) makes that worse by deferring a late-in-the-day soak a further ~24 h.
+    // Costs a few cents on the rare occasion it fires; hygiene is not a thing to optimise for price.
+    if (sanitizeUrgent && draft.length) {
+      const first = draft[0];
+      first.target = opts.sanitizeF;
+      first.sani = true;
+      first.reason = `OVERDUE sanitize to ${opts.sanitizeF}°F = 60°C (I8 window lapsed — earliest hour, not the warmest)`;
+    }
     for (const [, ds] of byDay) {
       if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
       if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
