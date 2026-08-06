@@ -45,4 +45,46 @@ const forecast: ForecastHour[] = Array.from({ length: 24 }, (_, h) => ({
   assert.equal(differing, 1, "exactly one hour (the soak) should differ between due and not-due");
 }
 
+// The as-found baseline curve as recorded in prod (hbx_config_versions seed): output 145–165°F,
+// so the everyday ceiling is governed by strictCap — what the plan sees once index.ts substitutes
+// the baseline for an autopilot-written live curve (#58 / curveOverridden).
+const asFoundCfg = { dot: 5, wwsd: 125, dbt: 165, mbt: 145 };
+
+// 4. bankF=0 (the default): no bank, and no phantom "pre-charge" labels — with idleF == dhwFloorF
+//    the pre-charge raises nothing, so the plan must not claim a decision it isn't making (#58).
+{
+  const plan = computeShadowPlan(forecast, asFoundCfg, DEFAULT_OPTS, null, false);
+  assert.equal(plan.some((b) => /bank|pre-charge/i.test(b.reason)), false, "bankF=0 plan has no bank/pre-charge labels");
+  assert.ok(plan.every((b) => b.tank_target_f === DEFAULT_OPTS.dhwFloorF), "bankF=0 plan sits on the DHW floor everywhere");
+}
+
+// 5. bankF=8, not a soak day → exactly one block at floor+8 = 128, at the warmest hour, with the
+//    HP line leading it by the I1 margin; every other block stays on the floor.
+{
+  const opts = { ...DEFAULT_OPTS, bankF: 8 };
+  const plan = computeShadowPlan(forecast, asFoundCfg, opts, null, false);
+  const banked = plan.filter((b) => /bank/i.test(b.reason));
+  assert.equal(banked.length, 1, "bankF=8 non-soak day has exactly one banked block");
+  assert.equal(banked[0].tank_target_f, opts.dhwFloorF + 8, "banked block sits at floor + bankF");
+  assert.equal(banked[0].ts, plan[23].ts, "bank lands on the warmest hour");
+  assert.ok(banked[0].hp1_setpoint_f >= banked[0].tank_target_f + opts.i1MarginF,
+    "banked block's hp1 setpoint must lead the target by the I1 margin");
+  assert.ok(plan.filter((b) => b !== banked[0]).every((b) => b.tank_target_f === opts.dhwFloorF),
+    "all non-banked blocks stay on the floor");
+}
+
+// 6. Soak day: the 140°F sanitize IS the bank — no separate bank block appears.
+{
+  const plan = computeShadowPlan(forecast, asFoundCfg, { ...DEFAULT_OPTS, bankF: 8 }, null, true);
+  assert.equal(plan.filter((b) => /bank/i.test(b.reason)).length, 0, "soak day skips the bank");
+  assert.equal(plan.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 1, "soak still present");
+}
+
+// 7. The bank can never exceed the everyday strictCap, no matter how large bankF is set.
+{
+  const plan = computeShadowPlan(forecast, asFoundCfg, { ...DEFAULT_OPTS, bankF: 99 }, null, false);
+  assert.equal(Math.max(...plan.map((b) => b.tank_target_f)), DEFAULT_OPTS.strictCapF,
+    "oversized bankF clamps to strictCap");
+}
+
 console.log("shadow.test.ts: all assertions passed ✓");

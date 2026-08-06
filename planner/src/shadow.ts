@@ -2,8 +2,9 @@
  * @purpose A-5 shadow planner (summer v1) — computes what the day plan WOULD command,
  * hour by hour for the next 24 h: tank target + HP1 setpoint + a human-readable reason
  * per block. SHADOW ONLY: results go to the shadow_plans table and the dashboard, never
- * to a device. Summer logic = DHW floor windows + pre-charge in the warmest lead hour
- * (flat electricity rate → COP timing is the only timing lever, plan §6.2). Hours whose
+ * to a device. Summer logic = DHW-ready floor + one optional afternoon bank in the day's
+ * warmest hour (flat electricity rate → COP timing is the only timing lever, plan §6.2, #58).
+ * Hours whose
  * forecast drops below WINTER_GUARD_F fall back to mimicking the HBX reset curve, so
  * plan-vs-actual stays meaningful into the season the winter solver isn't built for yet.
  */
@@ -40,6 +41,7 @@ export interface ShadowOpts {
   sanitizeF: number; // I8: daily thermal-hygiene excursion target (140 °F = 60 °C pasteurization)
   strictCapF: number; // I4: everyday hard ceiling until Phase B actively manages HP setpoints
   sanitizeCapF: number; // I8: the daily sanitize excursion may exceed strictCapF up to here (I1 still guards)
+  bankF: number; // #58: one block/day at the warmest hour raised to dhwFloorF + bankF (0 = off; env BANK_F)
 }
 
 export const DEFAULT_OPTS: ShadowOpts = {
@@ -60,6 +62,11 @@ export const DEFAULT_OPTS: ShadowOpts = {
   sanitizeF: 140,
   strictCapF: 135,
   sanitizeCapF: 145, // hard ceiling for the 140 °F soak (bypasses curve+3); < the 154 °F the hardware ran as-found
+  // #58 afternoon bank, OFF by default (wired to env BANK_F). Measured 2026-08-06 over 14 d:
+  // 28% of charge starts landed 00–06h at ~63 °F outdoor while afternoons peaked ~85 °F — one
+  // deliberate warm-hour charge carries the evening draws + overnight coast instead. Only ever
+  // ADDS heat above the DHW floor, so it can never make a shower colder.
+  bankF: 0,
 };
 
 /**
@@ -107,7 +114,7 @@ export function computeShadowPlan(
   const hours = forecast.slice(0, 24);
   const inWindow = (h: number) => opts.dhwWindows.some(([a, b]) => h >= a && h < b);
 
-  type Draft = { f: ForecastHour; localH: number; target: number; reason: string; sani?: boolean };
+  type Draft = { f: ForecastHour; localH: number; target: number; reason: string; sani?: boolean; bank?: boolean };
   const draft: Draft[] = hours.map((f) => {
     const localH = f.ts.getHours(); // TZ env makes this local time
     // Off-window still holds the DHW-ready floor — draws are unpredictable and happen year-round,
@@ -126,8 +133,13 @@ export function computeShadowPlan(
       .filter((d) => !inWindow(d.localH));
     if (!lead.length) continue;
     const warmest = lead.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
-    warmest.target = opts.dhwFloorF;
-    warmest.reason = `pre-charge for ${String(start).padStart(2, "0")}:00 window (warmest lead hour, ${warmest.f.outdoorF.toFixed(0)}°F)`;
+    // Only a real raise earns the label: since 337628a set idleF == dhwFloorF this assignment
+    // changed nothing, yet every plan still claimed "pre-charge (warmest lead hour)" (#58).
+    // Dormant until idleF drops below the floor again.
+    if (warmest.target < opts.dhwFloorF) {
+      warmest.target = opts.dhwFloorF;
+      warmest.reason = `pre-charge for ${String(start).padStart(2, "0")}:00 window (warmest lead hour, ${warmest.f.outdoorF.toFixed(0)}°F)`;
+    }
   }
 
   // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
@@ -136,13 +148,13 @@ export function computeShadowPlan(
   // passes true for the conservative daily soak (auto-sanitize OFF) or when a pasteurization is actually
   // due (auto-sanitize ON, demand-aware), and false to skip a redundant soak. checkI8 only alarms; it
   // never actuates — so the setpoint coordination is never bypassed.
+  const byDay = new Map<string, Draft[]>();
+  for (const d of draft) {
+    const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day)!.push(d);
+  }
   if (sanitizeDue) {
-    const byDay = new Map<string, Draft[]>();
-    for (const d of draft) {
-      const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
-      if (!byDay.has(day)) byDay.set(day, []);
-      byDay.get(day)!.push(d);
-    }
     for (const [, ds] of byDay) {
       if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
       if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
@@ -150,6 +162,24 @@ export function computeShadowPlan(
       warmest.target = opts.sanitizeF;
       warmest.sani = true;
       warmest.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, warmest hour)`;
+    }
+  }
+
+  // #58 afternoon bank: one block/day at the day's warmest hour raised to dhwFloorF + bankF
+  // (never above strictCapF). Buys the day's charge at the best outdoor COP and carries the
+  // evening draws + overnight coast, trimming the ~63°F small-hours refires. Soak days are
+  // skipped — the 140°F sanitize already banks far more than bankF. Phase B leads the pump
+  // setpoints off this block (max(operative, plan)), so the raise clears I1 like the soak does.
+  if (opts.bankF > 0) {
+    const bankTo = Math.min(opts.dhwFloorF + opts.bankF, opts.strictCapF);
+    for (const [, ds] of byDay) {
+      if (ds.length < 6) continue; // too little day left for a deliberate charge to pay back
+      if (ds.some((d) => d.sani || d.target >= opts.sanitizeF)) continue; // soak day IS the bank
+      const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
+      if (bankTo <= warmest.target) continue;
+      warmest.target = bankTo;
+      warmest.bank = true;
+      warmest.reason = `afternoon bank to ${bankTo}°F (warmest hour, ${warmest.f.outdoorF.toFixed(0)}°F outdoor)`;
     }
   }
 
@@ -176,7 +206,11 @@ export function computeShadowPlan(
     target = clamp(target, band.lo, band.hi);
     // Advisory HP line must cover the target (setpoints lead it up — Phase B does this live), so the
     // sanitize hour is allowed a higher HP cap; otherwise the plan would draw setpoint < target.
-    const hpCapF = d.sani ? opts.sanitizeCapF + opts.i1MarginF : opts.hpMaxF;
+    // Banked hours get the same treatment (hpMaxF is the reg-2027 nameplate line, which predates
+    // live Phase B): without it a 128°F bank would advertise a 131°F setpoint — an I1-violating hour.
+    const hpCapF = d.sani ? opts.sanitizeCapF + opts.i1MarginF
+      : d.bank ? opts.strictCapF + opts.i1MarginF
+      : opts.hpMaxF;
     const hp1 = clamp(target + opts.i1MarginF, opts.hpMinF, hpCapF);
     return {
       ts: d.f.ts.toISOString(),
