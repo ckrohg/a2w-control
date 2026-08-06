@@ -275,7 +275,31 @@ async def test_brief_offline_blip_logs_but_never_pages(rig, monkeypatch):
     await pump.tick()
     await poller.poll_once()
     await asyncio.sleep(0.01)
-    assert [(p["ch"], p["priority"]) for p in pushes] == [("ntfy", "low")]
+    assert [(p["ch"], p["priority"]) for p in pushes] == [("ntfy", "min")]
+
+
+async def test_client_recreation_does_not_fake_never_online(rig, monkeypatch):
+    """apply_gateway recreates the PumpClient with fresh stats (ok_polls=0). A dropout
+    after that must take the QUIET sustained/flap path, not the immediate bench-day
+    'never responded' page — latent hazard found 2026-08-06 auditing alert noise."""
+    from bridge.modbus_client import PumpClient
+
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    await poller.poll_once()
+    assert poller.online
+
+    # simulate a MAC-follow gateway reassignment: fresh client, zeroed stats
+    poller.client.close()
+    poller.client = PumpClient(poller.cfg.host, poller.cfg.port, poller.cfg.device_id,
+                               poller.app_cfg.modbus_timeout_s)
+
+    await pump.server.shutdown()
+    for _ in range(3):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert not poller.online
+    assert pushes == []  # quiet edge under the default 10-min gate — no instant page
 
 
 async def test_sustained_offline_pages_once_and_recovery_closes_by_email(rig, monkeypatch):
@@ -328,8 +352,8 @@ async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
     assert {p["ch"] for p in degrading} == {"ntfy", "email"}
     assert all(p["priority"] == "high" for p in degrading)
     assert len([p for p in degrading if p["ch"] == "ntfy"]) == 1  # window cleared: no re-spam
-    # the individual blips themselves never paged — only low recovery breadcrumbs
-    assert all(p["priority"] == "low" for p in pushes if "back online" in p["title"])
+    # the individual blips themselves never paged — only silent min recovery breadcrumbs
+    assert all(p["priority"] == "min" for p in pushes if "back online" in p["title"])
 
 
 async def test_write_enable_toggle_persists_and_composes_with_gateway_overrides(tmp_path):
