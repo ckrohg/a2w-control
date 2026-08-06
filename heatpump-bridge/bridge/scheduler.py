@@ -171,7 +171,10 @@ class Scheduler:
         tags = "warning" if title.startswith("⚠") else "white_check_mark"
         await notify.ntfy(self.notifications, title=title, message=message,
                           priority=priority, tags=tags)
-        await notify.email(self.notifications, subject=title, body=message, priority=priority)
+        # Pi-health crossings (hot CPU, full disk) are intervention-worthy; their
+        # recoveries come through at default priority and stay push-only.
+        if priority in ("high", "urgent"):
+            await notify.email(self.notifications, subject=title, body=message)
 
     async def _fire(self, poller: PumpPoller, action: str) -> None:
         """Execute a timer. Under unattended-write restriction (default), the scheduler

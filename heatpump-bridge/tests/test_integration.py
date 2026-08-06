@@ -93,30 +93,20 @@ async def test_p17_is_info_and_does_not_set_fault_state(rig):
     assert poller.snapshot["state"] != "fault"  # anti-freeze never alarms the chip
 
 
-async def test_warning_fault_pushes_email_eligible_alert(rig, monkeypatch):
-    """WARNING faults (degraded-but-heating: failed sensors, E21 display comm loss) must
-    page at 'high' priority so the Resend email channel fires too — an E21 once sat
-    unnoticed for two weeks. INFO (P17) keeps its never-page guarantee above."""
-    from bridge import notify
-
-    pushes: list[dict] = []
-
-    async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
-        pushes.append({"ch": "ntfy", "title": title, "priority": priority})
-
-    async def fake_email(cfg, *, subject, body, priority="default"):
-        pushes.append({"ch": "email", "title": subject, "priority": priority})
-
-    monkeypatch.setattr(notify, "ntfy", fake_ntfy)
-    monkeypatch.setattr(notify, "email", fake_email)
-
+async def test_warning_fault_pushes_and_emails(rig, monkeypatch):
+    """WARNING faults (degraded-but-heating: failed sensors, E21 display comm loss) page
+    AND email — equipment fault codes are the 'requires intervention' class, the one thing
+    the owner always wants in the inbox. An E21 once sat unnoticed for two weeks. INFO
+    (P17) keeps its never-page guarantee above."""
+    pushes = _capture_pushes(monkeypatch)
     pump, poller, store = rig
     await pump.inject_fault("E21", on=True)
     await poller.poll_once()
     await asyncio.sleep(0.01)  # let the fire-and-forget notify tasks run
 
     assert {p["ch"] for p in pushes} == {"ntfy", "email"}
-    assert all("E21" in p["title"] and p["priority"] == "high" for p in pushes)
+    assert all("E21" in p["title"] for p in pushes)
+    assert [p["priority"] for p in pushes if p["ch"] == "ntfy"] == ["high"]
 
 
 async def test_guarded_write_with_readback(rig):
@@ -235,18 +225,17 @@ async def test_offline_banner_splits_gateway_down_from_pump_silent(rig):
 
 
 def _capture_pushes(monkeypatch) -> list[dict]:
-    """Record every ntfy/email push the poller fires (channel + title + priority)."""
+    """Record every ntfy/email push the poller fires. notify.email has no gate of its
+    own — _push's explicit email flag decides — so an "email" entry here means an email
+    would actually deliver."""
     from bridge import notify
     pushes: list[dict] = []
 
     async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
         pushes.append({"ch": "ntfy", "title": title, "priority": priority})
 
-    async def fake_email(cfg, *, subject, body, priority="default"):
-        # mirror notify.email's own priority gate (unit-tested in test_notify) so an
-        # "email" entry here means an email would actually DELIVER
-        if priority in ("high", "urgent", "max"):
-            pushes.append({"ch": "email", "title": subject, "priority": priority})
+    async def fake_email(cfg, *, subject, body):
+        pushes.append({"ch": "email", "title": subject})
 
     monkeypatch.setattr(notify, "ntfy", fake_ntfy)
     monkeypatch.setattr(notify, "email", fake_email)
@@ -302,9 +291,10 @@ async def test_client_recreation_does_not_fake_never_online(rig, monkeypatch):
     assert pushes == []  # quiet edge under the default 10-min gate — no instant page
 
 
-async def test_sustained_offline_pages_once_and_recovery_closes_by_email(rig, monkeypatch):
-    """Past the sustained threshold the outage pages ntfy+email exactly once, and the
-    recovery closes the loop at the same (email-eligible) priority with the duration."""
+async def test_sustained_offline_pages_ntfy_only(rig, monkeypatch):
+    """Past the sustained threshold the outage pages ntfy exactly once — but does NOT
+    email (owner policy: email only for equipment errors and PROLONGED outages). The
+    recovery closes at high ntfy, also without email."""
     pushes = _capture_pushes(monkeypatch)
     pump, poller, store = rig
     poller.app_cfg.notifications.offline_alert_min = 0  # "sustained" immediately, for the test
@@ -315,9 +305,33 @@ async def test_sustained_offline_pages_once_and_recovery_closes_by_email(rig, mo
         await poller.poll_once()  # edge at 3; sustained push fires once, never repeats
     await asyncio.sleep(0.01)
     offline = [p for p in pushes if "offline" in p["title"]]
-    assert {p["ch"] for p in offline} == {"ntfy", "email"}
-    assert all(p["priority"] == "high" for p in offline)
-    assert len([p for p in offline if p["ch"] == "ntfy"]) == 1
+    assert {p["ch"] for p in offline} == {"ntfy"}
+    assert len(offline) == 1 and offline[0]["priority"] == "high"
+
+    await pump.start()
+    await pump.tick()
+    await poller.poll_once()
+    await asyncio.sleep(0.01)
+    recovery = [p for p in pushes if "back online" in p["title"]]
+    assert {p["ch"] for p in recovery} == {"ntfy"}
+    assert recovery[0]["priority"] == "high"
+
+
+async def test_prolonged_offline_emails_and_recovery_closes_by_email(rig, monkeypatch):
+    """The email tier: an outage persisting past offline_email_min sends the 'prolonged
+    outage' email once, and the recovery then closes the loop by email too."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    poller.app_cfg.notifications.offline_alert_min = 0
+    poller.app_cfg.notifications.offline_email_min = 0  # prolonged immediately, for the test
+    await poller.poll_once()
+
+    await pump.server.shutdown()
+    for _ in range(5):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    emails = [p for p in pushes if p["ch"] == "email"]
+    assert len(emails) == 1 and "prolonged outage" in emails[0]["title"]
 
     await pump.start()
     await pump.tick()
@@ -325,7 +339,6 @@ async def test_sustained_offline_pages_once_and_recovery_closes_by_email(rig, mo
     await asyncio.sleep(0.01)
     recovery = [p for p in pushes if "back online" in p["title"]]
     assert {p["ch"] for p in recovery} == {"ntfy", "email"}
-    assert all(p["priority"] == "high" for p in recovery)
 
 
 async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
@@ -349,9 +362,8 @@ async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
     await asyncio.sleep(0.01)
 
     degrading = [p for p in pushes if "link degrading" in p["title"]]
-    assert {p["ch"] for p in degrading} == {"ntfy", "email"}
-    assert all(p["priority"] == "high" for p in degrading)
-    assert len([p for p in degrading if p["ch"] == "ntfy"]) == 1  # window cleared: no re-spam
+    assert {p["ch"] for p in degrading} == {"ntfy"}  # pages the phone; not inbox-worthy
+    assert len(degrading) == 1 and degrading[0]["priority"] == "high"  # window cleared: no re-spam
     # the individual blips themselves never paged — only silent min recovery breadcrumbs
     assert all(p["priority"] == "min" for p in pushes if "back online" in p["title"])
 

@@ -11,9 +11,10 @@ import urllib.request
 
 log = logging.getLogger(__name__)
 
-# Email fires only for serious alerts (a second, sticky channel); recoveries/info stay
-# push-only so the inbox isn't noisy. ntfy still gets everything.
-_EMAIL_PRIORITIES = {"high", "urgent", "max"}
+# Email is the INTERVENTION channel (owner policy 2026-08-06): equipment errors that need
+# a human, and prolonged outages — decided explicitly at each call site, NOT inferred from
+# ntfy priority (priority tunes phone loudness; it says nothing about inbox-worthiness).
+# ntfy still gets everything.
 
 
 async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
@@ -40,13 +41,11 @@ async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
     await asyncio.to_thread(_post)
 
 
-async def email(cfg, *, subject: str, body: str, priority: str = "default") -> None:
-    """Fire-and-forget email alert via Resend. No-op unless configured AND the alert is
-    serious (high/urgent) — email is the sticky second channel for things that need
-    attention, not every recovery. Subject/body are JSON (UTF-8), so emoji are fine here."""
+async def email(cfg, *, subject: str, body: str) -> None:
+    """Fire-and-forget email alert via Resend. No-op unless configured. The CALLER decides
+    what deserves email — this sends whenever invoked. Subject/body are JSON (UTF-8), so
+    emoji are fine here."""
     if not cfg or not cfg.resend_api_key or not cfg.resend_to:
-        return
-    if priority not in _EMAIL_PRIORITIES:
         return
     payload = json.dumps({
         "from": cfg.resend_from,

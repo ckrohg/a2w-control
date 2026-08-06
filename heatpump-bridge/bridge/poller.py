@@ -91,6 +91,7 @@ class PumpPoller:
         # flapping (flap_alert_count edges inside flap_window_min). _offline_push_sent also
         # decides whether the recovery closes the loop by email or stays a quiet ntfy ping.
         self._offline_push_sent = False
+        self._offline_email_sent = False
         self._offline_since: float | None = None
         self._offline_edges: deque[float] = deque()
         # True once ANY poll has succeeded this process. Poller-level on purpose — the
@@ -203,12 +204,13 @@ class PumpPoller:
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
             if self._offline_push_sent and self._offline_since is not None:
-                # This outage was paged (sustained/never-online) — close the loop on the
-                # same channels, email included, with the outage duration.
+                # This outage was paged — close the loop with the duration. Email the
+                # close-out only if the outage itself reached the email (prolonged) tier.
                 mins = max(1, int((time.monotonic() - self._offline_since) / 60))
                 self._push(title=f"✓ {self.cfg.name} back online",
                            message=f"Communication restored after ~{mins} min offline.",
-                           priority="high", tags="white_check_mark")
+                           priority="high", tags="white_check_mark",
+                           email=self._offline_email_sent)
             else:
                 # Brief blip: "min"-priority breadcrumb — lands in the ntfy app's list with
                 # no banner/sound/email (owner: blips are FYI at most, never a notification).
@@ -217,6 +219,7 @@ class PumpPoller:
         self._ever_online = True
         self._offline_alerted = False
         self._offline_push_sent = False
+        self._offline_email_sent = False
         self._offline_since = None
         await self.store.add_sample(self.cfg.id, decoded | {"status_word": regs.get(R.REG_STATUS, 0)})
         await self._maybe_comm_row()
@@ -336,11 +339,15 @@ class PumpPoller:
                 self.cfg.id, "comm", code="offline", severity="high",
                 message=message, detail={"category": exc.category})
             if never_online:
-                # Bench-day miswire: nothing to flap against, page immediately.
+                # Bench-day miswire: nothing to flap against, page immediately — a pump
+                # that has never answered is a provisioning failure needing a human.
+                # Counts as the email tier so recovery closes the loop by email too.
                 self._offline_push_sent = True
+                self._offline_email_sent = True
                 self._push(title=f"⚠ {self.cfg.name} offline",
                            message=f"No response for {failures} polls ({exc.category}). "
-                                   f"Check the gateway / WiFi.", priority="high", tags="warning")
+                                   f"Check the gateway / WiFi.", priority="high", tags="warning",
+                           email=True)
             else:
                 self._note_offline_edge(exc.category)
         else:
@@ -348,8 +355,8 @@ class PumpPoller:
             if failures >= threshold:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
-        # Sustained outage: the edge was logged quietly; page once the silence has lasted
-        # long enough to be a real outage rather than a WiFi blip.
+        # Sustained outage: the edge was logged quietly; PAGE (ntfy only) once the silence
+        # outlasts a WiFi blip. Email waits for the prolonged tier below.
         ncfg = self.app_cfg.notifications
         if (self._offline_alerted and not self._offline_push_sent
                 and self._offline_since is not None
@@ -360,6 +367,16 @@ class PumpPoller:
                        message=f"No response for {mins} minutes ({exc.category}). "
                                f"Check the gateway / WiFi / pump comm board.",
                        priority="high", tags="warning")
+        # Prolonged outage: the "requires intervention" tier — this one emails.
+        if (self._offline_alerted and not self._offline_email_sent
+                and self._offline_since is not None
+                and time.monotonic() - self._offline_since >= ncfg.offline_email_min * 60):
+            self._offline_email_sent = True
+            hrs = (time.monotonic() - self._offline_since) / 3600
+            self._push(title=f"⚠ {self.cfg.name} offline {hrs:.1f} h — prolonged outage",
+                       message=f"Still no response after {hrs:.1f} hours ({exc.category}). "
+                               f"This needs a look: gateway power/WiFi, or the pump's comm board.",
+                       priority="high", tags="rotating_light", email=True)
         if not self.snapshot.get("online"):
             link, detail = self._link_status()
             self.snapshot["link"] = link
@@ -515,14 +532,18 @@ class PumpPoller:
         return {"key": key, "code": fdef.code, "message": fdef.message,
                 "severity": fdef.severity, "since": since}
 
-    def _push(self, title: str, message: str, priority: str = "default", tags: str = "") -> None:
-        """Fire-and-forget alert; safe if unconfigured. Fans out to ntfy (all alerts) and,
-        for serious ones, Resend email — each no-ops when not configured."""
+    def _push(self, title: str, message: str, priority: str = "default", tags: str = "",
+              email: bool = False) -> None:
+        """Fire-and-forget alert; safe if unconfigured. ntfy always; email only when the
+        call site says so — email is the intervention channel (owner policy 2026-08-06:
+        equipment errors needing a human + prolonged outages), independent of ntfy
+        priority, which only tunes phone loudness."""
         asyncio.create_task(notify.ntfy(
             self.app_cfg.notifications, title=title, message=message,
             priority=priority, tags=tags))
-        asyncio.create_task(notify.email(
-            self.app_cfg.notifications, subject=title, body=message, priority=priority))
+        if email:
+            asyncio.create_task(notify.email(
+                self.app_cfg.notifications, subject=title, body=message))
 
     async def _update_faults(self, current: dict[str, FaultDef]) -> None:
         """Edge detection: log fault_on for new bits, fault_off for cleared bits."""
@@ -536,14 +557,15 @@ class PumpPoller:
                 # push every real fault, not only high/critical: WARNING covers the
                 # degraded-but-heating states (failed sensors, E21 display comm loss) that
                 # otherwise sit unnoticed for weeks — an E21 lived 2 weeks before the owner
-                # spotted it on the dashboard. "high" priority so the Resend email channel
-                # fires too. P17 anti-freeze (info) must still never page.
+                # spotted it on the dashboard. Equipment fault codes are exactly the
+                # "requires intervention" class, so they email. P17 (info) never pages.
                 if fdef.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING):
                     self._push(
                         title=f"⚠ {self.cfg.name}: {fdef.code}",
                         message=fdef.message,
                         priority="urgent" if fdef.severity == Severity.CRITICAL else "high",
-                        tags="rotating_light" if fdef.severity == Severity.CRITICAL else "warning")
+                        tags="rotating_light" if fdef.severity == Severity.CRITICAL else "warning",
+                        email=True)
         for key in list(self.active_faults):
             if key not in current:
                 gone = self.active_faults.pop(key)

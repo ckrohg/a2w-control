@@ -64,7 +64,7 @@ async def test_resend_email_high_priority_sends_correct_request(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     cfg = NotifyConfig(resend_api_key="re_test", resend_to="me@example.com")
-    await notify.email(cfg, subject="⚠ Pump 1 offline", body="down", priority="high")
+    await notify.email(cfg, subject="⚠ Pump 1 offline", body="down")
 
     assert captured["url"] == "https://api.resend.com/emails"
     assert captured["auth"] == "Bearer re_test"
@@ -76,7 +76,10 @@ async def test_resend_email_high_priority_sends_correct_request(monkeypatch):
     assert captured["body"]["from"] == "A2W Alerts <onboarding@resend.dev>"
 
 
-async def test_resend_email_skips_low_priority_and_unconfigured(monkeypatch):
+async def test_resend_email_skips_unconfigured(monkeypatch):
+    """email() sends whenever invoked — the intervention-tier decision lives at the call
+    sites (poller._push email flag, scheduler priority check) — but it must still no-op
+    without credentials."""
     calls = 0
 
     def fake_urlopen(req, timeout=10):
@@ -85,7 +88,5 @@ async def test_resend_email_skips_low_priority_and_unconfigured(monkeypatch):
         return _FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    cfg = NotifyConfig(resend_api_key="re_test", resend_to="me@example.com")
-    await notify.email(cfg, subject="back online", body="ok", priority="low")   # recovery
-    await notify.email(NotifyConfig(), subject="x", body="y", priority="high")  # unconfigured
+    await notify.email(NotifyConfig(), subject="x", body="y")  # unconfigured
     assert calls == 0

@@ -78,11 +78,14 @@ notifications:
   #    Resend only delivers to the account owner's address — set resend_to to that.
   # resend_api_key: "re_..."
   # resend_to: "you@example.com"
-  # 4. Comm-loss alert shaping: brief dropouts land in the dashboard/event log only. A page
-  #    (ntfy + email) fires after offline_alert_min of CONTINUOUS silence, or when
-  #    flap_alert_count dropouts occur within flap_window_min (link degrading). A pump that
-  #    has never been online still pages immediately (bench-day miswire). Defaults shown.
+  # 4. Comm-loss alert shaping: brief dropouts land in the dashboard/event log only.
+  #    An ntfy PAGE fires after offline_alert_min of CONTINUOUS silence, or when
+  #    flap_alert_count dropouts occur within flap_window_min (link degrading).
+  #    EMAIL is the intervention tier only: equipment fault codes, a never-online pump
+  #    (bench-day miswire, immediate), and outages persisting past offline_email_min.
+  #    Defaults shown.
   # offline_alert_min: 10
+  # offline_email_min: 60
   # flap_alert_count: 3
   # flap_window_min: 60
   # 3. Optional email (Resend) — a sticky second channel for SERIOUS alerts (high/urgent only).
