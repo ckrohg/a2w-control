@@ -58,6 +58,13 @@ const POLL_SECONDS = Number(env("POLL_SECONDS", "300"));
 const PORT = Number(process.env.PORT ?? 8080);
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
+// Email second channel (Resend) for the SERIOUS planner alerts — freeze risk, DHW
+// shortfall, backup element, I1, unserved calls all page at "high" and now also email,
+// mirroring the bridge/hub contract (clears and notices stay push-only).
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const RESEND_TO = process.env.RESEND_TO ?? "";
+const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
+const EMAIL_PRIORITIES = new Set(["high", "urgent", "max"]);
 const OFFLINE_AFTER_FAILURES = 5;
 
 const HUB_URL = process.env.HUB_URL;
@@ -196,16 +203,36 @@ let stormSynthetic: SyntheticTrigger[] = [];
 let lastStormPollAt: string | null = null;
 
 async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
-  if (!NTFY_TOPIC) return;
-  try {
-    await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
-      method: "POST",
-      headers: { Title: title, Priority: priority, Tags: "hbx" },
-      body,
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch (e) {
-    console.error("ntfy send failed:", (e as Error).message);
+  if (NTFY_TOPIC) {
+    try {
+      await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
+        method: "POST",
+        headers: { Title: title, Priority: priority, Tags: "hbx" },
+        body,
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (e) {
+      console.error("ntfy send failed:", (e as Error).message);
+    }
+  }
+  if (EMAIL_PRIORITIES.has(priority) && RESEND_API_KEY && RESEND_TO) {
+    try {
+      const r = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+          // Cloudflare fronts Resend and 403s blocklisted/bare client signatures (the
+          // bridge's urllib silently failed for weeks on this, 2026-08-06) — honest UA.
+          "User-Agent": "a2w-planner/1.0",
+        },
+        body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject: title, text: body }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) console.error("resend email failed:", r.status);
+    } catch (e) {
+      console.error("resend email failed:", (e as Error).message);
+    }
   }
 }
 

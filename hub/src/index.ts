@@ -107,7 +107,10 @@ async function notifyEmail(subject: string, body: string): Promise<void> {
   try {
     await fetch(RESEND_API_URL, {
       method: "POST",
-      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      // Explicit UA: Cloudflare fronts Resend and 403s blocklisted/bare client signatures
+      // (the bridge's urllib failed silently for weeks on this — 2026-08-06 lesson).
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json",
+                 "User-Agent": "a2w-hub/1.0" },
       body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body }),
     });
   } catch (err) {
