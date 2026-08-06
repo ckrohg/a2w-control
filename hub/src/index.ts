@@ -94,28 +94,34 @@ function describeFetchError(err: unknown): string {
   return `${e.message} — cause: ${one(cause)}`;
 }
 
-/** Fire-and-forget ntfy push. No-op when NTFY_TOPIC is unset; never throws. */
+/** Fire-and-forget ntfy push. No-op when NTFY_TOPIC is unset; never throws.
+ *  Retries over ~15s: #66 diagnosis showed Railway→ntfy.sh connectivity is INTERMITTENT —
+ *  connect-level AggregateError on one boot, HTTP 200 minutes later — and dead-man pushes
+ *  are rare and load-bearing, so a transient no-route must not eat one. A non-2xx HTTP
+ *  response is NOT retried (the server answered; hammering a 429 makes it worse). */
 async function notifyNtfy(title: string, message: string,
                           opts: { priority?: string; tags?: string } = {}): Promise<void> {
   if (!NTFY_TOPIC) return;
-  try {
-    // HTTP headers are ByteStrings (Latin-1) — strip anything above U+00FF so a stray emoji in
-    // a title can never throw and silently kill the alert. Emoji belong in `tags`, which ntfy
-    // renders (e.g. warning -> ⚠️); the message body (below) is UTF-8 and takes emoji fine.
-    const headers: Record<string, string> = { Title: title.replace(/[^\x00-\xFF]/g, "").trim() };
-    if (opts.priority) headers.Priority = opts.priority;
-    if (opts.tags) headers.Tags = opts.tags;
-    const res = await fetch(`${NTFY_SERVER.replace(/\/+$/, "")}/${NTFY_TOPIC}`, {
-      method: "POST", headers, body: message, signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) console.warn(`[hub] ntfy push rejected: HTTP ${res.status}`);
-  } catch (err) {
-    // undici wraps the real network error (ETIMEDOUT/ENETUNREACH/DNS/TLS) in .cause and
-    // reports only "fetch failed" — the 2026-08-06 dead-man drill lost its diagnosis to
-    // exactly that (kanban #66). Round 1 revealed an AggregateError (happy-eyeballs: ALL
-    // address families failed to connect), whose String() hides the per-attempt errors —
-    // unpack them: each carries code + address:port, the actual verdict.
-    console.warn(`[hub] ntfy push failed: ${describeFetchError(err)} (node ${process.version})`);
+  // HTTP headers are ByteStrings (Latin-1) — strip anything above U+00FF so a stray emoji in
+  // a title can never throw and silently kill the alert. Emoji belong in `tags`, which ntfy
+  // renders (e.g. warning -> ⚠️); the message body (below) is UTF-8 and takes emoji fine.
+  const headers: Record<string, string> = { Title: title.replace(/[^\x00-\xFF]/g, "").trim() };
+  if (opts.priority) headers.Priority = opts.priority;
+  if (opts.tags) headers.Tags = opts.tags;
+  const delays = [0, 3_000, 12_000];
+  for (let attempt = 1; attempt <= delays.length; attempt++) {
+    if (delays[attempt - 1]) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
+    try {
+      const res = await fetch(`${NTFY_SERVER.replace(/\/+$/, "")}/${NTFY_TOPIC}`, {
+        method: "POST", headers, body: message, signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) console.warn(`[hub] ntfy push rejected: HTTP ${res.status}`);
+      else if (attempt > 1) console.log(`[hub] ntfy push delivered on attempt ${attempt}`);
+      return;
+    } catch (err) {
+      console.warn(`[hub] ntfy push attempt ${attempt}/${delays.length} failed: `
+        + `${describeFetchError(err)} (node ${process.version})`);
+    }
   }
 }
 
