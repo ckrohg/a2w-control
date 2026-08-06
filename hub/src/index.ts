@@ -81,6 +81,19 @@ function extractBearer(headerValue: string | undefined): string {
   return m ? m[1].trim() : "";
 }
 
+/** Flatten a fetch error to its real network story: unwrap undici's .cause and expand
+ *  AggregateError (happy-eyeballs) into per-attempt `CODE addr:port` entries. */
+function describeFetchError(err: unknown): string {
+  const e = err as Error & { cause?: unknown };
+  const cause = e.cause as (Error & { code?: string; address?: string; port?: number;
+                                      errors?: Array<Error & { code?: string; address?: string; port?: number }> }) | undefined;
+  if (!cause) return e.message;
+  const one = (c: { code?: string; message?: string; address?: string; port?: number }) =>
+    `${c.code ?? c.message}${c.address ? ` ${c.address}:${c.port ?? ""}` : ""}`;
+  if (cause.errors?.length) return `${e.message} — attempts: ${cause.errors.map(one).join("; ")}`;
+  return `${e.message} — cause: ${one(cause)}`;
+}
+
 /** Fire-and-forget ntfy push. No-op when NTFY_TOPIC is unset; never throws. */
 async function notifyNtfy(title: string, message: string,
                           opts: { priority?: string; tags?: string } = {}): Promise<void> {
@@ -99,10 +112,10 @@ async function notifyNtfy(title: string, message: string,
   } catch (err) {
     // undici wraps the real network error (ETIMEDOUT/ENETUNREACH/DNS/TLS) in .cause and
     // reports only "fetch failed" — the 2026-08-06 dead-man drill lost its diagnosis to
-    // exactly that (kanban #66). Surface cause + node version.
-    const e = err as Error & { cause?: unknown };
-    console.warn(`[hub] ntfy push failed: ${e.message}`
-      + (e.cause ? ` — cause: ${String(e.cause)}` : "") + ` (node ${process.version})`);
+    // exactly that (kanban #66). Round 1 revealed an AggregateError (happy-eyeballs: ALL
+    // address families failed to connect), whose String() hides the per-attempt errors —
+    // unpack them: each carries code + address:port, the actual verdict.
+    console.warn(`[hub] ntfy push failed: ${describeFetchError(err)} (node ${process.version})`);
   }
 }
 
@@ -392,6 +405,19 @@ const server = app.listen(PORT, () => {
   // after each deploy is the channel's health record; a failure logs its cause above.
   void notifyNtfy("A2W hub online", `hub started (node ${process.version}) — ntfy self-test`,
                   { priority: "min", tags: "white_check_mark" });
+  // Comparative boot probe (#66): ntfy.sh unreachable while api.resend.com works from the
+  // same container = host-specific blockage (e.g. ntfy.sh banning the shared egress IP),
+  // not a Railway egress problem. GETs, no auth, logged either way.
+  for (const url of ["https://ntfy.sh/v1/health", "https://api.resend.com"]) {
+    void (async () => {
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+        console.log(`[hub] boot probe ${url} -> HTTP ${r.status}`);
+      } catch (err) {
+        console.warn(`[hub] boot probe ${url} FAILED: ${describeFetchError(err)}`);
+      }
+    })();
+  }
 });
 
 if (!NTFY_TOPIC) {
