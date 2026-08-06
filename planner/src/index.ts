@@ -34,7 +34,7 @@ import {
 import { DemandFeed } from "./demand";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows } from "./dhw";
-import { HbxWriter, WriteError } from "./writes";
+import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -95,6 +95,11 @@ const PHASE_B_DRY_RUN = process.env.PHASE_B_DRY_RUN === "1";
 // twin of Phase B). Off by default; DRY_RUN=1 logs what it would set without writing.
 const AUTOPILOT_ENABLED = process.env.AUTOPILOT_ENABLED === "1";
 const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
+
+// #58 afternoon bank: one block/day at the day's warmest hour raised to dhwFloor + BANK_F,
+// so the day's charge is bought at the best outdoor COP. 0 (default) = off — plans identical
+// to before. Only ever ADDS heat above the DHW floor; clamped to a sane 0–15 °F.
+const BANK_F = Math.min(Math.max(Number(process.env.BANK_F ?? "0") || 0, 0), 15);
 
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
 // OFF by default — deploying this changes NOTHING until AUTO_SANITIZE_ENABLED=1.
@@ -635,7 +640,13 @@ async function stormTick(): Promise<void> {
 
 async function shadowOnce(): Promise<void> {
   const forecast = await fetchForecast(LAT, LON);
-  const cfg = await store.latestConfig();
+  // #58: when the operative curve is one the autopilot wrote (near-flat band on the last
+  // commanded target), the plan's ceiling, winter curve-mimic, and storm ceiling must all
+  // reference the AS-FOUND baseline curve — judging any of them against our own write is
+  // self-referential (see curveOverridden in writes.ts).
+  const cfgLive = await store.latestConfig();
+  const baseline = await store.baselineConfig().catch(() => null);
+  const cfg = curveOverridden(cfgLive, baseline) ? baseline : cfgLive;
 
   // learned DHW windows once ≥5 days of tank history exist; fixed defaults until then
   let learned = null;
@@ -644,7 +655,7 @@ async function shadowOnce(): Promise<void> {
   } catch (e) {
     console.warn("dhw learner failed, using default windows:", (e as Error).message);
   }
-  const opts = learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows } : DEFAULT_OPTS;
+  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows } : DEFAULT_OPTS), bankF: BANK_F };
 
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
   let demandFloor: DemandFloor | null = null;
@@ -715,6 +726,7 @@ async function shadowOnce(): Promise<void> {
     windows_learned: !!learned,
     learn_days: learned?.days ?? 0,
     draw_events: learned?.drawEvents ?? 0,
+    bank_f: BANK_F,
   });
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);

@@ -32,6 +32,21 @@ export class WriteError extends Error {
   }
 }
 
+/**
+ * True when the live curve endpoints differ from the as-found baseline — i.e. the operative
+ * curve is one WE wrote (autopilot/boost near-flat band), not the human's. The I4 comfort
+ * ceiling (curve+3, "never hotter than the regime the hardware already tolerated") must then
+ * reference the BASELINE curve: judged against our own near-flat curve the ceiling becomes
+ * self-referential — "last commanded +3", a ratchet that 422s any real raise (the #58 bank,
+ * a winter demand floor) even though the as-found regime ran far hotter (#58).
+ */
+export function curveOverridden(
+  cfg: Record<string, any> | null,
+  baseline: Record<string, any> | null,
+): boolean {
+  return cfg != null && baseline != null && (cfg.dbt !== baseline.dbt || cfg.mbt !== baseline.mbt);
+}
+
 export class HbxWriter {
   private lastWriteAt = 0;
 
@@ -60,9 +75,8 @@ export class HbxWriter {
       this.store.baselineConfig(),
     ]);
     const outdoor = latest?.outdoorF ?? null;
-    const band = outdoor != null ? bandFor(outdoor, cfg, DEFAULT_OPTS.strictCapF) : null;
-    const overridden = cfg != null && baseline != null &&
-      (cfg.dbt !== baseline.dbt || cfg.mbt !== baseline.mbt);
+    const overridden = curveOverridden(cfg, baseline);
+    const band = outdoor != null ? bandFor(outdoor, overridden ? baseline : cfg, DEFAULT_OPTS.strictCapF) : null;
     // Commanded target = midpoint of the current curve band we wrote; operative = temp1.target
     // the device is actually driving to. They differ during the adoption lag (until the next
     // reheat cycle) — surface both so the UI shows "commanded X, adopts next cycle" rather than
@@ -110,10 +124,15 @@ export class HbxWriter {
       await reject(503, "no fresh SensorLinx reading — cannot evaluate the outdoor-indexed envelope");
     }
     const cfg = await this.store.latestConfig();
+    const baseline = await this.store.baselineConfig();
+    // The I4 ceiling references the AS-FOUND curve when the live one is ours (curveOverridden
+    // above) — the live cfg still supplies dot/wwsd for the write solve below (we never change
+    // those endpoints, only dbt/mbt).
+    const envelopeCfg = curveOverridden(cfg, baseline) ? baseline : cfg;
     // A cap above the everyday strictCap marks a sanitize excursion, which is allowed above the
     // curve+3 comfort ceiling (bounded by capF); I1 below still requires setpoints to cover it.
     const sanitize = capF > DEFAULT_OPTS.strictCapF;
-    const band = bandFor(latest!.outdoorF as number, cfg, capF, sanitize);
+    const band = bandFor(latest!.outdoorF as number, envelopeCfg, capF, sanitize);
     if (targetF < band.lo || targetF > band.hi) {
       await reject(422, `target ${targetF}°F outside the I4 envelope [${Math.round(band.lo)}–${Math.round(band.hi)}]°F at ${latest!.outdoorF}°F outdoor`);
     }
