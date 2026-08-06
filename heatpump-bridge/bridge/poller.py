@@ -93,6 +93,10 @@ class PumpPoller:
         self._offline_push_sent = False
         self._offline_since: float | None = None
         self._offline_edges: deque[float] = deque()
+        # True once ANY poll has succeeded this process. Poller-level on purpose — the
+        # client (and its stats) is recreated on gateway reassignment, so client.ok_polls
+        # can read 0 mid-day and must not be used to detect the bench-day never-online case.
+        self._ever_online = False
         # rolling window of recent poll outcomes ("ok" | connect | timeout | io | exception
         # | decode) so the gateway-vs-pump diagnosis is stable on a FLAPPING link — a single
         # most-recent failure is noise when a gateway drops on/off WiFi (see _link_status).
@@ -191,10 +195,11 @@ class PumpPoller:
             "remote_lease_source": self._lease["source"] if self._lease else None,
             "comm": client.stats.as_dict(),
         }
-        # ok_polls here counts PRIOR successes (record_poll runs at the END of this method,
-        # so a decode crash above counts the poll as failed). Also close the loop for a pump
-        # that alerted offline without ever having been online (fresh boot, dead gateway).
-        if not was_online and (client.stats.ok_polls >= 1 or self._offline_alerted):
+        # _ever_online reflects PRIOR successes (it's set below, after this gate, mirroring
+        # the old ok_polls semantics: a decode crash above counts the poll as failed). Also
+        # close the loop for a pump that alerted offline without ever having been online
+        # (fresh boot, dead gateway).
+        if not was_online and (self._ever_online or self._offline_alerted):
             await self.store.add_event(self.cfg.id, "comm", code="online",
                                        message=f"{self.cfg.name} back online")
             if self._offline_push_sent and self._offline_since is not None:
@@ -205,9 +210,11 @@ class PumpPoller:
                            message=f"Communication restored after ~{mins} min offline.",
                            priority="high", tags="white_check_mark")
             else:
-                # Brief blip: quiet ntfy breadcrumb only, never email.
+                # Brief blip: "min"-priority breadcrumb — lands in the ntfy app's list with
+                # no banner/sound/email (owner: blips are FYI at most, never a notification).
                 self._push(title=f"✓ {self.cfg.name} back online",
-                           message="Communication restored.", priority="low", tags="white_check_mark")
+                           message="Communication restored.", priority="min", tags="white_check_mark")
+        self._ever_online = True
         self._offline_alerted = False
         self._offline_push_sent = False
         self._offline_since = None
@@ -315,7 +322,10 @@ class PumpPoller:
         if failures >= threshold and not self._offline_alerted:
             self._offline_alerted = True
             self._offline_since = time.monotonic()
-            never_online = self.client.stats.ok_polls == 0
+            # Poller-level flag, NOT client.stats.ok_polls: apply_gateway recreates the
+            # PumpClient (fresh stats), so a MAC-follow reassignment after a WiFi flap
+            # would make a routine mid-day dropout look "never online" and page instantly.
+            never_online = not self._ever_online
             self.snapshot = {**self.snapshot, "online": False, "state": "offline",
                              "comm": self.client.stats.as_dict()}
             message = (f"{self.cfg.name} has never responded ({exc.category}) — see the "
