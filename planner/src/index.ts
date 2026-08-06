@@ -319,8 +319,8 @@ const SANITIZE_DWELL_MIN = 30;
  *  enough that the hygiene window would lapse within a day — so we soak at the plan's warmest (cheapest)
  *  hour BEFORE it expires, and skip a redundant soak otherwise. Errors ⇒ true (fail safe). The soak runs
  *  on the plan→autopilot→Phase B path (setpoint-coordinated so it clears I1); checkI8 only alarms. */
-async function sanitizeDueNow(): Promise<boolean> {
-  if (!autoSanitizeLive) return true; // OFF = conservative daily soak
+async function sanitizeDueNow(): Promise<{ due: boolean; urgent: boolean }> {
+  if (!autoSanitizeLive) return { due: true, urgent: false }; // OFF = conservative daily soak
   try {
     const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
     const series = await store.getRecentSeries(intervalH);
@@ -328,10 +328,16 @@ async function sanitizeDueNow(): Promise<boolean> {
     const hoursSince = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : Infinity;
     // Soak ~a day before the window lapses; floor at 3h so the default 26h interval still soaks ~daily
     // (no behavior change), while a relaxed summer interval (e.g. 60h) skips days between soaks.
-    return hoursSince >= Math.max(intervalH - 24, 3);
+    const due = hoursSince >= Math.max(intervalH - 24, 3);
+    // URGENT = the window has actually lapsed, so the plan must stop shopping for the warmest hour
+    // (computeShadowPlan's deadline backstop). lastEnd === null means no qualifying dwell anywhere in
+    // the lookback — which includes "telemetry was down so we can't prove one happened". Treating that
+    // as urgent soaks redundantly at worst; the opposite error is the one that matters.
+    const urgent = lastEnd == null || hoursSince >= intervalH;
+    return { due, urgent };
   } catch (e) {
     console.error("sanitizeDue check failed — defaulting to soak:", (e as Error).message);
-    return true;
+    return { due: true, urgent: false };
   }
 }
 
@@ -341,12 +347,15 @@ async function sanitizeDueNow(): Promise<boolean> {
  *  (hygiene.ts) so they're unit-tested. Edge-alerted with a clear once satisfied. Trivially satisfied
  *  under as-found/current temps; load-bearing once the cool-tank optimized targets run. */
 let i8Alerted = false;
+let i8BlindAlerted = false; // separate edge for the "can't verify" page — see checkI8
 // Last checkI8 verdict, surfaced on /health so go-live is verifiable with one curl (is the actuator
 // armed? what interval is in force? was the last window pasteurized?) — not inferable from __version__.
 let i8LastIntervalH: number | null = null;
 let i8LastDwellMin: number | null = null;
 let i8LastSatisfied: boolean | null = null;
 let i8LastCheckedAt: string | null = null;
+let i8LastBlind: boolean | null = null;
+let i8LastGapMin: number | null = null;
 // Hours since the END of the last qualifying dwell — the number the dashboard shows. Computed here,
 // off the SAME series and thresholds as the verdict, so the card can never drift from the runtime
 // rule (it used to compute its own "hours since tank_f >= 131", a momentary touch, not a dwell).
@@ -364,7 +373,7 @@ async function checkI8(): Promise<void> {
   // Completeness gate scales with the window (≈ the original 200-of-26h ≈ 64%), so a sparse history
   // (planner just started / DB gap) never false-fires the alert or an auto-soak.
   const minReadings = Math.round((intervalH * 200) / 26);
-  const { dwellMin, satisfied, overdue } = hygieneVerdict(res, {
+  const { dwellMin, satisfied, overdue, blind, largestGapMin } = hygieneVerdict(res, {
     verifyF: SANITIZE_VERIFY_F,
     dwellMin: SANITIZE_DWELL_MIN,
     minReadings,
@@ -373,6 +382,8 @@ async function checkI8(): Promise<void> {
   i8LastDwellMin = Math.round(dwellMin);
   i8LastSatisfied = satisfied;
   i8LastCheckedAt = new Date().toISOString();
+  i8LastBlind = blind;
+  i8LastGapMin = Math.round(largestGapMin);
   const lastEnd = lastDwellEnd(res, SANITIZE_VERIFY_F, SANITIZE_DWELL_MIN);
   // null = no qualifying dwell anywhere in the window, which is exactly the `overdue` case below.
   i8HoursSinceDwell = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : null;
@@ -384,14 +395,34 @@ async function checkI8(): Promise<void> {
   // missed, page the owner.
   if (overdue && !i8Alerted) {
     i8Alerted = true;
+    const gapNote = largestGapMin >= 60
+      ? `\n\nNote: telemetry also went dark for ${(largestGapMin / 60).toFixed(1)}h inside this window — the missed soak is likely a consequence.`
+      : "";
     await ntfy(
       `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in ${intervalH}h`,
-      `The DHW coil's potable slug hasn't held a pasteurizing soak (needs ≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min; best in the window: ${Math.round(dwellMin)} min). Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card), or check why the planner's sanitize didn't run.`,
+      `The DHW coil's potable slug hasn't held a pasteurizing soak (needs ≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min; best in the window: ${Math.round(dwellMin)} min). Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card), or check why the planner's sanitize didn't run.${gapNote}`,
       "high",
     );
   } else if (satisfied && i8Alerted) {
     i8Alerted = false;
     await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`);
+  }
+
+  // BLIND: can't confirm a soak, and the window is too sparse to call it overdue. This state used to
+  // be SILENT — which meant an outage could mute the very alarm it had just caused to be needed. On
+  // 2026-07-31 a 17.75h gap left ~508 readings against a 462 threshold: the overdue page survived by
+  // ~10%, and three more hours of downtime would have bought silence instead. "Can't verify" is not
+  // "fine", so it gets its own page. Edge-triggered, and cleared once a real dwell is seen again.
+  if (blind && !i8BlindAlerted) {
+    i8BlindAlerted = true;
+    await ntfy(
+      "I8 hygiene: CANNOT VERIFY — telemetry gap",
+      `The pasteurization monitor is blind: only ${res.length} of ~${minReadings}+ expected readings in the last ${intervalH}h, with a ${(largestGapMin / 60).toFixed(1)}h stretch of no data. This does NOT mean the soak was missed — it means we can't prove it happened. Check the bridge/Pi is reporting; the planner will soak at the earliest hour while the window reads as lapsed.`,
+      "high",
+    );
+  } else if (satisfied && i8BlindAlerted) {
+    i8BlindAlerted = false;
+    await ntfy("I8 hygiene verifiable again", `Telemetry recovered and the tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`);
   }
 }
 
@@ -760,7 +791,10 @@ async function shadowOnce(): Promise<void> {
   // INTERLOCK: hand the shadow planner the actuator state so its calendar sanitize boost stands down
   // exactly when the demand-driven checkI8 auto-sanitize is armed — one soak actuator, never two/none.
   const sanitizeDue = await sanitizeDueNow();
-  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue);
+  if (sanitizeDue.urgent) {
+    console.warn("[I8] pasteurization window LAPSED — scheduling the soak at the earliest hour, not the warmest");
+  }
+  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue.due, sanitizeDue.urgent);
   if (!plan.length) throw new Error("empty forecast");
 
   // #59 winter DP — solve the cost-optimal trajectory over the SAME hard floors the plan
@@ -1112,6 +1146,10 @@ async function main(): Promise<void> {
               verify_f: SANITIZE_VERIFY_F,
               dwell_min_required: SANITIZE_DWELL_MIN,
               sanitize_f: DEFAULT_OPTS.sanitizeF,
+              // blind = monitor can't confirm a soak because telemetry has holes (distinct from
+              // "overdue", which is a confident no). largest_gap_min is the evidence.
+              blind: i8LastBlind,
+              largest_gap_min: i8LastGapMin,
               // Stagnation half — from OUR 5-min tank series (dhw.ts detectDrawTimes), not TempIQ's
               // recharge stream, which undercounts ~6× and lags a day. Context, never a gate.
               draws: dhwDraws
