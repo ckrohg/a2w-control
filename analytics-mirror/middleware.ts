@@ -10,6 +10,7 @@ export function middleware(req: NextRequest) {
     pathname.startsWith("/api/ingest") ||
     pathname.startsWith("/api/login") ||
     pathname.startsWith("/api/webauthn/auth") ||
+    pathname.startsWith("/api/digest") || // guards itself: CRON_SECRET bearer/key or view cookie
     pathname === "/login";
   if (open) return NextResponse.next();
 

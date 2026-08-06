@@ -73,6 +73,11 @@ notifications:
   #    on the hub to the same topic above). heartbeat_url below is an optional extra channel
   #    (e.g. healthchecks.io) only if you want a second, hub-independent monitor.
   # heartbeat_url: "https://hc-ping.com/your-uuid"
+  # 3. Email for serious alerts (high/urgent — every fault edge qualifies, incl. WARNING
+  #    sensor/comm faults) via resend.com. With the default onboarding@resend.dev sender,
+  #    Resend only delivers to the account owner's address — set resend_to to that.
+  # resend_api_key: "re_..."
+  # resend_to: "you@example.com"
   # 3. Optional email (Resend) — a sticky second channel for SERIOUS alerts (high/urgent only).
   #    EASIEST: pass A2W_RESEND_API_KEY + A2W_RESEND_TO to pi-bootstrap.sh. Without a verified
   #    sender domain Resend delivers only to your own account email — set resend_to to that.
