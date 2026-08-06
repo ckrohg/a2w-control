@@ -119,6 +119,15 @@ const WINTER_DP_ENABLED = process.env.WINTER_DP_ENABLED === "1";
 const DP_COMPUTE_BELOW_F = 55; // any forecast hour below this → solve (inert in high summer)
 let winterDpState: Record<string, unknown> | null = null; // /health surface
 
+// #59 first-cold-week commissioning watch: real cold + a cap-pinned plan + the same hydronic
+// zone calling across consecutive hourly shadow cycles = the signature of the 135°F strictCap
+// under-serving an emitter (the as-found system ran 145–165°F on such days). Latched: one
+// urgent (email-tier) alert per episode; clears when any leg of the condition breaks.
+const CAP_WATCH_OUTDOOR_F = 35;
+const CAP_WATCH_STREAK = 3; // consecutive shadow cycles ≈ hours
+const capWatchStreaks = new Map<string, number>();
+let capWatchLatched = false;
+
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
 // OFF by default — deploying this changes NOTHING until AUTO_SANITIZE_ENABLED=1.
 // When on, the I8 hygiene check fires one durable/guarded boost(131,60) per overdue
@@ -754,7 +763,10 @@ async function shadowOnce(): Promise<void> {
     await demandFeed.refresh(); // never throws
     const latest = await store.getLatestSlx().catch(() => null);
     const outdoorF = latest?.outdoorF ?? forecast[0]?.outdoorF ?? null;
-    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF) : null;
+    // learnedSupply (TempIQ#1632): the LIVE floor is evaluated at now-outdoor, so it may
+    // prefer TempIQ's learned per-zone reset curve; the DP's per-hour future floors below
+    // stay on the local parametric model (the learned value is now-conditions only).
+    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF, undefined, true) : null;
     // SHADOW (#33): what would the floor be if warm-adjacent zones borrowed heat? Logs only; the live
     // `demandFloor` below is untouched. Never throws / blocks the cycle.
     if (floor && ADJACENCY_SETBACK_SHADOW && TEMPIQ_SURFACE_TOKEN) {
@@ -876,6 +888,34 @@ async function shadowOnce(): Promise<void> {
       block.hp1_setpoint_f = Math.round(Math.min(Math.max(raised + opts.i1MarginF, opts.hpMinF), opts.hpMaxF));
       block.reason = `storm mode: banking heat (${storm.trigger})`;
     }
+  }
+
+  // #59 cap-adequacy watch (see CAP_WATCH_* above) — runs on the FINAL plan values.
+  try {
+    const nowBlock = plan[0];
+    const pinned = nowBlock.tank_target_f >= DEFAULT_OPTS.strictCapF - 1;
+    const calling = demandFeed?.callsHealthy() ? demandFeed.callingZoneIds() ?? [] : [];
+    if (nowBlock.outdoor_f < CAP_WATCH_OUTDOOR_F && pinned && calling.length) {
+      for (const id of calling) capWatchStreaks.set(id, (capWatchStreaks.get(id) ?? 0) + 1);
+      for (const id of [...capWatchStreaks.keys()]) if (!calling.includes(id)) capWatchStreaks.delete(id);
+      const persistent = [...capWatchStreaks.entries()].filter(([, n]) => n >= CAP_WATCH_STREAK);
+      if (persistent.length && !capWatchLatched) {
+        capWatchLatched = true;
+        const names = persistent
+          .map(([id]) => demandFeed?.zones().find((z) => z.id === id)?.name ?? id)
+          .join(", ");
+        await ntfy(
+          "Winter cap check: zones may need more than 135°F",
+          `${names} ${persistent.length === 1 ? "has" : "have"} been calling for ~${CAP_WATCH_STREAK}+ hours at ${Math.round(nowBlock.outdoor_f)}°F outdoor with the plan pinned at the ${DEFAULT_OPTS.strictCapF}°F cap. The as-found system ran hotter on days like this — if rooms are cold, the seasonal cap needs a deliberate raise (issue #59).`,
+          "urgent",
+        );
+      }
+    } else {
+      capWatchStreaks.clear();
+      capWatchLatched = false;
+    }
+  } catch (e) {
+    console.warn("cap-adequacy watch failed:", (e as Error).message);
   }
 
   await store.insertShadowPlan(plan, {
