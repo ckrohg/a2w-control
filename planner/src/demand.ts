@@ -18,6 +18,11 @@ export interface InsightZone {
   uaBtuHrF: number | null;
   thermalMassBtuF: number | null;
   confidence: number | null;
+  // TempIQ#1632 (live since TempIQ PR #1703): the zone's required supply-water temp at the
+  // CURRENT outdoor, from TempIQ's learned per-zone reset curve (design outdoor, WWSD,
+  // demonstrated plant max). Only emitted for owner-verified hydronic zones with fresh
+  // outdoor data — null otherwise. NOW-conditions only: never reuse it for future hours.
+  requiredSupplyF: number | null;
 }
 
 /** Live per-zone call state from TempIQ GET /api/insights/calls (TempIQ#1506). The
@@ -35,6 +40,7 @@ export interface ZoneFloor {
   awtF: number | null;
   calling: boolean;
   verified: boolean | null; // TempIQ#1508: is this zone's delivery_type owner-verified?
+  learned: boolean; // TempIQ#1632: awtF came from TempIQ's learned reset curve, not the local model
 }
 
 export interface FloorResult {
@@ -79,16 +85,24 @@ export function requiredAwtF(deliveryType: string, outdoorF: number, roomF = 68)
 /**
  * Per-zone floors + binding zone. callingZoneIds === null means no live call feed yet
  * (TempIQ#1506): conservatively treat every zone with a non-null floor as calling.
+ * learnedSupply=true (TempIQ#1632) prefers the zone's TempIQ-learned required supply temp
+ * over the local parametric model — ONLY valid when outdoorF is the CURRENT outdoor (the
+ * learned value is computed at now-conditions); per-hour future floors must pass false.
  */
 export function computeFloors(
   zones: InsightZone[],
   callingZoneIds: string[] | null,
   outdoorF: number,
+  learnedSupply = false,
 ): FloorResult {
   const perZone: ZoneFloor[] = zones.map((z) => {
-    const awtF = requiredAwtF(z.deliveryType, outdoorF);
+    const localF = requiredAwtF(z.deliveryType, outdoorF);
+    // The learned value only substitutes where the local model also considers the zone a
+    // buffer-served emitter (localF !== null) — a mini-split can never gain a floor from it.
+    const useLearned = learnedSupply && localF !== null && z.requiredSupplyF != null;
+    const awtF = useLearned ? (z.requiredSupplyF as number) : localF;
     const calling = callingZoneIds === null ? awtF !== null : callingZoneIds.includes(z.id);
-    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling, verified: z.deliveryTypeVerified };
+    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling, verified: z.deliveryTypeVerified, learned: useLearned };
   });
 
   let binding: ZoneFloor | null = null;
@@ -179,6 +193,7 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       uaBtuHrF: num(env.ua) ?? num(o.uaBtuHrF),
       thermalMassBtuF: num(env.thermalMass) ?? num(o.thermalMassBtuF),
       confidence: num(env.confidence) ?? num(o.confidence),
+      requiredSupplyF: num(o.requiredSupplyWaterTempF),
     };
   });
 }
@@ -279,12 +294,12 @@ export class DemandFeed {
     return this.cached;
   }
 
-  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null): FloorResult | null {
+  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null, learnedSupply = false): FloorResult | null {
     if (!this.isHealthy()) return null; // degraded mode: A2W never depends on TempIQ
     // Explicit arg wins (tests); otherwise ride the live call feed, falling back to the
     // conservative all-zones posture (null) when /calls is unhealthy.
     const calling = callingZoneIds !== undefined ? callingZoneIds : this.callingZoneIds();
-    return computeFloors(this.cached, calling ?? null, outdoorF);
+    return computeFloors(this.cached, calling ?? null, outdoorF, learnedSupply);
   }
 
   status(): {
