@@ -222,17 +222,44 @@ let stormAlerts: StormAlert[] = [];
 let stormSynthetic: SyntheticTrigger[] = [];
 let lastStormPollAt: string | null = null;
 
+/** Flatten a fetch error to its real network story: unwrap undici's .cause and expand
+ *  AggregateError (happy-eyeballs) into per-attempt `CODE addr:port` entries (hub #66). */
+function describeFetchError(err: unknown): string {
+  const e = err as Error & { cause?: unknown };
+  const cause = e.cause as (Error & { code?: string; address?: string; port?: number;
+                                      errors?: Array<Error & { code?: string; address?: string; port?: number }> }) | undefined;
+  if (!cause) return e.message;
+  const one = (c: { code?: string; message?: string; address?: string; port?: number }) =>
+    `${c.code ?? c.message}${c.address ? ` ${c.address}:${c.port ?? ""}` : ""}`;
+  if (cause.errors?.length) return `${e.message} — attempts: ${cause.errors.map(one).join("; ")}`;
+  return `${e.message} — cause: ${one(cause)}`;
+}
+
 async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
   if (NTFY_TOPIC) {
-    try {
-      await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
-        method: "POST",
-        headers: { Title: title, Priority: priority, Tags: "hbx" },
-        body,
-        signal: AbortSignal.timeout(10_000),
-      });
-    } catch (e) {
-      console.error("ntfy send failed:", (e as Error).message);
+    // HTTP headers are ByteStrings — a leading emoji (⚠ = U+26A0) THROWS and silently
+    // kills the push. Caught live by the first /api/drill run (2026-08-06): the real
+    // freeze-risk title would have died the same way in January. The bridge and hub were
+    // sanitized long ago; the planner never was. Strip to Latin-1; the body stays UTF-8.
+    const safeTitle = title.replace(/[^\x00-\xFF]/g, "").trim();
+    // Railway→ntfy.sh is intermittently unreachable at the TCP level (#66) — same
+    // 3-attempt retry as the hub. Non-2xx is not retried (the server answered).
+    const delays = [0, 3_000, 12_000];
+    for (let attempt = 1; attempt <= delays.length; attempt++) {
+      if (delays[attempt - 1]) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
+      try {
+        const r = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
+          method: "POST",
+          headers: { Title: safeTitle, Priority: priority, Tags: "hbx" },
+          body,
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!r.ok) console.error("ntfy push rejected:", r.status);
+        else if (attempt > 1) console.log(`ntfy delivered on attempt ${attempt}`);
+        break;
+      } catch (e) {
+        console.error(`ntfy send attempt ${attempt}/${delays.length} failed:`, describeFetchError(e));
+      }
     }
   }
   if (EMAIL_PRIORITIES.has(priority) && RESEND_API_KEY && RESEND_TO) {
