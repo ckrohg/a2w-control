@@ -1205,6 +1205,30 @@ async function main(): Promise<void> {
             },
           });
         }
+        if (req.url === "/api/drill" && req.method === "POST") {
+          // Winter-readiness alert drill (owner-triggered, authed): fires the REAL alert
+          // paths with [DRILL] prefixes at their REAL priorities so the whole tiering is
+          // exercised end to end — urgent → ntfy + email, high → ntfy only. The safety
+          // stack was built in August; this is how it gets proven before January without
+          // faking sensor state. WARN THE OWNER FIRST — the messages look real on arrival.
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          await ntfy(
+            "[DRILL] Freeze-risk advisory",
+            "Drill of the freeze-risk path (urgent → ntfy + email). No freeze risk exists — if you received this by EMAIL and push, the winter safety channel works end to end.",
+            "urgent",
+          );
+          await ntfy(
+            "[DRILL] Backup element called",
+            "Drill of the backup-element path (high → ntfy only, no email). If this arrived as a push and NOT an email, the tiering is correct.",
+            "high",
+          );
+          return json(res, 200, {
+            fired: [
+              { drill: "freeze-risk", priority: "urgent", expect: "ntfy push AND email" },
+              { drill: "backup-element", priority: "high", expect: "ntfy push only — an email here means the tiering regressed" },
+            ],
+          });
+        }
         if (req.url === "/api/hbx/target" || req.url === "/api/hbx/restore" || req.url === "/api/hbx/boost") {
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });
           if (req.url === "/api/hbx/target" && req.method === "GET") {
