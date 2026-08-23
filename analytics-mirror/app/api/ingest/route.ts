@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { ensureSchema, ensureEventsSchema, ensureSpanSchema, ensureSpanArmSchema,
   ensureSystemSchema } from "@/lib/db";
 

@@ -4,7 +4,7 @@
 // measured pump kWh × (avg overshoot °F × ~1%/°F COP sensitivity) × rate — the 1%/°F is a
 // typical figure for these water temps and is exactly what the A-4 test calibrates.
 // Rate: ELECTRIC_RATE_USD_KWH env (default 0.30) until TempIQ#1470 supplies the real tariff.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";

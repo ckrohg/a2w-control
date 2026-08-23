@@ -1124,7 +1124,11 @@ async function loop(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  await store.ensureSchema();
+  // A one-shot run fails fast, so a broken database surfaces as a non-zero exit. The
+  // long-running service waits the outage out instead of dying — see the comment on
+  // ensureSchemaWithRetry() for why that distinction cost us four days in August.
+  if (process.env.POLL_ONCE === "1") await store.ensureSchema();
+  else await store.ensureSchemaWithRetry();
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the

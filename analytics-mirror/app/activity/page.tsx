@@ -9,7 +9,7 @@
 // idioms: nodejs runtime, force-dynamic, parameterized sql, Eastern time via @/lib/tz, try/catch
 // degraded state. This is also the "easier to look back" surface — retention is indefinite
 // (nothing prunes), so the "all" window reaches back to when each table began recording.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtDay, fmtTime, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";

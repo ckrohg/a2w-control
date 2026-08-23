@@ -2,7 +2,7 @@
 // rendered from the latest full snapshot each pump pushes every ~5 min (pump_snapshots).
 // Read-only. Until the Pi ships the exporter change (release-* tag), this page shows an
 // explanatory empty state — the Pi UI over LAN/Funnel remains the break-glass full view.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtTime, fmtDateTime } from "@/lib/tz";
 import { recentEvents, latestSystemStat, recentSystemStats,
   type Event, type EventFilter, type SystemStat } from "@/lib/db";

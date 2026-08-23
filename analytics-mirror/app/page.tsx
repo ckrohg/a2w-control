@@ -2,7 +2,7 @@
 // + current shadow-plan card, an alert-chip row (reader/pump offline, backup called, HBX
 // drift), the I1 banner, and the per-pump history charts. Mobile-first (kanban card).
 // Deep views: /hbx (tank, curve, plan detail), /control (setpoint writes).
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { ensureSchema, recentReadings, recentSpanReadings, getSpanArmState, recentSpanArmEvents,
   type Reading } from "@/lib/db";
 import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
@@ -13,10 +13,11 @@ import { Chart, type Series, type Band } from "@/app/ui/chart";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// force-no-store matters as much as force-dynamic: @vercel/postgres runs over HTTP fetch,
-// and parameterless queries (identical request bodies) otherwise hit Vercel's Data Cache —
-// the tank card once fossilized on a 10-hour-old row this way while parameterized queries
-// (changing ${since}) stayed fresh.
+// Kept as a guard, though the original hazard is gone. Under @vercel/postgres every
+// query was an HTTP fetch, so parameterless ones (identical request bodies) landed in
+// Vercel's Data Cache — the tank card once fossilized on a 10-hour-old row this way,
+// while parameterized queries (changing ${since}) stayed fresh. Queries now run over a
+// raw TCP socket via node-postgres, which the Data Cache never sees.
 export const fetchCache = "force-no-store";
 
 const f = (c: number | null) => (c == null ? null : (c * 9) / 5 + 32);
