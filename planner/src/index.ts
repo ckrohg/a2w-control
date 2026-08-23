@@ -67,7 +67,10 @@ const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const RESEND_TO = process.env.RESEND_TO ?? "";
 const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
-const EMAIL_PRIORITIES = new Set(["urgent", "max"]);
+// The owner reads email only (2026-08-23), so "high" must email as well — otherwise the
+// element-called / no-pump-running / reader-offline alerts have NO channel at all. Anything
+// quieter than high stays informational and does not email unless it is a resolution.
+const EMAIL_PRIORITIES = new Set(["urgent", "max", "high"]);
 const OFFLINE_AFTER_FAILURES = 5;
 
 const HUB_URL = process.env.HUB_URL;
@@ -249,16 +252,30 @@ function describeFetchError(err: unknown): string {
  * alerts get the siren; if everything shouts, nothing does.
  */
 const CRITICAL_PRIORITIES = new Set(["urgent", "max"]);
-export function alertSubject(title: string, priority: string): string {
+
+/**
+ * Four visual tiers, so the inbox is scannable at a glance and the siren keeps its
+ * meaning. The owner reads EMAIL ONLY (2026-08-23: "I dont want to do ntfy... emails are
+ * plenty"), so every tier below has to survive on its subject line alone.
+ *
+ *   🚨 CRITICAL  urgent/max — act now (freeze risk, winter cap)
+ *   ⚠️  warning   high       — needs attention (element called, no pump, reader offline)
+ *   ✅ RESOLVED  recovery   — the all-clear for something we already alerted on
+ *      plain     default    — informational (config confirmations, digest)
+ */
+export function alertSubject(title: string, priority: string, resolved = false): string {
   const t = title.trim();
-  // Non-critical: only label it if it isn't already self-labelled, so the weekly digest
+  const core = () => t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\s]+/, "").trim() || t;
+  if (resolved) return `✅ A2W RESOLVED — ${core()}`;
+  if (CRITICAL_PRIORITIES.has(priority)) return `🚨 A2W CRITICAL — ${core()}`;
+  if (priority === "high") return `⚠️ A2W — ${core()}`;
+  // Informational: only label it if it isn't already self-labelled, so the weekly digest
   // doesn't become "A2W — A2W weekly: …".
-  if (!CRITICAL_PRIORITIES.has(priority)) return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
-  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t;
-  return `🚨 A2W CRITICAL — ${core}`;
+  return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
 }
 
-async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
+async function ntfy(title: string, body: string, priority = "default",
+                    opts: { resolved?: boolean; email?: boolean } = {}): Promise<void> {
   if (NTFY_TOPIC) {
     // HTTP headers are ByteStrings — a leading emoji (⚠ = U+26A0) THROWS and silently
     // kills the push. Caught live by the first /api/drill run (2026-08-06): the real
@@ -285,7 +302,10 @@ async function ntfy(title: string, body: string, priority = "default"): Promise<
       }
     }
   }
-  if (EMAIL_PRIORITIES.has(priority) && RESEND_API_KEY && RESEND_TO) {
+  // opts.email is the explicit override in BOTH directions: false mutes a high-priority
+  // signal that fires too often to be worth an inbox slot, true forces one through.
+  const wantsEmail = opts.email ?? (EMAIL_PRIORITIES.has(priority) || !!opts.resolved);
+  if (wantsEmail && RESEND_API_KEY && RESEND_TO) {
     try {
       const r = await fetch("https://api.resend.com/emails", {
         method: "POST",
@@ -297,7 +317,7 @@ async function ntfy(title: string, body: string, priority = "default"): Promise<
           "User-Agent": "a2w-planner/1.0",
         },
         body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO],
-                               subject: alertSubject(title, priority), text: body }),
+                               subject: alertSubject(title, priority, opts.resolved), text: body }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!r.ok) console.error("resend email failed:", r.status);
@@ -356,12 +376,15 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
       "I1 violation: HP setpoint below HBX target + margin",
       `Tank target ${tankTargetF.toFixed(1)}°F.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
       "high",
+      // ~0.4/day and usually self-clearing within a cycle — the /optimize banner and the
+      // i1_episodes history carry it. An inbox slot every other day would dull the tier.
+      { email: false },
     );
   } else if (!offenders.length && i1Violated) {
     i1Violated = false;
     i1Detail = null;
     await store.closeI1Episode().catch(() => {});
-    await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`);
+    await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`, "default", { resolved: true, email: false });
   }
 }
 
@@ -465,7 +488,7 @@ async function checkI8(): Promise<void> {
     );
   } else if (satisfied && i8Alerted) {
     i8Alerted = false;
-    await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`);
+    await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`, "default", { resolved: true });
   }
 
   // BLIND: can't confirm a soak, and the window is too sparse to call it overdue. This state used to
@@ -482,7 +505,7 @@ async function checkI8(): Promise<void> {
     );
   } else if (satisfied && i8BlindAlerted) {
     i8BlindAlerted = false;
-    await ntfy("I8 hygiene verifiable again", `Telemetry recovered and the tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`);
+    await ntfy("I8 hygiene verifiable again", `Telemetry recovered and the tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`, "default", { resolved: true });
   }
 }
 
@@ -504,7 +527,7 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
     if (unservedAlerted) {
       unservedAlerted = false;
       await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.");
+      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.", "default", { resolved: true });
     }
     return;
   }
@@ -520,7 +543,7 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
     if (unservedAlerted) {
       unservedAlerted = false;
       await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "A pump is running against the call again.");
+      await ntfy("Unserved call cleared", "A pump is running against the call again.", "default", { resolved: true });
     }
     return;
   }
@@ -551,7 +574,7 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
     );
   } else if (called === false && backupWasCalled) {
     backupWasCalled = false;
-    await ntfy("Backup element call ended", "HBX released the backup element.");
+    await ntfy("Backup element call ended", "HBX released the backup element.", "default", { resolved: true });
   }
 }
 
@@ -572,7 +595,7 @@ async function checkDHWShortfall(reading: SlxReading): Promise<void> {
     dhwShortfallStreak = 0;
     if (dhwShortfallAlerted) {
       dhwShortfallAlerted = false;
-      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`);
+      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`, "default", { resolved: true });
     }
     return;
   }
@@ -605,7 +628,7 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
     );
   } else if (!risk && freezeRiskAlerted) {
     freezeRiskAlerted = false;
-    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`);
+    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`, "default", { resolved: true });
   }
 }
 
@@ -644,7 +667,7 @@ async function checkSingleWriter(): Promise<void> {
     );
   } else if (multiInstanceAlerted && !peerSet.size) {
     multiInstanceAlerted = false;
-    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`);
+    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`, "default", { resolved: true });
   }
 }
 
@@ -696,7 +719,7 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
     adoptionReheatSeenWhileOff = false;
     if (adoptionAlerted) {
       adoptionAlerted = false;
-      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`);
+      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`, "default", { resolved: true });
     }
     return;
   }
@@ -776,7 +799,7 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
     );
   } else {
     await store.closeStormEvent().catch((e) => console.error("storm event close failed:", (e as Error).message));
-    await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.");
+    await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { resolved: true });
   }
 }
 
@@ -1110,7 +1133,9 @@ async function pollOnce(): Promise<void> {
         );
       } else {
         console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
-        await ntfy("HBX config changed (outside the planner)", summary, "high");
+        // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
+        // history and the /hbx page, not in a daily email that would dilute the warn tier.
+        await ntfy("HBX config changed (outside the planner)", summary, "high", { email: false });
       }
     }
   }
@@ -1121,7 +1146,7 @@ async function loop(): Promise<void> {
     await pollOnce();
     lastPollAt = new Date().toISOString();
     if (consecutiveFailures >= OFFLINE_AFTER_FAILURES && offlineAlerted) {
-      await ntfy("SensorLinx reader recovered", `polling resumed at ${lastPollAt}`);
+      await ntfy("SensorLinx reader recovered", `polling resumed at ${lastPollAt}`, "default", { resolved: true });
       offlineAlerted = false;
     }
     consecutiveFailures = 0;

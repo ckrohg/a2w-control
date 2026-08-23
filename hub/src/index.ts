@@ -137,22 +137,31 @@ async function notifyNtfy(title: string, message: string,
  * address, because both projects use Resend's shared onboarding domain. Identical sender
  * plus an unremarkable subject made a real emergency look like routine mail.
  *
- * Severity leads instead, in the one field with room for it. Only alerts that need action
- * tonight get the siren — recoveries and notices stay quiet, or the marker stops meaning
- * anything.
+ * Severity leads instead, in the one field with room for it. Three tiers, because the owner
+ * reads email only (2026-08-23: "I dont want to do ntfy... emails are plenty") and every
+ * tier has to survive on its subject line alone:
+ *
+ *   🚨 CRITICAL  something needs attention now
+ *   ✅ RESOLVED  the all-clear — the owner asked to be told a problem is OVER, not just
+ *                that it started, so an alert is never left hanging
+ *      plain     informational
+ *
+ * Only the first tier gets the siren; if everything shouts, nothing does.
  */
-function alertSubject(title: string, critical: boolean): string {
+function alertSubject(title: string, tier: "critical" | "resolved" | "info"): string {
   const t = title.trim();
-  // Non-critical: only label it if it isn't already self-labelled, so the weekly digest
+  const core = () => t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\s]+/, "").trim() || t;
+  if (tier === "critical") return `🚨 A2W CRITICAL — ${core()}`;
+  if (tier === "resolved") return `✅ A2W RESOLVED — ${core()}`;
+  // Informational: only label it if it isn't already self-labelled, so the weekly digest
   // doesn't become "A2W — A2W weekly: …".
-  if (!critical) return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
-  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t;
-  return `🚨 A2W CRITICAL — ${core}`;
+  return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
 }
 
-async function notifyEmail(subject: string, body: string, critical = false): Promise<void> {
+async function notifyEmail(subject: string, body: string,
+                           tier: "critical" | "resolved" | "info" = "info"): Promise<void> {
   if (!RESEND_API_KEY || !RESEND_TO) return;
-  subject = alertSubject(subject, critical);
+  subject = alertSubject(subject, tier);
   try {
     await fetch(RESEND_API_URL, {
       method: "POST",
@@ -469,13 +478,13 @@ setInterval(() => {
     const body = `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
       "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.";
     void notifyNtfy(title, body, { priority: "high", tags: "warning" });
-    void notifyEmail(title, body, true);   // dead-man is rare + important → email too
+    void notifyEmail(title, body, "critical");   // dead-man is rare + important → email too
   } else if (!silent && piSilenceAlerted) {
     piSilenceAlerted = false;
     const title = "A2W: heat-pump bridge back online";
     const body = "The Pi is checking in with the hub again.";
     void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
-    void notifyEmail(title, body);   // closure for the offline email above
+    void notifyEmail(title, body, "resolved");   // closure for the offline email above
   }
 }, WATCHDOG_INTERVAL_MS);
 
@@ -546,13 +555,13 @@ setInterval(() => {
         "and no SPAN backup-element alarm. Heating still runs on the wall controllers + HBX. " +
         "Check: https://a2w-planner-production.up.railway.app/health";
       void notifyNtfy(title, body, { priority: "high", tags: "rotating_light" });
-      void notifyEmail(title, body, true);
+      void notifyEmail(title, body, "critical");
     } else if (!down && plannerAlerted) {
       plannerAlerted = false;
       const title = "A2W: planner back online";
       const body = "The planner is healthy and polling again.";
       void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
-      void notifyEmail(title, body);
+      void notifyEmail(title, body, "resolved");
     }
   });
 }, PLANNER_WATCHDOG_INTERVAL_MS);
