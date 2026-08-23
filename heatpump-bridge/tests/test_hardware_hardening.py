@@ -12,7 +12,7 @@ import pytest
 from bridge import registers as R
 from bridge.config import AppConfig, GuardrailConfig, PumpConfig
 from bridge.guardrails import SetpointGuard
-from bridge.modbus_client import ModbusError, PumpClient
+from bridge.modbus_client import REBUILD_AFTER_CONNECT_FAILURES, ModbusError, PumpClient
 from bridge.poller import PumpPoller
 from bridge.store import Store
 from sim.fake_pump import FakePump
@@ -129,3 +129,19 @@ async def test_split_reserved_hole_fallback_polls_and_writes(rig, monkeypatch):
 
     result = await poller.write_setpoint(48, source="test")   # _read_control merges both
     assert result["setpoint_c"] == 48 and result["verified"] is True
+
+
+async def test_wedged_transport_is_rebuilt_after_sustained_connect_failures():
+    """2026-08-20 regression: TCP connects failed for 3 days against ONE
+    AsyncModbusTcpClient instance and only a reboot recovered — after
+    REBUILD_AFTER_CONNECT_FAILURES straight failed connects the client must swap in a
+    fresh transport object rather than trusting the wedged one forever."""
+    client = PumpClient("127.0.0.1", free_port(), 1, timeout_s=0.2)  # nothing listens
+    first = client._client
+    for _ in range(REBUILD_AFTER_CONNECT_FAILURES):
+        with pytest.raises(ModbusError) as exc:
+            await client.read_block(R.BLOCK_STATUS)
+        assert exc.value.category == "connect"
+    assert client._client is not first
+    assert client.stats.connect_failures == REBUILD_AFTER_CONNECT_FAILURES
+    client.close()

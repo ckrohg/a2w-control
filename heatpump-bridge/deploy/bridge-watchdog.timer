@@ -1,0 +1,12 @@
+# @purpose: fire bridge-watchdog.sh every 5 minutes, starting 10 min after boot so a
+# fresh boot (or watchdog-triggered reboot) gets a full grace window to come up.
+[Unit]
+Description=Run the bridge self-heal watchdog every 5 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
