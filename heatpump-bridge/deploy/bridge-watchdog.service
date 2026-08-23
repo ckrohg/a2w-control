@@ -1,0 +1,11 @@
+# @purpose: oneshot runner for bridge-watchdog.sh (see the script header for the
+# escalation ladder and install steps). Triggered by bridge-watchdog.timer.
+[Unit]
+Description=Bridge self-heal watchdog (restart/reboot ladder for wedged comm)
+# Never race a deploy: pi-update stops the bridge; is-active guard in the script
+# also covers this, this is just belt-and-braces ordering.
+After=heatpump-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bridge-watchdog.sh

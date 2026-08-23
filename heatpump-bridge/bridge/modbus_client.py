@@ -57,6 +57,16 @@ class ModbusError(Exception):
         self.category = category
 
 
+# Rebuild the pymodbus transport after this many consecutive failed connects (~10 min at
+# a 20 s poll interval). The 2026-08-20 blackout ran 3 days of connect failures against
+# ONE AsyncModbusTcpClient instance and only a Pi reboot recovered it — the async client
+# can wedge in a state where connect() fails instantly forever (dead internal reconnect
+# task). MAC-follow rediscovery never helps in that state because the gateway hasn't
+# moved. A fresh client object is the cheapest rung of the self-heal ladder; the
+# bridge-watchdog timer (deploy/bridge-watchdog.sh) escalates above it.
+REBUILD_AFTER_CONNECT_FAILURES = 30
+
+
 class PumpClient:
     """One RTU-over-TCP connection to one heat pump. The bridge is the only Modbus
     master on each bus, so no cross-request locking beyond this client's own mutex."""
@@ -65,17 +75,23 @@ class PumpClient:
         self.host = host
         self.port = port
         self.device_id = device_id
+        self._timeout_s = timeout_s
         self.stats = CommStats()
         # retries=0: NO pymodbus retransmits. RTU-over-TCP has no transaction IDs, so a
         # response that arrives after its timeout would be matched to whatever request is
         # pending NEXT — a retransmit doubles the pump's responses and creates exactly that
         # stale frame. The poller's own cycle (every poll_interval_s) is the retry policy;
         # at 2400 baud a lost frame costs one failed poll, not corrupted data.
-        self._client = AsyncModbusTcpClient(
-            host, port=port, framer=FramerType.RTU, timeout=timeout_s, retries=0,
-        )
+        self._client = self._new_transport()
         self._lock = asyncio.Lock()  # serialize requests on the half-duplex bus
         self._was_connected = False
+        self._consecutive_connect_failures = 0
+
+    def _new_transport(self) -> AsyncModbusTcpClient:
+        return AsyncModbusTcpClient(
+            self.host, port=self.port, framer=FramerType.RTU,
+            timeout=self._timeout_s, retries=0,
+        )
 
     async def _ensure_connected(self) -> None:
         if self._client.connected:
@@ -84,7 +100,16 @@ class PumpClient:
         if not ok:
             self.stats.connect_failures += 1
             self.stats.last_error_category = "connect"
+            self._consecutive_connect_failures += 1
+            if self._consecutive_connect_failures % REBUILD_AFTER_CONNECT_FAILURES == 0:
+                log.warning(
+                    "%s:%s unreachable for %d consecutive connects — rebuilding the "
+                    "pymodbus transport (wedged-client self-heal)",
+                    self.host, self.port, self._consecutive_connect_failures)
+                self._client.close()
+                self._client = self._new_transport()
             raise ModbusError(f"cannot connect to {self.host}:{self.port}", "connect")
+        self._consecutive_connect_failures = 0
         if self._was_connected:
             self.stats.reconnects += 1
         self._was_connected = True
