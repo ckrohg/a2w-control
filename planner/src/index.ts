@@ -1304,8 +1304,13 @@ async function main(): Promise<void> {
           );
           return json(res, 200, {
             fired: [
-              { drill: "freeze-risk", priority: "urgent", expect: "ntfy push AND email" },
-              { drill: "backup-element", priority: "high", expect: "ntfy push only — an email here means the tiering regressed" },
+              { drill: "freeze-risk", priority: "urgent",
+                expect: "ntfy push AND email, subject '🚨 A2W CRITICAL — …'" },
+              // Was "ntfy push only" until 2026-08-23. The owner reads email only, so `high`
+              // now emails on purpose — the regression to watch for here is the WRONG TIER
+              // (a siren on a warning), not the presence of an email.
+              { drill: "backup-element", priority: "high",
+                expect: "ntfy push AND email, subject '⚠️ A2W — …' (NOT the 🚨 siren)" },
             ],
           });
         }
