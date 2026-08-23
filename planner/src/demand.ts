@@ -56,7 +56,13 @@ export interface FloorResult {
 /** Buffer→emitter margin, °F (plan §6.9; measure via reg 2051 later). */
 export const BUFFER_MARGIN_F = 4.5;
 
-const HEALTHY_WINDOW_MS = 30 * 60_000;
+// The feed refreshes only at the top of each shadow cycle (SHADOW_EVERY_MIN, default 60),
+// so "fresh" must cover a full cycle plus grace — a fixed 30 min window made
+// /health.winter_solver read "degraded" for the back half of every hour even though every
+// floor computation runs immediately after a refresh. The October commissioning playbook
+// keys its daily check off that field (2026-08-23 winter-readiness audit).
+const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
+const HEALTHY_WINDOW_MS = Math.max(35, SHADOW_EVERY_MIN + 5) * 60_000;
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
