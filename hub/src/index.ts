@@ -456,6 +456,84 @@ setInterval(() => {
 }, WATCHDOG_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
+// Planner dead-man — the gap that cost us four days
+// ---------------------------------------------------------------------------
+// On 2026-08-19 Neon's compute quota ran out, the planner crash-looped into a terminal
+// Railway CRASHED state, and nobody found out until 2026-08-23. The Pi dead-man above
+// worked perfectly the whole time — but nothing watched the PLANNER, and the planner is
+// where its own monitors lived, so its death took the alarm with it.
+//
+// The hub is the right place for this: it stayed up throughout, it already owns the
+// ntfy + email channels, and it has no dependency on Postgres, so a database outage
+// cannot silence it. Deliberately the same shape as the Pi watchdog — a grace window
+// measured from the last healthy observation, and alerts only on transitions.
+//
+// "Healthy" is more than HTTP 200: a planner that answers but has stopped polling is
+// still not doing its job, so a stale lastPollAt counts as down.
+const PLANNER_HEALTH_URL =
+  process.env.PLANNER_HEALTH_URL ?? "https://a2w-planner-production.up.railway.app/health";
+const PLANNER_ALERT_AFTER_MS = Number(process.env.PLANNER_ALERT_AFTER_MS ?? 900_000); // 15 min
+const PLANNER_POLL_STALE_MS = Number(process.env.PLANNER_POLL_STALE_MS ?? 1_200_000); // 20 min = 4 missed polls
+const PLANNER_WATCHDOG_INTERVAL_MS = Number(process.env.PLANNER_WATCHDOG_INTERVAL_MS ?? 60_000);
+
+// Start the grace window at boot so a hub restart during a planner deploy stays quiet.
+let lastPlannerOkAt = Date.now();
+let plannerAlerted = false;
+let lastPlannerDetail = "";
+
+async function checkPlannerHealth(): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const r = await fetch(PLANNER_HEALTH_URL, { signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) return { ok: false, detail: `HTTP ${r.status}` };
+    const h = (await r.json()) as { ok?: boolean; lastPollAt?: string | null };
+    if (h.ok === false) return { ok: false, detail: "reports ok:false" };
+    if (!h.lastPollAt) return { ok: false, detail: "no lastPollAt" };
+    const age = Date.now() - new Date(h.lastPollAt).getTime();
+    if (age > PLANNER_POLL_STALE_MS) {
+      return { ok: false, detail: `answering but last poll was ${Math.round(age / 60_000)} min ago` };
+    }
+    return { ok: true, detail: "ok" };
+  } catch (err) {
+    return { ok: false, detail: describeFetchError(err) };
+  }
+}
+
+if (!PLANNER_HEALTH_URL) {
+  console.warn("[hub] PLANNER_HEALTH_URL empty — planner dead-man alerts are disabled.");
+}
+
+setInterval(() => {
+  if (!PLANNER_HEALTH_URL || !NTFY_TOPIC) return;
+  void checkPlannerHealth().then(({ ok, detail }) => {
+    if (ok) lastPlannerOkAt = Date.now();
+    else lastPlannerDetail = detail;
+
+    const downMs = Date.now() - lastPlannerOkAt;
+    const down = downMs > PLANNER_ALERT_AFTER_MS;
+
+    if (down && !plannerAlerted) {
+      plannerAlerted = true;
+      const mins = Math.max(1, Math.round(downMs / 60_000));
+      // Title/Tags are HTTP headers → ASCII only.
+      const title = "A2W: planner DOWN - no optimization or monitoring";
+      const body =
+        `The planner has been unhealthy for ~${mins} min (${lastPlannerDetail}). ` +
+        "While it is down there is no autopilot, no Phase B, no hygiene soak scheduling, " +
+        "and no SPAN backup-element alarm. Heating still runs on the wall controllers + HBX. " +
+        "Check: https://a2w-planner-production.up.railway.app/health";
+      void notifyNtfy(title, body, { priority: "high", tags: "rotating_light" });
+      void notifyEmail(title, body);
+    } else if (!down && plannerAlerted) {
+      plannerAlerted = false;
+      const title = "A2W: planner back online";
+      const body = "The planner is healthy and polling again.";
+      void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
+      void notifyEmail(title, body);
+    }
+  });
+}, PLANNER_WATCHDOG_INTERVAL_MS);
+
+// ---------------------------------------------------------------------------
 // WebSocket server (Pi bridge) — path /pi
 // ---------------------------------------------------------------------------
 
