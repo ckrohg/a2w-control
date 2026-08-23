@@ -87,4 +87,21 @@ export async function sql<T extends QueryResultRow = QueryResultRow>(
   return getPool().query<T>(text, values);
 }
 
+/**
+ * Escape hatch for queries the tagged template cannot express — specifically batched
+ * multi-row inserts via UNNEST, where the parameters are arrays rather than scalars.
+ *
+ * This exists because per-row inserts are a latency trap. Every `sql`…`` is one network
+ * round-trip; a 500-row backlog became 500 sequential round-trips, blew past the Pi's
+ * 10s client timeout, and left the exporter's cursor permanently stuck — the backlog
+ * could never drain because draining it was what timed out. One UNNEST statement moves
+ * the same 500 rows in a single round-trip.
+ */
+export async function query<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  params: unknown[] = [],
+): Promise<QueryResult<T>> {
+  return getPool().query<T>(text, params);
+}
+
 export default sql;
