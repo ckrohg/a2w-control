@@ -3,7 +3,7 @@
 // readings (same DB) to render: live tank state, the I1 overlay chart (tank vs target vs
 // target+margin vs HP setpoints vs outdoor — crossing lines = the deadlock), the reset
 // curve card (configured line vs observed scatter), and the config-drift version history.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtTime, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";

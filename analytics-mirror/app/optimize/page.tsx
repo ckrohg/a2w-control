@@ -4,7 +4,7 @@
 // controller_status heartbeat (the actual auto-pilot + Phase B flags), so the client shows
 // ground-truth autonomy instead of hardcoded copy that can drift. The client draws the timeline,
 // previews the autonomy modes + Boost (preview only), and keeps the guarded 131°F rec + Restore.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { I1Banner } from "../i1-banner";
 import OptimizeClient, { type ShadowBlock, type Autonomy } from "./optimize-client";
 

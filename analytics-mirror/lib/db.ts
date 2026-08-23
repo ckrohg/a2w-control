@@ -1,4 +1,4 @@
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 
 // One reading row per pump per push. The Pi sends a snapshot every ~60s; the time series
 // accumulates here. Idempotent create — cheap to call before an insert.

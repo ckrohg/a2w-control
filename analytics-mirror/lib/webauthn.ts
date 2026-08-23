@@ -3,7 +3,7 @@
 // base64url-encoded in Postgres (webauthn_credentials); decoded back to Uint8Array for the
 // SimpleWebAuthn v13 verify calls. RP_ID/ORIGIN are env-driven so the same code runs on
 // the Vercel prod host and any preview/custom domain.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import type { AuthenticatorTransportFuture, Uint8Array_ } from "@simplewebauthn/server";
 
 export const RP_ID = process.env.WEBAUTHN_RP_ID ?? "a2w-analytics-mirror.vercel.app";

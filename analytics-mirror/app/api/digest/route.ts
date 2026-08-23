@@ -9,7 +9,7 @@
 // single-hue bar strip (validated #2a78d6 on white), baseline-anchored 4px data ends,
 // selective direct labels, status colors reserved for status (with glyphs, never alone).
 import { NextResponse } from "next/server";
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { isAuthed } from "@/lib/auth";
 
 export const runtime = "nodejs";

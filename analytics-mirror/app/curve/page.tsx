@@ -10,7 +10,7 @@
 // (lib/curve-history.json, dev-time script) — the dashboard has NO runtime dependency on
 // TempIQ. Live overlays come from Neon. Honesty per the net-accounting doctrine: measured
 // (SPAN, cop_measurements) vs model (COP surface, counterfactuals) is labeled on every number.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";
 import historyJson from "@/lib/curve-history.json";

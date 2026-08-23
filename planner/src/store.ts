@@ -258,6 +258,37 @@ export class Store {
     `);
   }
 
+  /**
+   * Retrying wrapper around ensureSchema() for the long-running service path.
+   *
+   * The planner is unattended, so a database that is briefly unreachable must not be
+   * fatal. It used to be: ensureSchema() threw, main() rejected, and the top-level
+   * catch called process.exit(1). Railway gives up after 10 restart attempts and marks
+   * the deployment CRASHED — at which point the planner stays dead even after the
+   * database recovers. That is exactly how 2026-08-19 played out when Neon's compute
+   * quota ran out: a recoverable outage became a four-day silent one.
+   *
+   * Retry forever with capped backoff instead. Staying alive is what lets the process
+   * heal itself the moment the database answers again.
+   */
+  async ensureSchemaWithRetry(): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.ensureSchema();
+        if (attempt > 1) console.log(`[store] schema ready after ${attempt} attempts`);
+        return;
+      } catch (e) {
+        // 1s, 2s, 4s … capped at 30s. Never gives up: an unreachable database is a
+        // condition to wait out, not a reason to die.
+        const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
+        console.error(
+          `[store] schema not ready (attempt ${attempt}): ${(e as Error).message} — retrying in ${delayMs / 1000}s`,
+        );
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+
   /** Upsert the pump-circuit energy for the current hour, keeping the MAX seen (SPAN's per-hour
    *  value grows monotonically within the hour, then resets — so the max is the hour's total). */
   async upsertSpanEnergyHour(hour: Date, kwh: number): Promise<void> {

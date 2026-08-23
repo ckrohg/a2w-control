@@ -3,7 +3,7 @@
 // or active storm the planner is banking heat for) straight from Neon — no planner
 // dependency, so the flag stays visible even if the planner service is down. Degrades
 // silently: any error (table not deployed yet) or no open event renders nothing.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtTime } from "@/lib/tz";
 
 type StormRow = { id: number; t: number; trigger: string; ceiling_f: number | null };

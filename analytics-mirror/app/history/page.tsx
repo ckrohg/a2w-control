@@ -4,7 +4,7 @@
 // (nothing prunes), so this makes the accumulated history actually browsable. All server-side from
 // Neon; hourly-downsampled so a 30-day window stays light. House idioms: nodejs runtime,
 // force-dynamic, parameterized sql, Eastern time via @/lib/tz, try/catch degraded states.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 import { fmtDateTime, fmtDay } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";

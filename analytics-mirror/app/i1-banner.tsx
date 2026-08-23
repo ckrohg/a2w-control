@@ -3,7 +3,7 @@
 // from slx_readings + latest per-pump setpoint from the Pi-pushed readings) — no planner
 // dependency, so the flag stays visible even if the planner service is down. Renders
 // nothing when data is stale/missing or the invariant holds.
-import { sql } from "@vercel/postgres";
+import { sql } from "@/lib/sql";
 
 const I1_MARGIN_F = 5; // A-4-measured 2026-07-14: HBX terminated at +3.1°F; 5 keeps a cushion
 const SLX_FRESH_S = 20 * 60;
