@@ -235,6 +235,29 @@ function describeFetchError(err: unknown): string {
   return `${e.message} — cause: ${one(cause)}`;
 }
 
+/**
+ * Build the EMAIL subject. Deliberately not the ntfy title — ntfy titles are HTTP headers
+ * and must stay Latin-1 (see the sanitizer below).
+ *
+ * The 2026-08-20 bridge-offline alert was delivered and never opened. It was not a
+ * plumbing failure: it read as "A2W: heat-pump bridge offline" in an inbox that also gets
+ * twice-daily job alerts from `tenet-job <onboarding@resend.dev>` — the SAME sender
+ * address, because both projects use Resend's shared onboarding domain. With the address
+ * identical and the subject unremarkable, a genuine emergency looked like routine mail.
+ *
+ * So the severity leads, in the one place with room for it. Only genuinely actionable
+ * alerts get the siren; if everything shouts, nothing does.
+ */
+const CRITICAL_PRIORITIES = new Set(["urgent", "max"]);
+export function alertSubject(title: string, priority: string): string {
+  const t = title.trim();
+  // Non-critical: only label it if it isn't already self-labelled, so the weekly digest
+  // doesn't become "A2W — A2W weekly: …".
+  if (!CRITICAL_PRIORITIES.has(priority)) return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
+  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t;
+  return `🚨 A2W CRITICAL — ${core}`;
+}
+
 async function ntfy(title: string, body: string, priority = "default"): Promise<void> {
   if (NTFY_TOPIC) {
     // HTTP headers are ByteStrings — a leading emoji (⚠ = U+26A0) THROWS and silently
@@ -273,7 +296,8 @@ async function ntfy(title: string, body: string, priority = "default"): Promise<
           // bridge's urllib silently failed for weeks on this, 2026-08-06) — honest UA.
           "User-Agent": "a2w-planner/1.0",
         },
-        body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject: title, text: body }),
+        body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO],
+                               subject: alertSubject(title, priority), text: body }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!r.ok) console.error("resend email failed:", r.status);

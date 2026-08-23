@@ -127,8 +127,32 @@ async function notifyNtfy(title: string, message: string,
 
 /** Fire-and-forget email via Resend. No-op when RESEND_API_KEY/RESEND_TO unset; never throws.
  * Subject/body are JSON (UTF-8), so emoji are fine (unlike the ntfy header title). */
-async function notifyEmail(subject: string, body: string): Promise<void> {
+/**
+ * Build the EMAIL subject. Deliberately not the ntfy title — ntfy titles are HTTP headers
+ * and must stay ASCII.
+ *
+ * The 2026-08-20 bridge-offline alert was delivered and never opened. Not a plumbing
+ * failure: it read as "A2W: heat-pump bridge offline" in an inbox that also receives
+ * twice-daily job alerts from `tenet-job <onboarding@resend.dev>` — the SAME sender
+ * address, because both projects use Resend's shared onboarding domain. Identical sender
+ * plus an unremarkable subject made a real emergency look like routine mail.
+ *
+ * Severity leads instead, in the one field with room for it. Only alerts that need action
+ * tonight get the siren — recoveries and notices stay quiet, or the marker stops meaning
+ * anything.
+ */
+function alertSubject(title: string, critical: boolean): string {
+  const t = title.trim();
+  // Non-critical: only label it if it isn't already self-labelled, so the weekly digest
+  // doesn't become "A2W — A2W weekly: …".
+  if (!critical) return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
+  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t;
+  return `🚨 A2W CRITICAL — ${core}`;
+}
+
+async function notifyEmail(subject: string, body: string, critical = false): Promise<void> {
   if (!RESEND_API_KEY || !RESEND_TO) return;
+  subject = alertSubject(subject, critical);
   try {
     await fetch(RESEND_API_URL, {
       method: "POST",
@@ -445,7 +469,7 @@ setInterval(() => {
     const body = `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
       "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.";
     void notifyNtfy(title, body, { priority: "high", tags: "warning" });
-    void notifyEmail(title, body);   // dead-man is rare + important → email too
+    void notifyEmail(title, body, true);   // dead-man is rare + important → email too
   } else if (!silent && piSilenceAlerted) {
     piSilenceAlerted = false;
     const title = "A2W: heat-pump bridge back online";
@@ -522,7 +546,7 @@ setInterval(() => {
         "and no SPAN backup-element alarm. Heating still runs on the wall controllers + HBX. " +
         "Check: https://a2w-planner-production.up.railway.app/health";
       void notifyNtfy(title, body, { priority: "high", tags: "rotating_light" });
-      void notifyEmail(title, body);
+      void notifyEmail(title, body, true);
     } else if (!down && plannerAlerted) {
       plannerAlerted = false;
       const title = "A2W: planner back online";
