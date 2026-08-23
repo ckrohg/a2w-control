@@ -34,11 +34,17 @@ const globalForPg = globalThis as unknown as { _a2wPool?: Pool };
 function getPool(): Pool {
   if (globalForPg._a2wPool) return globalForPg._a2wPool;
 
-  const connectionString = process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
+  // A2W_DATABASE_URL first, and deliberately so. DATABASE_URL / POSTGRES_URL /
+  // DATABASE_URL_UNPOOLED are all owned by the Vercel Marketplace integration that
+  // provisioned Neon — removing that integration deletes them. Pointing the dashboard
+  // at a variable the integration does not manage means tearing Neon down cannot take
+  // the dashboard with it. The others remain as fallbacks for local dev.
+  const connectionString =
+    process.env.A2W_DATABASE_URL ?? process.env.DATABASE_URL ?? process.env.POSTGRES_URL;
   if (!connectionString) {
     throw new Error(
-      "No database connection string. Set DATABASE_URL (or POSTGRES_URL) to the Railway " +
-        "Postgres TCP-proxy URL — Railway → a2w-hub → Postgres → Variables → DATABASE_PUBLIC_URL.",
+      "No database connection string. Set A2W_DATABASE_URL to the Railway Postgres " +
+        "TCP-proxy URL — Railway → a2w-hub → Postgres → Variables (RAILWAY_TCP_PROXY_DOMAIN/PORT).",
     );
   }
 
