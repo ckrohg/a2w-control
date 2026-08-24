@@ -888,6 +888,28 @@ async function shadowOnce(): Promise<void> {
         if (floor.bindingVerified === false) {
           console.warn(`[demand] binding zone "${floor.bindingZone}" has an UNVERIFIED delivery_type — tank floor ${floor.tankTargetF}°F may be wrong; confirm in TempIQ (#1508)`);
         }
+        // MONITOR ONLY (#89): TempIQ's requiredSupplyWaterTempF and our local parametric
+        // model encode OPPOSITE assumptions about emitter sizing, and the gap widens as it
+        // gets colder — TempIQ ramps baseboard 120°F@60 outdoor → 180°F@5 (a generic type
+        // curve anchored on the house's own demonstrated max, i.e. its AS-FOUND hot
+        // operation), while ours tops out at 135°F. Both agree in mild weather, which is
+        // the only weather this integration has ever run in. Below ~50°F outdoor the
+        // learned value alone pushes the floor past strictCap, where it clamps (safe) but
+        // pegs — trading the winter savings away and firing cap-watch. Surface the
+        // divergence in shoulder season so the sizing question gets settled deliberately
+        // instead of at 2am in January. No behavior change here on purpose: which model is
+        // right is an owner decision, not something to silently pick.
+        const bindingZf = floor.perZone.find((z) => z.name === floor.bindingZone);
+        if (bindingZf?.learned && bindingZf.awtF != null) {
+          const localF = requiredAwtF(bindingZf.deliveryType, outdoorF as number);
+          if (localF != null && Math.abs(bindingZf.awtF - localF) >= 10) {
+            console.warn(
+              `[demand] MODEL DIVERGENCE on binding zone "${floor.bindingZone}" at ${Math.round(outdoorF as number)}°F outdoor: ` +
+              `TempIQ says ${bindingZf.awtF.toFixed(1)}°F supply, local model says ${localF.toFixed(1)}°F ` +
+              `(${(bindingZf.awtF - localF).toFixed(1)}°F apart). Tank floor in use: ${floor.tankTargetF}°F vs cap ${DEFAULT_OPTS.strictCapF}°F. See #89.`,
+            );
+          }
+        }
       }
     }
   }
@@ -991,11 +1013,24 @@ async function shadowOnce(): Promise<void> {
     try {
       await forecastFeed.refresh(); // never throws
       const fc = forecastFeed.forecast();
-      // TempIQ#1508 gate: only owner-verified hydronic zones may command heat. Unverified
-      // zones still appear in the shadow record, they just can't move a setpoint.
+      // Provenance gate: only zones TempIQ vouches for may command heat.
+      //
+      // NOTE (2026-08-24, verified against the live payload): /api/insights/zones does NOT
+      // emit deliveryTypeVerified at all, so demand.ts parses it as null for every zone and
+      // a `=== true` test is never satisfiable — that spelling made this whole path silently
+      // inert. What TempIQ actually exposes is the gate's RESULT: its route only emits
+      // requiredSupplyWaterTempF for zones that pass its own verified check (4 of 7 hydronic
+      // zones here), so a present value IS the vouching signal available today. An explicit
+      // false still hard-blocks, for when TempIQ starts sending the field
+      // (delivery_type_source, migration 0162 — currently dead; asked for on TempIQv2#2009).
       const verifiedIds = new Set(
-        (demandFeed?.zones() ?? []).filter((z) => z.deliveryTypeVerified === true && requiredAwtF(z.deliveryType, 20) !== null).map((z) => z.id),
+        (demandFeed?.zones() ?? [])
+          .filter((z) => z.deliveryTypeVerified !== false
+            && z.requiredSupplyF != null
+            && requiredAwtF(z.deliveryType, 20) !== null)
+          .map((z) => z.id),
       );
+      if (fc && !verifiedIds.size) console.warn("[forecast] no zone carries a TempIQ-vouched supply temp — pre-heat inert this cycle");
       if (fc && verifiedIds.size) {
         const decisions = planPreheat(plan, fc, {
           threshold: PREHEAT_CONFIDENCE,
