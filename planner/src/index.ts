@@ -34,6 +34,7 @@ import {
   StormState,
 } from "./storm";
 import { DemandFeed, requiredAwtF } from "./demand";
+import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes } from "./dhw";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
@@ -199,6 +200,23 @@ const demandFeed = WINTER_SOLVER_SHADOW && TEMPIQ_SURFACE_TOKEN
   ? new DemandFeed(TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
 if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but TEMPIQ_SURFACE_TOKEN missing — winter solver shadow disabled");
+
+// A-8 demand forecast (#87; contract in knowledge/reference/tempiq-demand-forecast-contract.md,
+// TempIQ build TempIQv2#2009). Two independent gates on purpose: FETCH records what the
+// predictions WOULD have done (plan meta + /health) while the endpoint is still landing;
+// PREHEAT is what lets a prediction actually raise a commanded target. Both default off, so
+// until the owner flips them the planner behaves byte-for-byte as it does today.
+const FORECAST_FETCH_ENABLED = process.env.FORECAST_FETCH_ENABLED === "1";
+const FORECAST_PREHEAT_ENABLED = process.env.FORECAST_PREHEAT_ENABLED === "1";
+// pCall × confidence must clear this for a zone to drive heat. 0.5 = "more likely than not".
+const PREHEAT_CONFIDENCE = Number(process.env.PREHEAT_CONFIDENCE ?? "0.5");
+const forecastFeed = FORECAST_FETCH_ENABLED && TEMPIQ_SURFACE_TOKEN
+  ? new ForecastFeed(TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  : null;
+if (FORECAST_FETCH_ENABLED && !forecastFeed) console.warn("FORECAST_FETCH_ENABLED but TEMPIQ_SURFACE_TOKEN missing — demand forecast disabled");
+if (FORECAST_PREHEAT_ENABLED && !FORECAST_FETCH_ENABLED) console.warn("FORECAST_PREHEAT_ENABLED without FORECAST_FETCH_ENABLED — no forecast to act on");
+let forecastState: Record<string, unknown> | null = null; // /health surface
+let predictedCapLatched = false; // one predictive cap alert per episode
 
 // Adjacency-aware setback shadow (#33). SHADOW ONLY: logs what the tank floor WOULD be if warm-adjacent
 // zones borrowed heat (deeper-setback savings), on top of the winter-solver floor. Never changes the
@@ -964,6 +982,63 @@ async function shadowOnce(): Promise<void> {
     }
   }
 
+  // A-8 (#87) predicted demand. Runs LAST among the raise passes so it only lifts what the
+  // reactive floor, DP, bank and storm left below the predicted need — and never lowers any
+  // of them (planPreheat is raises-only by construction). With FORECAST_PREHEAT_ENABLED off
+  // it mutates nothing and just records what it would have done.
+  let preheatMeta: Record<string, unknown> | null = null;
+  if (forecastFeed) {
+    try {
+      await forecastFeed.refresh(); // never throws
+      const fc = forecastFeed.forecast();
+      // TempIQ#1508 gate: only owner-verified hydronic zones may command heat. Unverified
+      // zones still appear in the shadow record, they just can't move a setpoint.
+      const verifiedIds = new Set(
+        (demandFeed?.zones() ?? []).filter((z) => z.deliveryTypeVerified === true && requiredAwtF(z.deliveryType, 20) !== null).map((z) => z.id),
+      );
+      if (fc && verifiedIds.size) {
+        const decisions = planPreheat(plan, fc, {
+          threshold: PREHEAT_CONFIDENCE,
+          verifiedZoneIds: verifiedIds,
+          ceilingFor: (b) => bandFor(b.outdoor_f, cfg, opts.strictCapF).hi,
+          setpointFor: (t) => Math.round(Math.min(Math.max(t + opts.i1MarginF, opts.hpMinF), opts.strictCapF + opts.i1MarginF)),
+          apply: FORECAST_PREHEAT_ENABLED,
+        });
+        preheatMeta = {
+          enabled: FORECAST_PREHEAT_ENABLED, threshold: PREHEAT_CONFIDENCE,
+          generated_at: fc.generatedAt, considered: decisions.length,
+          applied: decisions.filter((d) => d.applied).length,
+          decisions: decisions.slice(0, 12),
+        };
+        if (decisions.some((d) => d.applied)) {
+          console.log(`[forecast] pre-heat applied to ${decisions.filter((d) => d.applied).length} block(s)`);
+        }
+
+        // Predictive cap check: tonight's predicted need vs the everyday cap, surfaced in the
+        // AFTERNOON instead of at 2 am via the reactive 3-hour-pinned streak.
+        const risk = predictedCapRisk(fc, opts.strictCapF, { threshold: PREHEAT_CONFIDENCE, verifiedZoneIds: verifiedIds });
+        if (risk && !predictedCapLatched) {
+          predictedCapLatched = true;
+          await ntfy(
+            "Winter cap check: tonight is predicted to need more than 135°F",
+            `${risk.zoneName} is predicted to call around ${new Date(risk.start).toLocaleString("en-US", { timeZone: "America/New_York" })} needing ~${Math.round(risk.requiredSupplyF)}°F supply (tank ${risk.tankTargetF}°F), above the ${opts.strictCapF}°F everyday cap. If rooms run cold tonight, the seasonal cap needs a deliberate raise (see winter-dp-commissioning.md).`,
+            "urgent",
+          );
+        } else if (!risk) {
+          predictedCapLatched = false;
+        }
+      }
+      forecastState = {
+        ...forecastFeed.status(), preheat_enabled: FORECAST_PREHEAT_ENABLED,
+        threshold: PREHEAT_CONFIDENCE, verified_zones: verifiedIds.size,
+        applied_last_cycle: preheatMeta ? (preheatMeta.applied as number) : 0,
+      };
+    } catch (e) {
+      // An optimizer must never break the cycle that keeps the house warm.
+      console.warn("demand forecast failed (plan unaffected):", (e as Error).message);
+    }
+  }
+
   // #59 cap-adequacy watch (see CAP_WATCH_* above) — runs on the FINAL plan values.
   try {
     const nowBlock = plan[0];
@@ -999,6 +1074,7 @@ async function shadowOnce(): Promise<void> {
     draw_events: learned?.drawEvents ?? 0,
     bank_f: BANK_F,
     ...(dpMeta ? { winter_dp: dpMeta } : {}),
+    ...(preheatMeta ? { preheat: preheatMeta } : {}),
   });
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);
@@ -1242,6 +1318,7 @@ async function main(): Promise<void> {
               : "off",
             // #59: last DP solve (null until the forecast first dips below the compute threshold)
             winter_dp: winterDpState ?? { mode: "idle", enabled: WINTER_DP_ENABLED },
+            demand_forecast: forecastState ?? { mode: "idle", fetch_enabled: FORECAST_FETCH_ENABLED, preheat_enabled: FORECAST_PREHEAT_ENABLED },
             storm: {
               state: stormState.kind,
               trigger: stormState.kind === "idle" ? null : stormState.trigger,
