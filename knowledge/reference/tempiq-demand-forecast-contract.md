@@ -1,5 +1,37 @@
 # TempIQ demand-forecast contract (A-8) — predicted zone calls feeding A2W winter planning
 
+> **STATUS 2026-08-24: the prediction core is DEAD — Phase 0 ran and the gate said STOP.**
+> TempIQ executed the backtest (TempIQv2#2009): hourly per-zone calls from Nest-derived
+> `readings`, chronological split, scored against *persistence* (the right bar, since A2W
+> already reads live calls) with a moving-block bootstrap. Result: **1 of 7 zones has real
+> skill, and it is the wrong one.** Master Bathroom (the only robust signal) runs 74.9%
+> duty — already always calling, so pre-heating buys nothing — and is unverified, so A2W's
+> own rule forbids acting on it. Living Room Baseboard, the zone this entire contract was
+> motivated by, has no predictable structure at any horizon. Outdoor regression had
+> essentially zero skill everywhere, refuting the "the signal is in the outdoor half"
+> hypothesis. Phase 2 setback-recovery is empty on this house: `detected_schedules` is 25
+> `constant_hold` + 1 `programmatic`, i.e. flat setpoints 24/7 — there are no setbacks to
+> recover from.
+>
+> **Do not build `p_call`, `expected_runtime_min`, or Phase 2.** A2W's consumption code
+> (PR #88) is merged with both gates OFF and stays off; its raises-only / degraded-parity
+> scaffolding is reusable for whatever we consume next.
+>
+> **What replaced it** (see the revised asks on TempIQv2#2009, authoritative over §"What
+> A2W needs from TempIQ" below):
+> 1. **Curve parameters + provenance** — per zone `minSupplyF`/`designSupplyF`/
+>    `designOutdoorF`/`wwsdOutdoorF` and *where designSupplyF came from*
+>    (`type_curve_default` | `demonstrated_max` | `measured`). Now the #1 ask, because of #89.
+> 2. `delivery_type_source` (migration 0162, currently dead) — A2W leans a safety gate on
+>    provenance it cannot see; `/api/insights/zones` does not emit `deliveryTypeVerified` at all.
+> 3. `required_supply_f` at forecast outdoor — still wanted for the DP's future floors, but
+>    only AFTER (1), or it propagates #89's divergence 167 h into the planning horizon.
+> 4. Wiring U4 (`supply-water-requirement-learner.ts`, zero readers) — the real fix.
+>
+> **Caveat worth keeping:** this is a finding about *this pilot* (one property, ~32 days of
+> clean per-zone coverage, Feb-2026 ingestion outage). A house that actually runs setbacks
+> would likely show real time-of-week skill. Re-run in Oct/Nov on a full heating season.
+
 Owner direction (2026-08-23): "Ideally TempIQ … has a good sense of what will be running
 (predicted demand / predicted schedule) — that should feed into how the A2W system is
 prepping / operates."
@@ -43,6 +75,14 @@ weather/cost; its per-hour future floors use the local parametric model with no 
   cold night.
 
 ## What A2W needs from TempIQ
+
+> ⚠️ Everything from here to "Non-goals" is the ORIGINAL ask, kept for the record.
+> Phases 0-2 are settled: Phase 0 RAN and returned STOP; Phases 1-2 are not to be built.
+> Three premises below were also disproven against prod — "learned reset curve" (it is a
+> static type curve with two per-property scalars; the real learner has zero readers),
+> "≥4 weeks of zone-call history" (no call table exists; `energy_calls` is empty globally —
+> the usable signal is Nest-derived `readings`), and "setback recoveries are near-
+> deterministic" (this house runs flat setpoints).
 
 ### Phase 0 — predictability analysis (cheap, do first; TempIQ-side analysis only)
 
