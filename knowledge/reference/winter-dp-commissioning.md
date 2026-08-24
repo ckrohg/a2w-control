@@ -66,13 +66,54 @@ Flip when ALL of:
 2. plan_scores show the DP trajectory would not have under-served any hour the floor logic
    served (gap analysis, not vibes);
 3. comm quality restored (#76 done) — the DP's raises depend on Phase B leading reliably;
-4. the winter-drill.md alert drill has passed this season.
+4. the winter-drill.md alert drill has passed this season;
+5. **the idle-baseboard cost is understood and accepted** (see below).
+
+### 5. What the conservative DP floor costs on idle-baseboard nights
+
+The DP's per-hour floors are built with `demandFeed.proposeFloor(o, null)` — the `null` is
+the CONSERVATIVE all-zones posture, because future calling state is unknowable. So every
+future hour is floored at the *baseboard* requirement whether or not the baseboards will
+actually call. That is the right default for a solver, and it is inert today (the DP is
+shadow-only; the LIVE plan uses the reactive call-driven floor — 620/621 floor snapshots
+over the 30 days to 2026-08-23 were `insights+calls`, with exactly one binding zone ever,
+at 112.5 °F, already under the 120 °F DHW floor).
+
+**It becomes live behavior the moment this flag flips**, since DP targets apply as raises.
+On a cold night with no baseboard calling, expect the floor to sit ~5–10 °F above the DHW
+floor — an efficiency cost, bounded by strictCap, never a safety issue. Before flipping,
+quantify it from the shadow record: compare `winter_dp` trajectory floors against the
+`zone_floor_snapshots` binding zone for the same hours.
+
+The real fix is the A-8 demand forecast (#87 / TempIQv2#2009): replace "assume every zone
+may call" with "these zones will probably call." Safe as a relaxation *because the reactive
+floor is an independent guarantee* — a missed prediction degrades to today's reactive path,
+not to something colder. If A-8 lands before the DP goes live, prefer sequencing it first.
 
 Mechanics: `cd planner && railway variables --set "WINTER_DP_ENABLED=1"` (auto-redeploys).
 Effect: DP targets apply as RAISES ONLY above the floor logic, band-clamped; sanitize
 outranks; storm raises on top. Rollback: unset the flag. First 48 h after the flip: watch
 autopilot_log for DP-reason writes and I1 rejection rate (a burst of I1 races that doesn't
 self-clear within a cycle = pause and investigate Phase B lead timing).
+
+## A-8 demand forecast (#87) — flipping the two gates
+
+The consumption code shipped 2026-08-23 (PR #88), both gates OFF. Sequence once
+TempIQv2#2009 Phase 1 is live:
+
+1. `railway variables --set "FORECAST_FETCH_ENABLED=1"` — records what predictions WOULD
+   have done in `/health.demand_forecast` and every plan's `meta.preheat.decisions`.
+   Nothing actuates. Let it run ≥ 2 weeks.
+2. Review: were predicted floors real? Cross-check `meta.preheat.decisions` (predicted
+   zone + hour) against `zone_floor_snapshots` (what actually bound that hour). A
+   prediction that never matched a real call is a reason to raise `PREHEAT_CONFIDENCE`,
+   not to actuate.
+3. `FORECAST_PREHEAT_ENABLED=1` — predictions may now raise commanded targets. Raises
+   only, band-clamped, sanitize outranks, verified zones only. Rollback = unset.
+
+Watch after step 3: `autopilot_log` for pre-heat-reason writes, and whether the reactive
+floor still fires *after* a pre-heat (it should sometimes — pre-heat is a head start, not
+a replacement).
 
 ## Standing hardware items before real cold
 
