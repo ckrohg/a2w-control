@@ -23,6 +23,10 @@ export interface InsightZone {
   // demonstrated plant max). Only emitted for owner-verified hydronic zones with fresh
   // outdoor data — null otherwise. NOW-conditions only: never reuse it for future hours.
   requiredSupplyF: number | null;
+  // Live room state from the payload's `demand` block — the EVIDENCE that decides how far
+  // up the local→learned range we actually need to be (#89 / #90 cost-first policy).
+  roomF: number | null;
+  setpointF: number | null;
 }
 
 /** Live per-zone call state from TempIQ GET /api/insights/calls (TempIQ#1506). The
@@ -41,6 +45,12 @@ export interface ZoneFloor {
   calling: boolean;
   verified: boolean | null; // TempIQ#1508: is this zone's delivery_type owner-verified?
   learned: boolean; // TempIQ#1632: awtF came from TempIQ's learned reset curve, not the local model
+  // #90: how much the ROOM's deficit added on top of the cheap local number, and the
+  // deficit that bought it. escalatedF 0 with a live ceiling = the cheap number sufficed.
+  escalatedF: number;
+  deficitF: number;
+  localF: number | null;   // what the local parametric model wanted
+  ceilingF: number | null; // what TempIQ's capacity model wanted (the ceiling)
 }
 
 export interface FloorResult {
@@ -89,26 +99,108 @@ export function requiredAwtF(deliveryType: string, outdoorF: number, roomF = 68)
 }
 
 /**
+ * Cost-first supply temp for one zone (#90; owner direction 2026-08-24: "TempIQ's model is
+ * not going to be optimized for the A2W operating costs — push back the excessive heating…
+ * be conservative, no cold showers, house not cold, save as much money as possible").
+ *
+ * TempIQ's requiredSupplyWaterTempF is a CAPACITY model: a generic type curve whose design
+ * anchor is this house's own demonstrated max — i.e. its as-found 154-165°F operation, the
+ * very thing this project exists to move away from (#89). Consuming it directly re-creates
+ * as-found running costs. But our local parametric model is equally unmeasured in the other
+ * direction, so we do not simply swap one guess for the other.
+ *
+ * The policy: START at the cheap local number, treat TempIQ's as a CEILING, and let the
+ * ROOM decide where between them we actually sit. Every °F the room sits below its setpoint
+ * buys ESCALATE_F_PER_DEG °F of extra supply temp, never past the learned ceiling. So a
+ * zone that is keeping up costs us the cheap number; a zone that is genuinely falling
+ * behind gets real heat within a cycle, on evidence rather than on a curve's assumption.
+ *
+ * Comfort is protected structurally, not by this function's judgment: the DHW floor is
+ * unconditional and separate (no cold showers can come from here), escalation is upward,
+ * and the HBX + backup element remain untouched underneath.
+ */
+export const ESCALATE_DEADBAND_F = 0.5; // ignore sub-half-degree noise around setpoint
+export const ESCALATE_F_PER_DEG = 6;    // supply °F granted per °F of room deficit
+export const ESCALATE_STEP_F = 6;       // supply °F per extra cycle of unbroken calling
+
+/**
+ * TWO independent kinds of evidence, because either can be missing:
+ *
+ *  - room deficit (setpoint − room). Precise, but the live payload's `demand.setpointF` is
+ *    null whenever a zone is off, and we have never seen it populated in a heating season.
+ *    Never assume it will be there.
+ *  - call persistence. A zone still calling after N consecutive planner cycles is BY
+ *    DEFINITION not keeping up, whatever the telemetry says. This is the backstop that
+ *    makes the policy safe when room data is absent, stale, or null.
+ *
+ * Whichever asks for more heat wins. With neither available the zone simply pays the cheap
+ * local number, and the unconditional DHW floor plus HBX/backup-element remain underneath.
+ */
+export function costFirstAwtF(
+  localF: number | null,
+  learnedF: number | null,
+  roomF: number | null,
+  setpointF: number | null,
+  callStreak = 0, // consecutive cycles this zone has been calling (0 = not calling / unknown)
+): { awtF: number | null; escalatedF: number; deficitF: number } {
+  // No local model (non-hydronic) → nothing to floor on either path.
+  if (localF === null) return { awtF: null, escalatedF: 0, deficitF: 0 };
+  // No learned ceiling → the local model is all we have; never escalate past itself.
+  const ceilingF = learnedF ?? localF;
+  const deficitF = roomF != null && setpointF != null ? setpointF - roomF : 0;
+  const fromDeficit = deficitF > ESCALATE_DEADBAND_F ? deficitF * ESCALATE_F_PER_DEG : 0;
+  // First cycle of calling is free — that is just normal operation. Each ADDITIONAL
+  // unbroken cycle says the current supply temp is not getting the room there.
+  const fromStreak = Math.max(0, callStreak - 1) * ESCALATE_STEP_F;
+  const bump = Math.max(fromDeficit, fromStreak);
+  if (bump <= 0) {
+    return { awtF: Math.min(localF, ceilingF), escalatedF: 0, deficitF: Math.max(0, deficitF) };
+  }
+  const awtF = Math.min(localF + bump, Math.max(localF, ceilingF));
+  return { awtF, escalatedF: Math.max(0, awtF - localF), deficitF: Math.max(0, deficitF) };
+}
+
+/**
  * Per-zone floors + binding zone. callingZoneIds === null means no live call feed yet
  * (TempIQ#1506): conservatively treat every zone with a non-null floor as calling.
  * learnedSupply=true (TempIQ#1632) prefers the zone's TempIQ-learned required supply temp
  * over the local parametric model — ONLY valid when outdoorF is the CURRENT outdoor (the
  * learned value is computed at now-conditions); per-hour future floors must pass false.
  */
+/** #90: how the learned (TempIQ) supply temp is used. "escalate" = cost-first default. */
+export type FloorPolicy = "escalate" | "learned" | "local";
+
 export function computeFloors(
   zones: InsightZone[],
   callingZoneIds: string[] | null,
   outdoorF: number,
   learnedSupply = false,
+  policy: FloorPolicy = "escalate",
+  callStreaks?: Map<string, number> | null,
 ): FloorResult {
   const perZone: ZoneFloor[] = zones.map((z) => {
     const localF = requiredAwtF(z.deliveryType, outdoorF);
     // The learned value only substitutes where the local model also considers the zone a
     // buffer-served emitter (localF !== null) — a mini-split can never gain a floor from it.
     const useLearned = learnedSupply && localF !== null && z.requiredSupplyF != null;
-    const awtF = useLearned ? (z.requiredSupplyF as number) : localF;
+    // #90 cost-first: in "escalate" mode the learned number becomes a CEILING and the room's
+    // own deficit decides how far toward it we go. "learned" reproduces the pre-#90 behavior
+    // (consume TempIQ's number outright); "local" ignores it entirely.
+    let awtF: number | null;
+    let escalatedF = 0;
+    let deficitF = 0;
+    if (useLearned && policy === "escalate") {
+      const r = costFirstAwtF(localF, z.requiredSupplyF, z.roomF, z.setpointF, callStreaks?.get(z.id) ?? 0);
+      awtF = r.awtF; escalatedF = r.escalatedF; deficitF = r.deficitF;
+    } else if (useLearned && policy === "learned") {
+      awtF = z.requiredSupplyF as number;
+    } else {
+      awtF = localF;
+    }
     const calling = callingZoneIds === null ? awtF !== null : callingZoneIds.includes(z.id);
-    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling, verified: z.deliveryTypeVerified, learned: useLearned };
+    return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling,
+      verified: z.deliveryTypeVerified, learned: useLearned,
+      escalatedF, deficitF, localF, ceilingF: useLearned ? z.requiredSupplyF : null };
   });
 
   let binding: ZoneFloor | null = null;
@@ -188,6 +280,7 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
     // deliveryType, envelope.{ua, thermalMass, confidence}; older spec names kept as
     // fallbacks so a payload change degrades to nulls, never throws
     const env = (o.envelope ?? {}) as Record<string, unknown>;
+    const dem = (o.demand ?? {}) as Record<string, unknown>;
     const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
     return {
       id: typeof o.zoneId === "string" ? o.zoneId : typeof o.id === "string" ? o.id : String(o.id ?? ""),
@@ -200,6 +293,8 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       thermalMassBtuF: num(env.thermalMass) ?? num(o.thermalMassBtuF),
       confidence: num(env.confidence) ?? num(o.confidence),
       requiredSupplyF: num(o.requiredSupplyWaterTempF),
+      roomF: num(dem.currentTempF) ?? num(o.currentTempF),
+      setpointF: num(dem.setpointF) ?? num(o.setpointF),
     };
   });
 }
@@ -300,12 +395,12 @@ export class DemandFeed {
     return this.cached;
   }
 
-  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null, learnedSupply = false): FloorResult | null {
+  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null, learnedSupply = false, policy: FloorPolicy = "escalate", callStreaks?: Map<string, number> | null): FloorResult | null {
     if (!this.isHealthy()) return null; // degraded mode: A2W never depends on TempIQ
     // Explicit arg wins (tests); otherwise ride the live call feed, falling back to the
     // conservative all-zones posture (null) when /calls is unhealthy.
     const calling = callingZoneIds !== undefined ? callingZoneIds : this.callingZoneIds();
-    return computeFloors(this.cached, calling ?? null, outdoorF, learnedSupply);
+    return computeFloors(this.cached, calling ?? null, outdoorF, learnedSupply, policy, callStreaks);
   }
 
   status(): {

@@ -33,7 +33,7 @@ import {
   SyntheticTrigger,
   StormState,
 } from "./storm";
-import { DemandFeed, requiredAwtF } from "./demand";
+import { DemandFeed, requiredAwtF, type FloorPolicy } from "./demand";
 import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes } from "./dhw";
@@ -130,6 +130,11 @@ let winterDpState: Record<string, unknown> | null = null; // /health surface
 const CAP_WATCH_OUTDOOR_F = 35;
 const CAP_WATCH_STREAK = 3; // consecutive shadow cycles ≈ hours
 const capWatchStreaks = new Map<string, number>();
+// #90 escalation backstop: consecutive shadow cycles each zone has been calling. A zone
+// still calling after a full cycle is not keeping up at the current supply temp, whatever
+// the room telemetry says (demand.setpointF is null whenever a zone is off, and has never
+// been observed populated in a heating season — the policy must not depend on it).
+const zoneCallStreaks = new Map<string, number>();
 let capWatchLatched = false;
 
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
@@ -206,6 +211,12 @@ if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but 
 // predictions WOULD have done (plan meta + /health) while the endpoint is still landing;
 // PREHEAT is what lets a prediction actually raise a commanded target. Both default off, so
 // until the owner flips them the planner behaves byte-for-byte as it does today.
+// #90 cost-first demand floor (owner direction 2026-08-24). "escalate" (default): the
+// cheap local model is the floor, TempIQ's capacity number is only a CEILING, and the
+// calling room's own deficit decides how far up we go. "learned" = pre-#90 behavior
+// (consume TempIQ outright — expensive, pegs the cap all winter, see #89). "local" =
+// ignore TempIQ's number entirely.
+const DEMAND_FLOOR_POLICY = (process.env.DEMAND_FLOOR_POLICY ?? "escalate") as FloorPolicy;
 const FORECAST_FETCH_ENABLED = process.env.FORECAST_FETCH_ENABLED === "1";
 const FORECAST_PREHEAT_ENABLED = process.env.FORECAST_PREHEAT_ENABLED === "1";
 // pCall × confidence must clear this for a zone to drive heat. 0.5 = "more likely than not".
@@ -858,7 +869,14 @@ async function shadowOnce(): Promise<void> {
     // learnedSupply (TempIQ#1632): the LIVE floor is evaluated at now-outdoor, so it may
     // prefer TempIQ's learned per-zone reset curve; the DP's per-hour future floors below
     // stay on the local parametric model (the learned value is now-conditions only).
-    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF, undefined, true) : null;
+    // Update call streaks BEFORE computing the floor so a zone that has been calling since
+    // last cycle escalates on this one. Zones that stopped calling reset to zero.
+    const callingNow = demandFeed.callingZoneIds();
+    if (callingNow !== null) {
+      for (const id of callingNow) zoneCallStreaks.set(id, (zoneCallStreaks.get(id) ?? 0) + 1);
+      for (const id of [...zoneCallStreaks.keys()]) if (!callingNow.includes(id)) zoneCallStreaks.delete(id);
+    }
+    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF, undefined, true, DEMAND_FLOOR_POLICY, zoneCallStreaks) : null;
     // SHADOW (#33): what would the floor be if warm-adjacent zones borrowed heat? Logs only; the live
     // `demandFloor` below is untouched. Never throws / blocks the cycle.
     if (floor && ADJACENCY_SETBACK_SHADOW && TEMPIQ_SURFACE_TOKEN) {
@@ -901,12 +919,14 @@ async function shadowOnce(): Promise<void> {
         // right is an owner decision, not something to silently pick.
         const bindingZf = floor.perZone.find((z) => z.name === floor.bindingZone);
         if (bindingZf?.learned && bindingZf.awtF != null) {
-          const localF = requiredAwtF(bindingZf.deliveryType, outdoorF as number);
-          if (localF != null && Math.abs(bindingZf.awtF - localF) >= 10) {
+          const localF = bindingZf.localF ?? requiredAwtF(bindingZf.deliveryType, outdoorF as number);
+          if (localF != null && Math.abs((bindingZf.ceilingF ?? localF) - localF) >= 10) {
             console.warn(
               `[demand] MODEL DIVERGENCE on binding zone "${floor.bindingZone}" at ${Math.round(outdoorF as number)}°F outdoor: ` +
-              `TempIQ says ${bindingZf.awtF.toFixed(1)}°F supply, local model says ${localF.toFixed(1)}°F ` +
-              `(${(bindingZf.awtF - localF).toFixed(1)}°F apart). Tank floor in use: ${floor.tankTargetF}°F vs cap ${DEFAULT_OPTS.strictCapF}°F. See #89.`,
+              `TempIQ ceiling ${bindingZf.ceilingF?.toFixed(1)}°F vs local ${localF.toFixed(1)}°F ` +
+              `(${((bindingZf.ceilingF ?? 0) - localF).toFixed(1)}°F apart). Policy "${DEMAND_FLOOR_POLICY}" is running at ` +
+              `${bindingZf.awtF.toFixed(1)}°F (room deficit ${bindingZf.deficitF.toFixed(1)}°F bought ${bindingZf.escalatedF.toFixed(1)}°F). ` +
+              `Tank floor ${floor.tankTargetF}°F vs cap ${DEFAULT_OPTS.strictCapF}°F. See #89/#90.`,
             );
           }
         }
