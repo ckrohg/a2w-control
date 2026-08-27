@@ -6,7 +6,7 @@
  * non-hydronic zones, and falls back to the local parametric model when absent.
  */
 import assert from "node:assert/strict";
-import { computeFloors, requiredAwtF, BUFFER_MARGIN_F, ESCALATE_F_PER_DEG, type InsightZone } from "./demand";
+import { computeFloors, fetchInsightZones, requiredAwtF, BUFFER_MARGIN_F, ESCALATE_F_PER_DEG, type InsightZone } from "./demand";
 
 const zone = (over: Partial<InsightZone>): InsightZone => ({
   id: "z1", name: "Zone", deliveryType: "baseboard", deliveryTypeVerified: true,
@@ -156,3 +156,64 @@ console.log("demand.test.ts: all assertions passed ✓");
   assert.ok((both.bindingAwtF as number) >= (c2.bindingAwtF as number), "deficit and streak combine by max");
   console.log("demand.test.ts: #90 call-persistence backstop assertions passed ✓");
 }
+
+// gtm#1593 / #89: the CEILING'S PROVENANCE rides along with the ceiling. "type_curve_default"
+// means TempIQ's number measured nothing about this house — the winter review has to be able
+// to tell that apart from a measured anchor, and today every zone here reports the generic one
+// (gtm#1599: their anchor query times out on the request path, so it never resolves).
+{
+  const z = (over: Partial<InsightZone>): InsightZone => ({
+    id: "bb", name: "LR Baseboard", deliveryType: "baseboard", deliveryTypeVerified: true,
+    uaBtuHrF: 200, thermalMassBtuF: null, confidence: 0.8, requiredSupplyF: 152.7,
+    roomF: null, setpointF: null, ceilingSource: "type_curve_default", ...over,
+  });
+
+  const used = computeFloors([z({})], ["bb"], 30, true, "escalate");
+  assert.equal(used.perZone[0].ceilingF, 152.7, "ceiling in play");
+  assert.equal(used.perZone[0].ceilingSource, "type_curve_default", "provenance rides with the ceiling");
+
+  // No ceiling in play → no provenance to report, whatever the payload claimed.
+  const future = computeFloors([z({})], ["bb"], 30, false);
+  assert.equal(future.perZone[0].ceilingF, null, "future floors take no ceiling");
+  assert.equal(future.perZone[0].ceilingSource, null, "and therefore report no provenance");
+
+  const noCeil = computeFloors([z({ requiredSupplyF: null })], ["bb"], 30, true, "escalate");
+  assert.equal(noCeil.perZone[0].ceilingSource, null, "absent ceiling -> null provenance");
+
+  // A measured anchor must be reported as such, not flattened into the generic case.
+  const measured = computeFloors([z({ ceilingSource: "demonstrated_max" })], ["bb"], 30, true, "escalate");
+  assert.equal(measured.perZone[0].ceilingSource, "demonstrated_max", "measured anchor reported distinctly");
+  console.log("demand.test.ts: gtm#1593 ceiling-provenance assertions passed ✓");
+}
+
+// The payload parse for the same field: present -> carried, absent (pre-gtm#1593 TempIQ) ->
+// null, junk -> null. Never throws: a shape change degrades, it does not take the floor down.
+void (async () => {
+  const body = {
+    zones: [
+      { zoneId: "a", zoneName: "Baseboard", deliveryType: "baseboard", requiredSupplyWaterTempF: 151.1,
+        resetCurve: { minSupplyF: 120, designSupplyF: 180, designOutdoorF: 2.2, wwsdOutdoorF: 60,
+                      designSupplyFSource: "type_curve_default" } },
+      { zoneId: "b", zoneName: "Old payload", deliveryType: "baseboard", requiredSupplyWaterTempF: 140 },
+      { zoneId: "c", zoneName: "Junk", deliveryType: "baseboard", requiredSupplyWaterTempF: 140,
+        resetCurve: { designSupplyFSource: 42 } },
+    ],
+  };
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
+  ) as typeof globalThis.fetch;
+  try {
+    const zones = await fetchInsightZones("https://tempiq.example", "tok");
+    assert.equal(zones[0].ceilingSource, "type_curve_default", "provenance parsed off resetCurve");
+    assert.equal(zones[0].requiredSupplyF, 151.1, "existing fields untouched");
+    assert.equal(zones[1].ceilingSource, null, "pre-gtm#1593 payload -> null, not undefined");
+    assert.equal(zones[2].ceilingSource, null, "non-string provenance -> null");
+  } finally {
+    globalThis.fetch = real;
+  }
+  console.log("demand.test.ts: gtm#1593 payload-parse assertions passed ✓");
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
