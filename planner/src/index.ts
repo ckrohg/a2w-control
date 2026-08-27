@@ -908,10 +908,11 @@ async function shadowOnce(): Promise<void> {
         }
         // MONITOR ONLY (#89): TempIQ's requiredSupplyWaterTempF and our local parametric
         // model encode OPPOSITE assumptions about emitter sizing, and the gap widens as it
-        // gets colder — TempIQ ramps baseboard 120°F@60 outdoor → 180°F@5 (a generic type
-        // curve anchored on the house's own demonstrated max, i.e. its AS-FOUND hot
-        // operation), while ours tops out at 135°F. Both agree in mild weather, which is
-        // the only weather this integration has ever run in. Below ~50°F outdoor the
+        // gets colder — TempIQ ramps baseboard 120°F@60 outdoor → 180°F@2.2 (a generic
+        // TEXTBOOK curve for the emitter type, anchored on nothing this house has ever
+        // done — see the corrected note in demand.ts and gtm#1592/gtm#1599), while ours
+        // tops out at 135°F. Both agree in mild weather, which is the only weather this
+        // integration has ever run in. Below ~50°F outdoor the
         // learned value alone pushes the floor past strictCap, where it clamps (safe) but
         // pegs — trading the winter savings away and firing cap-watch. Surface the
         // divergence in shoulder season so the sizing question gets settled deliberately
@@ -921,9 +922,13 @@ async function shadowOnce(): Promise<void> {
         if (bindingZf?.learned && bindingZf.awtF != null) {
           const localF = bindingZf.localF ?? requiredAwtF(bindingZf.deliveryType, outdoorF as number);
           if (localF != null && Math.abs((bindingZf.ceilingF ?? localF) - localF) >= 10) {
+            // gtm#1593: say WHERE the ceiling came from. "type_curve_default" means it
+            // measured nothing about this house, which is the difference between a
+            // divergence worth acting on and one worth ignoring.
+            const src = bindingZf.ceilingSource ?? "unknown(pre-gtm#1593)";
             console.warn(
               `[demand] MODEL DIVERGENCE on binding zone "${floor.bindingZone}" at ${Math.round(outdoorF as number)}°F outdoor: ` +
-              `TempIQ ceiling ${bindingZf.ceilingF?.toFixed(1)}°F vs local ${localF.toFixed(1)}°F ` +
+              `TempIQ ceiling ${bindingZf.ceilingF?.toFixed(1)}°F [anchor: ${src}] vs local ${localF.toFixed(1)}°F ` +
               `(${((bindingZf.ceilingF ?? 0) - localF).toFixed(1)}°F apart). Policy "${DEMAND_FLOOR_POLICY}" is running at ` +
               `${bindingZf.awtF.toFixed(1)}°F (room deficit ${bindingZf.deficitF.toFixed(1)}°F bought ${bindingZf.escalatedF.toFixed(1)}°F). ` +
               `Tank floor ${floor.tankTargetF}°F vs cap ${DEFAULT_OPTS.strictCapF}°F. See #89/#90.`,

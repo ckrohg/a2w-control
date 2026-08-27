@@ -19,10 +19,16 @@ export interface InsightZone {
   thermalMassBtuF: number | null;
   confidence: number | null;
   // TempIQ#1632 (live since TempIQ PR #1703): the zone's required supply-water temp at the
-  // CURRENT outdoor, from TempIQ's learned per-zone reset curve (design outdoor, WWSD,
-  // demonstrated plant max). Only emitted for owner-verified hydronic zones with fresh
-  // outdoor data — null otherwise. NOW-conditions only: never reuse it for future hours.
+  // CURRENT outdoor, from TempIQ's per-zone reset curve (design outdoor, WWSD, design
+  // supply anchor). Only emitted for owner-verified hydronic zones with fresh outdoor data
+  // — null otherwise. NOW-conditions only: never reuse it for future hours.
   requiredSupplyF: number | null;
+  // TempIQ gtm#1593 (live 2026-08-27): where the reset curve's design anchor came from —
+  // "demonstrated_max" (this plant's measured p99), "measured" (a per-zone fitted
+  // requirement, the U4 learner — no readers on their side yet), or "type_curve_default"
+  // (a GENERIC textbook curve for the emitter type, measured nothing). null = pre-gtm#1593
+  // payload. Read it before treating the ceiling as though it knows this house: see #89.
+  ceilingSource: string | null;
   // Live room state from the payload's `demand` block — the EVIDENCE that decides how far
   // up the local→learned range we actually need to be (#89 / #90 cost-first policy).
   roomF: number | null;
@@ -51,6 +57,10 @@ export interface ZoneFloor {
   deficitF: number;
   localF: number | null;   // what the local parametric model wanted
   ceilingF: number | null; // what TempIQ's capacity model wanted (the ceiling)
+  // gtm#1593 provenance of ceilingF, persisted into zone_floor_snapshots so the winter
+  // review can tell a MEASURED ceiling from a generic textbook one (#89). null when the
+  // zone has no ceiling, or when TempIQ's payload predates gtm#1593.
+  ceilingSource: string | null;
 }
 
 export interface FloorResult {
@@ -103,11 +113,24 @@ export function requiredAwtF(deliveryType: string, outdoorF: number, roomF = 68)
  * not going to be optimized for the A2W operating costs — push back the excessive heating…
  * be conservative, no cold showers, house not cold, save as much money as possible").
  *
- * TempIQ's requiredSupplyWaterTempF is a CAPACITY model: a generic type curve whose design
- * anchor is this house's own demonstrated max — i.e. its as-found 154-165°F operation, the
- * very thing this project exists to move away from (#89). Consuming it directly re-creates
- * as-found running costs. But our local parametric model is equally unmeasured in the other
- * direction, so we do not simply swap one guess for the other.
+ * TempIQ's requiredSupplyWaterTempF is a CAPACITY model. This comment used to say its design
+ * anchor was "this house's own demonstrated max — its as-found 154-165°F operation". That was
+ * WRONG, twice over, and the correction matters because it changes what the number is:
+ *
+ *   - TempIQ's anchor query was broken (it named a non-existent column), so the anchor was
+ *     never the measured max for ANY property — it silently fell back to a generic textbook
+ *     curve, 180°F design supply for baseboard (their gtm#1592).
+ *   - That bug is fixed and deployed, and the anchor is STILL the generic 180°F here: the
+ *     corrected query cannot finish inside their 10s request-path query timeout, so it
+ *     errors on every request and falls back exactly as before (gtm#1599, verified
+ *     2026-08-27 against their prod DB — the real p99 is 164.7°F over 202,521 rows).
+ *
+ * So the ceiling we are served is an UNMEASURED generic curve for the emitter type, and
+ * `ceilingSource` says so per-zone (gtm#1593). Consuming it directly would buy as-found
+ * running costs on the strength of a textbook default. But our local parametric model is
+ * equally unmeasured in the other direction, so we do not simply swap one guess for the
+ * other — and if their anchor ever does start working it will then ratchet DOWNWARD off
+ * our own control (#89), which is a different problem, not a reason to trust it now.
  *
  * The policy: START at the cheap local number, treat TempIQ's as a CEILING, and let the
  * ROOM decide where between them we actually sit. Every °F the room sits below its setpoint
@@ -200,7 +223,8 @@ export function computeFloors(
     const calling = callingZoneIds === null ? awtF !== null : callingZoneIds.includes(z.id);
     return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling,
       verified: z.deliveryTypeVerified, learned: useLearned,
-      escalatedF, deficitF, localF, ceilingF: useLearned ? z.requiredSupplyF : null };
+      escalatedF, deficitF, localF, ceilingF: useLearned ? z.requiredSupplyF : null,
+      ceilingSource: useLearned ? z.ceilingSource : null };
   });
 
   let binding: ZoneFloor | null = null;
@@ -281,6 +305,7 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
     // fallbacks so a payload change degrades to nulls, never throws
     const env = (o.envelope ?? {}) as Record<string, unknown>;
     const dem = (o.demand ?? {}) as Record<string, unknown>;
+    const rc = (o.resetCurve ?? {}) as Record<string, unknown>;
     const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
     return {
       id: typeof o.zoneId === "string" ? o.zoneId : typeof o.id === "string" ? o.id : String(o.id ?? ""),
@@ -293,6 +318,7 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       thermalMassBtuF: num(env.thermalMass) ?? num(o.thermalMassBtuF),
       confidence: num(env.confidence) ?? num(o.confidence),
       requiredSupplyF: num(o.requiredSupplyWaterTempF),
+      ceilingSource: typeof rc.designSupplyFSource === "string" ? rc.designSupplyFSource : null,
       roomF: num(dem.currentTempF) ?? num(o.currentTempF),
       setpointF: num(dem.setpointF) ?? num(o.setpointF),
     };
