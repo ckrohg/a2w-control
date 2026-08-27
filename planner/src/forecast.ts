@@ -1,150 +1,194 @@
 /**
- * @purpose A-8 demand-forecast client (issue #87; contract:
- * knowledge/reference/tempiq-demand-forecast-contract.md; TempIQ build: TempIQv2#2009).
- * Consumes TempIQ's PREDICTED per-zone calls so the planner can pre-heat before a
- * high-temp zone wakes up, instead of discovering the demand reactively an hour late.
+ * @purpose Consume TempIQ's per-zone required-supply FORECAST (issue #87; TempIQ gtm#1591,
+ * shipped TempIQv2#2017) so the planner can pre-heat for a call already in progress instead
+ * of chasing its ramp an hour late.
  *
- * Same posture as demand.ts, and the same three-state discipline: the feed never throws,
- * goes unhealthy on staleness, and every consumer must behave exactly as it does today
- * when the forecast is absent. Two extra invariants specific to prediction:
+ * ## What we built for, and what actually shipped
  *
- *   1. RAISES ONLY. A prediction may lift a future block's target; it may never lower or
- *      suppress the reactive floor a live call produces. A wrong prediction costs a few
- *      kWh — never comfort.
- *   2. VERIFIED ZONES ONLY. Pre-heating on a seeded/unconfirmed delivery type could be
- *      wrong by 15-25°F (TempIQ#1508), so an unverified zone can predict, but can never
- *      command heat.
+ * This file was originally written against the A-8 contract's `/api/insights/demand-forecast`:
+ * per zone-hour `p_call`, expected runtime, and a required supply temp. **That endpoint was
+ * never built.** TempIQ's Phase 0 backtest gated it and returned STOP — scored against
+ * persistence, 1 of 7 zones showed skill and it was the wrong one (Master Bathroom, 74.9%
+ * duty, unverified), while Living Room Baseboard, the motivating zone, had zero structure at
+ * any horizon. So call PREDICTION does not exist and is not coming.
+ *
+ * The survivor is `GET /api/insights/zones/required-supply-forecast`: for each owner-verified
+ * hydronic zone, the same reset curve `/zones` already emits, evaluated at the FORECAST
+ * outdoor of each persisted hour (48 h live, refreshed 6-hourly). It answers "how hot must
+ * the water be at 03:00 IF this zone calls" — and says nothing whatever about whether it will.
+ *
+ * ## Why the confidence gate could not just be deleted
+ *
+ * The old code gated every floor on `pCall * confidence >= threshold`. That gate was not
+ * decoration: it was the only thing stopping EVERY verified zone from setting a floor for
+ * EVERY hour. Dropping it and keeping the rest would silently turn pre-heat into the
+ * conservative all-zones future floor — the hottest verified emitter's requirement, 24 h a
+ * day — whose idle-baseboard cost is already a stated blocker for the winter DP going live
+ * (`knowledge/reference/winter-dp-commissioning.md`, criterion 5). A cost regression wearing
+ * a feature's clothes.
+ *
+ * So the probability gate is replaced by LIVE EVIDENCE, which is the #90 doctrine applied to
+ * the time axis: **only a zone that is CALLING NOW earns a forecast-driven raise, and only
+ * for its own requirement.** That is not predicting a call; it is anticipating the ramp of a
+ * call already in progress. With nothing calling — or with the call feed unhealthy — nothing
+ * is raised and the planner behaves exactly as it does today.
+ *
+ * Note the deliberate asymmetry with `computeFloors`, where a null call feed conservatively
+ * treats every zone as calling: there the fallback direction is SAFE (a live requirement,
+ * clamped). Here the raise is speculative, so a null call feed must mean "raise nothing".
+ *
+ * The two original invariants survive unchanged:
+ *
+ *   1. RAISES ONLY. A forecast may lift a future block's target; it may never lower or
+ *      suppress the reactive floor a live call produces.
+ *   2. VERIFIED ZONES ONLY. TempIQ now omits unverified zones itself (`omittedReason:
+ *      "unverified"`), but we keep our own gate as defence in depth — pre-heating on a
+ *      seeded delivery type could be wrong by 15-25°F (TempIQ#1508).
  */
 
 import { BUFFER_MARGIN_F } from "./demand";
 import type { ShadowBlock } from "./shadow";
 
-/** One predicted hour for one zone (contract Phase 1). */
-export interface DemandForecastHour {
-  start: string; // ISO, hour-aligned
-  pCall: number; // 0..1 probability the zone calls during this hour
-  expectedRuntimeMin: number | null;
-  // The zone's required supply temp at the FORECAST outdoor for THAT hour — the key
-  // difference from TempIQ#1632's requiredSupplyF, which is now-conditions only.
+/** One forecast hour for one zone. */
+export interface ForecastHour {
+  start: string;              // ISO, hour-aligned (payload: targetTimestamp)
+  outdoorF: number | null;    // the forecast outdoor this requirement was evaluated at
   requiredSupplyF: number | null;
-  basis: string; // "history" | "schedule" | "recovery"
-  confidence: number; // 0..1 model confidence for this zone/hour
+  vintage: string | null;     // when the weather forecast behind this hour was generated
 }
 
 export interface ForecastZone {
   id: string;
   name: string;
-  hours: DemandForecastHour[];
+  deliveryType: string;
+  /** TempIQ's own reason for emitting no hours: "no-curve" (non-hydronic) | "unverified". */
+  omittedReason: string | null;
+  hours: ForecastHour[];
 }
 
-export interface DemandForecast {
-  generatedAt: string;
-  basisWindowDays: number | null;
+export interface SupplyForecast {
+  generatedAt: string;        // when TempIQ BUILT the response — not the weather vintage
+  newestVintage: string | null;
+  oldestVintage: string | null;
+  hoursAvailable: number | null;
+  degradeReason: string | null;
   zones: ForecastZone[];
 }
 
-/** A predicted floor for one hour: which zone drives it and how confident we are. */
+/** A required-supply figure for one hour, and which zone drove it. */
 export interface PredictedFloor {
   tankTargetF: number;
   zoneId: string;
   zoneName: string;
   requiredSupplyF: number;
-  pCall: number;
-  confidence: number;
-  basis: string;
 }
 
 const HORIZON_HOURS = 24;
-// Predictions age out faster than the zone feed: a forecast generated more than 2 h ago
-// has been overtaken by weather and occupancy (contract "degraded mode").
+/** Our own fetch freshness — we poll every cycle, so anything older is a fetch problem. */
 const STALE_MS = 2 * 60 * 60_000;
+/**
+ * Weather-vintage tolerance. The upstream forecast refreshes 6-hourly, so a vintage of up
+ * to ~6 h is NORMAL and must not read as unhealthy — the old 2 h window applied to
+ * `generatedAt` would have been wrong here in a way that only showed up as permanent
+ * degraded mode. 8 h = one refresh interval plus slack.
+ */
+const MAX_VINTAGE_MS = 8 * 60 * 60_000;
 
 function hourKey(iso: string): number {
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? NaN : Math.floor(ms / 3_600_000);
 }
 
-/** Tolerant parse: an endpoint still in development must degrade, never throw. */
-export function parseForecast(raw: unknown): DemandForecast | null {
+const num = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : null;
+const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+
+/** Tolerant parse: a shape change must degrade to null/[], never throw. */
+export function parseForecast(raw: unknown): SupplyForecast | null {
   const r = raw as Record<string, unknown> | null;
   if (!r || typeof r !== "object") return null;
-  const zonesRaw = Array.isArray(r.zones) ? r.zones : null;
+  const zonesRaw = Array.isArray(r.zones) ? (r.zones as Record<string, unknown>[]) : null;
   if (!zonesRaw) return null;
+  const meta = (r.forecast ?? {}) as Record<string, unknown>;
+
   const zones: ForecastZone[] = [];
-  for (const z of zonesRaw as Record<string, unknown>[]) {
-    if (!z || typeof z.id !== "string") continue;
+  for (const z of zonesRaw) {
+    if (!z || typeof z !== "object") continue;
+    const id = str(z.zoneId) ?? str(z.id);
+    if (!id) continue;
     const hoursRaw = Array.isArray(z.hours) ? (z.hours as Record<string, unknown>[]) : [];
-    const hours: DemandForecastHour[] = [];
+    const hours: ForecastHour[] = [];
     for (const h of hoursRaw) {
-      if (!h || typeof h.start !== "string" || Number.isNaN(hourKey(h.start))) continue;
-      const pCall = typeof h.p_call === "number" ? h.p_call : typeof h.pCall === "number" ? h.pCall : NaN;
-      if (!Number.isFinite(pCall)) continue;
-      const req = h.required_supply_f ?? h.requiredSupplyF;
-      const conf = h.confidence;
-      const runtime = h.expected_runtime_min ?? h.expectedRuntimeMin;
+      if (!h || typeof h !== "object") continue;
+      const start = str(h.targetTimestamp) ?? str(h.start);
+      if (!start || Number.isNaN(hourKey(start))) continue;
       hours.push({
-        start: h.start,
-        pCall: Math.min(1, Math.max(0, pCall)),
-        expectedRuntimeMin: typeof runtime === "number" ? runtime : null,
-        requiredSupplyF: typeof req === "number" ? req : null,
-        basis: typeof h.basis === "string" ? h.basis : "history",
-        // Absent confidence is treated as fully confident ONLY in the sense that the
-        // pCall gate still governs; an endpoint that omits it is taken at its word.
-        confidence: typeof conf === "number" ? Math.min(1, Math.max(0, conf)) : 1,
+        start,
+        outdoorF: num(h.outdoorF),
+        requiredSupplyF: num(h.requiredSupplyWaterTempF) ?? num(h.requiredSupplyF),
+        vintage: str(h.forecastGeneratedAt),
       });
     }
-    zones.push({ id: z.id, name: typeof z.name === "string" ? z.name : z.id, hours });
+    zones.push({
+      id,
+      name: str(z.zoneName) ?? str(z.name) ?? id,
+      deliveryType: str(z.deliveryType) ?? "",
+      omittedReason: str(z.omittedReason),
+      hours,
+    });
   }
   return {
-    generatedAt: typeof r.generatedAt === "string" ? r.generatedAt : new Date().toISOString(),
-    basisWindowDays: typeof r.basis_window_days === "number" ? r.basis_window_days : null,
+    generatedAt: str(r.generatedAt) ?? new Date().toISOString(),
+    newestVintage: str(meta.newestVintage),
+    oldestVintage: str(meta.oldestVintage),
+    hoursAvailable: num(meta.hoursAvailable),
+    degradeReason: str(meta.degradeReason),
     zones,
   };
 }
 
-export async function fetchDemandForecast(
+export async function fetchSupplyForecast(
   baseUrl: string,
   token: string,
   hours = HORIZON_HOURS,
-): Promise<DemandForecast | null> {
-  const url = `${baseUrl.replace(/\/$/, "")}/api/insights/demand-forecast?hours=${hours}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) throw new Error(`demand-forecast HTTP ${res.status}`);
+): Promise<SupplyForecast | null> {
+  const url = `${baseUrl.replace(/\/$/, "")}/api/insights/zones/required-supply-forecast?hours=${hours}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`required-supply-forecast HTTP ${res.status}`);
   return parseForecast(await res.json());
 }
 
 /**
- * The predicted floor for one hour: the hottest zone whose predicted call clears the
- * confidence gate. Returns null when nothing clears — the caller then does exactly what
- * it does today.
+ * The hottest required supply for one hour among the zones that pass both filters.
  *
- * `verifiedZoneIds` is the TempIQ#1508 gate: pass the set of owner-verified hydronic
- * zones and an unverified zone can never command a pre-heat. Pass null to skip the gate
- * (shadow accounting only — never for a path that writes).
+ * `verifiedZoneIds` is the TempIQ#1508 provenance gate. `zoneIds` is the EVIDENCE filter —
+ * pass the zones calling now to get a pre-heat requirement, or null to ask the unconditional
+ * capacity question (what the hottest verified zone would need), which is monitoring only and
+ * must never drive a commanded target.
  */
 export function predictedFloorForHour(
-  forecast: DemandForecast,
+  forecast: SupplyForecast,
   hourIso: string,
-  opts: { threshold: number; verifiedZoneIds: Set<string> | null },
+  opts: { verifiedZoneIds: Set<string> | null; zoneIds: Set<string> | null },
 ): PredictedFloor | null {
   const key = hourKey(hourIso);
   if (Number.isNaN(key)) return null;
   let best: PredictedFloor | null = null;
   for (const z of forecast.zones) {
     if (opts.verifiedZoneIds && !opts.verifiedZoneIds.has(z.id)) continue;
+    if (opts.zoneIds && !opts.zoneIds.has(z.id)) continue;
     for (const h of z.hours) {
-      if (hourKey(h.start) !== key) continue;
       if (h.requiredSupplyF === null) continue;
-      if (h.pCall * h.confidence < opts.threshold) continue;
+      if (hourKey(h.start) !== key) continue;
       if (best && h.requiredSupplyF <= best.requiredSupplyF) continue;
       best = {
         tankTargetF: Math.round((h.requiredSupplyF + BUFFER_MARGIN_F) * 10) / 10,
         zoneId: z.id,
         zoneName: z.name,
         requiredSupplyF: h.requiredSupplyF,
-        pCall: h.pCall,
-        confidence: h.confidence,
-        basis: h.basis,
       };
     }
   }
@@ -152,27 +196,31 @@ export function predictedFloorForHour(
 }
 
 /**
- * Earliest predicted hour whose required tank temp exceeds the everyday cap — the
- * afternoon warning that tonight will want more than strictCapF, instead of discovering
- * it at 2 am through the reactive 3-hour-pinned streak (#59 cap watch).
+ * Earliest forecast hour whose required tank temp exceeds the everyday cap — the afternoon
+ * warning that tonight will want more than strictCapF, instead of discovering it at 2 am via
+ * the reactive 3-hour-pinned streak (#59 cap watch).
+ *
+ * Deliberately UNGATED by live calls: this is a capacity question ("if these emitters are
+ * asked to work tonight, the cap is short"), it commands nothing, and gating it on what
+ * happens to be calling this minute would silence the warning precisely in the mild hours
+ * when it is still actionable.
  */
 export function predictedCapRisk(
-  forecast: DemandForecast,
+  forecast: SupplyForecast,
   capF: number,
-  opts: { threshold: number; verifiedZoneIds: Set<string> | null },
-): PredictedFloor & { start: string } | null {
+  opts: { verifiedZoneIds: Set<string> | null },
+): (PredictedFloor & { start: string }) | null {
   let earliest: (PredictedFloor & { start: string }) | null = null;
   for (const z of forecast.zones) {
     if (opts.verifiedZoneIds && !opts.verifiedZoneIds.has(z.id)) continue;
     for (const h of z.hours) {
       if (h.requiredSupplyF === null) continue;
-      if (h.pCall * h.confidence < opts.threshold) continue;
       const need = Math.round((h.requiredSupplyF + BUFFER_MARGIN_F) * 10) / 10;
       if (need <= capF) continue;
       if (earliest && hourKey(h.start) >= hourKey(earliest.start)) continue;
       earliest = {
         start: h.start, tankTargetF: need, zoneId: z.id, zoneName: z.name,
-        requiredSupplyF: h.requiredSupplyF, pCall: h.pCall, confidence: h.confidence, basis: h.basis,
+        requiredSupplyF: h.requiredSupplyF,
       };
     }
   }
@@ -184,7 +232,7 @@ export function predictedCapRisk(
  * throws, and every consumer treats "unhealthy" as "behave exactly as today".
  */
 export class ForecastFeed {
-  private cached: DemandForecast | null = null;
+  private cached: SupplyForecast | null = null;
   private lastSuccessAt: Date | null = null;
   private lastError: string | null = null;
 
@@ -196,7 +244,7 @@ export class ForecastFeed {
 
   async refresh(): Promise<void> {
     try {
-      const f = await fetchDemandForecast(this.baseUrl, this.token, this.horizonHours);
+      const f = await fetchSupplyForecast(this.baseUrl, this.token, this.horizonHours);
       if (f) {
         this.cached = f;
         this.lastSuccessAt = new Date();
@@ -205,28 +253,41 @@ export class ForecastFeed {
         this.lastError = "unparseable payload";
       }
     } catch (err) {
-      // Expected until TempIQv2#2009 Phase 1 ships — a 404 must stay a quiet degraded
-      // mode, not a recurring alarm.
       this.lastError = (err as Error).message;
     }
   }
 
-  isHealthy(): boolean {
-    return this.cached !== null && this.lastSuccessAt !== null
-      && Date.now() - this.lastSuccessAt.getTime() < STALE_MS;
+  /** Weather vintage age in ms, or null when the payload does not say. */
+  vintageAgeMs(now = Date.now()): number | null {
+    const v = this.cached?.newestVintage ?? this.cached?.oldestVintage ?? null;
+    if (!v) return null;
+    const ms = Date.parse(v);
+    return Number.isNaN(ms) ? null : now - ms;
   }
 
-  forecast(): DemandForecast | null {
+  isHealthy(): boolean {
+    if (!this.cached || !this.lastSuccessAt) return false;
+    if (Date.now() - this.lastSuccessAt.getTime() >= STALE_MS) return false;
+    const age = this.vintageAgeMs();
+    if (age !== null && age >= MAX_VINTAGE_MS) return false;
+    return this.cached.zones.some((z) => z.hours.length > 0);
+  }
+
+  forecast(): SupplyForecast | null {
     return this.isHealthy() ? this.cached : null;
   }
 
   status(): Record<string, unknown> {
+    const age = this.vintageAgeMs();
     return {
       healthy: this.isHealthy(),
       lastSuccessAt: this.lastSuccessAt ? this.lastSuccessAt.toISOString() : null,
       lastError: this.lastError,
       zoneCount: this.cached?.zones.length ?? 0,
+      zonesWithHours: this.cached?.zones.filter((z) => z.hours.length > 0).length ?? 0,
       generatedAt: this.cached?.generatedAt ?? null,
+      vintageAgeH: age === null ? null : Math.round((age / 3_600_000) * 10) / 10,
+      degradeReason: this.cached?.degradeReason ?? null,
     };
   }
 }
@@ -237,40 +298,43 @@ export interface PreheatDecision {
   fromF: number;
   toF: number;
   zoneName: string;
-  pCall: number;
-  basis: string;
-  lead: boolean;       // true = lifted as the LEAD hour for a call predicted next hour
+  requiredSupplyF: number;
+  lead: boolean;       // true = lifted as the LEAD hour for the next hour's requirement
   applied: boolean;
   skipped?: string;    // why it was not applied
 }
 
 /**
- * Predicted floors + their lead hour, applied to a plan.
+ * Forecast requirements for the CALLING zones, applied to a plan.
  *
- * For block i the requirement is max(predicted floor for hour i, predicted floor for hour
- * i+1): the first term carries the hour the call is predicted in, the second pre-heats the
- * hour BEFORE it so the tank is already there when the zone wakes up (the up-to-an-hour
- * floor-raise latency this whole feature exists to remove). Doing both in one pass also
- * avoids a sawtooth — lifting only the lead hour would drop the target again exactly when
- * the call starts.
+ * For block i the requirement is max(hour i, hour i+1): the first term carries the hour
+ * itself, the second pre-heats the hour BEFORE the requirement rises, so the tank is already
+ * there when it does. Doing both in one pass avoids a sawtooth — lifting only the lead hour
+ * would drop the target again exactly when it is needed.
  *
- * RAISES ONLY, and never past the block's band ceiling. Sanitize blocks are left alone —
- * the soak already outranks every other raise. With apply=false nothing is mutated and the
- * decisions are returned for shadow accounting.
+ * `callingZoneIds` is the evidence gate. Null (call feed unhealthy) or empty (nothing
+ * calling) means NO raises: a speculative raise on unknown demand is exactly the cost this
+ * design refuses. RAISES ONLY, never past the block's band ceiling, sanitize blocks left
+ * alone. With apply=false nothing is mutated and the decisions are returned for shadow
+ * accounting.
  */
 export function planPreheat(
   plan: ShadowBlock[],
-  forecast: DemandForecast,
+  forecast: SupplyForecast,
   opts: {
-    threshold: number;
     verifiedZoneIds: Set<string> | null;
+    callingZoneIds: string[] | null;
     ceilingFor: (block: ShadowBlock) => number;
     setpointFor: (targetF: number) => number;
     apply: boolean;
   },
 ): PreheatDecision[] {
+  if (!opts.callingZoneIds || opts.callingZoneIds.length === 0) return [];
+  const gate = {
+    verifiedZoneIds: opts.verifiedZoneIds,
+    zoneIds: new Set(opts.callingZoneIds),
+  };
   const decisions: PreheatDecision[] = [];
-  const gate = { threshold: opts.threshold, verifiedZoneIds: opts.verifiedZoneIds };
   for (let i = 0; i < plan.length; i++) {
     const block = plan[i];
     const own = predictedFloorForHour(forecast, block.ts, gate);
@@ -281,7 +345,7 @@ export function planPreheat(
     if (needed <= block.tank_target_f) continue;
     const base = {
       ts: block.ts, fromF: block.tank_target_f, toF: needed, zoneName: driver.zoneName,
-      pCall: driver.pCall, basis: driver.basis, lead: driver === next && driver !== own,
+      requiredSupplyF: driver.requiredSupplyF, lead: driver === next && driver !== own,
     };
     if (/sanitize/i.test(block.reason)) {
       decisions.push({ ...base, applied: false, skipped: "sanitize block outranks" });
@@ -297,12 +361,12 @@ export function planPreheat(
       continue;
     }
     block.tank_target_f = Math.round(raised);
-    // Same leading-setpoint treatment as the bank/DP/storm raises: the advisory HP line
-    // must cover the raised target or the plan draws an I1-violating hour.
+    // Same leading-setpoint treatment as the bank/DP/storm raises: the advisory HP line must
+    // cover the raised target or the plan draws an I1-violating hour.
     block.hp1_setpoint_f = opts.setpointFor(block.tank_target_f);
     block.reason = base.lead
-      ? `pre-heat: ${driver.zoneName} predicted to call next hour (${Math.round(driver.pCall * 100)}%, ${driver.basis})`
-      : `predicted demand: ${driver.zoneName} needs ${Math.round(driver.requiredSupplyF)}°F (${Math.round(driver.pCall * 100)}%, ${driver.basis})`;
+      ? `pre-heat: ${driver.zoneName} is calling and needs ${Math.round(driver.requiredSupplyF)}°F next hour`
+      : `forecast demand: ${driver.zoneName} is calling and needs ${Math.round(driver.requiredSupplyF)}°F`;
     decisions.push({ ...base, toF: block.tank_target_f, applied: true });
   }
   return decisions;

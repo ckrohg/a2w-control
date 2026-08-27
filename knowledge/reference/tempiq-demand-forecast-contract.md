@@ -150,3 +150,65 @@ Field semantics that matter to A2W:
 - TempIQ build: filed as a TempIQv2 issue referencing this doc (Phase 0 → 1 → 2).
 - A2W consumption (blocked on Phase 1): planner issue — DP future floors from forecast,
   confidence-gated pre-heat, predictive cap-watch, degraded-mode parity tests.
+
+---
+
+## AMENDMENT 2026-08-27 — the survivor shipped, and it changed the gate
+
+TempIQ shipped gtm#1591 as **TempIQv2#2017**, and A2W's consumption side was rewired onto it
+(a2w#87). This section is authoritative over everything above it that describes the endpoint
+or the pre-heat gate.
+
+**What exists now:** `GET /api/insights/zones/required-supply-forecast` — for each
+owner-verified hydronic zone, the same reset curve `/zones` emits, evaluated at the FORECAST
+outdoor of each persisted hour. Live shape, verified against prod:
+
+```jsonc
+{ "generatedAt": "…",                                  // when the RESPONSE was built
+  "forecast": { "hoursAvailable": 48, "oldestVintage": "…", "newestVintage": "…",
+                "degradeReason": null },               // weather vintage; refreshes 6-hourly
+  "zones": [{ "zoneId": "…", "zoneName": "…", "deliveryType": "baseboard",
+              "omittedReason": null,                   // "no-curve" | "unverified"
+              "resetCurve": { … },                     // gtm#1593 block, incl. provenance
+              "hours": [{ "targetTimestamp": "…", "outdoorF": 18.4,
+                          "requiredSupplyWaterTempF": 143.2,
+                          "forecastGeneratedAt": "…" }] }] }
+```
+
+Two traps worth writing down:
+
+- **`generatedAt` is not the vintage.** It is when the response was built, so it is always
+  fresh and useless as a staleness check. The weather vintage lives in
+  `forecast.newestVintage` and is legitimately up to ~6 h old. The client's old 2 h window
+  applied to the wrong field would have read as permanent degraded mode.
+- **`omittedReason` is TempIQ's verified gate, expressed as an omission.** A zone with hours
+  has passed their check; 4 of 7 hydronic zones here qualify. We keep our own verified gate
+  anyway (TempIQ#1508 defence in depth).
+
+**The gate changed, and this is the part to not undo.** Everything above describes
+`p_call`-gated pre-heat. There is no `p_call`. Deleting the gate and keeping the mechanism
+would have converted pre-heat into *the conservative all-zones future floor* — the hottest
+verified emitter's requirement, every hour of the day — which is precisely the idle-baseboard
+cost named as winter-DP go-live criterion 5. The replacement is the #90 doctrine on the time
+axis:
+
+> **Only a zone that is CALLING NOW earns a forecast-driven raise, and only for its own
+> requirement.** Not a prediction that a call will happen — an anticipation of the ramp of a
+> call already in progress.
+
+Consequences, all test-pinned in `planner/src/forecast.test.ts`:
+
+- Nothing calling, or the call feed unhealthy (`null`) → **no raises at all**. Note the
+  deliberate inversion vs `computeFloors`, where a null call feed conservatively treats every
+  zone as calling: there the fallback is a live requirement (safe); here the raise is
+  speculative, so the safe fallback is to do nothing.
+- A hotter **non-calling** zone can never move the plan.
+- `predictedCapRisk` stays deliberately **ungated** by live calls — it commands nothing, and
+  gating a capacity warning on what happens to be calling this minute would silence it in
+  exactly the mild hours when it is still actionable. Its alert text now says explicitly that
+  it is a capacity warning at the forecast outdoor, not a prediction that the zone will call.
+- `PREHEAT_CONFIDENCE` is **gone**; setting it has no effect.
+
+Unchanged: raises only, never past the band ceiling, sanitize blocks untouched, both gates
+(`FORECAST_FETCH_ENABLED`, `FORECAST_PREHEAT_ENABLED`) default OFF, and full degraded-mode
+parity when the feed is absent.
