@@ -206,11 +206,12 @@ const demandFeed = WINTER_SOLVER_SHADOW && TEMPIQ_SURFACE_TOKEN
   : null;
 if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but TEMPIQ_SURFACE_TOKEN missing — winter solver shadow disabled");
 
-// A-8 demand forecast (#87; contract in knowledge/reference/tempiq-demand-forecast-contract.md,
-// TempIQ build TempIQv2#2009). Two independent gates on purpose: FETCH records what the
-// predictions WOULD have done (plan meta + /health) while the endpoint is still landing;
-// PREHEAT is what lets a prediction actually raise a commanded target. Both default off, so
-// until the owner flips them the planner behaves byte-for-byte as it does today.
+// Required-supply FORECAST (#87; TempIQ gtm#1591, shipped TempIQv2#2017). NOT the A-8
+// prediction contract — that was gated STOP at Phase 0 and never built, so there is no
+// p_call and no pre-heating of zones that are merely LIKELY to call; see forecast.ts's
+// header. Two independent gates on purpose: FETCH records what the forecast WOULD have
+// done (plan meta + /health); PREHEAT is what lets it actually raise a commanded target.
+// Both default off, so until the owner flips them the planner behaves as it does today.
 // #90 cost-first demand floor (owner direction 2026-08-24). "escalate" (default): the
 // cheap local model is the floor, TempIQ's capacity number is only a CEILING, and the
 // calling room's own deficit decides how far up we go. "learned" = pre-#90 behavior
@@ -219,8 +220,10 @@ if (WINTER_SOLVER_SHADOW && !demandFeed) console.warn("WINTER_SOLVER_SHADOW but 
 const DEMAND_FLOOR_POLICY = (process.env.DEMAND_FLOOR_POLICY ?? "escalate") as FloorPolicy;
 const FORECAST_FETCH_ENABLED = process.env.FORECAST_FETCH_ENABLED === "1";
 const FORECAST_PREHEAT_ENABLED = process.env.FORECAST_PREHEAT_ENABLED === "1";
-// pCall × confidence must clear this for a zone to drive heat. 0.5 = "more likely than not".
-const PREHEAT_CONFIDENCE = Number(process.env.PREHEAT_CONFIDENCE ?? "0.5");
+// PREHEAT_CONFIDENCE is GONE (#87 rewire): it gated on p_call, which TempIQ's Phase 0
+// backtest killed and never shipped. The gate is now live evidence — a zone must be
+// CALLING to earn a forecast raise. See forecast.ts's header for why the old gate could
+// not simply be deleted. Setting the old env var has no effect.
 const forecastFeed = FORECAST_FETCH_ENABLED && TEMPIQ_SURFACE_TOKEN
   ? new ForecastFeed(TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
@@ -1057,15 +1060,19 @@ async function shadowOnce(): Promise<void> {
       );
       if (fc && !verifiedIds.size) console.warn("[forecast] no zone carries a TempIQ-vouched supply temp — pre-heat inert this cycle");
       if (fc && verifiedIds.size) {
+        // The call feed IS the gate now. Note the inversion vs computeFloors: there a null
+        // feed conservatively treats every zone as calling (safe — a live requirement,
+        // clamped); here the raise is speculative, so null must mean raise nothing.
+        const callingNowIds = demandFeed?.callsHealthy() ? demandFeed.callingZoneIds() : null;
         const decisions = planPreheat(plan, fc, {
-          threshold: PREHEAT_CONFIDENCE,
           verifiedZoneIds: verifiedIds,
+          callingZoneIds: callingNowIds,
           ceilingFor: (b) => bandFor(b.outdoor_f, cfg, opts.strictCapF).hi,
           setpointFor: (t) => Math.round(Math.min(Math.max(t + opts.i1MarginF, opts.hpMinF), opts.strictCapF + opts.i1MarginF)),
           apply: FORECAST_PREHEAT_ENABLED,
         });
         preheatMeta = {
-          enabled: FORECAST_PREHEAT_ENABLED, threshold: PREHEAT_CONFIDENCE,
+          enabled: FORECAST_PREHEAT_ENABLED, calling_zones: callingNowIds?.length ?? null,
           generated_at: fc.generatedAt, considered: decisions.length,
           applied: decisions.filter((d) => d.applied).length,
           decisions: decisions.slice(0, 12),
@@ -1076,12 +1083,12 @@ async function shadowOnce(): Promise<void> {
 
         // Predictive cap check: tonight's predicted need vs the everyday cap, surfaced in the
         // AFTERNOON instead of at 2 am via the reactive 3-hour-pinned streak.
-        const risk = predictedCapRisk(fc, opts.strictCapF, { threshold: PREHEAT_CONFIDENCE, verifiedZoneIds: verifiedIds });
+        const risk = predictedCapRisk(fc, opts.strictCapF, { verifiedZoneIds: verifiedIds });
         if (risk && !predictedCapLatched) {
           predictedCapLatched = true;
           await ntfy(
             "Winter cap check: tonight is predicted to need more than 135°F",
-            `${risk.zoneName} is predicted to call around ${new Date(risk.start).toLocaleString("en-US", { timeZone: "America/New_York" })} needing ~${Math.round(risk.requiredSupplyF)}°F supply (tank ${risk.tankTargetF}°F), above the ${opts.strictCapF}°F everyday cap. If rooms run cold tonight, the seasonal cap needs a deliberate raise (see winter-dp-commissioning.md).`,
+            `If ${risk.zoneName} is calling around ${new Date(risk.start).toLocaleString("en-US", { timeZone: "America/New_York" })} it will need ~${Math.round(risk.requiredSupplyF)}°F supply (tank ${risk.tankTargetF}°F), above the ${opts.strictCapF}°F everyday cap — this is a capacity warning at the forecast outdoor, NOT a prediction that the zone will call. If rooms run cold tonight, the seasonal cap needs a deliberate raise (see winter-dp-commissioning.md).`,
             "urgent",
           );
         } else if (!risk) {
@@ -1090,7 +1097,7 @@ async function shadowOnce(): Promise<void> {
       }
       forecastState = {
         ...forecastFeed.status(), preheat_enabled: FORECAST_PREHEAT_ENABLED,
-        threshold: PREHEAT_CONFIDENCE, verified_zones: verifiedIds.size,
+        verified_zones: verifiedIds.size,
         applied_last_cycle: preheatMeta ? (preheatMeta.applied as number) : 0,
       };
     } catch (e) {
