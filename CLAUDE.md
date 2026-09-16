@@ -61,6 +61,23 @@ The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real 
 `FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated,
 not work-gated.
 
+**Working rules (added 2026-09-16 after the Pi went offline mid-session — see
+`knowledge/reference/incident-20260916-pi-offline.md`):**
+
+- **Merge deploying PRs ONE AT A TIME, verified.** Use `scripts/deploy-gate.sh merge <pr>`: it
+  refuses to merge from an unhealthy baseline, waits for the deploy, and re-verifies. Anything
+  touching `planner/` or `hub/` redeploys a live service controlling this house's heat. Docs,
+  CI and `knowledge/` PRs are inert (watchPatterns) and can land freely.
+- **Never run analysis queries against the production database.** Use
+  `scripts/analyze-local.sh` to restore the newest encrypted backup locally and query that.
+  Same schema, same history, zero load on the box the house's telemetry ingests into.
+- **Never cut a `release-*` tag on the owner's behalf.** That is the ONLY path to the Pi, and
+  it is deliberately a human step (fusion audit risk 4).
+- **A burst of merges destroys attribution.** The point of serialising is not that a merge is
+  likely to break something — it is that without a known-good bracket you cannot answer "did we
+  cause this?" with anything better than a guess. On home-heating infrastructure that is the
+  difference that matters.
+
 **Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
 
 Owner rejects over-engineering — right-sized solutions first (SQLite, single process, Cloudflare Tunnel).
