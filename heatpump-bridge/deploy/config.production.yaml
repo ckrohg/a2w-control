@@ -70,9 +70,18 @@ guardrails:
   #   holds the buffer at low ambient before trusting this for freeze safety.
   # Remote-optimizer lease: a remote setpoint is a renewable LEASE; on optimizer silence the
   # Pi reverts to this warm baseline so the house is never stranded at a stale value.
-  # baseline_setpoint_c: 48       # warm winter default reverted to when a lease lapses
-  # lease_max_minutes: 180
-  # lease_warn_minutes: 15
+  # ARMED 2026-09-16 (FINDING-1). This was commented out, which made the ENTIRE lease regime
+  # dormant: poller.py:600 only records a lease when baseline_setpoint_c is set, so the Pi
+  # held no lease, check_lease() returned early every tick, and the revert + its "optimizer
+  # stale" alert + the 15-min warning could never fire -- while planner /health cheerfully
+  # reported "lease 90m" from its own constant. Every doc promised this failsafe; it did not
+  # exist. Unlike the freeze FLOOR above (still commented -- confidence LOW, and a de-rated
+  # compressor may not physically REACH 45C at very low ambient), arming the lease has no
+  # downside: 48C is a WARM value and the only new behaviour is reverting TO it.
+  # Validates against the defaults: floor falls back to setback_setpoint_c (40), 40<=48<=75.
+  baseline_setpoint_c: 48       # warm winter default reverted to when a lease lapses
+  lease_max_minutes: 180
+  lease_warn_minutes: 15
 
 # Push alerts (ntfy — free, no account) + external dead-man heartbeat.
 # EASIEST: pass A2W_NTFY_TOPIC and/or A2W_HEARTBEAT_URL to pi-bootstrap.sh and it writes this
