@@ -62,6 +62,10 @@ export function computeTracking(
 export class PhaseB {
   private failStreak: Record<string, number> = {};
   private alerted: Record<string, boolean> = {};
+  /** Per-pump: did the Pi actually ARM the lease we asked for? null = not yet observed.
+   *  See verifyLeases() — this is the FINDING-1b fix. */
+  private leaseArmed: Record<string, boolean | null> = {};
+  private leaseAlerted: Record<string, boolean> = {};
   public lastRunAt: string | null = null;
   public lastResults: Record<string, string> = {};
 
@@ -119,8 +123,11 @@ export class PhaseB {
         continue;
       }
       const res = await this.hub.sendSetpoint(d.pump_id, d.value_c, LEASE_MINUTES, "phase-b");
+      // NB: this string is provisional — it records what we ASKED for. verifyLeases() below
+      // overwrites it with what the Pi actually did. Reporting the request as though it were
+      // the outcome is exactly what hid FINDING-1 for two months (FINDING-1b).
       this.lastResults[d.pump_id] = res.ok
-        ? `ok ${d.value_c}°C (lease ${LEASE_MINUTES}m)`
+        ? `ok ${d.value_c}°C (lease ${LEASE_MINUTES}m requested)`
         : `failed: ${res.detail}`;
       await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "active", valueC: d.value_c, result: res.ok ? "sent" : `failed: ${res.detail}` }).catch(() => {});
       if (res.ok) {
@@ -138,7 +145,67 @@ export class PhaseB {
           this.alerted[d.pump_id] = true;
           await this.notify(
             "Phase B tracking failing",
-            `${d.pump_id}: 3 consecutive write failures (${res.detail}). Lease will lapse to baseline — house safe, savings paused.`,
+            `${d.pump_id}: 3 consecutive write failures (${res.detail}). ` +
+              (this.leaseArmed[d.pump_id] === false
+                ? "⚠ NO LEASE IS ARMED on the Pi — the setpoint will NOT revert to baseline; " +
+                  "it will stay where it is. See FINDING-1."
+                : "Lease will lapse to baseline — house safe, savings paused."),
+            "high",
+          );
+        }
+      }
+    }
+    await this.verifyLeases(decisions.map((d) => d.pump_id));
+  }
+
+  /**
+   * FINDING-1b — report what the Pi DID, not what we asked for.
+   *
+   * The Pi records a setpoint lease only `if lease_minutes and baseline_setpoint_c is not
+   * None` (poller.py:600). With baseline_setpoint_c unset the lease is silently dropped:
+   * check_lease() then returns early every tick, so the revert to baseline, its "optimizer
+   * stale" alert, and the 15-min warning can never fire. Before this, Phase B rendered
+   * "lease 90m" from its own LEASE_MINUTES constant regardless — so /health asserted a
+   * failsafe that did not exist, and two months of green dashboards hid it.
+   *
+   * Best-effort: a hub read failure must never break tracking, so we leave the provisional
+   * string in place and try again next cycle.
+   */
+  private async verifyLeases(pumpIds: string[]): Promise<void> {
+    let pumps;
+    try {
+      pumps = (await this.hub.getState()).pumps;
+    } catch (e) {
+      console.warn(`[phase-b] lease verify skipped (hub read failed): ${(e as Error).message}`);
+      return;
+    }
+    for (const id of pumpIds) {
+      const p = pumps.find((x) => x.id === id);
+      // Field absent (older hub build) is UNKNOWN, not "unarmed" — don't cry wolf.
+      if (!p || p.remote_lease_until === undefined) continue;
+      const armed = p.remote_lease_until !== null;
+      this.leaseArmed[id] = armed;
+      const prev = this.lastResults[id] ?? "";
+      if (!prev.startsWith("ok ")) continue; // the write itself failed; that message wins
+      if (armed) {
+        const mins = Math.max(0, Math.round((p.remote_lease_until! * 1000 - Date.now()) / 60000));
+        this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} (lease ${mins}m armed)`;
+        if (this.leaseAlerted[id]) {
+          this.leaseAlerted[id] = false;
+          await this.notify("Phase B lease armed", `${id}: the Pi is now holding a lease again.`);
+        }
+      } else {
+        this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} — ⚠ NO LEASE ARMED`;
+        console.warn(`[phase-b] ${id}: wrote setpoint but the Pi armed NO lease — ` +
+          "baseline_setpoint_c is unset, revert-to-baseline cannot fire (FINDING-1)");
+        if (!this.leaseAlerted[id]) {
+          this.leaseAlerted[id] = true;
+          await this.notify(
+            "⚠ Phase B: no lease armed",
+            `${id}: setpoint accepted but the Pi recorded NO lease, so baseline_setpoint_c is ` +
+              "unset and the revert-to-baseline failsafe cannot fire. The house is not at " +
+              "immediate risk (it holds the last warm setpoint) but there is no automatic " +
+              "recovery from a dead planner. See the FINDING-1 runbook.",
             "high",
           );
         }

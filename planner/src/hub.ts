@@ -14,6 +14,13 @@ export interface HubPump {
   inlet_c?: number | null;
   state?: string | null; // "heating" | "idle" | "offline" — for the unserved-call check
   outlet_c?: number | null;
+  // The Pi pushes both of these in every state frame, but they were never declared here, so
+  // the planner structurally COULD NOT see them — which is how FINDING-1 hid for two months:
+  // Phase B asserted "lease 90m" from its own constant while the Pi held no lease at all.
+  // remote_lease_until is the ONLY remote evidence that the revert-to-baseline failsafe is
+  // armed (the Pi records a lease only when baseline_setpoint_c is set — poller.py:600).
+  remote_lease_until?: number | null;
+  write_enabled?: boolean;
 }
 
 export interface HubState {
