@@ -84,19 +84,26 @@ case "${1:-status}" in
     PR="${2:-}"
     [ -z "$PR" ] && { echo "usage: $0 merge <pr-number>" >&2; exit 2; }
 
-    echo "── PRE-MERGE GATE ──────────────────────────────────────"
-    if ! report "before"; then
-      red "REFUSING to merge #$PR: the system is already unhealthy."
-      red "Stacking a deploy on an unexplained outage is how you lose the ability to"
-      red "attribute the next failure. Resolve this first, or override deliberately."
-      exit 1
-    fi
-
-    # Does this PR actually deploy anything? planner/** and hub/** are the watchPattern'd
-    # paths; everything else is inert and needs no post-verification wait.
+    # Classify FIRST. The health gate applies only to PRs that actually deploy: refusing an
+    # inert docs/CI merge because the system is unwell would, among other things, have blocked
+    # the write-up OF an incident during that incident. Only planner/** and hub/** redeploy
+    # under the watchPatterns; everything else cannot touch a live surface.
     files="$(gh pr view "$PR" --json files --jq '.files[].path' 2>/dev/null)"
     deploys=0
     grep -qE '^(planner|hub)/' <<<"$files" && deploys=1
+
+    echo "── PRE-MERGE GATE ──────────────────────────────────────"
+    if [ "$deploys" -eq 1 ]; then
+      if ! report "before"; then
+        red "REFUSING to merge #$PR: it deploys a live service and the system is already unhealthy."
+        red "Stacking a deploy on an unexplained outage is how you lose the ability to"
+        red "attribute the next failure. Resolve this first, or override deliberately."
+        exit 1
+      fi
+    else
+      report "before" || true   # recorded for the log, not a gate: this PR deploys nothing
+      echo "           (non-deploying PR — health is recorded, not enforced)"
+    fi
 
     echo
     echo "── MERGING #$PR (deploying: $([ $deploys -eq 1 ] && echo YES || echo no)) ──"
