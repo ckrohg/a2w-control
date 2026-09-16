@@ -2,6 +2,24 @@
 
 > Phases are settled (handoff §8). Phase 0 needs no hardware and can start immediately.
 
+> **RECONCILED 2026-09-16.** This file was last edited 2026-07-14 and had drifted ~2 months
+> behind the running system: it still listed as open/deferred several things that had shipped,
+> and named Neon as the database after the 2026-08-23 migration to Railway Postgres (#79).
+> Ground truth is `reference/live-state-20260916.md`, captured from `/health`, not from docs.
+> `scripts/drift-check.sh` now guards this class of rot — run it before trusting any claim here.
+>
+> **Shipped since this file was last accurate:** the W1-UI dashboard wave (2026-07-15, 8
+> issues); HBX target write path DISCOVERED and in use (2026-07-16) — it was listed below as
+> "must be discovered"; **Phase B live** (planner tracks HBX target on 90-min leases, both
+> pumps); the planner service itself (autopilot, SPAN local power, savings engine, history);
+> email + ntfy alerting and the weekly digest (2026-08-06) — listed below as an undecided
+> v1.1 item; **winter DP solver v1** shadow-first (2026-08-06) — listed below as a "future"
+> Phase 4 item; TempIQ demand-forecast consumption (2026-08-23..27).
+>
+> **OPEN SAFETY ITEM — FINDING-1:** the revert-to-baseline failsafe referenced throughout this
+> file is NOT armed on the live Pi (`baseline_setpoint_c` unset ⇒ no lease recorded ⇒
+> `check_lease()` early-returns). Remediation: `reference/finding1-arm-baseline-runbook.md`.
+
 ## Done — Phase 0: simulator-first build ✅ (2026-07-04)
 
 - [x] Scaffold `heatpump-bridge/` repo per handoff §6.2
@@ -57,8 +75,9 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
 - [ ] **Router prep**: confirm a 2.4 GHz-capable SSID with no client isolation; plan
       three DHCP reservations (Pi, W610 ×2).
 - [ ] **Bench kit for W610 day**: any 12 V DC adapter for bench config, labels.
-- [ ] **Decide alert notifications** (v1.1): critical faults (P01 water flow) currently
-      show only in the UI — nobody gets paged. Options: ntfy.sh (free, no account),
+- [x] **Decide alert notifications** — DONE 2026-08-06 (#57, #64, #74): Resend email on every
+      real fault, ntfy push, severity-led subjects, email-only owner tiering, weekly digest.
+      Superseded the option list below. Options: ntfy.sh (free, no account),
       Pushover (~$5 once), or email. Fully buildable + testable against the sim now.
 - [x] Winnie: BMS port/pinout **ANSWERED 2026-07-07** — CN22, pins 2/3/4=GND/A/B, separate
       bus, slave addr 1, no activation (`reference/winnie-bms-port-reply.md`).
@@ -96,8 +115,12 @@ a recorded step. Read-only Phase 1 does not need it live but should verify it ea
       tracks HBX target + margin, no HBX writes needed) captures most savings and fixes the
       tank-target-above-HP-setpoint failure mode. Supersedes `tempiq-integration-sketch.md`
       §3 framing; lease mechanics carry over.
-- [ ] Phase 3: second pump + Cloudflare Tunnel + systemd hardening (`Restart=always`)
-- [ ] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — as a new consumer of existing API endpoints
+- [x] Phase 3 (partly): **second pump is live and write-enabled**. Cloudflare Tunnel still
+      deferred (Tailscale Funnel in use); systemd hardening shipped as the bridge-watchdog
+      service/timer + the self-heal ladder (#85).
+- [x] Phase 4 (future): weather-predictive / price-optimized setpoint scheduling — **winter DP
+      solver v1 SHIPPED 2026-08-06 (#69), running in SHADOW.** Go-live is gated on real cold,
+      not on code: `reference/winter-dp-commissioning.md`.
 - [ ] Phase 4 platform (architecture DECIDED 2026-07-06, `reference/remote-api-architecture.md`): **Cloudflare Tunnel + Access** for the remote optimizer API (direct tunnel, not a cloud relay). Setpoint **lease** primitive already built (release-20260706-1). Defer: cloudflared/DNS/Access wiring, the optimizer itself (start read-only → setpoint-only), any hosted dashboard (pure outbound push, later). Never let the optimizer hold authority without a lease.
 - [ ] Phase 4 (future): **coordinated HP + HBX control** — hard requirement (2026-07-04): A2W must write HBX setpoints so buffer tank and heat pumps work in conjunction. Write path discovery: Proxyman capture of the SensorLinx app changing a setpoint (owner already built the read side this way). Same guardrail discipline as heat pump writes.
 
