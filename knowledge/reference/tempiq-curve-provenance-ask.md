@@ -5,6 +5,8 @@ Context: A2W consumes requiredSupplyWaterTempF to set this house's water tempera
 cannot currently see where the number comes from.
 -->
 
+**FILED 2026-09-16 as [ckrohg-org/TempIQv2#2025](https://github.com/ckrohg-org/TempIQv2/issues/2025).** This document is the source text; the issue is the live thread.
+
 # Ask TempIQ: expose the required-supply curve's parameters and provenance
 
 **Why this matters to A2W:** `requiredSupplyWaterTempF` is consumed live to set the demand
