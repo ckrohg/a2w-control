@@ -115,9 +115,20 @@ class Store:
         self._conn = await asyncio.to_thread(_open)
 
     async def close(self) -> None:
-        if self._conn:
-            await asyncio.to_thread(self._conn.close)
-            self._conn = None
+        # Under BOTH locks (#94). Closing is the most dangerous connection operation there is:
+        # it destroys the object another thread may be mid-execute() on. The first pass at #94
+        # guarded _exec/_query/backup and left this one bare -- so a second loop tearing the
+        # store down while the app loop had a poll in flight still segfaulted, which is exactly
+        # what CI kept hitting. self._conn is cleared INSIDE the worker so no other waiter can
+        # pick up a freed handle after we release.
+        if not self._conn:
+            return
+        async with self._conn_lock:
+            conn, self._conn = self._conn, None
+            def _run():
+                with self._thread_lock:
+                    conn.close()
+            await asyncio.to_thread(_run)
 
     async def _exec(self, sql: str, params: tuple = ()) -> None:
         # one writer at a time: `with conn:` manages the CONNECTION-wide transaction,
