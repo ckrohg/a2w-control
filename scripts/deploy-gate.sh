@@ -111,7 +111,12 @@ case "${1:-status}" in
 
     if [ "$deploys" -eq 0 ]; then
       grn "non-deploying PR — no live surface to verify."
-      report "after"; exit $?
+      # Record the after-state, but do NOT let it set the exit code: this PR cannot have
+      # touched a live surface, so failing here would report an unrelated ongoing outage as
+      # "the merge failed". Conflating those two is exactly the kind of bad signal that makes
+      # people stop trusting a gate.
+      report "after" || true
+      exit 0
     fi
 
     echo
