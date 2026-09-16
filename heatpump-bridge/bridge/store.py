@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 
 SCHEMA = """
@@ -93,6 +94,16 @@ class Store:
         self.path = path
         self._conn: sqlite3.Connection | None = None
         self._conn_lock = asyncio.Lock()
+        # CROSS-LOOP guard (#94). _conn_lock is an asyncio.Lock, which is bound to the event
+        # loop that created it: it serialises tasks within ONE loop and provides no exclusion
+        # at all against a second loop. Tests run an anyio blocking portal alongside the app's
+        # loop, so both sides passed the asyncio guard simultaneously, both called
+        # asyncio.to_thread, and two OS threads then used the SAME sqlite3 connection
+        # (opened check_same_thread=False) concurrently -- which segfaults the interpreter
+        # rather than raising. This lock is taken INSIDE each worker, so it serialises by
+        # THREAD and holds no matter how many loops are alive. Cheap: it is only ever
+        # contended in the two-loop case, and sqlite calls here are sub-millisecond.
+        self._thread_lock = threading.Lock()
 
     async def open(self) -> None:
         def _open():
@@ -113,8 +124,9 @@ class Store:
         # so concurrent to_thread writers could roll back each other's work
         async with self._conn_lock:
             def _run():
-                with self._conn:  # implicit transaction
-                    self._conn.execute(sql, params)
+                with self._thread_lock:      # see _thread_lock (#94)
+                    with self._conn:         # implicit transaction
+                        self._conn.execute(sql, params)
             await asyncio.to_thread(_run)
 
     async def _query(self, sql: str, params: tuple = ()) -> list[dict]:
@@ -124,7 +136,8 @@ class Store:
         # connection-access lock.
         async with self._conn_lock:
             def _run():
-                return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+                with self._thread_lock:      # see _thread_lock (#94)
+                    return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
             return await asyncio.to_thread(_run)
 
     # --- writes ---------------------------------------------------------------
@@ -296,12 +309,13 @@ class Store:
         as long as yesterday's copy does. Under the connection lock (touches _conn)."""
         async with self._conn_lock:
             def _run():
-                dst = sqlite3.connect(dest)
-                try:
-                    with dst:
-                        self._conn.backup(dst)
-                finally:
-                    dst.close()
+                with self._thread_lock:      # see _thread_lock (#94)
+                    dst = sqlite3.connect(dest)
+                    try:
+                        with dst:
+                            self._conn.backup(dst)
+                    finally:
+                        dst.close()
             await asyncio.to_thread(_run)
 
     async def prune(self, *, samples_days: float = 365, comm_days: float = 90,
