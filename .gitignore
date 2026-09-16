@@ -1,16 +1,28 @@
 # Tenet workspace state (local-only, gitignored by convention)
-.tenet/memory.db*
-.tenet/context-hub.pid
-.tenet/context-hub.port
-.tenet/context-hub.token
-.tenet/logs/
-.tenet/sessions/
-.tenet/presence/
-.tenet/telemetry/
-.tenet/map-events.jsonl
-.tenet/service-events.jsonl
-.tenet/training-buffer.jsonl
-.tenet/telemetry-agent-state.json
+# UN-ANCHORED 2026-09-16: these were written with a leading `.tenet/`, which git anchors to the
+# repo root. A hub started from a SUBDIRECTORY (the init.js:506 cwd-binding bug) writes
+# planner/.tenet/ and analytics-mirror/.tenet/ -- none of which these patterns matched, so 2.9 MB
+# of stray runtime state sat untracked-but-unignored for two months. `**/` covers both.
+**/.tenet/memory.db*
+**/.tenet/context-hub.pid
+**/.tenet/context-hub.port
+**/.tenet/context-hub.token
+**/.tenet/logs/
+**/.tenet/sessions/
+**/.tenet/presence/
+**/.tenet/telemetry/
+**/.tenet/map-events.jsonl
+**/.tenet/service-events.jsonl
+**/.tenet/training-buffer.jsonl
+**/.tenet/telemetry-agent-state.json
+
+# The workspace journal is the project's decision history -- and this repo is PUBLIC. It is
+# backed up ENCRYPTED to the `journals` orphan branch by scripts/backup-journal.sh, never
+# committed in the clear: it carries room names, family first names, DHW draw timestamps (an
+# occupancy signal) and the property UUID. Scanned clean of credential patterns, encrypted anyway.
+**/.tenet/journal/
+**/.tenet/build-journal.jsonl
+**/.tenet/replay-buffer.jsonl
 
 # Worktrees + temp dirs
 worktrees/

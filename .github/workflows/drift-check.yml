@@ -1,0 +1,36 @@
+# @purpose Daily DECLARED-vs-LIVE drift check. Every finding of the 2026-09-16 audit was the
+# same bug: state asserted in one place, silently diverging from the truth, with nothing
+# watching. The one that mattered -- FINDING-1, the revert-to-baseline failsafe armed nowhere
+# while planner /health reported "lease 90m" -- hid behind two months of green dashboards.
+# A red run here is the alarm that did not exist.
+#
+# Read-only: GETs health endpoints and the hub state. Never writes a setpoint, never cuts a
+# release-* tag, never touches the Pi.
+#
+# Optional secret HUB_CLIENT_TOKEN enables the FINDING-1 lease assertion (section [2]).
+# Without it that section SKIPS rather than fails -- so the workflow is useful immediately,
+# but the assertion that matters most stays dark until the secret is added. Add it with:
+#   cd planner && gh secret set HUB_CLIENT_TOKEN --body "$(railway variables --json | jq -r .HUB_CLIENT_TOKEN)"
+name: drift-check
+
+on:
+  schedule:
+    - cron: "23 13 * * *" # daily 13:23 UTC (~09:23 ET) -- off the top of the hour
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths: ["scripts/drift-check.sh", ".github/workflows/drift-check.yml"]
+
+concurrency:
+  group: drift-check
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run drift check
+        env:
+          HUB_CLIENT_TOKEN: ${{ secrets.HUB_CLIENT_TOKEN }}
+        run: bash scripts/drift-check.sh

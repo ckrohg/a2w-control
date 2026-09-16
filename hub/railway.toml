@@ -1,6 +1,27 @@
 [build]
 builder = "nixpacks"
 buildCommand = "npm install && npm run build"
+# Only redeploy when THIS service's code actually changes. Without this, every push to main
+# redeployed planner+hub -- including docs-only commits -- and each redeploy is a ~15 min
+# writer-lease handover on a system controlling a real home's heat. CI's paths-ignore does
+# NOT apply to Railway; this is the only thing that stops it.
+#
+# Both spellings are listed deliberately. The service rootDirectory is "/hub", and it is
+# ambiguous whether Railway matches these against the repo root or the root directory -- a
+# pattern that is wrong under the live interpretation would SILENTLY STOP DEPLOYING real
+# fixes, which is far worse than a harmless extra restart. Listing both makes the set correct
+# either way: under repo-root matching "hub/**" fires and the bare paths never match (there
+# is no root-level package.json); under root-dir matching the bare paths fire instead.
+# Verified safe to narrow: hub/src has ZERO parent-escaping imports and no file:/workspace:
+# deps, so nothing outside hub/ can change this service's build output.
+watchPatterns = [
+  "hub/**",
+  "src/**",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "railway.toml",
+]
 
 [deploy]
 startCommand = "npm start"
