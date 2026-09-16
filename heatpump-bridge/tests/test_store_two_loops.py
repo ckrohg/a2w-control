@@ -37,6 +37,31 @@ def _worker_functions(tree: ast.AST) -> list[ast.FunctionDef]:
             if isinstance(n, ast.FunctionDef) and n.name == "_run"]
 
 
+def test_no_to_thread_call_touches_the_connection_directly():
+    """The blind spot that let #94 survive its first fix. The original guard checked only
+    nested `def _run()` workers -- but close() passed `self._conn.close` STRAIGHT to
+    asyncio.to_thread with no worker at all, so it was invisible to that check and stayed
+    unguarded. Closing is the most dangerous operation of the lot: it destroys the object
+    another thread may be mid-execute() on. Assert no to_thread argument is a bare
+    self._conn.<attr>; it must be a worker that takes the lock."""
+    tree = ast.parse(STORE_SRC.read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_thread"):
+            continue
+        for arg in node.args:
+            # asyncio.to_thread(self._conn.close) -- bound method of the shared connection
+            if (isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Attribute)
+                    and arg.value.attr == "_conn"):
+                offenders.append((node.lineno, f"self._conn.{arg.attr}"))
+    assert not offenders, (
+        f"asyncio.to_thread called directly on the shared connection at {offenders}. Wrap it "
+        "in a worker that takes self._thread_lock -- a bare handoff is unguarded and can race "
+        "another loop's in-flight query (#94)."
+    )
+
+
 def test_every_to_thread_worker_takes_the_thread_lock():
     """The segfault needs only ONE unguarded worker, so assert on all of them rather than on
     the three that exist today — a fourth added later is caught for free."""
