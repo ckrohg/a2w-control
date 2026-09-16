@@ -40,6 +40,10 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          # setup-node resolves this from the REPO ROOT, not working-directory -- without it
+          # the cache step fails with "Dependencies lock file is not found". node-builds
+          # already does this via the matrix dir; this job needs its own.
+          cache-dependency-path: planner/package-lock.json
       - run: npm ci
       - name: Run planner assertion suites
         run: |
