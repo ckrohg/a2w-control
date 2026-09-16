@@ -61,6 +61,15 @@ export interface ZoneFloor {
   // review can tell a MEASURED ceiling from a generic textbook one (#89). null when the
   // zone has no ceiling, or when TempIQ's payload predates gtm#1593.
   ceilingSource: string | null;
+  // #89 EVIDENCE CAPTURE. These arrive on every DemandZone and were being DROPPED before the
+  // snapshot was persisted, which is why the sizing question ("do the emitters actually
+  // deliver at 135 F?") has no data behind it. Persisting them makes zone_floor_snapshots
+  // self-sufficient: for each zone, at each outdoor temp, what supply did we command AND did
+  // the room hold its setpoint. The first real cold snap then answers #89 automatically,
+  // instead of someone having to run a manual experiment at 2 am in January.
+  // Observation only -- nothing reads these in the control path.
+  roomF: number | null;
+  setpointF: number | null;
 }
 
 export interface FloorResult {
@@ -224,7 +233,8 @@ export function computeFloors(
     return { zoneId: z.id, name: z.name, deliveryType: z.deliveryType, awtF, calling,
       verified: z.deliveryTypeVerified, learned: useLearned,
       escalatedF, deficitF, localF, ceilingF: useLearned ? z.requiredSupplyF : null,
-      ceilingSource: useLearned ? z.ceilingSource : null };
+      ceilingSource: useLearned ? z.ceilingSource : null,
+      roomF: z.roomF, setpointF: z.setpointF };  // #89 evidence capture — observation only
   });
 
   let binding: ZoneFloor | null = null;
