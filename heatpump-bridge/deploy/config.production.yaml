@@ -1,12 +1,25 @@
-# Production config template for the Pi. The bootstrap copies this to
-# ~/bridge-data/config.yaml (OUTSIDE the repo — auto-updates never touch it).
-# Fill in the W610 addresses there. LEAVE write_enabled FALSE until Phase 2 —
-# Phase 1 is read-only by rule (handoff §8).
+# Production config TEMPLATE for a FRESH Pi. This file is NOT a mirror of what the live Pi is
+# running, and it is not supposed to be (#78). pi-bootstrap.sh:43 copies it to
+# ~/bridge-data/config.yaml ONLY IF that file does not already exist, and pi-update.sh never
+# touches it — deliberately, so auto-updates can never clobber a commissioned unit. To read or
+# change the LIVE configuration you must edit ~/bridge-data/config.yaml on the Pi itself; no
+# merge, tag, or deploy to this repo can do it.
+#
+# ⚠️ write_enabled MUST STAY false here. It looks "stale" against a live system where writes
+# are enabled, and the tempting fix is to flip it to match. Do not. This file provisions NEW
+# hardware, and writes must not be armed before the network-isolation verification
+# (deploy/verify-isolation.sh) and the HBX-override bench test have been run ON THAT UNIT —
+# the fusion audit made that a recorded human step precisely because software cannot enforce
+# network isolation. Phase 1 is read-only by rule (handoff §8). scripts/drift-check.sh
+# section [3] guards this.
+#
+# The host addresses below are PLACEHOLDERS for a fresh install, not the current gateways.
+# Set real ones (with DHCP reservations) when provisioning.
 
 pumps:
   - id: pump1
     name: Heat Pump 1
-    host: 192.168.1.61     # W610 #1 — set a DHCP reservation for its MAC
+    host: 192.168.1.61     # PLACEHOLDER — W610 #1; set a DHCP reservation for its MAC
     # mac: leave BLANK — let the bridge auto-adopt it when you assign the gateway in the
     #   dashboard. It adopts the ARP (WiFi station-interface) MAC, which is what the
     #   per-poll identity check compares against. ⚠️ Do NOT copy the MAC off the W610's
@@ -22,7 +35,7 @@ pumps:
     write_enabled: false   # Phase 2 flips this — one pump at a time
   - id: pump2
     name: Heat Pump 2
-    host: 192.168.1.62     # W610 #2
+    host: 192.168.1.62     # PLACEHOLDER — W610 #2; set a DHCP reservation for its MAC
     # mac: leave BLANK — auto-adopted on assignment (see pump1 note above; never the label MAC)
     port: 8899
     device_id: 1           # separate bus, so same address is fine
