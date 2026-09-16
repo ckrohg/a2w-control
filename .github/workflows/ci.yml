@@ -24,6 +24,37 @@ jobs:
       - run: uv sync
       - run: uv run pytest -q
 
+  # The planner's assertions are plain node:assert scripts run under tsx, not a vitest suite --
+  # so `npm run build` (the node-builds job) never executed them and they gated nothing. They
+  # cover the demand floor, the winter DP, hygiene, realized savings and the forecast path:
+  # the logic that decides what water temperature this house runs at. Verified all 7 green
+  # before wiring them in, so a red here is a real regression, not a pre-existing failure.
+  planner-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: planner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          # setup-node resolves this from the REPO ROOT, not working-directory -- without it
+          # the cache step fails with "Dependencies lock file is not found". node-builds
+          # already does this via the matrix dir; this job needs its own.
+          cache-dependency-path: planner/package-lock.json
+      - run: npm ci
+      - name: Run planner assertion suites
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in src/*.test.ts; do
+            echo "── $f"
+            npx tsx "$f" || { echo "::error file=planner/$f::assertions failed"; fail=1; }
+          done
+          exit "$fail"
+
   node-builds:
     runs-on: ubuntu-latest
     strategy:
