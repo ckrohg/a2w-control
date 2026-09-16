@@ -32,7 +32,34 @@ Write journal entries AS YOU WORK, not at session end. Each entry needs:
 2. `knowledge/reference/modbus-register-map.md` — distilled register map (source of truth: `A2W Modbus.docx` same folder, from Winnie @ Guangdong Macon)
 3. `knowledge/PRODUCT_SPEC.md` + `knowledge/ROADMAP.md` — working summaries
 
-**Stage:** Phase 0 COMPLETE (2026-07-04) — `heatpump-bridge/` is built and verified against the simulator (27 tests, UI exit criteria met). Cloud side deployed + self-wiring (2026-07-07): Railway hub + Vercel dashboard + Neon Postgres all live; `pi-bootstrap.sh` injects hub + analytics from env vars. **Phase 1 is now UNGATED — Winnie confirmed the BMS port 2026-07-07** (`knowledge/reference/winnie-bms-port-reply.md`): CN22, pins 2/3/4=GND/A/B (not pin 1/12V), separate bus from CN23 (keep wall controller connected), no activation, slave address 1. Next: W610 bench config + Pi provisioning (`heatpump-bridge/deploy/`), then Phase 1 read-only commissioning (waits only on hardware). Still owed Winnie: series number (MAHRW030ZA/BEH2) + forced-defrost register question. Dev quickstart in `heatpump-bridge/README.md`.
+**Stage (reconciled 2026-09-16 against the RUNNING system — see
+`knowledge/reference/live-state-20260916.md`):** Phases 0-2 are DONE. The bridge runs on the Pi
+against both real pumps; write_enabled was flipped on pump 1 on 2026-07-13 and both pumps are
+write-enabled now. The cloud side is live: Railway hub + Railway Postgres (migrated off Neon
+2026-08-23, #79) + Vercel dashboard. **Phase B is ACTIVE** — the planner drives both pumps'
+setpoints to track the HBX tank target (52 °C at last check) on 90-minute leases. The winter DP
+solver runs in SHADOW; `demand_forecast` is idle with both gates off. TempIQ push/read are
+live (18 zones, 38 spatial edges). Winnie's thread CLOSED 2026-07-14 — nothing is owed either
+direction. Dev quickstart in `heatpump-bridge/README.md`.
+
+**Do not trust a doc over `/health`.** This file was ~2 months stale before 2026-09-16, and so
+was ROADMAP.md. `scripts/drift-check.sh` now asserts declared-vs-live; run it before believing
+any stage claim, including this one.
+
+**OPEN SAFETY ITEM — FINDING-1 (read before touching the control path):** the
+revert-to-baseline failsafe that every doc promises is **not armed on the live Pi**.
+`baseline_setpoint_c` is unset, so the Pi records NO lease (`poller.py:600`), `check_lease()`
+returns early every tick, and the revert + its alert + the 15-min warning cannot fire. Measured:
+`remote_lease_until: null` on both pumps. Not an imminent freeze hazard (the pumps hold their
+last warm setpoint) but there is no automatic recovery from a dead planner. Remediation is a
+hands-on Pi edit — `knowledge/reference/finding1-arm-baseline-runbook.md`. The live config is
+`~/bridge-data/config.yaml`, OUTSIDE the repo; no merge, tag, or deploy can change it.
+
+**Next:** run the FINDING-1 runbook; then the winter backlog (#89 TempIQ/local required-supply
+divergence up to 45 °F, #87 winter DP v2, #76 comm degradation, #94 bridge-tests segfault).
+The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
+`FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated,
+not work-gated.
 
 **Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
 
