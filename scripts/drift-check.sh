@@ -50,8 +50,51 @@ echo "[2] FINDING-1 — revert-to-baseline failsafe actually armed"
 # the documented "dead planner -> warm baseline" recovery does not exist. The only remote
 # evidence is remote_lease_until in the hub state payload.
 PHASE_B_MODE="$(jq -r '.phase_b.mode // "unknown"' <<<"${HEALTH:-{\}}")"
+
+# [2a] TOKEN-FREE assertion. #97 made phase_b report what the Pi actually ARMED rather than
+# echoing its own LEASE_MINUTES constant, so the public /health now carries the answer and this
+# check needs no credentials -- which means it runs in CI, on a phone, from anywhere.
+# phaseb.ts emits exactly three shapes (phaseb.ts:130/192/198):
+#   "(lease Nm armed)"     -> the Pi confirmed a lease   -> ok
+#   "NO LEASE ARMED"       -> wrote, Pi armed nothing    -> DRIFT (this is FINDING-1)
+#   "(lease Nm requested)" -> hub read failed, unobserved -> cannot assert, say so
+# Anything else means the string changed and THIS CHECK HAS GONE STALE. That is reported as
+# drift too, deliberately: a silently-passing safety assertion is the exact failure class
+# this script exists to prevent -- see the header. Do not "fix" it by loosening the match.
+if [ -z "$HEALTH" ]; then
+  skip "planner /health unreachable — cannot assert lease state"
+elif [ "$PHASE_B_MODE" != "active" ]; then
+  skip "phase_b mode=$PHASE_B_MODE — lease assertion only applies when actively writing"
+else
+  RESULTS="$(jq -r '.phase_b.lastResults // {} | to_entries[] | select(.key != "_skip") | "\(.key)\t\(.value)"' <<<"$HEALTH")"
+  if [ -z "$RESULTS" ]; then
+    skip "phase_b active but reported no per-pump results yet"
+  else
+    while IFS=$'\t' read -r PUMP MSG; do
+      [ -z "$PUMP" ] && continue
+      case "$MSG" in
+        *"NO LEASE ARMED"*)
+          fail "$PUMP: wrote a setpoint but the Pi armed NO lease — revert-to-baseline CANNOT fire"
+          fail "  -> baseline_setpoint_c is unset on the live Pi (~/bridge-data/config.yaml)"
+          fail "  -> fix: knowledge/reference/finding1-arm-baseline-runbook.md" ;;
+        *"armed)"*)
+          pass "$PUMP: Pi confirmed a live lease — failsafe armed (${MSG})" ;;
+        *"requested)"*)
+          skip "$PUMP: lease unverified — the planner could not read hub state (${MSG})" ;;
+        *"DRY-RUN"*)
+          skip "$PUMP: phase_b in dry-run (${MSG})" ;;
+        *)
+          fail "$PUMP: unrecognised phase_b result \"${MSG}\" — this assertion has gone STALE"
+          fail "  -> phaseb.ts changed its result string; re-derive the cases, do not loosen the match" ;;
+      esac
+    done <<<"$RESULTS"
+  fi
+fi
+
+# [2b] Corroboration from the hub's raw remote_lease_until. Same property, independent source:
+# [2a] trusts the planner's rendering, this reads the value the Pi reported. Needs a token.
 if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
-  skip "hub state needs HUB_CLIENT_TOKEN (set it to enable the lease assertion)"
+  skip "corroboration skipped — set HUB_CLIENT_TOKEN to also assert on raw remote_lease_until"
 elif [ "$PHASE_B_MODE" != "active" ]; then
   skip "phase_b mode=$PHASE_B_MODE — lease assertion only applies when actively writing"
 else

@@ -31,6 +31,35 @@ house keeps heating. The real exposure is no automatic recovery from a stale val
 that alert channel, and the bad case — Phase B's last write landing at its 45 °C floor before
 the planner dies during a cold snap, with nothing to correct it. Severity rises sharply in winter.
 
+## Before you touch anything — the known-good bracket
+
+This is the 2026-09-16 lesson made procedural. That session merged nine PRs, four inside five
+minutes, across a live deploy, and when the Pi dropped 10 minutes later the honest answer to
+"did we cause it?" was *probably not* rather than *no*. The fix is not to move slower; it is to
+leave a record that makes the question answerable. One change, bracketed, verified.
+
+**1. Capture a known-good before-state** (from your laptop, before you SSH in):
+
+```bash
+bash scripts/drift-check.sh | tee /tmp/a2w-before.txt
+```
+
+Expect `[2]` to be **DRIFT** (that is today's truth) and `[1]`, `[3]`, `[4]` to be green. If
+anything in `[1]` is red, **stop** — do not change a config on a system that is already unhealthy.
+You would be layering a change onto an unknown failure, and that is how causation gets lost.
+
+**2. Back up the live config** (on the Pi, before editing):
+
+```bash
+cp -a ~/bridge-data/config.yaml ~/bridge-data/config.yaml.bak-$(date +%Y%m%d-%H%M%S)
+ls -la ~/bridge-data/config.yaml*
+```
+
+Rollback is then a `cp` back, not a reconstruction from memory. The bridge never reads `.bak-*`.
+
+**3. Change nothing else in the same window.** No tag, no merge, no second edit. If the restart
+misbehaves, the cause must be unambiguous.
+
 ## Change
 
 SSH to the Pi (Tailscale), then edit `~/bridge-data/config.yaml`. Under `guardrails:` add:
@@ -64,15 +93,30 @@ will name the offending field. Revert the edit and restart to get back to the cu
 
 ## Verify (do not skip — this is the whole point)
 
-From your laptop, ~2 minutes after the restart so Phase B has written once:
+From your laptop, ~2 minutes after the restart so Phase B has written once and read the
+result back. **No token needed** — since #97 the planner's public `/health` reports what the Pi
+actually armed, and `drift-check.sh` now asserts on it directly:
+
+```bash
+bash scripts/drift-check.sh | tee /tmp/a2w-after.txt
+diff /tmp/a2w-before.txt /tmp/a2w-after.txt
+```
+
+Section `[2]` must flip from
+`DRIFT pumpN: wrote a setpoint but the Pi armed NO lease` to
+`ok  pumpN: Pi confirmed a live lease — failsafe armed (... lease Nm armed)` on **both** pumps,
+and the diff must show **nothing else changing**. A second difference means the restart moved
+something you did not intend.
+
+If `[2]` instead reports `lease unverified`, the planner could not read hub state — the arming
+is unproven, not failed. Re-run in a few minutes before concluding anything.
+
+Optional corroboration from the Pi's own reported value, via the hub:
 
 ```bash
 cd planner && export HUB_CLIENT_TOKEN=$(railway variables --json | jq -r .HUB_CLIENT_TOKEN)
-cd .. && bash scripts/drift-check.sh
+cd .. && bash scripts/drift-check.sh   # [2b] now also runs
 ```
-
-Section `[2]` must flip from `DRIFT` to
-`ok  all write-enabled pumps hold a live lease (failsafe armed)`.
 
 Raw check if you prefer:
 
@@ -85,14 +129,23 @@ curl -s -H "Authorization: Bearer $HUB_CLIENT_TOKEN" \
 
 ## Rollback
 
-Delete the three lines and restart. The system returns to exactly today's behaviour (no lease,
-no revert) — nothing else depends on them.
+Restore the backup and restart:
+
+```bash
+cp -a ~/bridge-data/config.yaml.bak-<stamp> ~/bridge-data/config.yaml
+sudo systemctl restart heatpump-bridge
+```
+
+The system returns to exactly today's behaviour (no lease, no revert) — nothing else depends on
+those lines. Then re-run `drift-check.sh` and confirm `[2]` is back to DRIFT and the rest green,
+so the rollback itself is bracketed too.
 
 ## Related
 
 - `knowledge/reference/live-state-20260916.md` — FINDING-1 evidence chain
-- FINDING-1b: planner `/health` reports `lease 90m` from its own constant
-  (`phaseb.ts:123`) regardless of what the Pi did. Fixed separately; until then, trust
-  `remote_lease_until`, never the planner's phase_b string.
+- FINDING-1b: **fixed** by #97 (`3e023a9`, 2026-09-16). `/health` used to render `lease 90m`
+  from the planner's own `LEASE_MINUTES` constant regardless of what the Pi did. It now reports
+  what the Pi actually armed (`phaseb.ts:192/198`), which is what makes the token-free assertion
+  in `drift-check.sh [2a]` possible at all. The phase_b string is now trustworthy on this point.
 - `phaseb.ts:23` claims `FLOOR_C = 45 // the Pi enforces this too` — it does not; the Pi's
   effective unattended floor is `setback_setpoint_c` (40). Phase B's own clamp still holds.
