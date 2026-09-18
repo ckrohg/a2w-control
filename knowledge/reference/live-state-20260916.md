@@ -38,8 +38,25 @@ Error rates: pump1 0.0257, pump2 0.0320.
 
 - **Pi**: `release-*` tags ONLY, forward-only (`pi-update.sh`, `TAG_GLOB`, guard at line 58).
   Commits to `main` CANNOT reach the hardware.
-- **Railway (planner + hub)**: GitHub-connected, **no `watchPatterns`** → every push to `main`
-  redeploys, including docs-only commits. CI's `paths-ignore` does NOT apply to Railway.
+- **Railway (planner + hub)**: GitHub-connected, **`watchPatterns` ARE set** on both services
+  (`planner/railway.toml`, `hub/railway.toml`) → only that service's own code redeploys.
+  A docs-, `knowledge/`- or `scripts/`-only push does **not** redeploy anything.
+  CI's `paths-ignore` does NOT apply to Railway; the `watchPatterns` are the only thing that does.
+  **Each redeploy costs a ~15 min writer-lease handover on live heating** — so batch real
+  planner changes rather than trickling them.
+
+  > **CORRECTED 2026-09-18.** This bullet originally read "**no `watchPatterns`** → every push
+  > to `main` redeploys, including docs-only commits." That was already false when this file was
+  > written: `watchPatterns` landed in #96 (`6b64751`) at **01:21** on 2026-09-16, and this
+  > snapshot was captured later the same day. Verified by reading `planner/railway.toml` directly
+  > and confirmed behaviourally — `deploy-gate.sh` classified PR #110 (scripts + docs) as
+  > **non-deploying** and skipped post-deploy verification.
+  >
+  > Worth naming: this file exists to be the one place that records what is *actually* running,
+  > and it shipped with a drifted claim. A snapshot is only ground truth for what it actually
+  > measured — this bullet was transcribed belief, not a reading. The deploy-topology section is
+  > the part of this document least anchored to a live probe, which is exactly why it drifted
+  > first. **Read `railway.toml`, not this file, for deploy behaviour.**
 - **CI**: skips `knowledge/**`, `.tenet/**`, `**.md`.
 
 ## Env vars present on the planner (names only)
