@@ -6,7 +6,7 @@
  * arm/disarm — through evaluateStormState, a pure idle/armed/active machine the
  * caller drives once per tick. stormCeilingF caps the storm pre-charge target
  * just above the HBX curve target. Unreachable OutageWatch = no signal, never
- * an outage.
+ * an outage; a forecast whose units we cannot read = no signal either (#112).
  */
 
 export interface StormAlert {
@@ -76,6 +76,72 @@ export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAle
   return alerts;
 }
 
+/**
+ * Unit normalisation for the forecast body (#112). Every threshold in
+ * deriveSyntheticTriggers is written in °F / mph / inch, and the request below asks for
+ * exactly those — but on 2026-09-23 the planner armed storm mode off eleven gust-hours
+ * "above 45 mph" whose real peak was 31.3 mph, i.e. plain km/h. ASKING for a unit is not
+ * the same as RECEIVING one, so the response's own `hourly_units` is what we convert from.
+ * An unrecognised or absent unit throws: stormTriggerPoll's catch then leaves the synthetic
+ * cache empty, and a forecast we cannot interpret arms nothing — the same fail-safe this
+ * module already applies to an unreachable OutageWatch.
+ */
+const UNIT_CONVERSIONS: Record<string, Record<string, (v: number) => number>> = {
+  temperature_2m: {
+    "°f": (v) => v,
+    f: (v) => v,
+    "°c": (v) => (v * 9) / 5 + 32,
+    c: (v) => (v * 9) / 5 + 32,
+  },
+  wind_gusts_10m: {
+    // Open-Meteo spells the mph label "mp/h" (verified live 2026-09-23); "mph" is kept as an alias
+    // because the REQUEST uses that spelling and a future response may too.
+    "mp/h": (v) => v,
+    mph: (v) => v,
+    "km/h": (v) => v / 1.609344,
+    kmh: (v) => v / 1.609344,
+    "m/s": (v) => v * 2.2369363,
+    ms: (v) => v * 2.2369363,
+    kn: (v) => v * 1.1507794,
+    kt: (v) => v * 1.1507794,
+    knots: (v) => v * 1.1507794,
+  },
+  snowfall: {
+    inch: (v) => v,
+    in: (v) => v,
+    cm: (v) => v / 2.54,
+    mm: (v) => v / 25.4,
+  },
+};
+
+export function unitConverter(field: string, unit: unknown): (v: number) => number {
+  const table = UNIT_CONVERSIONS[field];
+  if (!table) throw new Error(`no unit table for ${field}`);
+  const fn = table[String(unit ?? "").trim().toLowerCase()];
+  if (!fn) throw new Error(`OpenMeteo returned ${field} in an unusable unit: ${unit ?? "(absent)"}`);
+  return fn;
+}
+
+/** Pure half of fetchStormForecast — exported so the units contract is testable without a fetch. */
+export function parseStormForecast(body: any): StormForecastHour[] {
+  const hourly = body?.hourly ?? {};
+  const units = body?.hourly_units ?? {};
+  // Resolved BEFORE the map so an unusable unit fails the whole poll rather than silently
+  // mixing converted and raw hours.
+  const toF = unitConverter("temperature_2m", units.temperature_2m);
+  const toMph = unitConverter("wind_gusts_10m", units.wind_gusts_10m);
+  const toInch = unitConverter("snowfall", units.snowfall);
+  const times: string[] = hourly.time ?? [];
+  // NaN survives every converter, so absent readings stay NaN and fail the threshold filters.
+  return times.map((ts, i) => ({
+    ts,
+    tempF: toF(Number(hourly.temperature_2m?.[i] ?? NaN)),
+    gustMph: toMph(Number(hourly.wind_gusts_10m?.[i] ?? NaN)),
+    snowfallIn: toInch(Number(hourly.snowfall?.[i] ?? 0)),
+    weatherCode: Number(hourly.weather_code?.[i] ?? 0),
+  }));
+}
+
 export async function fetchStormForecast(lat: string, lon: string): Promise<StormForecastHour[]> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
@@ -84,16 +150,7 @@ export async function fetchStormForecast(lat: string, lon: string): Promise<Stor
     `&forecast_days=3&timezone=auto`;
   const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`OpenMeteo fetch failed: ${res.status}`);
-  const body = (await res.json()) as any;
-  const hourly = body?.hourly ?? {};
-  const times: string[] = hourly.time ?? [];
-  return times.map((ts, i) => ({
-    ts,
-    tempF: Number(hourly.temperature_2m?.[i] ?? NaN),
-    gustMph: Number(hourly.wind_gusts_10m?.[i] ?? NaN),
-    snowfallIn: Number(hourly.snowfall?.[i] ?? 0),
-    weatherCode: Number(hourly.weather_code?.[i] ?? 0),
-  }));
+  return parseStormForecast(await res.json());
 }
 
 function triggerWindow(qualifying: StormForecastHour[]): { onset: string; expires: string } {
