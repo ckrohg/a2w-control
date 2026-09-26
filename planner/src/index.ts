@@ -417,6 +417,8 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     return;
   }
   // #122 Wave 1: free ride — this state is already fetched every poll for the I1 check.
+  // Wave 2 rides along too (see checkLeaseAndPi): one hub read per poll, never two.
+  lastPiConnected = state.pi_connected === true;
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );
@@ -680,6 +682,7 @@ let freezeRiskAlerted = false;
 // long outage pages once, not every poll.
 let leaseLostSince: number | null = null;
 let leaseAlerted = false;
+let lastPiConnected: boolean | null = null; // cached from checkI1's existing hub read
 let piDisconnectedSince: number | null = null;
 let piQuietAlerted = false;
 const LEASE_LOST_ALERT_S = 900;  // past the ~11-15 min handover a redeploy legitimately causes
@@ -1263,7 +1266,14 @@ async function checkLeaseAndPi(): Promise<void> {
     // pi_connected is the unambiguous signal and the one drift-check asserts on. HubState.ts is
     // deliberately NOT used for staleness here: its units are not documented, and guessing at a
     // timestamp scale is how you build an alert that fires at the wrong time or never.
-    const connected = (await hub.getState()).pi_connected === true;
+    //
+    // DELIBERATELY NOT a hub call of its own. checkI1 already fetches hub state every poll and
+    // caches pi_connected there, so this check adds ZERO traffic. GET /api/state serves the hub's
+    // in-memory copy of the Pi's last push (hub/src/index.ts:275), so it never reaches the Pi
+    // either -- but a second redundant read per poll is still waste, and on a bridge with an open
+    // comm-degradation bug (#76) the right default is to add no round-trips at all.
+    const connected = lastPiConnected;
+    if (connected === null) return;      // no reading yet this process; say nothing
     if (!connected) {
       piDisconnectedSince ??= Date.now();
       const downS = Math.round((Date.now() - piDisconnectedSince) / 1000);
