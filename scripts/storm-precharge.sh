@@ -15,6 +15,18 @@
 #
 # Usage:  DRY_RUN=1 bash scripts/storm-precharge.sh     # validate everything, POST nothing
 #         bash scripts/storm-precharge.sh               # for real
+#
+# SCHEDULING. Installed as a one-shot crontab entry, e.g.
+#   30 7 26 9 * cd <repo> && /bin/bash scripts/storm-precharge.sh >> /tmp/a2w-storm-precharge.out 2>&1
+# NOTE THE TIMEZONE. cron uses MACHINE-local time; the house is Eastern. This laptop runs PDT, so
+# 10:30 EDT at the house is 07:30 here. Getting that backwards fires the pre-charge three hours
+# after onset -- the same naive-timestamp trap as #121, in a different tool. Always convert:
+#   TZ=America/New_York date -j -f "%Y-%m-%d %H:%M" "<target>" "+%s" | xargs -I{} date -r {}
+# Claude Code needs "Bash(crontab:*)" in ~/.claude/settings.json permissions.allow to install it;
+# scheduling was otherwise refused as unauthorized persistence.
+#
+# Two things must also hold for an unattended run: the token must be present, and the machine must
+# be awake at the scheduled minute. cron does not wake a sleeping Mac.
 set -uo pipefail
 
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
