@@ -9,6 +9,9 @@
  * plan-vs-actual stays meaningful into the season the winter solver isn't built for yet.
  */
 
+// One-way dependency: storm.ts imports nothing from this module, so this cannot cycle.
+import { unitConverter } from "./storm";
+
 export interface ForecastHour {
   ts: Date;
   outdoorF: number;
@@ -239,6 +242,29 @@ export function computeShadowPlan(
   });
 }
 
+/**
+ * Pure half of fetchForecast — exported so the units contract is testable without a fetch.
+ *
+ * #122 audit, 2026-09-26: this fetch ASKED for fahrenheit and never checked what it RECEIVED —
+ * the response type did not even include `hourly_units`. That is byte-for-byte the #112 bug that
+ * armed storm mode off km/h-read-as-mph for two months; #113 fixed it in storm.ts and left this
+ * copy untouched. And this is the feed that matters more: storm.ts decides whether to bank a few
+ * degrees, while THIS feed sets curveTargetF — the tank target — every hour of winter. A °C body
+ * here would put the buffer on the wrong curve silently.
+ *
+ * Same contract as parseStormForecast: convert from the unit the response DECLARES, and treat an
+ * unreadable unit as fatal so the caller's catch leaves the last good forecast in place rather
+ * than mixing scales.
+ */
+export function parseForecastBody(body: unknown, nowMs: number): ForecastHour[] {
+  const b = body as { hourly?: { time?: string[]; temperature_2m?: (number | null)[] }; hourly_units?: Record<string, unknown> };
+  if (!b?.hourly?.time) throw new Error("open-meteo: no hourly block");
+  const toF = unitConverter("temperature_2m", b.hourly_units?.temperature_2m);
+  return b.hourly.time
+    .map((t, i) => ({ ts: new Date(t), outdoorF: toF(Number(b.hourly!.temperature_2m?.[i] ?? NaN)) }))
+    .filter((h) => h.ts.getTime() >= nowMs && Number.isFinite(h.outdoorF));
+}
+
 /** OpenMeteo hourly forecast, °F, local timezone (keyless, free). */
 export async function fetchForecast(lat: string, lon: string): Promise<ForecastHour[]> {
   const url =
@@ -246,10 +272,5 @@ export async function fetchForecast(lat: string, lon: string): Promise<ForecastH
     `&hourly=temperature_2m&temperature_unit=fahrenheit&forecast_days=2&timezone=auto`;
   const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`open-meteo: HTTP ${res.status}`);
-  const body = (await res.json()) as { hourly?: { time: string[]; temperature_2m: number[] } };
-  if (!body.hourly) throw new Error("open-meteo: no hourly block");
-  const now = Date.now() - 3600_000; // keep the current (partial) hour
-  return body.hourly.time
-    .map((t, i) => ({ ts: new Date(t), outdoorF: body.hourly!.temperature_2m[i] }))
-    .filter((h) => h.ts.getTime() >= now && Number.isFinite(h.outdoorF));
+  return parseForecastBody(await res.json(), Date.now() - 3600_000); // keep the current (partial) hour
 }
