@@ -161,6 +161,23 @@ const HYGIENE_BASE_INTERVAL_H = Number(process.env.HYGIENE_MAX_INTERVAL_H ?? "26
 const HYGIENE_SUMMER_INTERVAL_H = Number(process.env.HYGIENE_SUMMER_INTERVAL_H ?? String(HYGIENE_BASE_INTERVAL_H));
 const HYGIENE_SUMMER_OUTDOOR_F = 55; // ≥ this outdoor ⇒ cool-tank regime ⇒ the summer interval applies
 let lastOutdoorF: number | null = null; // freshest outdoor from the poll — the season signal for checkI8
+/**
+ * #122 Wave 1: the freshest thermal state, cached at poll time so /health can report it without a
+ * DB round-trip on every scrape (drift-check, the storm watch and the mirror all poll it).
+ *
+ * This exists because on 2026-09-26, mid-High-Wind-Warning, the only way to answer "is the buffer
+ * warm enough to coast an outage?" was to INFER it from hygiene.hours_since_dwell. For a system
+ * whose entire purpose is thermal resilience, the tank temperature not being in its own health
+ * endpoint is the wrong default. Setpoints ride along free: checkI1 already fetches hub state
+ * every poll.
+ */
+let lastThermal: {
+  at: string | null;
+  tank_f: number | null;
+  tank_target_f: number | null;
+  outdoor_f: number | null;
+  setpoints_f: Record<string, number | null>;
+} = { at: null, tank_f: null, tank_target_f: null, outdoor_f: null, setpoints_f: {} };
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
@@ -399,6 +416,10 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     console.warn("I1 check skipped — hub unreachable:", (e as Error).message);
     return;
   }
+  // #122 Wave 1: free ride — this state is already fetched every poll for the I1 check.
+  lastThermal.setpoints_f = Object.fromEntries(
+    state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
+  );
   const required = tankTargetF + DEFAULT_OPTS.i1MarginF;
   const offenders = state.pumps
     .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
@@ -1201,6 +1222,13 @@ async function pollOnce(): Promise<void> {
   const reading = toReading(dev);
   await store.insertReading(reading);
   lastOutdoorF = reading.outdoorF; // season signal for the checkI8 interval (hygiene.ts)
+  lastThermal = {
+    ...lastThermal, // setpoints are refreshed by checkI1 below, not here
+    at: reading.ts.toISOString(),
+    tank_f: reading.tankF,
+    tank_target_f: reading.tankTargetF,
+    outdoor_f: reading.outdoorF,
+  };
   // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
   // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
   // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
@@ -1396,6 +1424,32 @@ async function main(): Promise<void> {
             // #59: last DP solve (null until the forecast first dips below the compute threshold)
             winter_dp: winterDpState ?? { mode: "idle", enabled: WINTER_DP_ENABLED },
             demand_forecast: forecastState ?? { mode: "idle", fetch_enabled: FORECAST_FETCH_ENABLED, preheat_enabled: FORECAST_PREHEAT_ENABLED },
+            // #122 Wave 1. dhw_ready / coast_h are derived here rather than by every consumer,
+            // because the whole point is that a reader should not have to know the physics to
+            // answer "can this ride out an outage?". coast_h is the standing-loss-only time to
+            // the DHW floor: C_eff/UA = 1/tank_ua hours per e-fold above the 65 °F ambient the UA
+            // is defined against (winterdp.ts). Draws are NOT modelled -- one shower is ~9 °F --
+            // so treat it as a ceiling, not a promise.
+            thermal: (() => {
+              // winterDpState is loosely typed; coerce and fall back rather than trust it.
+              const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
+              const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
+              const t = lastThermal.tank_f;
+              const floor = DEFAULT_OPTS.dhwFloorF;
+              const coast =
+                t != null && t > floor && ua > 0
+                  ? Math.round((Math.log((t - 65) / (floor - 65)) / ua) * 10) / 10
+                  : t != null && t <= floor
+                    ? 0
+                    : null;
+              return {
+                ...lastThermal,
+                dhw_floor_f: floor,
+                dhw_ready: t != null ? t >= floor : null,
+                coast_h: coast,
+                tank_ua: ua,
+              };
+            })(),
             storm: {
               state: stormState.kind,
               trigger: stormState.kind === "idle" ? null : stormState.trigger,
