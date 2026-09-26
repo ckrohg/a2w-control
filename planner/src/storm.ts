@@ -53,8 +53,12 @@ const H = 3600_000;
  * is captured in the 3-6 h before onset (#114), so lead from onset and do NOT clamp to now: a
  * windowStart in the future is exactly the "armed but not yet shaping" state index.ts already
  * honours via its `startMs` gate.
+ *
+ * 2 h is the OWNER SPEC (2026-09-25): "make sure tank gets hot before the onset of the storm, only
+ * an hour or two before." A 10 °F charge is ~9,200 Btu ≈ 25 min of pump output, so 2 h is ample
+ * lead with margin, and it is the smallest window that still lands the heat before onset.
  */
-const PRECHARGE_LEAD_H = 4;
+const PRECHARGE_LEAD_H = 2;
 /** #119: don't re-time an armed window for forecast jitter smaller than this. */
 const RETIME_MIN_SHIFT_MS = 1 * H;
 const NWS_EVENT_RE = /winter storm|ice storm|blizzard|high wind|extreme cold|wind chill/i;
@@ -174,14 +178,43 @@ function triggerWindow(qualifying: StormForecastHour[]): { onset: string; expire
   return { onset: first, expires: new Date(new Date(last).getTime() + 6 * H).toISOString() };
 }
 
+/**
+ * A lull shorter than this is the same storm; longer and it is the next one. 6 h is chosen to match
+ * the tail `triggerWindow` already adds — two events closer than that would have overlapping
+ * windows anyway, so splitting them buys nothing.
+ */
+const SEGMENT_GAP_H = 6;
+
+/**
+ * Split qualifying hours into one group per STORM.
+ *
+ * OWNER SPEC 2026-09-25: "understand each storm, when it will hit and when it ends, always keeping
+ * in mind back-to-back storms." The old code passed ALL qualifying hours to `triggerWindow`, which
+ * takes first → last — so two storms three days apart in the same forecast became ONE continuous
+ * window spanning the calm days between them, pre-charging straight through. With `forecast_days=3`
+ * that was reachable any time two fronts landed in the same 72 h.
+ */
+function segmentByStorm(qualifying: StormForecastHour[]): StormForecastHour[][] {
+  const runs: StormForecastHour[][] = [];
+  for (const h of qualifying) {
+    const cur = runs[runs.length - 1];
+    const prevTs = cur ? Date.parse(cur[cur.length - 1].ts) : NaN;
+    if (!cur || !Number.isFinite(prevTs) || Date.parse(h.ts) - prevTs > SEGMENT_GAP_H * H) runs.push([h]);
+    else cur.push(h);
+  }
+  return runs;
+}
+
 export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTrigger[] {
   const triggers: SyntheticTrigger[] = [];
 
   // North Shore (5A coastal) design temp ~7°F: a sub-0°F bar almost never fires here, so a
   // genuine cold snap never pre-charged. Bar is <10°F sustained ≥3 h (matches the wind ≥3 h /
   // freezing-rain ≥2 h sustained-count pattern) — fires on a real cold event, not every dip.
-  const cold = hours.filter((h) => h.tempF < 10);
-  if (cold.length >= 3) {
+  // Each family is segmented per storm, so back-to-back events get their own windows rather than
+  // one span bridging the calm between them.
+  for (const cold of segmentByStorm(hours.filter((h) => h.tempF < 10))) {
+    if (cold.length < 3) continue;
     triggers.push({
       kind: "extreme-cold",
       detail: `forecast low ${Math.min(...cold.map((h) => h.tempF))}F across ${cold.length} h`,
@@ -189,8 +222,8 @@ export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTr
     });
   }
 
-  const windy = hours.filter((h) => h.gustMph > 45);
-  if (windy.length >= 3) {
+  for (const windy of segmentByStorm(hours.filter((h) => h.gustMph > 45))) {
+    if (windy.length < 3) continue;
     triggers.push({
       kind: "high-wind",
       detail: `gusts to ${Math.max(...windy.map((h) => h.gustMph))} mph across ${windy.length} h`,
@@ -198,8 +231,8 @@ export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTr
     });
   }
 
-  const icy = hours.filter((h) => h.weatherCode === 66 || h.weatherCode === 67);
-  if (icy.length >= 2) {
+  for (const icy of segmentByStorm(hours.filter((h) => h.weatherCode === 66 || h.weatherCode === 67))) {
+    if (icy.length < 2) continue;
     triggers.push({
       kind: "freezing-rain",
       detail: `freezing rain in ${icy.length} forecast hours`,
@@ -207,9 +240,11 @@ export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTr
     });
   }
 
-  const snowy = hours.filter((h) => h.snowfallIn > 0);
-  const totalSnowIn = snowy.reduce((sum, h) => sum + h.snowfallIn, 0);
-  if (totalSnowIn >= 8) {
+  // Snow totals are now per-storm too: 8 in from ONE storm is the bar, not 8 in accumulated across
+  // two. The old sum-over-everything could arm on two unremarkable 4 in events days apart.
+  for (const snowy of segmentByStorm(hours.filter((h) => h.snowfallIn > 0))) {
+    const totalSnowIn = snowy.reduce((sum, h) => sum + h.snowfallIn, 0);
+    if (totalSnowIn < 8) continue;
     triggers.push({
       kind: "heavy-snow",
       detail: `${totalSnowIn.toFixed(1)} in total snowfall`,

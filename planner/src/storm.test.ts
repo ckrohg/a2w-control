@@ -239,7 +239,7 @@ const REAL_KMH_BODY = {
   const res = evaluateStormState({ kind: "idle" }, { ...base, synthetic: [farOff] }, now);
   assert.equal(res.transitions[0], "arm");
   const startMs = Date.parse((res.state as { windowStart: string }).windowStart);
-  assert.equal(startMs, Date.parse("2026-09-27T08:00:00Z"), "lead is 4 h off onset, not 24 h and not now");
+  assert.equal(startMs, Date.parse("2026-09-27T10:00:00Z"), "lead is 2 h off onset (owner spec), not 24 h and not now");
   assert.ok(startMs > now.getTime(), "a trigger two days out must not start shaping the plan today");
 }
 
@@ -250,6 +250,48 @@ const REAL_KMH_BODY = {
   assert.equal(stormCeilingF(120, 135, 3), 123, "STORM_STEP_F=3 restores pre-decision behaviour");
   assert.equal(stormCeilingF(130, 135), 135, "the cap still binds over the step");
   assert.equal(stormCeilingF(120, 122), 122, "a cap below curve+step clamps, never raises past it");
+}
+
+// 10. OWNER SPEC 2026-09-25 — back-to-back storms get their own windows. The old code handed ALL
+//     qualifying hours to triggerWindow (first → last), so two fronts in one forecast became a
+//     single span bridging the calm days between them and pre-charged straight through.
+{
+  const mk = (ts: string, gustMph: number): StormForecastHour =>
+    ({ ts, tempF: 50, gustMph, snowfallIn: 0, weatherCode: 3 });
+  const twoStorms: StormForecastHour[] = [
+    // storm A: 3 h on the 26th
+    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52), mk("2026-09-26T14:00", 48),
+    // ~2 days of calm (below the bar, so absent from the qualifying set entirely)
+    // storm B: 3 h on the 28th
+    mk("2026-09-28T12:00", 49), mk("2026-09-28T13:00", 51), mk("2026-09-28T14:00", 47),
+  ];
+  const t = deriveSyntheticTriggers(twoStorms).filter((x) => x.kind === "high-wind");
+  assert.equal(t.length, 2, "two fronts must produce TWO triggers, not one merged span");
+  assert.equal(t[0].onset, "2026-09-26T12:00", "first storm keeps its own onset");
+  assert.ok(Date.parse(t[0].expires) < Date.parse(t[1].onset),
+    "the first window must CLOSE before the second opens — no bridging the calm between them");
+  assert.equal(t[1].onset, "2026-09-28T12:00", "second storm keeps its own onset");
+
+  // A short lull inside one storm must NOT split it — that would re-introduce churn.
+  const oneStormWithLull: StormForecastHour[] = [
+    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52),
+    mk("2026-09-26T16:00", 48), mk("2026-09-26T17:00", 49),
+  ];
+  assert.equal(deriveSyntheticTriggers(oneStormWithLull).filter((x) => x.kind === "high-wind").length, 1,
+    "a 3 h lull is one storm, not two");
+
+  // Snow is per-storm too: two unremarkable events must not sum into a heavy-snow arm.
+  const snow = (ts: string, inches: number): StormForecastHour =>
+    ({ ts, tempF: 28, gustMph: 10, snowfallIn: inches, weatherCode: 73 });
+  const twoSmallSnows: StormForecastHour[] = [
+    snow("2026-01-10T00:00", 2), snow("2026-01-10T01:00", 2.5),
+    snow("2026-01-13T00:00", 2), snow("2026-01-13T01:00", 2.5),
+  ];
+  assert.equal(deriveSyntheticTriggers(twoSmallSnows).filter((x) => x.kind === "heavy-snow").length, 0,
+    "4.5 in twice, days apart, is not an 8 in storm");
+  const oneBigSnow: StormForecastHour[] = [snow("2026-01-10T00:00", 5), snow("2026-01-10T01:00", 4)];
+  assert.equal(deriveSyntheticTriggers(oneBigSnow).filter((x) => x.kind === "heavy-snow").length, 1,
+    "9 in in one storm still arms");
 }
 
 console.log("storm.test.ts: all assertions passed");
