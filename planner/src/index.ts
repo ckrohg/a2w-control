@@ -1377,6 +1377,12 @@ async function main(): Promise<void> {
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
+            // #121: storm windows and shadow.ts's DHW windows are both correct ONLY because this
+            // process runs with TZ set to Eastern — shadow.ts:120 relies on getHours() being local,
+            // and storm.ts parses OpenMeteo's naive local timestamps against the process TZ. That
+            // dependency lived in a code comment and a Railway dashboard variable, outside the repo,
+            // with nothing asserting it. Reporting it is what lets drift-check make it loud.
+            tz: { env: process.env.TZ ?? null, resolved: Intl.DateTimeFormat().resolvedOptions().timeZone },
             writer_lease: WRITER_LEASE_ENABLED ? (writerLeaseState ?? "pending") : "off",
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
