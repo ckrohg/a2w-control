@@ -46,6 +46,17 @@ export interface StormForecastHour {
 }
 
 const H = 3600_000;
+/**
+ * #114/#119: pre-charge lead. The old `min(onset - 24h, now)` did not mean "start 24 h early" —
+ * because `now` is always the smaller term until onset is within 24 h, it meant "start the moment
+ * a trigger appears," which is why an armed window could shape the plan for days. The whole bank
+ * is captured in the 3-6 h before onset (#114), so lead from onset and do NOT clamp to now: a
+ * windowStart in the future is exactly the "armed but not yet shaping" state index.ts already
+ * honours via its `startMs` gate.
+ */
+const PRECHARGE_LEAD_H = 4;
+/** #119: don't re-time an armed window for forecast jitter smaller than this. */
+const RETIME_MIN_SHIFT_MS = 1 * H;
 const NWS_EVENT_RE = /winter storm|ice storm|blizzard|high wind|extreme cold|wind chill/i;
 
 export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAlert[]> {
@@ -69,7 +80,11 @@ export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAle
       severity: String(p.severity ?? "Unknown"),
       tier: event.includes("Warning") ? "arm" : "notice",
       onset: p.onset ?? p.effective ?? null,
-      expires: p.expires ?? p.ends ?? null,
+      // #118: `ends` is when the WEATHER stops; `expires` is only when NWS must reissue the
+      // bulletin. `expires` is always present on an active alert, so the old `expires ?? ends`
+      // made `ends` dead code and read every warning short — 31 h short on the 2026-09-25 High
+      // Wind Warning. `ends` can legitimately be null on some alert types, so keep the fallback.
+      expires: p.ends ?? p.expires ?? null,
       headline: String(p.headline ?? event),
     });
   }
@@ -248,11 +263,12 @@ function liveTriggers(inputs: StormInputs, nowMs: number): LiveTrigger[] {
   return live;
 }
 
-function armFrom(trigger: LiveTrigger, nowMs: number): StormState {
+/** Always the armed variant — narrowed so callers can read the window without re-narrowing. */
+function armFrom(trigger: LiveTrigger): Extract<StormState, { kind: "armed" }> {
   return {
     kind: "armed",
     trigger: trigger.name,
-    windowStart: new Date(Math.min(trigger.onsetMs - 24 * H, nowMs)).toISOString(),
+    windowStart: new Date(trigger.onsetMs - PRECHARGE_LEAD_H * H).toISOString(),
     windowEnd: new Date(trigger.expiresMs + 6 * H).toISOString(),
   };
 }
@@ -312,15 +328,28 @@ export function evaluateStormState(
 
   const live = liveTriggers(inputs, nowMs);
 
-  // 5. Armed: hold through the window; stand down after it unless a trigger is still live.
+  // 5. Armed: re-time as the forecast sharpens, hold through the window, stand down after it
+  //    unless a trigger is still live.
   if (prev.kind === "armed") {
+    // #119: a window computed at arm time used to be frozen until it lapsed, so a storm that
+    // shifted left the window behind — live on 2026-09-25, the held window ended 8 h before the
+    // forecast peak. Re-time to the current best trigger when it has moved more than the jitter
+    // threshold. A MANUAL arm is the owner's explicit window and is never re-timed by a forecast.
+    // Re-timing applies only while the held window is still CURRENT. Once it has lapsed the
+    // existing stand-down / re-arm path owns the decision — re-time must not pre-empt it.
     if (Number.isFinite(prevWindowEndMs) && nowMs <= prevWindowEndMs) {
+      if (prev.trigger !== "manual" && live.length > 0) {
+        const candidate = armFrom(live[0]);
+        if (Math.abs(Date.parse(candidate.windowEnd) - prevWindowEndMs) > RETIME_MIN_SHIFT_MS) {
+          return { state: candidate, transitions: ["re-time"] };
+        }
+      }
       return { state: prev, transitions: [] };
     }
     if (live.length === 0) {
       return { state: { kind: "idle" }, transitions: ["stand-down"] };
     }
-    return { state: armFrom(live[0], nowMs), transitions: ["re-arm"] };
+    return { state: armFrom(live[0]), transitions: ["re-arm"] };
   }
 
   // 4. Idle: manual-disarm suppression blocks re-arming until it lapses.
@@ -329,13 +358,23 @@ export function evaluateStormState(
     return { state: prev, transitions: [] };
   }
   if (live.length > 0) {
-    return { state: armFrom(live[0], nowMs), transitions: ["arm"] };
+    return { state: armFrom(live[0]), transitions: ["arm"] };
   }
 
   // 6. outageActive === null never changes state by itself.
   return { state: { kind: "idle" }, transitions: [] };
 }
 
-export function stormCeilingF(hbxCurveTargetF: number | null, capF: number): number {
-  return Math.min((hbxCurveTargetF ?? capF) + 3, capF);
+/**
+ * Storm pre-charge ceiling: the curve target raised by `stepF`, never above `capF`.
+ *
+ * `stepF` defaults to 3 °F, which is what has shipped since 2026-07-14 and is deliberately
+ * unchanged here — but it buys only ~0.8 kWh thermal (~a third of a shower, ~2.6 h of coast).
+ * `knowledge/reference/storm-precharge-economics.md` measures the trade and argues for 10 °F
+ * (to `strictCapF` 135): ~1.6 showers and ~12.8 h of coast for ~$0.39, with an 8 % COP penalty.
+ * That is a change to this house's heating behaviour and is the owner's call (#114), so it is
+ * exposed as a parameter rather than silently redefined.
+ */
+export function stormCeilingF(hbxCurveTargetF: number | null, capF: number, stepF = 3): number {
+  return Math.min((hbxCurveTargetF ?? capF) + stepF, capF);
 }

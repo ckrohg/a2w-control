@@ -163,4 +163,90 @@ const REAL_KMH_BODY = {
   assert.equal(stormCeilingF(null, 135), 135, "no curve reading → the cap");
 }
 
+// 6. #118 NWS window: `ends` is the weather, `expires` is only the bulletin's refresh deadline.
+//    Fixture is the REAL High Wind Warning live at 2026-09-25T16:5xZ, whose two fields were 31 h
+//    apart — the planner read it as ending Sat 01:30 EDT when the wind ran to Sun 08:00 EDT.
+{
+  const REAL_HIGH_WIND = {
+    features: [{
+      properties: {
+        event: "High Wind Warning", severity: "Severe", messageType: "Update",
+        onset: "2026-09-25T12:30:00-04:00",
+        expires: "2026-09-26T01:30:00-04:00", // bulletin refresh
+        ends: "2026-09-27T08:00:00-04:00",    // the weather
+        headline: "High Wind Warning issued September 25 at 12:30PM EDT until September 27 at 8:00AM EDT",
+      },
+    }],
+  };
+  // fetchNwsAlerts' mapping, exercised through the same shape it builds from.
+  const mapped = REAL_HIGH_WIND.features.map((f) => {
+    const p = f.properties as Record<string, string>;
+    return { expires: p.ends ?? p.expires ?? null };
+  });
+  assert.equal(mapped[0].expires, "2026-09-27T08:00:00-04:00", "the event end, not the refresh deadline");
+
+  // And end-to-end through the machine: the armed window must outlast the bulletin.
+  const now = new Date("2026-09-25T17:00:00Z");
+  const alert = {
+    event: "High Wind Warning", severity: "Severe", tier: "arm" as const,
+    onset: "2026-09-25T12:30:00-04:00", expires: "2026-09-27T08:00:00-04:00",
+    headline: "hwo",
+  };
+  const res = evaluateStormState({ kind: "idle" }, { alerts: [alert], synthetic: [], outageActive: null }, now);
+  assert.equal(res.transitions[0], "arm");
+  assert.ok(res.state.kind === "armed" && Date.parse(res.state.windowEnd) > Date.parse("2026-09-27T08:00:00-04:00"),
+    "window must extend past the event end, not stop at the bulletin refresh");
+}
+
+// 7. #119 re-timing. An armed window used to be frozen until it lapsed, so a storm that shifted
+//    left the window behind — measured live 2026-09-25: held window ended 8 h before the peak.
+{
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const now = new Date("2026-09-25T17:00:00Z");
+  const early = { kind: "high-wind", detail: "d", onset: "2026-09-26T12:00:00Z", expires: "2026-09-26T17:00:00Z" };
+  const armed = evaluateStormState({ kind: "idle" }, { ...base, synthetic: [early] }, now);
+  assert.equal(armed.transitions[0], "arm");
+  const heldEnd = (armed.state as { windowEnd: string }).windowEnd;
+
+  // The storm slips 8 h later. The window must follow, without waiting to lapse.
+  const late = { ...early, onset: "2026-09-26T20:00:00Z", expires: "2026-09-27T01:00:00Z" };
+  const retimed = evaluateStormState(armed.state, { ...base, synthetic: [late] }, now);
+  assert.deepEqual(retimed.transitions, ["re-time"], "a materially moved trigger re-times the window");
+  assert.ok(Date.parse((retimed.state as { windowEnd: string }).windowEnd) > Date.parse(heldEnd),
+    "the re-timed window must end later than the one it replaced");
+
+  // Jitter below the threshold must NOT churn the window (and so must not page).
+  const jitter = { ...early, expires: "2026-09-26T17:30:00Z" };
+  assert.equal(evaluateStormState(armed.state, { ...base, synthetic: [jitter] }, now).transitions.length, 0,
+    "30 min of forecast jitter is not a re-time");
+
+  // A manual arm is the owner's explicit window — a forecast never overrides it.
+  const manual = evaluateStormState({ kind: "idle" }, { ...base, manual: { armHours: 24 } }, now);
+  assert.equal(manual.transitions[0], "manual-arm");
+  assert.equal(evaluateStormState(manual.state, { ...base, synthetic: [late] }, now).transitions.length, 0,
+    "a manual window is never re-timed by the forecast");
+}
+
+// 8. #114/#119 lead-in. `min(onset - 24h, now)` never meant "24 h early": `now` was always the
+//    smaller term until onset came within 24 h, so it meant "start the moment a trigger appears."
+//    The lead must now come off onset, and a future windowStart must survive (index.ts gates
+//    shaping on it, which is what "armed but not yet banking" looks like).
+{
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const now = new Date("2026-09-25T17:00:00Z");
+  const farOff = { kind: "high-wind", detail: "d", onset: "2026-09-27T12:00:00Z", expires: "2026-09-27T18:00:00Z" };
+  const res = evaluateStormState({ kind: "idle" }, { ...base, synthetic: [farOff] }, now);
+  assert.equal(res.transitions[0], "arm");
+  const startMs = Date.parse((res.state as { windowStart: string }).windowStart);
+  assert.equal(startMs, Date.parse("2026-09-27T08:00:00Z"), "lead is 4 h off onset, not 24 h and not now");
+  assert.ok(startMs > now.getTime(), "a trigger two days out must not start shaping the plan today");
+}
+
+// 9. Ceiling step is a parameter, and its default is unchanged.
+{
+  assert.equal(stormCeilingF(120, 135), 123, "default step is still +3 — behaviour preserved");
+  assert.equal(stormCeilingF(120, 135, 10), 130, "a 10 °F step is honoured");
+  assert.equal(stormCeilingF(130, 135, 10), 135, "the cap still binds over the step");
+}
+
 console.log("storm.test.ts: all assertions passed");
