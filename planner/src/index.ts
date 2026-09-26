@@ -92,6 +92,10 @@ const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
 // is only shaped when STORM_MODE_ENABLED=1 (plan §11 Q6 is an open owner question).
 const STORM_MODE_ENABLED = process.env.STORM_MODE_ENABLED === "1";
 const STORM_CAP_F = Number(process.env.STORM_CAP_F ?? "135");
+// #114 owner decision 2026-09-25: the pre-charge step above the curve target. 10 °F (to strictCap)
+// is DHW resilience — ~1.6 showers / ~12.8 h of coast for ~$0.39. Set 3 to restore pre-2026-09-25
+// behaviour. See knowledge/reference/storm-precharge-economics.md.
+const STORM_STEP_F = Number(process.env.STORM_STEP_F ?? "10");
 const OUTAGEWATCH_URL = process.env.OUTAGEWATCH_URL ?? "https://victorious-light-production.up.railway.app";
 
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
@@ -814,7 +818,7 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
       const cfg = await store.latestConfig();
       const latest = await store.getLatestSlx();
       const curve = cfg && latest?.outdoorF != null ? curveTargetF(cfg, latest.outdoorF) : null;
-      ceilingF = stormCeilingF(curve, STORM_CAP_F);
+      ceilingF = stormCeilingF(curve, STORM_CAP_F, STORM_STEP_F);
     } catch { /* no config/reading yet — the cap stands */ }
     await store
       .insertStormEvent(state.trigger, { transitions, windowEnd: state.windowEnd }, ceilingF)
@@ -1023,7 +1027,7 @@ async function shadowOnce(): Promise<void> {
     for (const block of plan) {
       const tsMs = Date.parse(block.ts);
       if (!(tsMs >= startMs && tsMs <= endMs)) continue;
-      const ceiling = Math.round(stormCeilingF(cfg ? curveTargetF(cfg, block.outdoor_f) : null, STORM_CAP_F));
+      const ceiling = Math.round(stormCeilingF(cfg ? curveTargetF(cfg, block.outdoor_f) : null, STORM_CAP_F, STORM_STEP_F));
       const raised = Math.max(block.tank_target_f, ceiling);
       if (raised === block.tank_target_f) continue;
       block.tank_target_f = raised;

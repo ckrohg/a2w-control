@@ -155,10 +155,11 @@ const REAL_KMH_BODY = {
     "an explicit manual arm beats the owner's own suppression");
 }
 
-// 5. Ceiling: curve + 3, capped. The cap is what binds in shoulder season, which is why a spurious
-//    arm is expensive — #112 held the tank at 135 °F against a 120 °F September idle target.
+// 5. Ceiling: curve + step, capped. The cap is what binds in shoulder season, which is why a
+//    spurious arm is expensive — #112 held the tank at 135 °F against a 120 °F September idle
+//    target. Step is 10 °F as of the 2026-09-25 owner decision (#114), was 3.
 {
-  assert.equal(stormCeilingF(120, 135), 123, "curve + 3 when it fits under the cap");
+  assert.equal(stormCeilingF(120, 135), 130, "curve + 10 when it fits under the cap");
   assert.equal(stormCeilingF(156, 135), 135, "cap binds");
   assert.equal(stormCeilingF(null, 135), 135, "no curve reading → the cap");
 }
@@ -242,11 +243,13 @@ const REAL_KMH_BODY = {
   assert.ok(startMs > now.getTime(), "a trigger two days out must not start shaping the plan today");
 }
 
-// 9. Ceiling step is a parameter, and its default is unchanged.
+// 9. Ceiling step: default is the owner-decided 10 °F, and the old 3 is still reachable so
+//    STORM_STEP_F=3 is a real rollback and not just a comment.
 {
-  assert.equal(stormCeilingF(120, 135), 123, "default step is still +3 — behaviour preserved");
-  assert.equal(stormCeilingF(120, 135, 10), 130, "a 10 °F step is honoured");
-  assert.equal(stormCeilingF(130, 135, 10), 135, "the cap still binds over the step");
+  assert.equal(stormCeilingF(120, 135), 130, "default step is +10 (#114, 2026-09-25)");
+  assert.equal(stormCeilingF(120, 135, 3), 123, "STORM_STEP_F=3 restores pre-decision behaviour");
+  assert.equal(stormCeilingF(130, 135), 135, "the cap still binds over the step");
+  assert.equal(stormCeilingF(120, 122), 122, "a cap below curve+step clamps, never raises past it");
 }
 
 console.log("storm.test.ts: all assertions passed");

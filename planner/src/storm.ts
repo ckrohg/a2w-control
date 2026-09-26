@@ -368,13 +368,15 @@ export function evaluateStormState(
 /**
  * Storm pre-charge ceiling: the curve target raised by `stepF`, never above `capF`.
  *
- * `stepF` defaults to 3 °F, which is what has shipped since 2026-07-14 and is deliberately
- * unchanged here — but it buys only ~0.8 kWh thermal (~a third of a shower, ~2.6 h of coast).
- * `knowledge/reference/storm-precharge-economics.md` measures the trade and argues for 10 °F
- * (to `strictCapF` 135): ~1.6 showers and ~12.8 h of coast for ~$0.39, with an 8 % COP penalty.
- * That is a change to this house's heating behaviour and is the owner's call (#114), so it is
- * exposed as a parameter rather than silently redefined.
+ * `stepF` defaults to **10 °F** — OWNER DECISION 2026-09-25, resolving #114's fork. The +3 °F that
+ * shipped from 2026-07-14 bought ~0.8 kWh thermal: a third of a shower, ~2.6 h of coast, 11 cents.
+ * 10 °F (i.e. to `strictCapF` 135 from a 125 °F curve) buys ~1.6 showers and ~12.8 h of coast for
+ * ~$0.39, at an 8 % COP penalty — measured in `knowledge/reference/storm-precharge-economics.md`.
+ *
+ * The framing that comes with the number matters: this is **DHW resilience**, explicitly NOT a
+ * space-heat bridge. 110 gal cannot bridge an outage's heating load at any temperature (#114), and
+ * nothing here claims otherwise. Overridable via `STORM_STEP_F`; 3 restores the old behaviour.
  */
-export function stormCeilingF(hbxCurveTargetF: number | null, capF: number, stepF = 3): number {
+export function stormCeilingF(hbxCurveTargetF: number | null, capF: number, stepF = 10): number {
   return Math.min((hbxCurveTargetF ?? capF) + stepF, capF);
 }
