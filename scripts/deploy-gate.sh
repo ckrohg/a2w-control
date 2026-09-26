@@ -20,20 +20,34 @@
 #   scripts/deploy-gate.sh merge 123           # gate -> merge -> wait -> re-verify
 #   scripts/deploy-gate.sh watch 20            # poll every 20s until healthy (Ctrl-C to stop)
 #
-# Env: PLANNER_URL, HUB_URL, STALE_S (default 180), DEPLOY_WAIT_S (default 240)
+# Env: PLANNER_URL, HUB_URL, STALE_S (180), DEPLOY_DEADLINE_S (900), LEASE_POLL_S (15)
 set -uo pipefail
 
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
 HUB="${HUB_URL:-https://a2w-hub-production.up.railway.app}"
 STALE_S="${STALE_S:-180}"
-DEPLOY_WAIT_S="${DEPLOY_WAIT_S:-240}"
+DEPLOY_WAIT_S="${DEPLOY_WAIT_S:-240}"          # retained for compatibility; no longer a blind sleep
+DEPLOY_DEADLINE_S="${DEPLOY_DEADLINE_S:-900}"  # #116: past the ~11-15 min real handover
+LEASE_POLL_S="${LEASE_POLL_S:-15}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$1"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$1"; }
 
 # Prints "ok|<detail>" or "bad|<detail>"; never exits, so callers decide.
+# #116 helpers. writer_lease is one of: {held,holder} | "pending" | "off" (index.ts). Exported
+# shape-handling so probe() and the reacquisition poll cannot disagree about what "held" means.
+lease_state() {  # $1 = planner /health json -> held | unheld | pending | off | unknown
+  jq -r 'if (.writer_lease|type) == "object"
+         then (if .writer_lease.held then "held" else "unheld" end)
+         else (.writer_lease // "unknown" | tostring) end' <<<"$1" 2>/dev/null || echo unknown
+}
+lease_holder() {  # $1 = planner /health json -> holder id, empty when not held
+  jq -r 'if (.writer_lease|type) == "object" and .writer_lease.held
+         then (.writer_lease.holder // "?") else "" end' <<<"$1" 2>/dev/null || echo ""
+}
+
 probe() {
-  local hub planner pi age results bad=""
+  local hub planner pi age results lease bad=""
   hub="$(curl -sf -m 15 "$HUB/health" 2>/dev/null)" || hub=""
   planner="$(curl -sf -m 15 "$PLANNER/health" 2>/dev/null)" || planner=""
 
@@ -54,10 +68,19 @@ probe() {
     # A Phase B result containing "failed" means we are not actually commanding the pumps.
     results="$(jq -r '[.phase_b.lastResults // {} | to_entries[] | select(.value|test("failed")) | .key] | join(",")' <<<"$planner")"
     [ -n "$results" ] && bad="${bad}phaseb-failing(${results}) "
+    # #116: the ONE thing a planner redeploy actually disturbs, and the one thing this gate
+    # could not see. A planner that is up, ok, and NOT holding the writer lease is silently
+    # not commanding setpoints -- and used to pass as "healthy". `off` means the lease is
+    # disabled by config, which is a deployment choice rather than a fault.
+    lease="$(lease_state "$planner")"
+    case "$lease" in
+      held|off) ;;
+      *) bad="${bad}writer-lease-${lease} " ;;
+    esac
   fi
 
   if [ -n "$bad" ]; then echo "bad|${bad}"; else
-    echo "ok|pi connected, last push ${age}s ago, phase_b clean"
+    echo "ok|pi connected, last push ${age}s ago, phase_b clean, lease ${lease}"
   fi
 }
 
@@ -67,6 +90,9 @@ report() {  # $1 = label
   printf '%-10s ' "$1"
   if [ "$state" = "ok" ]; then grn "OK    $detail"; return 0; else red "UNWELL $detail"; return 1; fi
 }
+
+# Allow the assertion suite to source the helpers without running a command.
+if [ -n "${DEPLOY_GATE_LIB_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
 
 case "${1:-status}" in
   status)
@@ -105,6 +131,12 @@ case "${1:-status}" in
       echo "           (non-deploying PR — health is recorded, not enforced)"
     fi
 
+    # #116: remember WHO held the lease before the merge. "Held" after a deploy is only
+    # meaningful if a DIFFERENT instance holds it -- otherwise we may simply have sampled
+    # before the outgoing instance let go.
+    BEFORE_HOLDER="$(lease_holder "$(curl -sf -m 15 "$PLANNER/health" 2>/dev/null || echo '{}')")"
+    [ -n "$BEFORE_HOLDER" ] && echo "           lease held by ${BEFORE_HOLDER} before the merge"
+
     echo
     echo "── MERGING #$PR (deploying: $([ $deploys -eq 1 ] && echo YES || echo no)) ──"
     gh pr merge "$PR" --squash --delete-branch || { red "merge failed"; exit 1; }
@@ -120,14 +152,34 @@ case "${1:-status}" in
     fi
 
     echo
-    echo "── WAITING ${DEPLOY_WAIT_S}s FOR THE DEPLOY TO SETTLE ──"
-    # A planner redeploy hands the writer lease over; ~15 min of lease churn is NORMAL and is
-    # not what we are checking for. We are checking the Pi is still there and Phase B recovers.
-    sleep "$DEPLOY_WAIT_S"
+    echo "── WAITING FOR THE WRITER LEASE TO RETURN (deadline ${DEPLOY_DEADLINE_S}s) ──"
+    # #116: DEPLOY_WAIT_S defaulted to 240 s while the real handover measured ~11 min on #113
+    # (live-state documents ~15 min). So the post-merge verify ran systematically INSIDE the
+    # handover, and a fixed sleep could not distinguish "in progress" from "stuck" -- it
+    # reported a blind wait as a clean bracket. Poll instead, and make each deploy MEASURE the
+    # handover rather than guess at it.
+    deploy_started=$(date +%s); handover=""
+    while :; do
+      elapsed=$(( $(date +%s) - deploy_started ))
+      now_holder="$(lease_holder "$(curl -sf -m 15 "$PLANNER/health" 2>/dev/null || echo '{}')")"
+      if [ -n "$now_holder" ] && [ "$now_holder" != "$BEFORE_HOLDER" ]; then
+        handover="$elapsed"
+        grn "lease reacquired after ${handover}s by ${now_holder} (was ${BEFORE_HOLDER:-none})"
+        break
+      fi
+      if [ "$elapsed" -ge "$DEPLOY_DEADLINE_S" ]; then
+        red "lease NOT reacquired within ${DEPLOY_DEADLINE_S}s (still ${now_holder:-unheld})."
+        red "The planner may be up and healthy while silently not commanding setpoints."
+        break
+      fi
+      printf '\r           waiting… %ds (holder: %s)' "$elapsed" "${now_holder:-unheld}"
+      sleep "$LEASE_POLL_S"
+    done
+    printf '\n'
 
     echo "── POST-MERGE VERIFY ───────────────────────────────────"
-    if report "after"; then
-      grn "clean bracket: #$PR merged, system healthy before and after."
+    if [ -n "$handover" ] && report "after"; then
+      grn "clean bracket: #$PR merged, healthy before and after; handover ${handover}s."
       exit 0
     fi
     red "REGRESSION after merging #$PR."
