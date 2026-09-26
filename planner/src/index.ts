@@ -673,6 +673,17 @@ async function checkDHWShortfall(reading: SlxReading): Promise<void> {
 const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
 const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
 let freezeRiskAlerted = false;
+// #122 Wave 2. #116 established that NOTHING watched the writer lease: a planner that is up,
+// healthy and silently not commanding setpoints read as fine everywhere. Same for a Pi that has
+// gone quiet -- the 2026-09-16 incident was a 73-minute WiFi drop on a calm day, and the only
+// reason anyone noticed was that a human happened to be looking. Both are edge-triggered so a
+// long outage pages once, not every poll.
+let leaseLostSince: number | null = null;
+let leaseAlerted = false;
+let piDisconnectedSince: number | null = null;
+let piQuietAlerted = false;
+const LEASE_LOST_ALERT_S = 900;  // past the ~11-15 min handover a redeploy legitimately causes
+const PI_QUIET_ALERT_S = 600;
 async function checkFreezeRisk(reading: SlxReading): Promise<void> {
   if (reading.outdoorF == null || reading.tankF == null) return;
   const risk = reading.outdoorF <= FREEZE_OUTDOOR_F && reading.tankF < FREEZE_TANK_F;
@@ -1217,6 +1228,64 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
   WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
+/**
+ * #122 Wave 2: page when the planner stops actually commanding, or the Pi goes quiet.
+ *
+ * The lease check deliberately waits LEASE_LOST_ALERT_S. A redeploy hands the lease over and
+ * ~11-15 min unheld is NORMAL (#116, live-state) -- alerting on that would train the owner to
+ * ignore the channel, which is worse than not having it.
+ */
+async function checkLeaseAndPi(): Promise<void> {
+  const held = writerLeaseState?.held === true;
+  if (!WRITER_LEASE_ENABLED) return;
+  if (held) {
+    if (leaseAlerted) {
+      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { resolved: true });
+    }
+    leaseLostSince = null; leaseAlerted = false;
+  } else {
+    leaseLostSince ??= Date.now();
+    const downS = Math.round((Date.now() - leaseLostSince) / 1000);
+    if (downS >= LEASE_LOST_ALERT_S && !leaseAlerted) {
+      leaseAlerted = true;
+      await ntfy(
+        "Planner not commanding setpoints",
+        `The writer lease has been unheld for ~${Math.round(downS / 60)} min — longer than a redeploy handover. ` +
+          `The planner is up and healthy but is NOT driving the pumps, so the tank is running on whatever ` +
+          `was last written. Check /health writer_lease and whether a second instance is contending.`,
+        "high",
+      );
+    }
+  }
+
+  if (!hub) return;
+  try {
+    // pi_connected is the unambiguous signal and the one drift-check asserts on. HubState.ts is
+    // deliberately NOT used for staleness here: its units are not documented, and guessing at a
+    // timestamp scale is how you build an alert that fires at the wrong time or never.
+    const connected = (await hub.getState()).pi_connected === true;
+    if (!connected) {
+      piDisconnectedSince ??= Date.now();
+      const downS = Math.round((Date.now() - piDisconnectedSince) / 1000);
+      if (downS >= PI_QUIET_ALERT_S && !piQuietAlerted) {
+        piQuietAlerted = true;
+        await ntfy(
+          "Pi disconnected",
+          `The bridge has been disconnected for ~${Math.round(downS / 60)} min. Setpoints are frozen at the last ` +
+            `written value, and until FINDING-1 (#117) is armed the revert-to-baseline failsafe cannot fire. ` +
+            `Precedent: a 73-minute WiFi drop on 2026-09-16, on a calm day.`,
+          "high",
+        );
+      }
+    } else {
+      if (piQuietAlerted) {
+        await ntfy("Pi reconnected", "The bridge is pushing state again.", "default", { resolved: true });
+      }
+      piDisconnectedSince = null; piQuietAlerted = false;
+    }
+  } catch { /* hub unreachable is already covered by the poll-failure path */ }
+}
+
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
@@ -1249,6 +1318,8 @@ async function pollOnce(): Promise<void> {
     try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
     catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
   }
+  // #122 Wave 2 — runs AFTER the renew so it judges this cycle's lease, not last cycle's.
+  await checkLeaseAndPi().catch((e) => console.error("lease/pi check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
 
   // W2-A: pull the runtime autonomy override and apply it per-tick BEFORE the controllers run, so
@@ -1493,6 +1564,53 @@ async function main(): Promise<void> {
             },
           });
         }
+        // #122 Wave 2. Answering "is the house ready for the storm?" on 2026-09-26 took five
+        // separate commands and a human to join up. Confidence that must be RECONSTRUCTED each
+        // time is not confidence. Public and read-only, same as /health: this reports, it never
+        // actuates. `ready` is deliberately conservative — anything unknown blocks rather than
+        // passes, because a readiness check that goes green on missing data is worse than none.
+        if (req.url === "/api/readiness") {
+          const el: Record<string, { ok: boolean | null; detail: string }> = {};
+          const pollAgeS = lastPollAt ? Math.round((Date.now() - Date.parse(lastPollAt)) / 1000) : null;
+          el.planner = {
+            ok: consecutiveFailures < OFFLINE_AFTER_FAILURES && pollAgeS != null && pollAgeS < 900,
+            detail: pollAgeS == null ? "never polled" : `last poll ${pollAgeS}s ago, ${consecutiveFailures} consecutive failures`,
+          };
+          const held = !WRITER_LEASE_ENABLED ? null : writerLeaseState?.held === true;
+          el.commanding = {
+            ok: held === null ? true : held,
+            detail: held === null ? "lease disabled by config"
+              : held ? `lease held by ${writerLeaseState?.holder}`
+              : "LEASE NOT HELD — planner is not driving the pumps",
+          };
+          // Phase B's own honest string is the evidence (#97): before that fix it lied "lease 90m".
+          const noLease = Object.values(phaseB?.lastResults ?? {}).some((v) => /NO LEASE ARMED/.test(String(v)));
+          el.failsafe = {
+            ok: phaseB ? !noLease : null,
+            detail: !phaseB ? "phase B disabled" : noLease
+              ? "FINDING-1 (#117): the Pi armed NO lease — revert-to-baseline CANNOT fire"
+              : "Pi confirmed a lease — revert-to-baseline armed",
+          };
+          const t = lastThermal.tank_f;
+          el.thermal = {
+            ok: t == null ? null : t >= DEFAULT_OPTS.dhwFloorF,
+            detail: t == null ? "no tank reading" : `tank ${t}F vs ${DEFAULT_OPTS.dhwFloorF}F DHW floor`,
+          };
+          el.storm = {
+            ok: true, // informational: armed is neither good nor bad, it is a state
+            detail: stormState.kind === "idle" ? "idle"
+              : `${stormState.kind} (${stormState.trigger}) until ${stormState.kind === "armed" || stormState.kind === "active" ? stormState.windowEnd : "-"}`,
+          };
+          const blocking = Object.entries(el).filter(([, v]) => v.ok !== true).map(([k]) => k);
+          return json(res, 200, {
+            ready: blocking.length === 0,
+            blocking,
+            elements: el,
+            note: "read-only; `ready` fails closed on unknowns. Propane, generator, trees and the water valve are NOT visible here — see epic #122.",
+            at: new Date().toISOString(),
+          });
+        }
+
         if (req.url === "/api/drill" && req.method === "POST") {
           // Winter-readiness alert drill (owner-triggered, authed): fires the REAL alert
           // paths with [DRILL] prefixes at their REAL priorities so the whole tiering is
