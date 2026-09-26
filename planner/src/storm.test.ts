@@ -155,12 +155,143 @@ const REAL_KMH_BODY = {
     "an explicit manual arm beats the owner's own suppression");
 }
 
-// 5. Ceiling: curve + 3, capped. The cap is what binds in shoulder season, which is why a spurious
-//    arm is expensive — #112 held the tank at 135 °F against a 120 °F September idle target.
+// 5. Ceiling: curve + step, capped. The cap is what binds in shoulder season, which is why a
+//    spurious arm is expensive — #112 held the tank at 135 °F against a 120 °F September idle
+//    target. Step is 10 °F as of the 2026-09-25 owner decision (#114), was 3.
 {
-  assert.equal(stormCeilingF(120, 135), 123, "curve + 3 when it fits under the cap");
+  assert.equal(stormCeilingF(120, 135), 130, "curve + 10 when it fits under the cap");
   assert.equal(stormCeilingF(156, 135), 135, "cap binds");
   assert.equal(stormCeilingF(null, 135), 135, "no curve reading → the cap");
+}
+
+// 6. #118 NWS window: `ends` is the weather, `expires` is only the bulletin's refresh deadline.
+//    Fixture is the REAL High Wind Warning live at 2026-09-25T16:5xZ, whose two fields were 31 h
+//    apart — the planner read it as ending Sat 01:30 EDT when the wind ran to Sun 08:00 EDT.
+{
+  const REAL_HIGH_WIND = {
+    features: [{
+      properties: {
+        event: "High Wind Warning", severity: "Severe", messageType: "Update",
+        onset: "2026-09-25T12:30:00-04:00",
+        expires: "2026-09-26T01:30:00-04:00", // bulletin refresh
+        ends: "2026-09-27T08:00:00-04:00",    // the weather
+        headline: "High Wind Warning issued September 25 at 12:30PM EDT until September 27 at 8:00AM EDT",
+      },
+    }],
+  };
+  // fetchNwsAlerts' mapping, exercised through the same shape it builds from.
+  const mapped = REAL_HIGH_WIND.features.map((f) => {
+    const p = f.properties as Record<string, string>;
+    return { expires: p.ends ?? p.expires ?? null };
+  });
+  assert.equal(mapped[0].expires, "2026-09-27T08:00:00-04:00", "the event end, not the refresh deadline");
+
+  // And end-to-end through the machine: the armed window must outlast the bulletin.
+  const now = new Date("2026-09-25T17:00:00Z");
+  const alert = {
+    event: "High Wind Warning", severity: "Severe", tier: "arm" as const,
+    onset: "2026-09-25T12:30:00-04:00", expires: "2026-09-27T08:00:00-04:00",
+    headline: "hwo",
+  };
+  const res = evaluateStormState({ kind: "idle" }, { alerts: [alert], synthetic: [], outageActive: null }, now);
+  assert.equal(res.transitions[0], "arm");
+  assert.ok(res.state.kind === "armed" && Date.parse(res.state.windowEnd) > Date.parse("2026-09-27T08:00:00-04:00"),
+    "window must extend past the event end, not stop at the bulletin refresh");
+}
+
+// 7. #119 re-timing. An armed window used to be frozen until it lapsed, so a storm that shifted
+//    left the window behind — measured live 2026-09-25: held window ended 8 h before the peak.
+{
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const now = new Date("2026-09-25T17:00:00Z");
+  const early = { kind: "high-wind", detail: "d", onset: "2026-09-26T12:00:00Z", expires: "2026-09-26T17:00:00Z" };
+  const armed = evaluateStormState({ kind: "idle" }, { ...base, synthetic: [early] }, now);
+  assert.equal(armed.transitions[0], "arm");
+  const heldEnd = (armed.state as { windowEnd: string }).windowEnd;
+
+  // The storm slips 8 h later. The window must follow, without waiting to lapse.
+  const late = { ...early, onset: "2026-09-26T20:00:00Z", expires: "2026-09-27T01:00:00Z" };
+  const retimed = evaluateStormState(armed.state, { ...base, synthetic: [late] }, now);
+  assert.deepEqual(retimed.transitions, ["re-time"], "a materially moved trigger re-times the window");
+  assert.ok(Date.parse((retimed.state as { windowEnd: string }).windowEnd) > Date.parse(heldEnd),
+    "the re-timed window must end later than the one it replaced");
+
+  // Jitter below the threshold must NOT churn the window (and so must not page).
+  const jitter = { ...early, expires: "2026-09-26T17:30:00Z" };
+  assert.equal(evaluateStormState(armed.state, { ...base, synthetic: [jitter] }, now).transitions.length, 0,
+    "30 min of forecast jitter is not a re-time");
+
+  // A manual arm is the owner's explicit window — a forecast never overrides it.
+  const manual = evaluateStormState({ kind: "idle" }, { ...base, manual: { armHours: 24 } }, now);
+  assert.equal(manual.transitions[0], "manual-arm");
+  assert.equal(evaluateStormState(manual.state, { ...base, synthetic: [late] }, now).transitions.length, 0,
+    "a manual window is never re-timed by the forecast");
+}
+
+// 8. #114/#119 lead-in. `min(onset - 24h, now)` never meant "24 h early": `now` was always the
+//    smaller term until onset came within 24 h, so it meant "start the moment a trigger appears."
+//    The lead must now come off onset, and a future windowStart must survive (index.ts gates
+//    shaping on it, which is what "armed but not yet banking" looks like).
+{
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const now = new Date("2026-09-25T17:00:00Z");
+  const farOff = { kind: "high-wind", detail: "d", onset: "2026-09-27T12:00:00Z", expires: "2026-09-27T18:00:00Z" };
+  const res = evaluateStormState({ kind: "idle" }, { ...base, synthetic: [farOff] }, now);
+  assert.equal(res.transitions[0], "arm");
+  const startMs = Date.parse((res.state as { windowStart: string }).windowStart);
+  assert.equal(startMs, Date.parse("2026-09-27T10:00:00Z"), "lead is 2 h off onset (owner spec), not 24 h and not now");
+  assert.ok(startMs > now.getTime(), "a trigger two days out must not start shaping the plan today");
+}
+
+// 9. Ceiling step: default is the owner-decided 10 °F, and the old 3 is still reachable so
+//    STORM_STEP_F=3 is a real rollback and not just a comment.
+{
+  assert.equal(stormCeilingF(120, 135), 130, "default step is +10 (#114, 2026-09-25)");
+  assert.equal(stormCeilingF(120, 135, 3), 123, "STORM_STEP_F=3 restores pre-decision behaviour");
+  assert.equal(stormCeilingF(130, 135), 135, "the cap still binds over the step");
+  assert.equal(stormCeilingF(120, 122), 122, "a cap below curve+step clamps, never raises past it");
+}
+
+// 10. OWNER SPEC 2026-09-25 — back-to-back storms get their own windows. The old code handed ALL
+//     qualifying hours to triggerWindow (first → last), so two fronts in one forecast became a
+//     single span bridging the calm days between them and pre-charged straight through.
+{
+  const mk = (ts: string, gustMph: number): StormForecastHour =>
+    ({ ts, tempF: 50, gustMph, snowfallIn: 0, weatherCode: 3 });
+  const twoStorms: StormForecastHour[] = [
+    // storm A: 3 h on the 26th
+    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52), mk("2026-09-26T14:00", 48),
+    // ~2 days of calm (below the bar, so absent from the qualifying set entirely)
+    // storm B: 3 h on the 28th
+    mk("2026-09-28T12:00", 49), mk("2026-09-28T13:00", 51), mk("2026-09-28T14:00", 47),
+  ];
+  const t = deriveSyntheticTriggers(twoStorms).filter((x) => x.kind === "high-wind");
+  assert.equal(t.length, 2, "two fronts must produce TWO triggers, not one merged span");
+  assert.equal(t[0].onset, "2026-09-26T12:00", "first storm keeps its own onset");
+  assert.ok(Date.parse(t[0].expires) < Date.parse(t[1].onset),
+    "the first window must CLOSE before the second opens — no bridging the calm between them");
+  assert.equal(t[1].onset, "2026-09-28T12:00", "second storm keeps its own onset");
+
+  // A short lull inside one storm must NOT split it — that would re-introduce churn.
+  const oneStormWithLull: StormForecastHour[] = [
+    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52),
+    mk("2026-09-26T16:00", 48), mk("2026-09-26T17:00", 49),
+  ];
+  assert.equal(deriveSyntheticTriggers(oneStormWithLull).filter((x) => x.kind === "high-wind").length, 1,
+    "a 3 h lull is one storm, not two");
+
+  // Snow is per-storm too: two unremarkable events must not sum into a heavy-snow arm.
+  const snow = (ts: string, inches: number): StormForecastHour =>
+    ({ ts, tempF: 28, gustMph: 10, snowfallIn: inches, weatherCode: 73 });
+  const twoSmallSnows: StormForecastHour[] = [
+    snow("2026-01-10T00:00", 2), snow("2026-01-10T01:00", 2.5),
+    snow("2026-01-13T00:00", 2), snow("2026-01-13T01:00", 2.5),
+  ];
+  assert.equal(deriveSyntheticTriggers(twoSmallSnows).filter((x) => x.kind === "heavy-snow").length, 0,
+    "4.5 in twice, days apart, is not an 8 in storm");
+  const oneBigSnow: StormForecastHour[] = [snow("2026-01-10T00:00", 5), snow("2026-01-10T01:00", 4)];
+  assert.equal(deriveSyntheticTriggers(oneBigSnow).filter((x) => x.kind === "heavy-snow").length, 1,
+    "9 in in one storm still arms");
 }
 
 console.log("storm.test.ts: all assertions passed");
