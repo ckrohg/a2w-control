@@ -27,6 +27,13 @@
 #
 # Two things must also hold for an unattended run: the token must be present, and the machine must
 # be awake at the scheduled minute. cron does not wake a sleeping Mac.
+#
+# AND THE REAL REASON THE 2026-09-26 FIRES MISSED -- corrected the same day: macOS cron CANNOT read a
+# script under ~/Documents (or Desktop/Downloads) without Full Disk Access. Both scheduled fires ran
+# on time and died with "/bin/bash: scripts/storm-precharge.sh: Operation not permitted". The "Mac was
+# asleep" diagnosis was wrong, and the canary that "proved cron works" was /bin/echo to /tmp, which
+# never touches a protected folder. Run cron jobs from a COPY outside ~/Documents (e.g. ~/.a2w/), and
+# prove them with: env -i PATH=/usr/bin:/bin HOME=$HOME /bin/bash ~/.a2w/<script>
 set -uo pipefail
 
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
