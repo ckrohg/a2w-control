@@ -92,6 +92,10 @@ const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
 // is only shaped when STORM_MODE_ENABLED=1 (plan §11 Q6 is an open owner question).
 const STORM_MODE_ENABLED = process.env.STORM_MODE_ENABLED === "1";
 const STORM_CAP_F = Number(process.env.STORM_CAP_F ?? "135");
+// #114 owner decision 2026-09-25: the pre-charge step above the curve target. 10 °F (to strictCap)
+// is DHW resilience — ~1.6 showers / ~12.8 h of coast for ~$0.39. Set 3 to restore pre-2026-09-25
+// behaviour. See knowledge/reference/storm-precharge-economics.md.
+const STORM_STEP_F = Number(process.env.STORM_STEP_F ?? "10");
 const OUTAGEWATCH_URL = process.env.OUTAGEWATCH_URL ?? "https://victorious-light-production.up.railway.app";
 
 const slx = new SensorLinxClient(EMAIL, PASSWORD);
@@ -157,6 +161,23 @@ const HYGIENE_BASE_INTERVAL_H = Number(process.env.HYGIENE_MAX_INTERVAL_H ?? "26
 const HYGIENE_SUMMER_INTERVAL_H = Number(process.env.HYGIENE_SUMMER_INTERVAL_H ?? String(HYGIENE_BASE_INTERVAL_H));
 const HYGIENE_SUMMER_OUTDOOR_F = 55; // ≥ this outdoor ⇒ cool-tank regime ⇒ the summer interval applies
 let lastOutdoorF: number | null = null; // freshest outdoor from the poll — the season signal for checkI8
+/**
+ * #122 Wave 1: the freshest thermal state, cached at poll time so /health can report it without a
+ * DB round-trip on every scrape (drift-check, the storm watch and the mirror all poll it).
+ *
+ * This exists because on 2026-09-26, mid-High-Wind-Warning, the only way to answer "is the buffer
+ * warm enough to coast an outage?" was to INFER it from hygiene.hours_since_dwell. For a system
+ * whose entire purpose is thermal resilience, the tank temperature not being in its own health
+ * endpoint is the wrong default. Setpoints ride along free: checkI1 already fetches hub state
+ * every poll.
+ */
+let lastThermal: {
+  at: string | null;
+  tank_f: number | null;
+  tank_target_f: number | null;
+  outdoor_f: number | null;
+  setpoints_f: Record<string, number | null>;
+} = { at: null, tank_f: null, tank_target_f: null, outdoor_f: null, setpoints_f: {} };
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
@@ -395,6 +416,12 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     console.warn("I1 check skipped — hub unreachable:", (e as Error).message);
     return;
   }
+  // #122 Wave 1: free ride — this state is already fetched every poll for the I1 check.
+  // Wave 2 rides along too (see checkLeaseAndPi): one hub read per poll, never two.
+  lastPiConnected = state.pi_connected === true;
+  lastThermal.setpoints_f = Object.fromEntries(
+    state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
+  );
   const required = tankTargetF + DEFAULT_OPTS.i1MarginF;
   const offenders = state.pumps
     .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
@@ -648,6 +675,18 @@ async function checkDHWShortfall(reading: SlxReading): Promise<void> {
 const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
 const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
 let freezeRiskAlerted = false;
+// #122 Wave 2. #116 established that NOTHING watched the writer lease: a planner that is up,
+// healthy and silently not commanding setpoints read as fine everywhere. Same for a Pi that has
+// gone quiet -- the 2026-09-16 incident was a 73-minute WiFi drop on a calm day, and the only
+// reason anyone noticed was that a human happened to be looking. Both are edge-triggered so a
+// long outage pages once, not every poll.
+let leaseLostSince: number | null = null;
+let leaseAlerted = false;
+let lastPiConnected: boolean | null = null; // cached from checkI1's existing hub read
+let piDisconnectedSince: number | null = null;
+let piQuietAlerted = false;
+const LEASE_LOST_ALERT_S = 900;  // past the ~11-15 min handover a redeploy legitimately causes
+const PI_QUIET_ALERT_S = 600;
 async function checkFreezeRisk(reading: SlxReading): Promise<void> {
   if (reading.outdoorF == null || reading.tankF == null) return;
   const risk = reading.outdoorF <= FREEZE_OUTDOOR_F && reading.tankF < FREEZE_TANK_F;
@@ -787,7 +826,7 @@ async function stormTriggerPoll(): Promise<void> {
     console.warn("NWS alert fetch failed:", (e as Error).message);
   }
   try {
-    stormSynthetic = deriveSyntheticTriggers(await fetchStormForecast(LAT, LON));
+    stormSynthetic = deriveSyntheticTriggers(await fetchStormForecast(LAT, LON), Date.now()); // drop hours already past (#119)
   } catch (e) {
     stormSynthetic = [];
     console.warn("storm forecast fetch failed:", (e as Error).message);
@@ -814,7 +853,7 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
       const cfg = await store.latestConfig();
       const latest = await store.getLatestSlx();
       const curve = cfg && latest?.outdoorF != null ? curveTargetF(cfg, latest.outdoorF) : null;
-      ceilingF = stormCeilingF(curve, STORM_CAP_F);
+      ceilingF = stormCeilingF(curve, STORM_CAP_F, STORM_STEP_F);
     } catch { /* no config/reading yet — the cap stands */ }
     await store
       .insertStormEvent(state.trigger, { transitions, windowEnd: state.windowEnd }, ceilingF)
@@ -1023,7 +1062,7 @@ async function shadowOnce(): Promise<void> {
     for (const block of plan) {
       const tsMs = Date.parse(block.ts);
       if (!(tsMs >= startMs && tsMs <= endMs)) continue;
-      const ceiling = Math.round(stormCeilingF(cfg ? curveTargetF(cfg, block.outdoor_f) : null, STORM_CAP_F));
+      const ceiling = Math.round(stormCeilingF(cfg ? curveTargetF(cfg, block.outdoor_f) : null, STORM_CAP_F, STORM_STEP_F));
       const raised = Math.max(block.tank_target_f, ceiling);
       if (raised === block.tank_target_f) continue;
       block.tank_target_f = raised;
@@ -1192,11 +1231,83 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
   WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
+/**
+ * #122 Wave 2: page when the planner stops actually commanding, or the Pi goes quiet.
+ *
+ * The lease check deliberately waits LEASE_LOST_ALERT_S. A redeploy hands the lease over and
+ * ~11-15 min unheld is NORMAL (#116, live-state) -- alerting on that would train the owner to
+ * ignore the channel, which is worse than not having it.
+ */
+async function checkLeaseAndPi(): Promise<void> {
+  const held = writerLeaseState?.held === true;
+  if (!WRITER_LEASE_ENABLED) return;
+  if (held) {
+    if (leaseAlerted) {
+      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { resolved: true });
+    }
+    leaseLostSince = null; leaseAlerted = false;
+  } else {
+    leaseLostSince ??= Date.now();
+    const downS = Math.round((Date.now() - leaseLostSince) / 1000);
+    if (downS >= LEASE_LOST_ALERT_S && !leaseAlerted) {
+      leaseAlerted = true;
+      await ntfy(
+        "Planner not commanding setpoints",
+        `The writer lease has been unheld for ~${Math.round(downS / 60)} min — longer than a redeploy handover. ` +
+          `The planner is up and healthy but is NOT driving the pumps, so the tank is running on whatever ` +
+          `was last written. Check /health writer_lease and whether a second instance is contending.`,
+        "high",
+      );
+    }
+  }
+
+  if (!hub) return;
+  try {
+    // pi_connected is the unambiguous signal and the one drift-check asserts on. HubState.ts is
+    // deliberately NOT used for staleness here: its units are not documented, and guessing at a
+    // timestamp scale is how you build an alert that fires at the wrong time or never.
+    //
+    // DELIBERATELY NOT a hub call of its own. checkI1 already fetches hub state every poll and
+    // caches pi_connected there, so this check adds ZERO traffic. GET /api/state serves the hub's
+    // in-memory copy of the Pi's last push (hub/src/index.ts:275), so it never reaches the Pi
+    // either -- but a second redundant read per poll is still waste, and on a bridge with an open
+    // comm-degradation bug (#76) the right default is to add no round-trips at all.
+    const connected = lastPiConnected;
+    if (connected === null) return;      // no reading yet this process; say nothing
+    if (!connected) {
+      piDisconnectedSince ??= Date.now();
+      const downS = Math.round((Date.now() - piDisconnectedSince) / 1000);
+      if (downS >= PI_QUIET_ALERT_S && !piQuietAlerted) {
+        piQuietAlerted = true;
+        await ntfy(
+          "Pi disconnected",
+          `The bridge has been disconnected for ~${Math.round(downS / 60)} min. Setpoints are frozen at the last ` +
+            `written value, and until FINDING-1 (#117) is armed the revert-to-baseline failsafe cannot fire. ` +
+            `Precedent: a 73-minute WiFi drop on 2026-09-16, on a calm day.`,
+          "high",
+        );
+      }
+    } else {
+      if (piQuietAlerted) {
+        await ntfy("Pi reconnected", "The bridge is pushing state again.", "default", { resolved: true });
+      }
+      piDisconnectedSince = null; piQuietAlerted = false;
+    }
+  } catch { /* hub unreachable is already covered by the poll-failure path */ }
+}
+
 async function pollOnce(): Promise<void> {
   const dev = await slx.getDevice(BUILDING_ID, SYNC_CODE);
   const reading = toReading(dev);
   await store.insertReading(reading);
   lastOutdoorF = reading.outdoorF; // season signal for the checkI8 interval (hygiene.ts)
+  lastThermal = {
+    ...lastThermal, // setpoints are refreshed by checkI1 below, not here
+    at: reading.ts.toISOString(),
+    tank_f: reading.tankF,
+    tank_target_f: reading.tankTargetF,
+    outdoor_f: reading.outdoorF,
+  };
   // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
   // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
   // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
@@ -1217,6 +1328,8 @@ async function pollOnce(): Promise<void> {
     try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
     catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
   }
+  // #122 Wave 2 — runs AFTER the renew so it judges this cycle's lease, not last cycle's.
+  await checkLeaseAndPi().catch((e) => console.error("lease/pi check failed:", (e as Error).message));
   await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
 
   // W2-A: pull the runtime autonomy override and apply it per-tick BEFORE the controllers run, so
@@ -1373,6 +1486,12 @@ async function main(): Promise<void> {
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
+            // #121: storm windows and shadow.ts's DHW windows are both correct ONLY because this
+            // process runs with TZ set to Eastern — shadow.ts:120 relies on getHours() being local,
+            // and storm.ts parses OpenMeteo's naive local timestamps against the process TZ. That
+            // dependency lived in a code comment and a Railway dashboard variable, outside the repo,
+            // with nothing asserting it. Reporting it is what lets drift-check make it loud.
+            tz: { env: process.env.TZ ?? null, resolved: Intl.DateTimeFormat().resolvedOptions().timeZone },
             writer_lease: WRITER_LEASE_ENABLED ? (writerLeaseState ?? "pending") : "off",
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
@@ -1386,6 +1505,32 @@ async function main(): Promise<void> {
             // #59: last DP solve (null until the forecast first dips below the compute threshold)
             winter_dp: winterDpState ?? { mode: "idle", enabled: WINTER_DP_ENABLED },
             demand_forecast: forecastState ?? { mode: "idle", fetch_enabled: FORECAST_FETCH_ENABLED, preheat_enabled: FORECAST_PREHEAT_ENABLED },
+            // #122 Wave 1. dhw_ready / coast_h are derived here rather than by every consumer,
+            // because the whole point is that a reader should not have to know the physics to
+            // answer "can this ride out an outage?". coast_h is the standing-loss-only time to
+            // the DHW floor: C_eff/UA = 1/tank_ua hours per e-fold above the 65 °F ambient the UA
+            // is defined against (winterdp.ts). Draws are NOT modelled -- one shower is ~9 °F --
+            // so treat it as a ceiling, not a promise.
+            thermal: (() => {
+              // winterDpState is loosely typed; coerce and fall back rather than trust it.
+              const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
+              const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
+              const t = lastThermal.tank_f;
+              const floor = DEFAULT_OPTS.dhwFloorF;
+              const coast =
+                t != null && t > floor && ua > 0
+                  ? Math.round((Math.log((t - 65) / (floor - 65)) / ua) * 10) / 10
+                  : t != null && t <= floor
+                    ? 0
+                    : null;
+              return {
+                ...lastThermal,
+                dhw_floor_f: floor,
+                dhw_ready: t != null ? t >= floor : null,
+                coast_h: coast,
+                tank_ua: ua,
+              };
+            })(),
             storm: {
               state: stormState.kind,
               trigger: stormState.kind === "idle" ? null : stormState.trigger,
@@ -1429,6 +1574,53 @@ async function main(): Promise<void> {
             },
           });
         }
+        // #122 Wave 2. Answering "is the house ready for the storm?" on 2026-09-26 took five
+        // separate commands and a human to join up. Confidence that must be RECONSTRUCTED each
+        // time is not confidence. Public and read-only, same as /health: this reports, it never
+        // actuates. `ready` is deliberately conservative — anything unknown blocks rather than
+        // passes, because a readiness check that goes green on missing data is worse than none.
+        if (req.url === "/api/readiness") {
+          const el: Record<string, { ok: boolean | null; detail: string }> = {};
+          const pollAgeS = lastPollAt ? Math.round((Date.now() - Date.parse(lastPollAt)) / 1000) : null;
+          el.planner = {
+            ok: consecutiveFailures < OFFLINE_AFTER_FAILURES && pollAgeS != null && pollAgeS < 900,
+            detail: pollAgeS == null ? "never polled" : `last poll ${pollAgeS}s ago, ${consecutiveFailures} consecutive failures`,
+          };
+          const held = !WRITER_LEASE_ENABLED ? null : writerLeaseState?.held === true;
+          el.commanding = {
+            ok: held === null ? true : held,
+            detail: held === null ? "lease disabled by config"
+              : held ? `lease held by ${writerLeaseState?.holder}`
+              : "LEASE NOT HELD — planner is not driving the pumps",
+          };
+          // Phase B's own honest string is the evidence (#97): before that fix it lied "lease 90m".
+          const noLease = Object.values(phaseB?.lastResults ?? {}).some((v) => /NO LEASE ARMED/.test(String(v)));
+          el.failsafe = {
+            ok: phaseB ? !noLease : null,
+            detail: !phaseB ? "phase B disabled" : noLease
+              ? "FINDING-1 (#117): the Pi armed NO lease — revert-to-baseline CANNOT fire"
+              : "Pi confirmed a lease — revert-to-baseline armed",
+          };
+          const t = lastThermal.tank_f;
+          el.thermal = {
+            ok: t == null ? null : t >= DEFAULT_OPTS.dhwFloorF,
+            detail: t == null ? "no tank reading" : `tank ${t}F vs ${DEFAULT_OPTS.dhwFloorF}F DHW floor`,
+          };
+          el.storm = {
+            ok: true, // informational: armed is neither good nor bad, it is a state
+            detail: stormState.kind === "idle" ? "idle"
+              : `${stormState.kind} (${stormState.trigger}) until ${stormState.kind === "armed" || stormState.kind === "active" ? stormState.windowEnd : "-"}`,
+          };
+          const blocking = Object.entries(el).filter(([, v]) => v.ok !== true).map(([k]) => k);
+          return json(res, 200, {
+            ready: blocking.length === 0,
+            blocking,
+            elements: el,
+            note: "read-only; `ready` fails closed on unknowns. Propane, generator, trees and the water valve are NOT visible here — see epic #122.",
+            at: new Date().toISOString(),
+          });
+        }
+
         if (req.url === "/api/drill" && req.method === "POST") {
           // Winter-readiness alert drill (owner-triggered, authed): fires the REAL alert
           // paths with [DRILL] prefixes at their REAL priorities so the whole tiering is

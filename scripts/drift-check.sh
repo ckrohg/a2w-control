@@ -113,6 +113,24 @@ else
 fi
 
 echo
+echo "[2c] #121 — the TZ the storm + DHW windows depend on"
+if [ -z "$HEALTH" ]; then
+  skip "planner unreachable — cannot assert TZ"
+else
+  TZ_RESOLVED="$(jq -r '.tz.resolved // empty' <<<"$HEALTH")"
+  TZ_ENV="$(jq -r '.tz.env // empty' <<<"$HEALTH")"
+  if [ -z "$TZ_RESOLVED" ]; then
+    skip "planner predates the tz field (#121) — redeploy to assert it"
+  elif [ "$TZ_RESOLVED" = "America/New_York" ]; then
+    pass "planner TZ is America/New_York (env=${TZ_ENV:-unset})"
+  else
+    fail "planner TZ is '$TZ_RESOLVED', not America/New_York (env=${TZ_ENV:-unset})"
+    fail "  -> shadow.ts:120 getHours() is NOT local; DHW windows are shifted"
+    fail "  -> storm.ts parses OpenMeteo naive timestamps wrong; every storm window is shifted"
+  fi
+fi
+
+echo
 echo "[3] FINDING-2 — production template must stay write-disabled"
 # config.production.yaml is a TEMPLATE for a fresh Pi, not a mirror of runtime. Flipping it to
 # true (the naive reading of #78) would arm writes on new hardware BEFORE the isolation and

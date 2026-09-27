@@ -5,7 +5,7 @@
  * lead) runs the soak exactly when the caller says a pasteurization is due — and skips it otherwise.
  */
 import assert from "node:assert/strict";
-import { computeShadowPlan, DEFAULT_OPTS, type ForecastHour } from "./shadow";
+import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, type ForecastHour } from "./shadow";
 
 // A flat summer day: 24 hours, all warm (no winter guard, no natural ≥sanitizeF hour). Timestamps use
 // LOCAL components so day-grouping + warmest-hour selection are deterministic regardless of machine TZ.
@@ -135,6 +135,25 @@ const asFoundCfg = { dot: 5, wwsd: 125, dbt: 165, mbt: 145 };
     lateRelaxed.filter((b) => b.tank_target_f >= DEFAULT_OPTS.sanitizeF).length, 0,
     "documents the old behaviour: a short horizon defers the soak (why the backstop is needed)",
   );
+}
+
+// #122 audit — UNITS CONTRACT on the feed that sets the tank target. Mirrors storm.test.ts
+// block 1: the bug class is "asked for °F, assumed °F, received something else". A °C body must
+// CONVERT (not pass through as if °F), °F must pass through, and a body with no declared unit
+// must be fatal — silently mixing scales on the curve target is worse than skipping a poll.
+{
+  const mk = (unit: string | undefined, vals: (number | null)[]) => ({
+    hourly_units: unit === undefined ? undefined : { time: "iso8601", temperature_2m: unit },
+    hourly: { time: vals.map((_, i) => `2026-01-15T${String(i).padStart(2, "0")}:00`), temperature_2m: vals },
+  });
+  const c = parseForecastBody(mk("°C", [10, 20, -5]), 0);
+  assert.deepEqual(c.map((h) => Math.round(h.outdoorF * 10) / 10), [50, 68, 23], "°C body converts to °F");
+  const f = parseForecastBody(mk("°F", [50, 68]), 0);
+  assert.deepEqual(f.map((h) => h.outdoorF), [50, 68], "°F body passes through");
+  assert.throws(() => parseForecastBody(mk(undefined, [50]), 0), /unusable unit/, "no declared unit is fatal");
+  assert.throws(() => parseForecastBody({ hourly_units: { temperature_2m: "°F" } }, 0), /no hourly block/, "missing hourly is fatal");
+  // A single null reading drops that hour, not the poll (NaN survives the converter and fails the filter).
+  assert.equal(parseForecastBody(mk("°F", [50, null]), 0).length, 1, "a null reading drops only its own hour");
 }
 
 console.log("shadow.test.ts: all assertions passed ✓");
