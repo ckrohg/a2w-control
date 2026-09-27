@@ -12,7 +12,14 @@ Written 2026-09-25. Do NOT run during the 2026-09-26/27 storm; deferred to a cal
 sits *below* what Phase B commands so a lapse genuinely falls back, and *above* `dhwFloorF: 120` so
 hot water keeps working while it is in force).
 
-Two terminals: **[L]** laptop, **[P]** the Pi over Tailscale.
+Two terminals: **[L]** laptop, **[P]** the Pi.
+
+> **Reachability (checked 2026-09-27):** the Pi is **not on the tailnet** — `tailscale status` lists only the
+> laptop and a phone — so it is reachable **only from the house LAN** (`admin@6bb-a2w-control.local`,
+> 192.168.184.197). From anywhere else, SSH times out. The runbook's "over Tailscale" was never true.
+> Either be on the house network, or first join the Pi to the tailnet (`sudo tailscale up` on the Pi,
+> from the LAN) — which is worth doing regardless, because it also makes the next outage debuggable
+> from wherever you are.
 
 ---
 
