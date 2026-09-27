@@ -19,9 +19,15 @@ g() { curl -sf -m 20 "$@" 2>/dev/null || echo null; }
 # A failed fetch must record as null, NEVER as "no alerts" / "no outage": the capture exists to
 # answer "did storm mode stand down when the warning ended?", and a transient NWS 5xx that reads
 # as [] would answer that question falsely. null = unknown; [] = genuinely none.
-NWS_RAW="$(g -H 'User-Agent: a2w-eval (ckrohg@me.com)' 'https://api.weather.gov/alerts/active?point=42.63,-70.87')"
-if [ "$NWS_RAW" = "null" ]; then NWS=null; else NWS="$(jq -c '[.features[]?.properties | {event,severity,onset,ends,expires}]' <<<"$NWS_RAW" 2>/dev/null || echo null)"; fi
+# 2026-09-27: api.weather.gov returned 403 for User-Agent "a2w-eval (...)" and 200 for "a2w (...)" --
+# same request, same env, only the UA string differed. 57 of the first 58 samples were lost to it.
+# Use the planner's own production UA (storm.ts), which is what the live system sees the warning
+# through, and RECORD the HTTP code so the next failure is diagnosable from the data itself.
+NWS_TMP="$(mktemp)"
+NWS_HTTP="$(curl -s -o "$NWS_TMP" -m 20 -H 'User-Agent: a2w-control-planner (ckrohg@me.com)' -w '%{http_code}' 'https://api.weather.gov/alerts/active?point=42.63,-70.87' 2>/dev/null || echo 000)"
+if [ "$NWS_HTTP" = "200" ]; then NWS="$(jq -c '[.features[]?.properties | {event,severity,onset,ends,expires}]' "$NWS_TMP" 2>/dev/null || echo null)"; else NWS=null; fi
+rm -f "$NWS_TMP"
 jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson planner "$(g "$PLANNER/health")" --argjson hub "$(g "$HUB/health")" \
-  --argjson outage "$(g "$OUTAGE/api/status")" --argjson nws "$NWS" \
-  '{ts:$ts, planner:$planner, hub:$hub, outage:$outage, nws:$nws}' >> "$OUT"
+  --argjson outage "$(g "$OUTAGE/api/status")" --argjson nws "$NWS" --arg nws_http "$NWS_HTTP" \
+  '{ts:$ts, planner:$planner, hub:$hub, outage:$outage, nws:$nws, nws_http:$nws_http}' >> "$OUT"
