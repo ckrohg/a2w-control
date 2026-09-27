@@ -351,6 +351,23 @@ type HbxStatus = {
 function HbxTargetCard() {
   const { confirm, Modals } = useModals();
   const [st, setSt] = useState<HbxStatus | null>(null);
+  // #126 custom Boost: the API has always taken any target/minutes (writes.ts boost(): ≤ strictCapF,
+  // 15–120 min) but the card only offered 131 °F / 60 min — the 135 °F / 120 min storm pre-charge
+  // had no button. Projection uses the same physics as /health.thermal.coast_h (ambient 65 °F).
+  const [custom, setCustom] = useState<{ open: boolean; f: number; min: number }>({ open: false, f: 135, min: 120 });
+  const [thermal, setThermal] = useState<{ tank_f: number | null; tank_ua: number; dhw_floor_f: number } | null>(null);
+  const loadThermal = useCallback(async () => {
+    try {
+      const res = await fetch("/api/planner/thermal", { cache: "no-store" });
+      const body: { thermal?: { tank_f: number | null; tank_ua: number; dhw_floor_f: number } } = await res.json().catch(() => ({}));
+      setThermal(res.ok && body.thermal ? body.thermal : null);
+    } catch { setThermal(null); }
+  }, []);
+  const CUSTOM_MAX_F = 135, CUSTOM_MIN_F = 120; // strictCapF / dhwFloorF — the planner enforces the real envelope
+  const projectedCoastH = (f: number) =>
+    thermal && thermal.tank_ua > 0 && f > thermal.dhw_floor_f
+      ? Math.log((f - 65) / (thermal.dhw_floor_f - 65)) / thermal.tank_ua
+      : null;
   const [target, setTarget] = useState<number | null>(null);
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
@@ -460,7 +477,49 @@ function HbxTargetCard() {
           >
             {st.active_boost ? "Boost active" : "Boost 131° / 1h"}
           </button>
+          <button
+            type="button"
+            disabled={busy || !!st.active_boost}
+            onClick={() => { const open = !custom.open; setCustom({ ...custom, open }); if (open) loadThermal(); }}
+            style={{ flex: "0 0 auto" }}
+            aria-expanded={custom.open}
+          >
+            {custom.open ? "Custom ▴" : "Custom…"}
+          </button>
         </div>
+        {custom.open && !st.active_boost && (() => {
+          const f = Math.min(CUSTOM_MAX_F, Math.max(CUSTOM_MIN_F, Math.round(custom.f)));
+          const min = Math.min(120, Math.max(15, Math.round(custom.min)));
+          const coast = projectedCoastH(f);
+          return (
+            <div className="meta" style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", marginTop: 6 }}>
+              <label>Target
+                <input type="number" min={CUSTOM_MIN_F} max={CUSTOM_MAX_F} step={1} value={custom.f}
+                  onChange={(e) => setCustom({ ...custom, f: Number(e.target.value) })}
+                  style={{ width: 64, marginLeft: 6 }} aria-label="custom boost target °F" /> °F
+              </label>
+              <label>for
+                <input type="number" min={15} max={120} step={15} value={custom.min}
+                  onChange={(e) => setCustom({ ...custom, min: Number(e.target.value) })}
+                  style={{ width: 64, marginLeft: 6 }} aria-label="custom boost minutes" /> min
+              </label>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => act("/api/planner/boost", { target_f: f, minutes: min },
+                  `Boost the tank to ${f}°F for ${min} minutes? ${coast != null ? `From there it coasts ≈ ${coast.toFixed(1)} h above the ${thermal?.dhw_floor_f ?? 120}°F hot-water floor with no draws (standing loss only — a shower is ~9°F). ` : ""}The curve restores itself automatically.`,
+                  "Boost tank")}
+              >
+                {busy ? "…" : `Boost ${f}° / ${min} min`}
+              </button>
+              <span>
+                {thermal
+                  ? <>tank now <b>{thermal.tank_f ?? "?"}°F</b>{coast != null ? <> · after boost ≈ <b>{coast.toFixed(1)} h</b> above the {thermal.dhw_floor_f}°F floor</> : null}</>
+                  : "tank reading unavailable"}
+              </span>
+            </div>
+          );
+        })()}
         {st.active_boost && (
           <div className="meta">
             Active boost: {st.active_boost.target_f}°F until{" "}
