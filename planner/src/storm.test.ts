@@ -294,4 +294,23 @@ const REAL_KMH_BODY = {
     "9 in in one storm still arms");
 }
 
+// 11. #119, observed live 2026-09-27T12:40Z: a storm that has ALREADY ENDED must not arm. The 3-day
+//     body starts at local midnight today, so this morning's qualifying hours sit in this
+//     afternoon's payload; without the `nowMs` filter they built a trigger and a lapsed window
+//     re-armed on them. An in-progress storm must still arm (future hours remain). Omitting nowMs
+//     keeps the old unfiltered behaviour so fixtures and the replay are unaffected.
+{
+  const mk = (ts: string, g: number): StormForecastHour => ({ ts, tempF: 55, gustMph: g, snowfallIn: 0, weatherCode: 3 });
+  const morning = [mk("2026-09-27T00:00", 47), mk("2026-09-27T02:00", 47), mk("2026-09-27T05:00", 47)]; // all past by afternoon
+  const noon = Date.parse("2026-09-27T14:00");
+  assert.equal(deriveSyntheticTriggers(morning, noon).length, 0, "a storm that ended this morning must not arm this afternoon");
+  assert.equal(deriveSyntheticTriggers(morning).length, 1, "omitting nowMs keeps the unfiltered contract (fixtures/replay)");
+  const inProgress = [...morning, mk("2026-09-27T15:00", 48), mk("2026-09-27T16:00", 49), mk("2026-09-27T17:00", 46)];
+  const t = deriveSyntheticTriggers(inProgress, noon);
+  assert.equal(t.length, 1, "an in-progress storm still arms");
+  assert.equal(t[0].onset, "2026-09-27T15:00", "onset is the first hour still ahead, not one already gone");
+  // the current partial hour is kept (now - 1h), matching shadow.ts
+  assert.equal(deriveSyntheticTriggers([mk("2026-09-27T13:30", 47), mk("2026-09-27T15:00", 47), mk("2026-09-27T16:00", 47)], noon).length, 1);
+}
+
 console.log("storm.test.ts: all assertions passed");

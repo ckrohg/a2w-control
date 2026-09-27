@@ -826,7 +826,7 @@ async function stormTriggerPoll(): Promise<void> {
     console.warn("NWS alert fetch failed:", (e as Error).message);
   }
   try {
-    stormSynthetic = deriveSyntheticTriggers(await fetchStormForecast(LAT, LON));
+    stormSynthetic = deriveSyntheticTriggers(await fetchStormForecast(LAT, LON), Date.now()); // drop hours already past (#119)
   } catch (e) {
     stormSynthetic = [];
     console.warn("storm forecast fetch failed:", (e as Error).message);

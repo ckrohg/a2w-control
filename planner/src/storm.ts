@@ -205,7 +205,18 @@ function segmentByStorm(qualifying: StormForecastHour[]): StormForecastHour[][] 
   return runs;
 }
 
-export function deriveSyntheticTriggers(hours: StormForecastHour[]): SyntheticTrigger[] {
+/**
+ * `nowMs` — drop forecast hours that have already happened. Open-Meteo's 3-day body starts at
+ * local MIDNIGHT TODAY, so this morning's storm is still in this afternoon's payload; without the
+ * filter, hours that are over still produce a trigger, and a lapsed window re-arms on them. That
+ * is exactly the 2026-09-27T12:40Z re-arm the eval capture recorded on #119: the NWS warning had
+ * ended at 12:00Z, and the machine re-armed on the synthetic trigger built from 00:00-07:00 local,
+ * all in the past. shadow.ts's parseForecastBody has always filtered `ts >= now - 1h`; storm.ts
+ * never did. Omitted (undefined) = no filter, so historical fixtures and the replay harness —
+ * which slices the window itself — behave exactly as before. index.ts passes Date.now().
+ */
+export function deriveSyntheticTriggers(allHours: StormForecastHour[], nowMs?: number): SyntheticTrigger[] {
+  const hours = nowMs == null ? allHours : allHours.filter((h) => Date.parse(h.ts) >= nowMs - H); // keep the current partial hour
   const triggers: SyntheticTrigger[] = [];
 
   // North Shore (5A coastal) design temp ~7°F: a sub-0°F bar almost never fires here, so a
