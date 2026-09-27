@@ -48,5 +48,13 @@ same='{"writer_lease":{"held":true,"holder":"1655bad3a83e:15"}}'
 ck "same holder is NOT a handover" "no" \
   "$([ "$(lease_holder "$same")" != "1655bad3a83e:15" ] && echo yes || echo no)"
 
+# ---- 5. CLASSIFICATION FAILS CLOSED (2026-09-27). #129 -- planner/src/storm.ts -- merged as
+#         "deploying: no" because the file list read back empty and no-match meant no-deploy.
+ck "empty list is UNKNOWN, never inert"      "unknown"   "$(printf '' | classify_files)"
+ck "whitespace-only list is UNKNOWN"         "unknown"   "$(printf '  \n' | classify_files)"
+ck "the exact #129 list is DEPLOYING"        "deploying" "$(printf 'planner/src/storm.test.ts\nplanner/src/storm.ts\n' | classify_files)"
+ck "hub/ is DEPLOYING"                       "deploying" "$(printf 'hub/src/index.ts\n' | classify_files)"
+ck "docs + scripts are INERT"                "inert"     "$(printf 'knowledge/reference/x.md\nscripts/y.sh\n.github/workflows/z.yml\n' | classify_files)"
+
 echo
 [ "$fails" -eq 0 ] && echo "deploy-gate.test.sh: all assertions passed" || { echo "deploy-gate.test.sh: FAILURES"; exit 1; }
