@@ -1,0 +1,16 @@
+# Acknowledged drift for scripts/drift-check.sh — ONE line per ack:  <expires YYYY-MM-DD> <issue> <regex>
+#
+# An acknowledged line is still PRINTED (yellow, ACK'D, with its issue) but does not fail the run,
+# so the daily check goes GREEN on the accepted baseline and RED only on NEW drift. Every ack must
+# carry an expiry: on that date it turns red again by itself and has to be consciously renewed or
+# fixed. That is the whole point — an ack is a dated decision, never a permanent silence.
+#
+# Why this file exists: from 2026-09-23 the daily check ran red every day on FINDING-1, an item that
+# was known, tracked (#117) and deliberately deferred. A permanently-red check is worse than none:
+# nobody reads it, so the NEXT real drift is invisible. Same salience failure as the 2026-08-20
+# outage email that was delivered and never opened.
+#
+# The regex is matched (extended, case-sensitive) against the full fail() message. Keep patterns
+# narrow. Do NOT ack "unrecognised phase_b result" or "hub unreachable": those mean the instrument
+# broke, not that a known condition persists.
+2026-10-11 #117 NO lease|baseline_setpoint_c is unset|finding1-arm-baseline-runbook

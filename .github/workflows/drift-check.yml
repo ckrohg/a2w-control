@@ -33,4 +33,23 @@ jobs:
       - name: Run drift check
         env:
           HUB_CLIENT_TOKEN: ${{ secrets.HUB_CLIENT_TOKEN }}
-        run: bash scripts/drift-check.sh
+        # tee so the email step can quote the output; exit with the SCRIPT's code, not tee's
+        run: |
+          bash scripts/drift-check.sh 2>&1 | tee drift.out
+          exit "${PIPESTATUS[0]}"
+      - name: Email on NEW drift (owner is email-only)
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # Inert until RESEND_API_KEY + RESEND_TO exist as repo secrets. Secrets cannot be tested in
+        # `if:`, so presence is checked here. Subject uses the alerting tier convention (⚠️ = high).
+        run: |
+          if [ -z "$RESEND_API_KEY" ] || [ -z "$RESEND_TO" ]; then
+            echo "email skipped: RESEND_API_KEY / RESEND_TO secrets not set (add them to activate)"; exit 0; fi
+          body="$(sed -e 's/\x1b\[[0-9;]*m//g' drift.out | head -80)"
+          jq -n --arg to "$RESEND_TO" --arg url "$RUN_URL" --arg body "$body" \
+            '{from:"onboarding@resend.dev", to:[$to], subject:"⚠️ A2W — NEW drift detected (daily drift-check)", text:("New drift — i.e. something that is NOT on the acknowledged list — was detected.\n\n" + $url + "\n\n" + $body)}' \
+          | curl -sf -X POST https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" -d @- >/dev/null \
+          && echo "email sent to $RESEND_TO" || echo "email FAILED (check key/recipient)"

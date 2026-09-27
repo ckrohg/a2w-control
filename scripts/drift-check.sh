@@ -19,9 +19,39 @@ PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
 HUB="${HUB_URL:-https://a2w-hub-production.up.railway.app}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILED=0
+ACKED=0; ACKED_BY=""
+# Acknowledged drift: dated, issue-linked regexes in scripts/drift-ack.txt (see that file's header).
+# DRIFT_ACK_FILE=/dev/null disables acks (then this script behaves exactly as before);
+# DRIFT_ACK_TODAY=YYYY-MM-DD overrides "today" so expiry can be tested.
+ACK_FILE="${DRIFT_ACK_FILE:-$(dirname "${BASH_SOURCE[0]}")/drift-ack.txt}"
+TODAY="${DRIFT_ACK_TODAY:-$(date -u +%Y-%m-%d)}"
+# prints "<issue> <expires>" if $1 matches a LIVE ack, "EXPIRED <issue> <expires>" if it matches
+# only an expired one, nothing otherwise.
+ack_match() {
+  local msg="$1" exp iss rx hit=""
+  [ -r "$ACK_FILE" ] || return 0
+  while read -r exp iss rx; do
+    case "$exp" in ''|\#*) continue;; esac
+    if printf '%s' "$msg" | grep -Eq -- "$rx"; then
+      if [[ "$TODAY" < "$exp" || "$TODAY" == "$exp" ]]; then printf '%s %s' "$iss" "$exp"; return 0; fi
+      hit="EXPIRED $iss $exp"
+    fi
+  done < "$ACK_FILE"
+  [ -n "$hit" ] && printf '%s' "$hit"; return 0
+}
 
 pass() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
-fail() { printf '  \033[31mDRIFT\033[0m %s\n' "$1"; FAILED=1; }
+fail() {
+  local a; a="$(ack_match "$1")"
+  case "$a" in
+    EXPIRED*) printf '  \033[31mDRIFT\033[0m %s\n' "$1"
+              printf '  \033[31mDRIFT\033[0m   ^ ack for %s EXPIRED %s — renew it in drift-ack.txt or fix it\n' "$(cut -d" " -f2 <<<"$a")" "$(cut -d" " -f3 <<<"$a")"
+              FAILED=1 ;;
+    "")       printf '  \033[31mDRIFT\033[0m %s\n' "$1"; FAILED=1 ;;
+    *)        printf "  \033[33mACK'D\033[0m %s   \033[33m(%s until %s)\033[0m\n" "$1" "${a%% *}" "${a##* }"
+              ACKED=$((ACKED+1)); [[ "$ACKED_BY" == *"${a%% *}"* ]] || ACKED_BY="${ACKED_BY:+$ACKED_BY, }${a%% *} until ${a##* }" ;;
+  esac
+}
 skip() { printf '  --   %s\n' "$1"; }
 
 echo "drift-check $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -159,5 +189,9 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
-if [ "$FAILED" -eq 0 ]; then echo "no drift detected"; else echo "DRIFT DETECTED — see above"; fi
+if [ "$FAILED" -eq 0 ]; then
+  if [ "$ACKED" -gt 0 ]; then echo "no NEW drift ($ACKED acknowledged: $ACKED_BY)"; else echo "no drift detected"; fi
+else
+  echo "NEW DRIFT DETECTED — see above$([ "$ACKED" -gt 0 ] && echo " ($ACKED acknowledged lines excluded)")"
+fi
 exit "$FAILED"
