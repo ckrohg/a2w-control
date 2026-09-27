@@ -96,10 +96,11 @@ const REAL_KMH_BODY = {
   assert.deepEqual(kinds(mk([{ snowfallIn: 4 }, { snowfallIn: 3.9 }])), [], "7.9 in is under the 8 in bar");
   assert.deepEqual(kinds(mk([{ snowfallIn: 4 }, { snowfallIn: 4 }])), ["heavy-snow"], "8 in arms");
 
-  // Window: onset is the first qualifying hour, expiry runs 6 h past the last.
+  // Window: onset is the first qualifying hour; expiry is the END of the last qualifying hour.
+  // (#114: was +6 h, which together with armFrom's old +6 h tail shaped the plan 12 h past a storm's end.)
   const t = deriveSyntheticTriggers(mk([{ gustMph: 46 }, { gustMph: 46 }, { gustMph: 46 }]))[0];
   assert.equal(t.onset, "2026-01-15T00:00");
-  assert.equal(Date.parse(t.expires) - Date.parse("2026-01-15T02:00"), 6 * 3600_000, "expiry = last + 6 h");
+  assert.equal(Date.parse(t.expires) - Date.parse("2026-01-15T02:00"), 1 * 3600_000, "expiry = end of the last qualifying hour (#114)");
 }
 
 // 4. State machine. now sits INSIDE the trigger window throughout.
@@ -129,7 +130,7 @@ const REAL_KMH_BODY = {
   const after = new Date("2026-01-16T06:00:00Z");
   assert.equal(evaluateStormState(armed.state, base, after).transitions[0], "stand-down", "window closed, nothing live");
   assert.equal(evaluateStormState(armed.state, { ...base, synthetic: [{ ...live, onset: "2026-01-16T05:00:00Z", expires: "2026-01-16T12:00:00Z" }] }, after).transitions[0],
-    "re-arm", "window closed but a fresh trigger is live");
+    "stand-down", "window closed but a fresh trigger is live");
 
   // Outage activates immediately and keeps the armed trigger's name; the debounce then holds the
   // window open after the outage clears, so a flapping feed can't drop the bank mid-event.
@@ -311,6 +312,33 @@ const REAL_KMH_BODY = {
   assert.equal(t[0].onset, "2026-09-27T15:00", "onset is the first hour still ahead, not one already gone");
   // the current partial hour is kept (now - 1h), matching shadow.ts
   assert.equal(deriveSyntheticTriggers([mk("2026-09-27T13:30", 47), mk("2026-09-27T15:00", 47), mk("2026-09-27T16:00", 47)], noon).length, 1);
+}
+
+// 12. #114 — armed DURATION is capped. (a) The tail: shaping ends 1 h after a trigger's expiry, and
+//     expiry is the END of the last qualifying hour — 2 h past the storm, not 12. (b) No chaining:
+//     when a window lapses the machine STANDS DOWN even if the next storm is already live, and arms
+//     it fresh on the following tick with its own window. Both are what this weekend's capture
+//     showed the old code failing (armed to 21:00Z on a storm that ended 12:00Z).
+{
+  const mk = (ts: string, g: number): StormForecastHour => ({ ts, tempF: 55, gustMph: g, snowfallIn: 0, weatherCode: 3 });
+  const storm = [mk("2026-09-26T18:00", 48), mk("2026-09-26T19:00", 50), mk("2026-09-26T20:00", 47)];
+  const t = deriveSyntheticTriggers(storm);
+  assert.equal(t[0].expires, new Date(Date.parse("2026-09-26T20:00") + 3600_000).toISOString(), "expiry = end of the last qualifying hour");
+  const base: StormInputs = { alerts: [], synthetic: t, outageActive: null };
+  const armed = evaluateStormState({ kind: "idle" }, base, new Date("2026-09-26T15:00"));
+  assert.ok(armed.state.kind === "armed");
+  const endMs = Date.parse(armed.state.windowEnd), lastMs = Date.parse("2026-09-26T20:00");
+  assert.equal((endMs - lastMs) / 3600_000, 2, "shaping stops 2 h after the storm's last qualifying hour (was 12)");
+
+  // (b) two storms, the second already live when the first's window lapses → stand-down, then a fresh arm
+  const next = { kind: "high-wind", detail: "d", onset: "2026-09-27T10:00", expires: new Date(Date.parse("2026-09-27T12:00") + 3600_000).toISOString() };
+  const afterA = new Date(endMs + 60_000);
+  const lapsed = evaluateStormState(armed.state, { ...base, synthetic: [next] }, afterA);
+  assert.deepEqual(lapsed.transitions, ["stand-down"], "a lapsed window stands down even with the next storm live — no chaining");
+  assert.equal(lapsed.state.kind, "idle");
+  const fresh = evaluateStormState(lapsed.state, { ...base, synthetic: [next] }, afterA);
+  assert.deepEqual(fresh.transitions, ["arm"], "…and the next tick arms the next storm on its own window");
+  assert.ok(fresh.state.kind === "armed" && Date.parse(fresh.state.windowStart) === Date.parse("2026-09-27T10:00") - 2 * 3600_000, "with its own 2 h lead off ITS onset");
 }
 
 console.log("storm.test.ts: all assertions passed");

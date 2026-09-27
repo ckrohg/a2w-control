@@ -172,11 +172,20 @@ export async function fetchStormForecast(lat: string, lon: string): Promise<Stor
   return parseStormForecast(await res.json());
 }
 
+/**
+ * #114 (owner decision 2026-09-27: cap armed DURATION). A trigger's `expires` is the END of its last
+ * qualifying hour — not that hour plus six. With armFrom's tail below, shaping now stops
+ * STORM_TAIL_H after the storm's last qualifying hour instead of 12 h after it. The owner's spec:
+ * "ends when the storm ends (not mid storm)" — and not half a day after it either. The replay over
+ * 26,784 h is the acceptance test: armed hours and max event length must both fall.
+ */
 function triggerWindow(qualifying: StormForecastHour[]): { onset: string; expires: string } {
   const first = qualifying[0].ts;
   const last = qualifying[qualifying.length - 1].ts;
-  return { onset: first, expires: new Date(new Date(last).getTime() + 6 * H).toISOString() };
+  return { onset: first, expires: new Date(new Date(last).getTime() + 1 * H).toISOString() };
 }
+/** Margin past a trigger's expiry during which the plan is still shaped. 1 h, not 6. (#114) */
+const STORM_TAIL_H = 1;
 
 /**
  * A lull shorter than this is the same storm; longer and it is the next one. 6 h is chosen to match
@@ -315,7 +324,7 @@ function armFrom(trigger: LiveTrigger): Extract<StormState, { kind: "armed" }> {
     kind: "armed",
     trigger: trigger.name,
     windowStart: new Date(trigger.onsetMs - PRECHARGE_LEAD_H * H).toISOString(),
-    windowEnd: new Date(trigger.expiresMs + 6 * H).toISOString(),
+    windowEnd: new Date(trigger.expiresMs + STORM_TAIL_H * H).toISOString(),
   };
 }
 
@@ -392,10 +401,13 @@ export function evaluateStormState(
       }
       return { state: prev, transitions: [] };
     }
-    if (live.length === 0) {
-      return { state: { kind: "idle" }, transitions: ["stand-down"] };
-    }
-    return { state: armFrom(live[0]), transitions: ["re-arm"] };
+    // #114: a lapsed window ALWAYS stands down — even if the next storm is already live. The next
+    // tick arms it fresh through rule 4 with its own window. The old "re-arm" branch chained
+    // back-to-back storms into one continuous armed run (replay: median 90 h, max 570 h), so the
+    // banner said "banking heat" across the calm between them and every storm paged as a re-arm.
+    // Shaping was already gated by windowStart, so this changes what the STATE says and when it
+    // pages, not (much) what the plan does — the tail change above is what cuts shaped hours.
+    return { state: { kind: "idle" }, transitions: ["stand-down"] };
   }
 
   // 4. Idle: manual-disarm suppression blocks re-arming until it lapses.
