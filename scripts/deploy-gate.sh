@@ -46,6 +46,22 @@ lease_holder() {  # $1 = planner /health json -> holder id, empty when not held
          then (.writer_lease.holder // "?") else "" end' <<<"$1" 2>/dev/null || echo ""
 }
 
+# Classification (2026-09-27, after #129 merged unbracketed). Pure function of the file list so it
+# can be tested; deploying | inert | unknown. Only planner/** and hub/** redeploy under the Railway
+# watchPatterns. An EMPTY list is "unknown" -- never "inert": on #129 `gh pr view --json files`
+# returned nothing for an instant and the old inline grep treated no-match as no-deploy.
+classify_files() {  # stdin = newline-separated paths
+  local files; files="$(cat)"
+  [ -z "${files//[[:space:]]/}" ] && { echo unknown; return 0; }
+  grep -qE '^(planner|hub)/' <<<"$files" && echo deploying || echo inert
+}
+classify_pr() {  # $1 = PR number; tries two sources before admitting it cannot tell
+  local files
+  files="$(gh pr view "$1" --json files --jq '.files[].path' 2>/dev/null)"
+  [ -z "${files//[[:space:]]/}" ] && files="$(gh pr diff "$1" --name-only 2>/dev/null)"
+  printf '%s' "$files" | classify_files
+}
+
 probe() {
   local hub planner pi age results lease bad=""
   hub="$(curl -sf -m 15 "$HUB/health" 2>/dev/null)" || hub=""
@@ -114,9 +130,16 @@ case "${1:-status}" in
     # inert docs/CI merge because the system is unwell would, among other things, have blocked
     # the write-up OF an incident during that incident. Only planner/** and hub/** redeploy
     # under the watchPatterns; everything else cannot touch a live surface.
-    files="$(gh pr view "$PR" --json files --jq '.files[].path' 2>/dev/null)"
-    deploys=0
-    grep -qE '^(planner|hub)/' <<<"$files" && deploys=1
+    cls="$(classify_pr "$PR")"
+    case "$cls" in
+      unknown)
+        red "REFUSING to merge #$PR: could not read its changed files from two sources, so it cannot be classified."
+        red "An unreadable file list is not evidence the PR is inert -- on 2026-09-27 that assumption merged a"
+        red "planner change with no bracket. Retry in a minute, or classify by hand with: gh pr view $PR --json files"
+        exit 1 ;;
+      deploying) deploys=1 ;;
+      *) deploys=0 ;;
+    esac
 
     echo "── PRE-MERGE GATE ──────────────────────────────────────"
     if [ "$deploys" -eq 1 ]; then
