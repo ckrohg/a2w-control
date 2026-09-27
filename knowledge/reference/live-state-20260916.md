@@ -34,6 +34,29 @@ Error rates: pump1 0.0257, pump2 0.0320.
 - `tempiq_push` / `tempiq_read`: both enabled and succeeding (18 zones, 38 spatial edges)
 - `storm`: idle, enabled · `hygiene`: auto-sanitize on, 60h effective interval, not blind
 
+## Runtime environment the code silently depends on
+
+**ADDED 2026-09-25 (#121).** This section exists because a load-bearing runtime fact was documented
+nowhere, which is the exact failure class this file was created to prevent.
+
+- **`TZ` is set to Eastern on the planner service, in the Railway dashboard only.** It is NOT in
+  `planner/railway.toml`, so no merge, tag, review or `watchPatterns` rule touches it, and
+  `drift-check.sh` did not assert it.
+  - `shadow.ts:120` needs `f.ts.getHours()` to be local — that is what places the DHW pre-charge
+    windows. Its only record of the dependency is the trailing comment `// TZ env makes this local time`.
+  - `storm.ts` parses Open-Meteo's **naive local** timestamps (`timezone=auto` returns
+    `"2026-09-25T10:00"`, no offset) with `Date.parse`, which resolves them against the process TZ.
+  - So if `TZ` is ever dropped or changed, **every storm window and the DHW pre-charge silently shift
+    4–5 hours** and nothing goes red.
+- Status: PR #120 adds `tz: {env, resolved}` to `/health` and a `[2c]` drift-check section that fails
+  if the resolved zone is not `America/New_York`. Until that deploys, `[2c]` reports `--` (skip), and
+  the claim above rests on code-reading, **not measurement**. The parsing rewrite — convert from the
+  response's own `utc_offset_seconds`, derive local hours explicitly the way `index.ts:1091` and
+  `store.ts:311` already do — remains open on #121.
+- **Related trap, different tool:** `cron` on the owner's laptop uses MACHINE-local time, and that
+  machine runs **PDT** while the house is Eastern. Any scheduled A2W action needs PDT = EDT − 3 h.
+  This bit the 2026-09-26 storm pre-charge schedule twice in one evening.
+
 ## Deploy topology (verified)
 
 - **Pi**: `release-*` tags ONLY, forward-only (`pi-update.sh`, `TAG_GLOB`, guard at line 58).

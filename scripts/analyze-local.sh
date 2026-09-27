@@ -46,7 +46,13 @@ git show "origin/db-backups:$LATEST" > "$TMP/dump.gz.gpg"
 echo "==> decrypting + restoring into '$DB' (dropping any existing copy)"
 dropdb --if-exists "$DB"
 createdb "$DB"
-gpg --batch --quiet --decrypt --passphrase-fd 3 "$TMP/dump.gz.gpg" 3< <(printf '%s' "$BACKUP_PASSPHRASE") \
+# --pinentry-mode loopback is REQUIRED, not optional. gpg 2.x ignores --passphrase-fd without it
+# and consults the agent instead -- which in a non-tty context fails as
+#   gpg: problem with the agent: Inappropriate ioctl for device
+#   gpg: decryption failed: Bad session key
+# i.e. it looks exactly like a wrong passphrase. Diagnosed 2026-09-26, when the restore failed
+# this way and the obvious conclusion (stale Keychain entry) was wrong.
+gpg --batch --quiet --pinentry-mode loopback --decrypt --passphrase-fd 3 "$TMP/dump.gz.gpg" 3< <(printf '%s' "$BACKUP_PASSPHRASE") \
   | gunzip \
   | psql -q -d "$DB" -v ON_ERROR_STOP=0 >/dev/null 2>&1 || true
 
