@@ -93,24 +93,49 @@ Per-zone duty, Nov 2025 – Jan 2026 (TempIQv2#2009 Phase 0, from Nest `hvacStat
 **Only 2 of 18 zones are baseboard, and they call in ≲9 % of hours.** For ~91 % of heating hours
 nothing on the plant needs baseboard water.
 
-### What that is worth
+### What that is worth — CORRECTED 2026-09-27 (the first pass overstated it)
 
-At 30 °F outdoor, 107 °F tank (radiant local model + 4.5 margin) vs 135 °F (`strictCapF`, where the
-floor pegs whenever a verified baseboard zone calls):
+The first version of this section compared a 107 °F tank against 135 °F and claimed ~+30 % COP for
+~91 % of heating hours. **That was wrong**, because `dhwFloorF` = 120 °F is held in EVERY hour of the
+year (`computeShadowPlan` starts each block at `max(idleF, dhwFloorF)`; the demand floor only raises).
+The tank is never at 107. Corrected, with A2W's own local model:
 
-    ((107+459.67)/77) / ((135+459.67)/105) = 7.359 / 5.663 = 1.30
+| outdoor | radiant + 4.5 margin | baseboard + 4.5 margin | tank actually commanded |
+|---:|---:|---:|---|
+| 30 °F | 107.0 | 117.4 | **120** — the DHW floor governs *both* |
+| 27.3 °F | — | 120.0 | 120 — where baseboard first bites |
+| 10 °F | 110.0 | 135.3 | 135 (`strictCapF`) |
 
-**≈ +30 % COP, for ~91 % of heating hours** — larger than anything else on the roadmap, including
-the winter DP (whose own shadow record shows `saved_pct` 0–5 %, correctly: a 110 gal tank stores
-~40 min of design load, so LWT discipline beats banking).
+Three consequences, all of which reorder the roadmap:
 
-Three ways to collect it, and only one is software:
+1. **Arbitrage is DHW-floor-bounded.** Moving a baseboard space to its Kumo cannot take the tank below
+   120 °F, so the available gain is 135 → 120, not 135 → 107:
+   at 30 °F, `(579.67/90)/(594.67/105)` = **+13.7 %**; at 10 °F, **+10.8 %** — and only in the hours
+   the tank is actually pegged.
+2. **The hour-weighting was optimistic too.** 4.7 % + 4.4 % is a sum, not a union, and baseboard calls
+   cluster in the coldest hours, which carry disproportionate load. The prize must be computed
+   **energy-weighted** before anyone funds actuation.
+3. **The crux is #89, not arbitrage.** Under the local model the tank rides ~120 °F for most of
+   winter and the baseboard question barely matters. If escalation walks toward TempIQ's ceiling
+   instead, the floor pegs at 135 °F from **46.4 °F outdoor** — nearly the whole season. Those are two
+   different winters, and that gap *is* the savings case. Everything else is second-order to it.
+
+**And it promotes a different top lever.** Because the DHW floor governs most hours, *measuring* it
+(#138.2) is worth more than the arbitrage card: 120 → 112 °F is ≈ +8 % COP at 30 °F
+(`(571.67/82)/(579.67/90)`) plus a quadratic cut in standby loss, applied to ~every hour of the year
+rather than to ~9 % of them. One thermometer, no code.
+
+Caveat on all of the above: it is computed with A2W's local model, which is itself unmeasured. That
+is the point of item 3 — the arithmetic cannot settle which winter we are in, only #89's cold-snap
+evidence can.
+
+### Ways to relax the max, once #89 says the max matters
 
 1. **Verify the radiant manifolds have tempering/injection.** Assumed, never inspected, after two
    months in §10 — and the tank has run 150 °F+ into those loops for years. If mixing exists,
    radiant is decoupled and only the baseboards ever justify a hot tank. → #138 item 1.
 2. **Source-substitute the baseboard spaces on design-cold days.** Living Room Baseboard *is* the
-   Xmas Room and it has its own Kumo. → #22, re-motivated with these numbers.
+   Xmas Room and it has its own Kumo. → #22.
 3. **Add injection mixing on the baseboard loop.** Hardware; the honest third option.
 
 ---
@@ -222,8 +247,11 @@ ingested-as-labelled-experiment are one payload — design once, serve both. →
    unable to describe the zones that have no ceiling. → #134
 4. **The DHW pre-charge branch is dead code** with a misleading reason string, and the element was
    the de-facto shock absorber for the 120 °F floor until `lagT` hid it. → #135
-5. **The arbitrage prize is ~+30 % COP for ~91 % of heating hours** and the card is `priority:low`.
-   This winter is the only clean measurement window for its counterfactual. → #22 comment
+5. **The arbitrage prize is real but smaller than first stated, and DHW-floor-bounded** —
+   ~+11–14 % in pegged hours, not +30 % across 91 % (§2, corrected). It is also downstream of
+   #89: under the local model the tank rides ~120 °F most of winter and the baseboard question
+   barely bites. The card is still worth promoting because this is the only clean measurement
+   window for its counterfactual — but **energy-weighted, not hour-weighted**. → #22 comment
 6. **Prediction is correctly dead and should not be rebuilt.** TempIQ's Phase 0 (chronological
    split, 2000-resample moving-block bootstrap) found skill in 1 of 7 zones — and that zone runs
    74.9 % duty, so pre-heating it buys nothing, and it is unverified so A2W may not act on it.
