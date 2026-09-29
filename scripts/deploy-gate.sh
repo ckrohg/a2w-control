@@ -20,14 +20,18 @@
 #   scripts/deploy-gate.sh merge 123           # gate -> merge -> wait -> re-verify
 #   scripts/deploy-gate.sh watch 20            # poll every 20s until healthy (Ctrl-C to stop)
 #
-# Env: PLANNER_URL, HUB_URL, STALE_S (180), DEPLOY_DEADLINE_S (900), LEASE_POLL_S (15)
+# Env: PLANNER_URL, HUB_URL, STALE_S (180), DEPLOY_DEADLINE_S (1500), LEASE_POLL_S (15)
 set -uo pipefail
 
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
 HUB="${HUB_URL:-https://a2w-hub-production.up.railway.app}"
 STALE_S="${STALE_S:-180}"
 DEPLOY_WAIT_S="${DEPLOY_WAIT_S:-240}"          # retained for compatibility; no longer a blind sleep
-DEPLOY_DEADLINE_S="${DEPLOY_DEADLINE_S:-900}"  # #116: past the ~11-15 min real handover
+# #116 measured ~11-15 min on 09-27; #139 (2026-09-29) measured 20 min: the old container kept
+# heartbeating ~7 min after the new one came up, the lease is only claimable INSTANCE_FRESH_MS (12 min)
+# after its last heartbeat, and the claim happens on the next 5-min poll. Worst case ≈ 7 + 12 + 5 = 24
+# min, so 900 s reported a false REGRESSION on a healthy handover. 1500 s covers the measured worst case.
+DEPLOY_DEADLINE_S="${DEPLOY_DEADLINE_S:-1500}"
 LEASE_POLL_S="${LEASE_POLL_S:-15}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$1"; }
