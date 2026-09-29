@@ -105,6 +105,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
 | `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
+| `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. Default off = the flat per-hour target. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
@@ -266,6 +267,27 @@ Windows persist in `identification_windows` (restart-safe) and are posted to Tem
 poster skips `identification` writes so the same minutes are not also filed as manual quarantine.
 `/status.identification` and `/health.identification` report mode, plan, and the open window;
 `controller_status.identification_*` feeds the dashboard. Assertions: `identify.test.ts`.
+## Demand-shaped reset curve (#133 b, FLAG-OFF)
+
+`setTarget` emulates a fixed target with a near-flat line, so a dead planner leaves the tank at
+one number all winter — the as-found weather compensation is gone (#133). With `SHAPED_CURVE=1`
+the auto-pilot commands a **demand-shaped curve** for non-excursion hours instead: `curve.ts`
+`shapeCurve()` puts the design point `dot` at (coldest outdoor in the next 24 h of forecast − 10 °F,
+bounded to [5, wwsd − 20]) with `dbt` = demand there (binding calling zone + buffer margin, floored
+by the DHW floor, clamped to the I4 envelope at that outdoor) and `mbt` = the floor at `wwsd`;
+`wwsd` is never moved (it shuts heating off above it). The design point moves because the I4 lower
+bound pins any 5 °F endpoint at 135 °F, and that line runs 11 °F hot at 35 °F — a COP tax every
+mild day. The HBX then compensates on its own between planner writes and after a planner death;
+below the design point it holds `dbt` (a bounded under-service only in a snap colder than
+forecast − 10 °F while the planner is *also* dead).
+
+`writer.setCurve()` guards I4 at **both** endpoints and I1 against the curve's **output** at the
+live outdoor; `restore()` puts the as-found `dot` back too. Phase B leads
+`max(curve output now, curve output at the next block's forecast outdoor)` (`curveLeadF`), not a
+commanded scalar. Excursions — bank, sanitize, storm, boost, pre-charge, identification probes — stay
+flat-target writes on top of the curve; the next non-excursion hour re-commands the curve.
+`/health.curve` reports the curve **in force** (endpoints + output at the live outdoor) and the
+curve the latest plan implies. Assertions: `curve.test.ts`.
 
 ## Storm mode (W0, NOTIFY-FIRST; plan §6.11)
 
