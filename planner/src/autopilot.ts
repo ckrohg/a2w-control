@@ -13,8 +13,43 @@
 import { Store } from "./store";
 import { HbxWriter, WriteError } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
+import { sameCurve, type ShapedCurve } from "./curve";
 
 const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this of the commanded
+
+export type CurveDecision =
+  | { kind: "excursion"; reason: string }                       // bank / soak / storm / boost hour → a flat target on top
+  | { kind: "curve"; curve: ShapedCurve; reason: string }        // the shaped curve is the command for this hour
+  | { kind: "no_curve"; reason: string };                        // the plan carries no shaped curve (feed degraded, mode off)
+
+/**
+ * #133 (b), pure: what the auto-pilot commands for the current plan block in shaped-curve mode. An
+ * excursion hour (the plan flagged it, or its reason names one) keeps today's flat-target write on top
+ * of the curve; every other hour the SHAPED curve is the command — written only when its endpoints
+ * differ from the commanded ones (sameCurve, dot included), which is a few times a season, not hourly.
+ */
+/**
+ * Is the plan's curve already the one the device holds? All FOUR endpoints must agree — dot, dbt, mbt
+ * within the adoption tolerance and wwsd within 0.5 °F (codex pass 2 on #145: comparing three of them
+ * let a wwsd drift read as "held" and never reach setCurve's stale-plan guard).
+ */
+export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null | undefined, toleranceF = APPLY_TOLERANCE_F): boolean {
+  if (!inForce) return false;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
+  return sameCurve(curve, { dbt: n(inForce.dbt), mbt: n(inForce.mbt) }, toleranceF)
+    && Math.abs(n(inForce.dot) - curve.dot) <= toleranceF
+    && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
+}
+
+export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
+  const reason = String(block?.reason ?? "");
+  if (block?.sani === true || block?.bank === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
+    return { kind: "excursion", reason };
+  }
+  const c = block?.shaped_curve as Partial<ShapedCurve> | undefined;
+  if (!c || [c.dot, c.wwsd, c.dbt, c.mbt].some((v) => typeof v !== "number")) return { kind: "no_curve", reason: reason || "plan block carries no shaped curve" };
+  return { kind: "curve", curve: c as ShapedCurve, reason };
+}
 
 export class AutoPilot {
   public lastRunAt: string | null = null;
@@ -27,6 +62,8 @@ export class AutoPilot {
     private readonly writer: HbxWriter,
     private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    /** #133 (b): command the plan's shaped curve for non-excursion hours (env SHAPED_CURVE=1). */
+    private readonly shapedCurve = false,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A). The env value only seeds the constructor; the
@@ -80,14 +117,52 @@ export class AutoPilot {
       await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`);
       return;
     }
-    // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
     const status = await this.writer.status();
     const commanded = status.commanded_target_f as number | null;
-    if (commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
+    // #133 (b): in shaped mode classify the block FIRST. The scalar "already commanded" check below must
+    // never decide a curve hour: after an excursion's near-flat write, a plan target within 2 °F of that
+    // flat midpoint would otherwise read as held forever and the curve would never come back (codex).
+    const curveHour = this.shapedCurve ? curveDecision(block) : null;
+    // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
+    if (curveHour?.kind !== "curve" && commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
       await this.record(target, reason, "held", `holding ${target}°F (${reason}) — already commanded`);
       return;
     }
 
+    // #133 (b): in shaped-curve mode a non-excursion hour commands the CURVE, not a flat target. The
+    // comparison is on the endpoints (dot/dbt/mbt) the device holds, so the curve is rewritten only when
+    // it changes — a few times a season.
+    if (curveHour) {
+      const d = curveHour;
+      if (d.kind === "curve") {
+        const same = curveAlreadyInForce(d.curve, status.curve_in_force as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null);
+        const label = `curve ${d.curve.dbt}@${d.curve.dot}→${d.curve.mbt}@${d.curve.wwsd}`;
+        if (same) {
+          await this.record(target, reason, "held-curve", `holding ${label} (${reason}) — already commanded`);
+          return;
+        }
+        if (this.dryRun) {
+          await this.record(target, reason, "would-set-curve", `DRY-RUN would command ${label} — ${reason}`);
+          console.log(`[autopilot] ${this.lastResult}`);
+          return;
+        }
+        try {
+          await this.writer.setCurve(d.curve, "autopilot");
+          await this.record(target, reason, "set-curve", `commanded ${label} — ${reason}`);
+          console.log(`[autopilot] ${this.lastResult}`);
+        } catch (e) {
+          if (e instanceof WriteError && e.status === 429) {
+            await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
+            return;
+          }
+          const msg = e instanceof WriteError ? e.message : (e as Error).message;
+          await this.record(target, reason, `rejected: ${msg}`, `rejected ${label}: ${msg}`);
+          console.warn(`[autopilot] ${this.lastResult}`);
+        }
+        return;
+      }
+      // excursion or no curve → the flat target write below, exactly as before
+    }
     if (this.dryRun) {
       await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
       console.log(`[autopilot] ${this.lastResult}`);

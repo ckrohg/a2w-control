@@ -17,6 +17,7 @@
 import { HubClient } from "./hub";
 import { Store } from "./store";
 import { DEFAULT_OPTS } from "./shadow";
+import { curveOutputF } from "./curve";
 
 const SLX_FRESH_MS = 15 * 60 * 1000;
 const LEASE_MINUTES = 90;
@@ -34,6 +35,18 @@ export interface TrackDecision {
   pump_id: string;
   value_c: number;
   reason: string;
+}
+
+/**
+ * #133 (b): with a SHAPED curve the operative target moves with outdoor between planner writes, so the
+ * setpoints must lead the curve's OUTPUT — now and over the next hour of forecast — not the last commanded
+ * scalar (setTarget's own Phase C caveat). Pure. null when the config is not a usable curve.
+ */
+export function curveLeadF(cfg: Record<string, any> | null, outdoorNowF: number | null, outdoorNextF: number | null): number | null {
+  if (!cfg || [cfg.dot, cfg.wwsd, cfg.dbt, cfg.mbt].some((v) => typeof v !== "number")) return null;
+  const c = { dot: cfg.dot as number, wwsd: cfg.wwsd as number, dbt: cfg.dbt as number, mbt: cfg.mbt as number };
+  const outs = [outdoorNowF, outdoorNextF].filter((v): v is number => v != null && Number.isFinite(v)).map((o) => curveOutputF(c, o));
+  return outs.length ? Math.max(...outs) : null;
 }
 
 /** Pure: what should each enrolled pump's setpoint be right now? */
@@ -75,6 +88,8 @@ export class PhaseB {
     private readonly pumpIds: string[],
     private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    /** #133 (b): lead the shaped curve's output (SHAPED_CURVE=1). Off = the pre-#133 tracking, byte-identical. */
+    private readonly shapedCurve = false,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A) — flipped from the dashboard Off/Armed switch via
@@ -90,19 +105,23 @@ export class PhaseB {
   get probeTarget(): number | null { return this.probeTargetF; }
 
   /** Current-hour tank target from the latest shadow plan — setpoints must LEAD the plan up (esp.
-   *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan. */
-  private async currentPlanTarget(): Promise<number | null> {
+   *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan.
+   *  Also returns the NEXT block's forecast outdoor, for the shaped-curve lead (#133). */
+  private async currentPlanTarget(): Promise<{ targetF: number | null; nextOutdoorF: number | null }> {
     try {
       const plans = await this.store.recentPlans(6);
       const latest = plans.at(-1);
-      if (!latest || !Array.isArray(latest.plan) || latest.plan.length === 0) return null;
+      if (!latest || !Array.isArray(latest.plan) || latest.plan.length === 0) return { targetF: null, nextOutdoorF: null };
       const now = Date.now();
-      const block =
-        latest.plan.filter((b: { ts: string }) => new Date(b.ts).getTime() <= now).at(-1) ?? latest.plan[0];
+      let idx = 0;
+      for (let n = 0; n < latest.plan.length; n++) if (new Date(latest.plan[n].ts).getTime() <= now) idx = n;
+      const block = latest.plan[idx];
+      const next = latest.plan[idx + 1];
       const t = Number(block?.tank_target_f);
-      return Number.isFinite(t) ? t : null;
+      const o = Number(next?.outdoor_f);
+      return { targetF: Number.isFinite(t) ? t : null, nextOutdoorF: Number.isFinite(o) ? o : null };
     } catch {
-      return null;
+      return { targetF: null, nextOutdoorF: null };
     }
   }
 
@@ -117,8 +136,11 @@ export class PhaseB {
     // the auto-pilot commands it, instead of a target-up / setpoint-lagging I1 deadlock. max() never
     // drops the setpoint below tracking the operative target, so I1 is only ever strengthened.
     const opTarget = latest.targetF;
-    const planTarget = await this.currentPlanTarget();
-    const effectiveTarget = Math.max(opTarget, planTarget ?? -Infinity, this.probeTargetF ?? -Infinity);
+    const { targetF: planTarget, nextOutdoorF } = await this.currentPlanTarget();
+    // #133 (b): the commanded CURVE's output now and next hour — with a shaped curve the operative target
+    // will climb on its own as it gets colder; the setpoints must already cover where it is going.
+    const curveLead = this.shapedCurve ? curveLeadF(await this.store.latestConfig().catch(() => null), latest.outdoorF, nextOutdoorF) : null;
+    const effectiveTarget = Math.max(opTarget, planTarget ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();
 

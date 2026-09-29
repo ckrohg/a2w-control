@@ -20,6 +20,7 @@ import { Store } from "./store";
 import { HubClient } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
 import { extractConfig, diffConfig } from "./drift";
+import { curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
 const SLX_FRESH_MS = 20 * 60 * 1000;
@@ -94,6 +95,13 @@ export class HbxWriter {
       band: band ? { lo: Math.round(band.lo), hi: Math.round(band.hi) } : null,
       curve_overridden: overridden,
       baseline: baseline ? { dbt: baseline.dbt, mbt: baseline.mbt } : null,
+      // #133 acceptance 3: the curve IN FORCE and what it evaluates to at the live outdoor — not just the
+      // last commanded scalar. A near-flat setTarget curve shows dbt ≈ mbt; a shaped one shows the slope.
+      curve_in_force: cfg && typeof cfg.dot === "number" && typeof cfg.wwsd === "number" && typeof cfg.dbt === "number" && typeof cfg.mbt === "number"
+        ? { dot: cfg.dot, wwsd: cfg.wwsd, dbt: cfg.dbt, mbt: cfg.mbt,
+            output_at_live_outdoor_f: outdoor != null ? Math.round(curveOutputF({ dot: cfg.dot, wwsd: cfg.wwsd, dbt: cfg.dbt, mbt: cfg.mbt }, outdoor) * 10) / 10 : null,
+            shaped: (cfg.dbt as number) - (cfg.mbt as number) > 4 }
+        : null,
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
@@ -194,6 +202,61 @@ export class HbxWriter {
   }
 
   /**
+   * #133 (b): command a demand-SHAPED reset curve — dot / dbt / mbt (wwsd is never moved). The device
+   * then weather-compensates on its own between planner writes and after a planner death, which is
+   * the whole point: the fallback becomes correct by construction instead of a flat target.
+   * Guardrails mirror setTarget, evaluated where they bite: I4 at BOTH endpoints (each against the
+   * envelope at its own outdoor), I1 against the curve's OUTPUT at the live outdoor (what the pumps
+   * must cover now — Phase B leads the output, not a commanded scalar), the rate limit, audit for
+   * every attempt, and the config-echo verify inside patch(). Excursions (bank, soak, storm, boost,
+   * identification probes) stay setTarget writes on top; restore() puts the as-found curve back.
+   */
+  async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+    // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
+    // validated (the guard already refused a wwsd that differs from the live one).
+    const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
+    const reject = async (status: number, detail: string) => {
+      await this.store.insertHbxWrite({ source, action: "set_curve", requested, result: "rejected", detail });
+      throw new WriteError(status, detail);
+    };
+    const latest = await this.store.getLatestSlx();
+    if (!latest || Date.now() - latest.ts.getTime() > SLX_FRESH_MS || latest.outdoorF == null) {
+      await reject(503, "no fresh SensorLinx reading — cannot evaluate the outdoor-indexed envelope");
+    }
+    const cfg = await this.store.latestConfig();
+    const baseline = await this.store.baselineConfig();
+    const envelopeCfg = curveOverridden(cfg, baseline) ? baseline : cfg;
+    const guard = curveWriteGuard({ curve, liveCfg: cfg, baseline, envelopeCfg, capF });
+    if (guard) await reject(guard.status, guard.detail);
+    // I1 against the curve's output at the LIVE outdoor.
+    const outputNow = curveOutputF(curve, latest!.outdoorF as number);
+    if (this.hub) {
+      try {
+        const state = await this.hub.getState();
+        const required = outputNow + DEFAULT_OPTS.i1MarginF;
+        const offenders = state.pumps
+          .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
+          .map((p) => `${p.id} at ${cToF(p.setpoint_c as number).toFixed(1)}°F < ${required.toFixed(1)}°F`);
+        if (offenders.length) {
+          await reject(409, `I1 conflict at the curve's output ${outputNow.toFixed(1)}°F (${Math.round(latest!.outdoorF as number)}°F outdoor): ${offenders.join("; ")} — raise pump setpoint(s) first`);
+        }
+      } catch (e) {
+        if (e instanceof WriteError) throw e;
+        await reject(503, `hub unreachable — cannot verify I1: ${(e as Error).message}`);
+      }
+    }
+    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
+      await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
+    }
+    return this.patch(
+      requested,
+      source,
+      "set_curve",
+      `curve commanded: ${curve.dbt}°F at ${curve.dot}°F → ${curve.mbt}°F at ${curve.wwsd}°F (output ${outputNow.toFixed(1)}°F at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+    );
+  }
+
+  /**
    * Timed boost with DURABLE auto-restore: set a fixed target now, and the poll loop
    * restores the as-found curve when restore_at passes — recorded in Neon, so a planner
    * restart mid-boost cannot strand the override (the Phase C write-safety primitive,
@@ -226,8 +289,11 @@ export class HbxWriter {
       await this.store.insertHbxWrite({ source, action: "restore", requested: null, result: "rejected", detail: "no baseline config version" });
       throw new WriteError(500, "no baseline config version");
     }
-    return this.patch({ dbt: baseline.dbt as number, mbt: baseline.mbt as number }, source, "restore",
-      `as-found curve restored (${baseline.dbt}/${baseline.mbt}°F)`);
+    // A shaped curve (#133) moves dot as well as dbt/mbt; the as-found dot comes back with them.
+    const fields: Record<string, number> = { dbt: baseline.dbt as number, mbt: baseline.mbt as number };
+    if (typeof baseline.dot === "number") fields.dot = baseline.dot as number;
+    return this.patch(fields, source, "restore",
+      `as-found curve restored (${baseline.dbt}/${baseline.mbt}°F${typeof baseline.dot === "number" ? ` from ${baseline.dot}°F` : ""})`);
   }
 
   private async patch(
