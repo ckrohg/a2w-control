@@ -6,6 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
+import { classifyKind } from "./tempiq-windows";
 
 // A flat summer day: 24 hours, all warm (no winter guard, no natural ≥sanitizeF hour). Timestamps use
 // LOCAL components so day-grouping + warmest-hour selection are deterministic regardless of machine TZ.
@@ -279,8 +280,19 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.match(wb.reason, /pre-boost to 126°F/, "the floor (122) did not raise a 126 block, so the reason is kept");
   assert.ok(w1.filter((x) => !x.boost).every((x) => /binding zone/.test(x.reason) && x.tank_target_f >= 122), "every other block took the floor (the I4 band lifts the coldest hours a little higher)");
   const floorHigh = { tankTargetF: 130, bindingZone: "baseboard", awtF: 126 };
-  const w2 = computeShadowPlan(winter, null, opts, floorHigh, false).filter((x) => x.boost)[0];
-  assert.equal(w2.tank_target_f, 130);
-  assert.match(w2.reason, /binding zone/, "a floor above the boost wins target and reason");
+  const w2all = computeShadowPlan(winter, null, opts, floorHigh, false);
+  assert.equal(w2all.filter((x) => x.boost).length, 0, "a floor above the boost subsumes it: the block is demand-driven, no boost identity");
+  assert.ok(w2all.every((x) => x.tank_target_f >= 130 && /binding zone/.test(x.reason)), "every block took the higher floor");
+  assert.equal(classifyKind({ source: "autopilot", reason: w2all[16].reason, stormActive: false, boostMatched: false, commandedTargetF: 130 }), "autopilot", "the poster files a floor-driven hour as autopilot, not bank");
+  assert.equal(classifyKind({ source: "autopilot", reason: wb.reason, stormActive: false, boostMatched: false, commandedTargetF: 126 }), "bank", "…and a real pre-boost as bank");
+
+  // A qualifying peak's lead may not sit inside ANOTHER learned peak, even one that earned no boost.
+  const twoPeaks = { ...opts, preBoosts: [
+    { windowStart: 17, windowEnd: 20, boostF: 6, sagP75F: 6.2, n: 11 },
+    { windowStart: 15, windowEnd: 17, boostF: 1, sagP75F: 1.0, n: 4 }, // predictable draws at 15–17, no boost of its own
+  ] };
+  const tp = computeShadowPlan(fc, null, twoPeaks, null, false).filter((x) => x.boost)[0];
+  assert.ok(tp, "the 17:00 peak still gets its boost");
+  assert.equal(new Date(tp.ts).getHours(), 14, "…placed at 14:00 — 15:00 and 16:00 are inside the other peak");
   console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
 }

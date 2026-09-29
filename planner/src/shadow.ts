@@ -230,8 +230,11 @@ export function computeShadowPlan(
   // Keyed to the PEAK draw windows the boosts were measured over (dhw.ts peakWindows), not the padded
   // floor windows: on this house those cover nearly the whole day, so "before the window" would mean
   // "before midnight". A lead hour must not itself lie inside a peak (that is where the draws are).
-  const peaks = (opts.preBoosts ?? []).filter((b) => b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F);
-  const inPeak = (h: number) => peaks.some((b) => h >= b.windowStart && h < b.windowEnd);
+  // Every learned peak excludes lead hours (a draw is predictable there whether or not its sag earned a
+  // boost); only the peaks with enough measured draws and sag RECEIVE a boost (codex, #148).
+  const allPeaks = opts.preBoosts ?? [];
+  const inPeak = (h: number) => allPeaks.some((b) => h >= b.windowStart && h < b.windowEnd);
+  const peaks = allPeaks.filter((b) => b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F);
   for (const pb of peaks) {
     const start = pb.windowStart;
     const idx = draft.findIndex((d) => d.localH === start);
@@ -269,16 +272,21 @@ export function computeShadowPlan(
       // or pre-boost that already sits higher keeps its identity, so the poster and the auto-pilot
       // still see the excursion they are meant to see (#135 codex; previously the reason was rewritten
       // unconditionally and a winter soak read as "binding zone").
+      // When the floor wins, a bank / pre-boost did not happen: the block is demand-driven, so it
+      // drops that flag too (one identity per block — the poster must file it as autopilot, not
+      // bank, and a DP raise afterwards appends to the floor's reason). The soak is never subsumed.
       if (demandFloor) {
         if (demandFloor.tankTargetF > target) {
           target = demandFloor.tankTargetF;
           reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+          d.bank = false; d.boost = false;
         }
       } else if (hbxConfig) {
         const curve = curveTargetF(hbxConfig, d.f.outdoorF);
         if (curve != null && curve > target) {
           target = curve;
           reason = "winter guard: mimic HBX curve (winter solver not built yet)";
+          d.bank = false; d.boost = false;
         }
       }
     }
