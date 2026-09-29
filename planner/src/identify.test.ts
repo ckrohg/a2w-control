@@ -110,7 +110,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[] }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -152,6 +152,7 @@ async function main(): Promise<void> {
           restores.push(source); return { ok: true };
         },
         async status() {
+          if (over.statusFailsAfterWrite && writes.length) throw new Error("SensorLinx unreachable");
           // the device commands the last ACCEPTED write when there was one, else the configured base
           const last = writes.at(-1);
           const c = last ? last.targetF : (over.commanded === undefined ? 135 : over.commanded);
@@ -394,6 +395,33 @@ async function main(): Promise<void> {
     assert.match(h.rows[0].cleanupDetail ?? "", /no longer at the probe target/);
     assert.equal(h.writes.length, 0, "nothing re-commanded");
     assert.equal(h.restores.length, 0);
+  }
+  // 4e. Cleanup FAILS CLOSED when the device's commanded target cannot be read (codex pass 6): a non-urgent
+  //     cleanup stays pending with no write and no restore; an urgent abort still restores (hotter is safe).
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, statusFailsAfterWrite: true });
+    await h.driver.tick(); await h.driver.tick();          // arming → active (the probe write)
+    assert.equal(h.rows[0].state, "active");
+    h.advance(121);
+    await h.driver.tick();                                  // completed → cleanup cannot confirm → pending
+    assert.equal(h.rows[0].state, "ended");
+    assert.equal(h.rows[0].cleanupState, "pending");
+    assert.match(h.rows[0].cleanupDetail ?? "", /commanded target unavailable/);
+    assert.equal(h.writes.length, 1, "no re-command without confirmation");
+    assert.equal(h.restores.length, 0, "no blind restore for a non-urgent cleanup");
+    for (let i = 0; i < 3; i++) await h.driver.tick();
+    assert.equal(h.rows[0].cleanupState, "pending", "keeps retrying rather than guessing");
+  }
+  {
+    const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], statusFailsAfterWrite: true });
+    await h.driver.tick();                                  // pending_write → written → active
+    assert.equal(h.rows[0].state, "active");
+    h.advance(10);
+    await h.driver.tick();                                  // room deficit → urgent abort with status unavailable
+    assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
+    assert.deepEqual(h.restores, ["identification-abort#1"], "urgent: the as-found restore does not depend on the saved base");
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.equal(h.writes.length, 1);
   }
   // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope) falls back to
   //     the as-found restore immediately instead of retrying the impossible command forever…

@@ -642,12 +642,18 @@ export class IdentificationDriver {
       }
       return null;
     };
-    // 0. Is there anything to return? If the device no longer commands this window's probe target — a
-    //    later window, the auto-pilot, or a human already moved it — cleanup is a no-op. This is what
-    //    makes replaying cleanup for a legacy/backfilled row safe (codex pass 4).
-    const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
-    if (typeof st.commanded_target_f === "number" && Math.round(st.commanded_target_f as number) !== Math.round(w.targetF)) {
-      return done(`plant no longer at the probe target (commanded ${st.commanded_target_f} °F, probe ${w.targetF} °F) — nothing to return`);
+    // 0. Is there anything to return? Cleanup may re-command a base ONLY after positively confirming the
+    //    device still commands THIS window's probe target (codex pass 6: an unavailable status must not
+    //    fall through to overwriting a later human or auto-pilot command). If the status cannot be read,
+    //    a non-urgent cleanup stays pending and retries; an urgent abort still restores the as-found
+    //    curve — that write depends on no saved base and hotter is the safe direction.
+    const st = await this.d.writer.status().catch(() => null as Record<string, unknown> | null);
+    const commanded = st && typeof st.commanded_target_f === "number" && Number.isFinite(st.commanded_target_f as number) ? (st.commanded_target_f as number) : null;
+    if (commanded != null && Math.round(commanded) !== Math.round(w.targetF)) {
+      return done(`plant no longer at the probe target (commanded ${commanded} °F, probe ${w.targetF} °F) — nothing to return`);
+    }
+    if (commanded == null && !urgent) {
+      return stillPending("commanded target unavailable — cannot confirm the plant is still at the probe target; not re-commanding blind");
     }
     // 1. The guarded re-command of the base. A 429 (rate limit) or any other 4xx guard rejection
     //    (422 envelope: the saved base may be outside I4 at the new outdoor; 409 I1; 423 lease) is
@@ -655,13 +661,15 @@ export class IdentificationDriver {
     //    (codex pass 2, high). Those fall through to the restore. 5xx/network are transient and are
     //    retried up to CLEANUP_TRANSIENT_MAX before the restore is used anyway.
     let permanent = urgent;
-    try {
-      await this.d.writer.setTarget(w.baseF, cleanupSource(w.id, false), DEFAULT_OPTS.strictCapF);
-      return await done(`re-commanded base ${w.baseF} °F`);
-    } catch (e) {
-      const status = e instanceof WriteError ? e.status : 0;
-      permanent = permanent || (status >= 400 && status < 500) || attempts >= CLEANUP_TRANSIENT_MAX;
-      if (!permanent) return stillPending(`re-command failed (transient): ${(e as Error).message.slice(0, 120)}`);
+    if (commanded != null) {
+      try {
+        await this.d.writer.setTarget(w.baseF, cleanupSource(w.id, false), DEFAULT_OPTS.strictCapF);
+        return await done(`re-commanded base ${w.baseF} °F`);
+      } catch (e) {
+        const status = e instanceof WriteError ? e.status : 0;
+        permanent = permanent || (status >= 400 && status < 500) || attempts >= CLEANUP_TRANSIENT_MAX;
+        if (!permanent) return stillPending(`re-command failed (transient): ${(e as Error).message.slice(0, 120)}`);
+      }
     }
     // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
     try {
