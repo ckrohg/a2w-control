@@ -15,6 +15,7 @@ import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
 import { TempiqWindowPoster } from "./tempiq-windows";
+import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
@@ -1244,6 +1245,35 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
   WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
 
+// Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs
+// RANDOMISED supply-water probes drawn from TempIQ's identification plan so U4 can MEASURE each
+// zone's requirement. Needs every actuator and feed: the guarded writer (I4/I1/rate limit), the
+// auto-pilot (held for the window), Phase B (leads the setpoints for an up-probe), the demand feed
+// (room-deficit abort), the hub (setpoint coverage, pump online), and the TempIQ token (plan +
+// window posting). IDENTIFICATION_ENABLED=1 constructs it; the RUNTIME mode (off | shadow | armed)
+// lives in controller_flags.identification_mode, seeded from IDENTIFICATION_MODE (default off) and
+// switched from the dashboard's Optimize page or POST /api/identification.
+const IDENTIFICATION_ENABLED = process.env.IDENTIFICATION_ENABLED === "1";
+const IDENTIFICATION_MODE_SEED: IdentMode = (IDENT_MODES as readonly string[]).includes(process.env.IDENTIFICATION_MODE ?? "")
+  ? (process.env.IDENTIFICATION_MODE as IdentMode) : "off";
+const identification = IDENTIFICATION_ENABLED && autopilot && phaseB && demandFeed && hub && TEMPIQ_SURFACE_TOKEN
+  ? new IdentificationDriver({
+      store, writer, autopilot, phaseB, demandFeed, hub,
+      baseUrl: TEMPIQ_BASE_URL, token: TEMPIQ_SURFACE_TOKEN, notify: ntfy,
+      isI1Violated: () => i1Violated,
+      isStormActive: () => stormState.kind !== "idle",
+      // Fresh from the device, not store.latestConfig(): the same midpoint writer.status() reports, but read
+      // now — so cleanup can never mistake a human's newer curve for the probe it wrote (codex pass 7).
+      liveCommandedTargetF: async () => {
+        const cfg = extractConfig(await slx.getDevice(BUILDING_ID, SYNC_CODE)) as { dbt?: unknown; mbt?: unknown };
+        return typeof cfg.dbt === "number" && typeof cfg.mbt === "number" ? Math.round((cfg.dbt + cfg.mbt) / 2) : null;
+      },
+    }, IDENTIFICATION_MODE_SEED)
+  : null;
+if (IDENTIFICATION_ENABLED && !identification) {
+  console.warn("IDENTIFICATION_ENABLED but a dependency is missing (autopilot / phase B / winter-solver feed / hub / TEMPIQ_SURFACE_TOKEN) — identification driver disabled");
+}
+
 /**
  * #122 Wave 2: page when the planner stops actually commanding, or the Pi goes quiet.
  *
@@ -1330,57 +1360,16 @@ async function pollOnce(): Promise<void> {
   // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
   const config = extractConfig(dev);
   const prevConfig = await store.latestConfig();
-  await checkI1(reading.tankTargetF);
-  await checkBackupCalled(reading.backupCalled);
-  await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
-  await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
-  await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
-  await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
-  if (WRITER_LEASE_ENABLED) {
-    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease.
-    try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
-    catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
-  }
-  // #122 Wave 2 — runs AFTER the renew so it judges this cycle's lease, not last cycle's.
-  await checkLeaseAndPi().catch((e) => console.error("lease/pi check failed:", (e as Error).message));
-  await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
-
-  // W2-A: pull the runtime autonomy override and apply it per-tick BEFORE the controllers run, so
-  // the dashboard Off/Armed switch takes effect within one poll with no redeploy. Falls back to the
-  // env-seeded values if the row is somehow unreadable. This governs ONLY dry-run (actuate vs
-  // shadow) — the I4/I1 guardrails, single-writer invariant (#36), and rate limits are untouched.
-  const flags = (await store.getControllerFlags().catch(() => null))
-    ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED };
-  if (autopilot) autopilot.setDryRun(flags.autopilotDryRun);
-  if (phaseB) phaseB.setDryRun(flags.phasebDryRun);
-  autoSanitizeLive = flags.autoSanitize; // dashboard toggle → demand-aware sanitize cadence (sanitizeDueNow)
-  writer.setAutoSanitize(autoSanitizeLive);
-
-  if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
-  if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
-
-  // Heartbeat the planner's ACTUAL (effective, runtime) controller flags so the dashboard shows
-  // ground truth (the Plan page reads this row instead of hardcoded copy — a stale updated_at ⇒
-  // planner down). Sourced from the live controller state, NOT the boot-time env const, so it
-  // reflects a mid-run switch flip.
-  await store.upsertControllerStatus({
-    autopilotEnabled: AUTOPILOT_ENABLED,
-    autopilotDryRun: autopilot ? autopilot.isDryRun : AUTOPILOT_DRY_RUN,
-    autopilotResult: autopilot ? autopilot.lastResult : null,
-    autopilotTargetF: autopilot ? autopilot.lastTargetF : null,
-    phasebEnabled: PHASE_B_ENABLED,
-    phasebDryRun: phaseB ? phaseB.isDryRun : PHASE_B_DRY_RUN,
-    phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
-    autoSanitize: autoSanitizeLive,
-  }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
-
-  await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
+  // Record a FOREIGN curve change NOW — before any controller acts this poll — so store.latestConfig()
+  // (which writer.status() and the auto-pilot's "already commanded there" check read) is current.
+  // Previously this ran at the end of the poll, one full cycle behind the device (codex pass 7 on
+  // the identification driver: cleanup could re-command a base over a human's newer curve).
   if (prevConfig === null) {
     await store.insertConfigVersion(config, null);
     console.log("seeded initial hbx_config_versions row");
   } else {
-    // prevConfig was read at the TOP of this poll, before our own writes — so any diff is a
-    // FOREIGN writer (the planner records its own writes separately, via writes.ts patch()).
+    // prevConfig was read just above, before this poll's own writes — so any diff is a FOREIGN
+    // writer (the planner records its own writes separately, via writes.ts patch()).
     const changes = diffConfig(prevConfig, config);
     if (changes) {
       await store.insertConfigVersion(config, changes);
@@ -1408,6 +1397,61 @@ async function pollOnce(): Promise<void> {
       }
     }
   }
+  await checkI1(reading.tankTargetF);
+  await checkBackupCalled(reading.backupCalled);
+  await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
+  await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
+  await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
+  await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
+  if (WRITER_LEASE_ENABLED) {
+    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease.
+    try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
+    catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
+  }
+  // #122 Wave 2 — runs AFTER the renew so it judges this cycle's lease, not last cycle's.
+  await checkLeaseAndPi().catch((e) => console.error("lease/pi check failed:", (e as Error).message));
+  await writer.expireBoosts().catch((e) => console.error("boost expiry failed:", (e as Error).message));
+
+  // W2-A: pull the runtime autonomy override and apply it per-tick BEFORE the controllers run, so
+  // the dashboard Off/Armed switch takes effect within one poll with no redeploy. Falls back to the
+  // env-seeded values if the row is somehow unreadable. This governs ONLY dry-run (actuate vs
+  // shadow) — the I4/I1 guardrails, single-writer invariant (#36), and rate limits are untouched.
+  const flags = (await store.getControllerFlags().catch(() => null))
+    ?? { autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED, identificationMode: IDENTIFICATION_MODE_SEED };
+  if (autopilot) autopilot.setDryRun(flags.autopilotDryRun);
+  if (phaseB) phaseB.setDryRun(flags.phasebDryRun);
+  autoSanitizeLive = flags.autoSanitize; // dashboard toggle → demand-aware sanitize cadence (sanitizeDueNow)
+  writer.setAutoSanitize(autoSanitizeLive);
+  if (identification) {
+    const m = (flags as { identificationMode?: string }).identificationMode ?? "off";
+    identification.setMode(((IDENT_MODES as readonly string[]).includes(m) ? m : "off") as IdentMode);
+  }
+
+  if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
+  // The driver runs BETWEEN Phase B (which may be leading a probe target) and the auto-pilot (which
+  // it holds for the window): a window opened here is respected by the auto-pilot in the same poll.
+  if (identification) await identification.tick();
+  if (autopilot) await autopilot.applyLatestPlan().catch((e) => console.error("autopilot failed:", (e as Error).message));
+
+  // Heartbeat the planner's ACTUAL (effective, runtime) controller flags so the dashboard shows
+  // ground truth (the Plan page reads this row instead of hardcoded copy — a stale updated_at ⇒
+  // planner down). Sourced from the live controller state, NOT the boot-time env const, so it
+  // reflects a mid-run switch flip.
+  await store.upsertControllerStatus({
+    autopilotEnabled: AUTOPILOT_ENABLED,
+    autopilotDryRun: autopilot ? autopilot.isDryRun : AUTOPILOT_DRY_RUN,
+    autopilotResult: autopilot ? autopilot.lastResult : null,
+    autopilotTargetF: autopilot ? autopilot.lastTargetF : null,
+    phasebEnabled: PHASE_B_ENABLED,
+    phasebDryRun: phaseB ? phaseB.isDryRun : PHASE_B_DRY_RUN,
+    phasebResult: phaseB ? (Object.values(phaseB.lastResults).join(" · ") || null) : null,
+    autoSanitize: autoSanitizeLive,
+    identificationMode: identification ? identification.currentMode : null,
+    identificationResult: identification ? identification.status().lastResult : null,
+  }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
+
+  await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
+
 }
 
 async function loop(): Promise<void> {
@@ -1457,6 +1501,7 @@ async function main(): Promise<void> {
     : AUTOPILOT_DRY_RUN && PHASE_B_DRY_RUN ? "off" : "custom";
   await store.seedControllerFlags({
     mode: seedMode, autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN, autoSanitize: AUTO_SANITIZE_ENABLED,
+    identificationMode: IDENTIFICATION_MODE_SEED,
   }).catch((e) => console.error("controller_flags seed failed:", (e as Error).message));
 
   if (process.env.POLL_ONCE === "1") {
@@ -1512,6 +1557,7 @@ async function main(): Promise<void> {
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
             tempiq_windows: tempiqWindows ? tempiqWindows.status() : "disabled",
+            identification: identification ? identification.status() : "disabled",
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
@@ -1730,6 +1776,29 @@ async function main(): Promise<void> {
           );
           console.log(`[autonomy] mode → ${mode} (dry-run ${dry}) via dashboard`);
           return json(res, 200, { ok: true, ...stored });
+        }
+        if (req.url === "/api/identification") {
+          // Identification driver mode (identify.ts): off | shadow | armed. Independent of the autonomy
+          // switch and of auto-sanitize — flips controller_flags.identification_mode and applies it live.
+          // Same bearer gate as every other write route; the dashboard proxy holds the token.
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          if (req.method === "GET") {
+            const cur = await store.getControllerFlags();
+            return json(res, 200, { mode: cur?.identificationMode ?? IDENTIFICATION_MODE_SEED, driver: identification ? identification.status() : "disabled" });
+          }
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          const body = JSON.parse((await readBody(req)) || "{}");
+          const mode = String(body.mode ?? "");
+          if (!(IDENT_MODES as readonly string[]).includes(mode)) return json(res, 400, { error: "mode must be 'off' | 'shadow' | 'armed'" });
+          await store.setIdentificationMode(mode, "dashboard");
+          if (identification) identification.setMode(mode as IdentMode);
+          await ntfy(
+            "Identification mode changed",
+            `→ ${mode.toUpperCase()} via dashboard${identification ? "" : " (driver not constructed on this deploy — set IDENTIFICATION_ENABLED=1)"}`,
+            mode === "armed" ? "high" : "default",
+          );
+          console.log(`[identify] mode → ${mode} via dashboard`);
+          return json(res, 200, { ok: true, mode, driver: identification ? identification.status() : "disabled" });
         }
         if (req.url === "/api/sanitize") {
           // Dashboard I8 auto-sanitize toggle. INDEPENDENT of the autonomy mode — flips auto_sanitize in

@@ -173,6 +173,24 @@ await (async () => {
   assert.match(st.lastResult ?? "", /opened 1, closed 0, rejected 0, restores 1/);
 })();
 
+// 1b. An identification write (any 'identification…' source — the driver's per-window tokens) is never a
+//     quarantine window: marked, not posted; it still closes the previous episode.
+await (async () => {
+  const { store, marks } = fakeStore([[
+    write({ id: 1, closedAt: new Date("2026-09-29T12:30:00Z") }),
+    write({ id: 2, ts: new Date("2026-09-29T12:30:00Z"), source: "identification#4", detail: "target 143°F commanded (curve 145/141 → 143°F output at 20°F outdoor; adopts on the next reheat cycle)", commandedTargetF: 143, closedAt: new Date("2026-09-29T14:30:00Z") }),
+    write({ id: 3, ts: new Date("2026-09-29T14:30:00Z"), source: "identification-end#4", commandedTargetF: 135, closedAt: null }),
+  ]]);
+  const calls: Call[] = [];
+  const poster = new TempiqWindowPoster(store, "https://tempiq.test", "tok", fakeFetch([{ status: 200, body: { upserted: 1, rejected: [] } }], calls));
+  await poster.tick();
+  assert.equal(calls[0].body.windows.length, 1, "only the autopilot episode is a quarantine window");
+  assert.equal(calls[0].body.windows[0].externalId, "a2w-hbx-write-1");
+  const byId = new Map(marks[0].map((m) => [m.writeId, m]));
+  assert.equal(byId.get(2)!.kind, "identification");
+  assert.equal(byId.get(3)!.kind, "identification");
+})();
+
 // 2. A closed window (the closer exists) is posted with endedAt and marked closed.
 await (async () => {
   const { store, marks } = fakeStore([[write({ id: 1, closedAt: new Date("2026-09-29T13:00:00Z") })]]);

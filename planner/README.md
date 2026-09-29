@@ -103,6 +103,8 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
+| `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
+| `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
@@ -238,6 +240,32 @@ posts only new episodes and newly-closable ones. Fail-soft like every TempIQ hop
 failure logs, counts a streak and retries; a per-window validation rejection is recorded and
 not retried. `/status.tempiq_windows` reports it. Local proof of the four queries against a
 synthetic history: `scripts/tempiq-windows-local-check.ts` (localhost only, never prod).
+
+## Identification driver (gtm#1616 / #137, FLAG-OFF)
+
+`identify.ts` runs **randomised** supply-water probes so TempIQ's U4 can *measure* each zone's
+required water temperature instead of reading a textbook curve. Passive variation is endogenous
+(the buffer sags because demand is high — TempIQv2#2043), so the only fittable evidence is a
+deliberately drawn, labelled perturbation. TempIQ owns the statistics
+(`GET /api/insights/identification-plan`: which zone × outdoor band, which direction, how big,
+whether it is safe — TempIQv2#2051); this module owns the actuator and the guardrails.
+
+One window at a time, drawn not scheduled: pick the top safe, owner-verified cell whose band is
+the current outdoor → draw against `assignmentProbability` (a **probe** arm or a **hold** arm — the
+hold is recorded too; it is U4's control evidence at the base level) → for an up-probe, publish
+the target to Phase B so the setpoints **lead** it (I1 would otherwise reject the write) → write
+through `writer.setTarget` with the identification ceiling (owner decision 2026-09-29: probes may
+exceed the everyday 135 °F cap up to `sanitizeCapF` 145; I1 + the rate limit still guard) → the
+auto-pilot is **held** for the window → abort checks every poll (I1 violated, room deficit on a
+down-probe, DHW draw on a down-probe, hub/SLX stale, storm, boost) → on the window's end the hold
+is released and the auto-pilot re-commands its plan. A down-probe abort **restores the as-found
+curve immediately** (the one write the rate limit never blocks; hotter is the safe direction).
+
+Windows persist in `identification_windows` (restart-safe) and are posted to TempIQ as kind
+`awt_identification` **with the drawn assignment** — the only kind U4 may fit. The quarantine
+poster skips `identification` writes so the same minutes are not also filed as manual quarantine.
+`/status.identification` and `/health.identification` report mode, plan, and the open window;
+`controller_status.identification_*` feeds the dashboard. Assertions: `identify.test.ts`.
 
 ## Storm mode (W0, NOTIFY-FIRST; plan §6.11)
 
