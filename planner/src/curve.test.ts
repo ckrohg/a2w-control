@@ -3,7 +3,7 @@
  * npx tsx planner/src/curve.test.ts — exits non-zero on failure.
  */
 import assert from "node:assert/strict";
-import { shapeCurve, curveOutputF, sameCurve, demandTargetF, curveWriteGuard, canShapeFromFeed, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
+import { shapeCurve, curveOutputF, sameCurve, demandTargetF, curveWriteGuard, canShapeFromFeed, parseShapedCurveMode, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
 import type { InsightZone } from "./demand";
 import { requiredAwtF, BUFFER_MARGIN_F } from "./demand";
 
@@ -165,5 +165,16 @@ import { curveDecision, curveAlreadyInForce } from "./autopilot";
   assert.equal(canShapeFromFeed(false, zones), false, "stale feed");
   assert.equal(canShapeFromFeed(true, []), false, "empty feed");
   assert.equal(canShapeFromFeed(true, [z("kumo", "mini_split")]), false, "no buffer-served zone");
+  // The rollout switch: anything but an explicit live/shadow value is OFF (fail-closed on a typo).
+  assert.equal(parseShapedCurveMode(undefined), "off");
+  assert.equal(parseShapedCurveMode(""), "off");
+  assert.equal(parseShapedCurveMode("0"), "off");
+  assert.equal(parseShapedCurveMode("true"), "off", "a typo must not arm the writer");
+  assert.equal(parseShapedCurveMode("on"), "off", "a generic boolean must not arm the writer (codex)");
+  assert.equal(parseShapedCurveMode("yes"), "off");
+  assert.equal(parseShapedCurveMode("shadow"), "shadow");
+  assert.equal(parseShapedCurveMode(" Shadow "), "shadow");
+  assert.equal(parseShapedCurveMode("1"), "live");
+  assert.equal(parseShapedCurveMode("live"), "live");
   console.log("curve.test.ts (phase B lead + autopilot decision): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
