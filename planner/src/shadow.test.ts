@@ -190,5 +190,11 @@ console.log("shadow.test.ts: all assertions passed ✓");
   // a failing cache save never fails a live result
   const r3 = await forecastWithFallback(async () => live, { load: async () => null, save: async () => { throw new Error("db down"); } }, now);
   assert.equal(r3.source, "live");
+  // a HANGING cache save never delays a live result (bounded, off the critical path)
+  const t0 = Date.now();
+  const r4 = await forecastWithFallback(async () => live, { load: async () => null, save: () => new Promise<void>(() => {}) }, now, FORECAST_CACHE_MAX_AGE_MS, 50);
+  assert.equal(r4.source, "live");
+  assert.ok(Date.now() - t0 < 1000, "live result must not wait on the cache write");
+  await new Promise((r) => setTimeout(r, 80)); // let the bounded save time out and log, not throw
   console.log("shadow.test.ts (forecast fallback): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

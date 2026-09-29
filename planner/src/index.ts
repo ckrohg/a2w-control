@@ -915,7 +915,6 @@ async function shadowOnce(): Promise<void> {
     Date.now(),
   );
   const forecast = fc.hours;
-  lastForecast = { source: fc.source, fetched_at: fc.fetchedAt.toISOString(), hours: forecast.length, error: fc.error ?? null, at: new Date().toISOString() };
   // #58: when the operative curve is one the autopilot wrote (near-flat band on the last
   // commanded target), the plan's ceiling, winter curve-mimic, and storm ceiling must all
   // reference the AS-FOUND baseline curve — judging any of them against our own write is
@@ -1263,6 +1262,9 @@ async function shadowOnce(): Promise<void> {
     ...(dpMeta ? { winter_dp: dpMeta } : {}),
     ...(preheatMeta ? { preheat: preheatMeta } : {}),
   });
+  // Published only now — after the plan built from this forecast is persisted — so /health.forecast
+  // always describes the LATEST STORED plan, never an attempt that failed further down (codex).
+  lastForecast = { source: fc.source, fetched_at: fc.fetchedAt.toISOString(), hours: forecast.length, error: fc.error ?? null, at: new Date().toISOString() };
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);
   console.log(

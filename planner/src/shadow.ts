@@ -284,17 +284,24 @@ export interface ForecastResult {
  * refresh, a degraded feed for an hour — for a 48-hour forecast that changes little in an hour. Now the
  * cached forecast (≤ maxAgeMs old, past hours trimmed the same way the live parser trims them) stands in
  * and the plan records `forecast_source: "cached"`; only when there is no usable cache does the original
- * error propagate. A live success refreshes the cache; a cache write failure never fails the step.
+ * error propagate. A live success refreshes the cache without waiting for it (bounded, fire-and-forget):
+ * a cache write failure or hang never fails or delays the step.
  */
 export async function forecastWithFallback(
   fetchLive: () => Promise<ForecastHour[]>,
   cache: { load: () => Promise<{ fetchedAt: Date; hours: ForecastHour[] } | null>; save: (hours: ForecastHour[]) => Promise<void> },
   nowMs: number,
   maxAgeMs: number = FORECAST_CACHE_MAX_AGE_MS,
+  saveTimeoutMs: number = 5_000,
 ): Promise<ForecastResult> {
   try {
     const hours = await fetchLive();
-    try { await cache.save(hours); } catch (e) { console.warn("forecast cache save failed:", (e as Error).message); }
+    // The cache write is off the critical path: fire-and-forget with a bound, so a locked row or a slow
+    // pool can never hold up a live plan (codex: the pool has no statement timeout of its own).
+    void Promise.race([
+      cache.save(hours),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("forecast cache save timed out")), saveTimeoutMs).unref?.()),
+    ]).catch((e) => console.warn("forecast cache save failed:", (e as Error).message));
     return { hours, source: "live", fetchedAt: new Date(nowMs) };
   } catch (e) {
     const error = (e as Error).message;
