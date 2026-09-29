@@ -41,9 +41,12 @@ export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown
     && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
 }
 
-export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
+export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
   const reason = String(block?.reason ?? "");
-  if (block?.sani === true || block?.bank === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
+  // The flags are authoritative; the reason regex is the fallback for blocks written before the flags
+  // were emitted. (#135: a winter pre-boost's reason can be rewritten by the demand floor — the flag
+  // must still make it an excursion, or shaped-curve mode would run the curve through the boost hour.)
+  if (block?.sani === true || block?.bank === true || block?.boost === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
     return { kind: "excursion", reason };
   }
   const c = block?.shaped_curve as Partial<ShapedCurve> | undefined;

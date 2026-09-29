@@ -262,9 +262,15 @@ export function computeShadowPlan(
     let target = d.target;
     let reason = d.reason;
     if (d.f.outdoorF < opts.winterGuardF) {
+      // The winter floor only takes the block's REASON when it actually raises the target: a soak, bank
+      // or pre-boost that already sits higher keeps its identity, so the poster and the auto-pilot
+      // still see the excursion they are meant to see (#135 codex; previously the reason was rewritten
+      // unconditionally and a winter soak read as "binding zone").
       if (demandFloor) {
-        target = Math.max(target, demandFloor.tankTargetF);
-        reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+        if (demandFloor.tankTargetF > target) {
+          target = demandFloor.tankTargetF;
+          reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+        }
       } else if (hbxConfig) {
         const curve = curveTargetF(hbxConfig, d.f.outdoorF);
         if (curve != null && curve > target) {

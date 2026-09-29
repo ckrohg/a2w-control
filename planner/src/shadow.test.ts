@@ -259,5 +259,20 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.ok(banked.some((x) => x.bank && new Date(x.ts).getHours() === 15), "bank sits in the lead");
   assert.equal(banked.filter((x) => x.boost).length, 0, "no pre-boost beside a bank in the lead");
   for (const x of [...s2, ...banked]) assert.ok(!(x.boost && (x.sani || x.bank)), "one excursion identity per block");
+
+  // WINTER: the demand floor takes a block's reason only when it raises the target. A pre-boost that
+  // sits above the floor keeps its reason (so the poster files it as a bank) and its flag; a floor
+  // above the boost wins the target and the reason, and the flag still marks the intended excursion.
+  const winter: ForecastHour[] = fc.map((f) => ({ ...f, outdoorF: 30 }));
+  const floorLow = { tankTargetF: 122, bindingZone: "baseboard", awtF: 118 };
+  const w1 = computeShadowPlan(winter, null, opts, floorLow, false);
+  const wb = w1.filter((x) => x.boost)[0];
+  assert.ok(wb, "the pre-boost survives the winter pass");
+  assert.match(wb.reason, /pre-boost to 126°F/, "the floor (122) did not raise a 126 block, so the reason is kept");
+  assert.ok(w1.filter((x) => !x.boost).every((x) => /binding zone/.test(x.reason) && x.tank_target_f === 122), "every other block took the floor");
+  const floorHigh = { tankTargetF: 130, bindingZone: "baseboard", awtF: 126 };
+  const w2 = computeShadowPlan(winter, null, opts, floorHigh, false).filter((x) => x.boost)[0];
+  assert.equal(w2.tank_target_f, 130);
+  assert.match(w2.reason, /binding zone/, "a floor above the boost wins target and reason");
   console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
 }
