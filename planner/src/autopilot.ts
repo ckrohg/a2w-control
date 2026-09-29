@@ -13,8 +13,30 @@
 import { Store } from "./store";
 import { HbxWriter, WriteError } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
+import { sameCurve, type ShapedCurve } from "./curve";
 
 const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this of the commanded
+
+export type CurveDecision =
+  | { kind: "excursion"; reason: string }                       // bank / soak / storm / boost hour → a flat target on top
+  | { kind: "curve"; curve: ShapedCurve; reason: string }        // the shaped curve is the command for this hour
+  | { kind: "no_curve"; reason: string };                        // the plan carries no shaped curve (feed degraded, mode off)
+
+/**
+ * #133 (b), pure: what the auto-pilot commands for the current plan block in shaped-curve mode. An
+ * excursion hour (the plan flagged it, or its reason names one) keeps today's flat-target write on top
+ * of the curve; every other hour the SHAPED curve is the command — written only when its endpoints
+ * differ from the commanded ones (sameCurve, dot included), which is a few times a season, not hourly.
+ */
+export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
+  const reason = String(block?.reason ?? "");
+  if (block?.sani === true || block?.bank === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
+    return { kind: "excursion", reason };
+  }
+  const c = block?.shaped_curve as Partial<ShapedCurve> | undefined;
+  if (!c || [c.dot, c.wwsd, c.dbt, c.mbt].some((v) => typeof v !== "number")) return { kind: "no_curve", reason: reason || "plan block carries no shaped curve" };
+  return { kind: "curve", curve: c as ShapedCurve, reason };
+}
 
 export class AutoPilot {
   public lastRunAt: string | null = null;
@@ -27,6 +49,8 @@ export class AutoPilot {
     private readonly writer: HbxWriter,
     private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    /** #133 (b): command the plan's shaped curve for non-excursion hours (env SHAPED_CURVE=1). */
+    private readonly shapedCurve = false,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A). The env value only seeds the constructor; the
@@ -88,6 +112,41 @@ export class AutoPilot {
       return;
     }
 
+    // #133 (b): in shaped-curve mode a non-excursion hour commands the CURVE, not a flat target. The
+    // comparison is on the endpoints (dot/dbt/mbt) the device holds, so the curve is rewritten only when
+    // it changes — a few times a season.
+    if (this.shapedCurve) {
+      const d = curveDecision(block);
+      if (d.kind === "curve") {
+        const inForce = status.curve_in_force as { dot?: number; dbt?: number; mbt?: number } | null;
+        const same = inForce != null && sameCurve(d.curve, { dbt: inForce.dbt ?? NaN, mbt: inForce.mbt ?? NaN }) && Math.abs((inForce.dot ?? NaN) - d.curve.dot) <= APPLY_TOLERANCE_F;
+        const label = `curve ${d.curve.dbt}@${d.curve.dot}→${d.curve.mbt}@${d.curve.wwsd}`;
+        if (same) {
+          await this.record(target, reason, "held-curve", `holding ${label} (${reason}) — already commanded`);
+          return;
+        }
+        if (this.dryRun) {
+          await this.record(target, reason, "would-set-curve", `DRY-RUN would command ${label} — ${reason}`);
+          console.log(`[autopilot] ${this.lastResult}`);
+          return;
+        }
+        try {
+          await this.writer.setCurve(d.curve, "autopilot");
+          await this.record(target, reason, "set-curve", `commanded ${label} — ${reason}`);
+          console.log(`[autopilot] ${this.lastResult}`);
+        } catch (e) {
+          if (e instanceof WriteError && e.status === 429) {
+            await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
+            return;
+          }
+          const msg = e instanceof WriteError ? e.message : (e as Error).message;
+          await this.record(target, reason, `rejected: ${msg}`, `rejected ${label}: ${msg}`);
+          console.warn(`[autopilot] ${this.lastResult}`);
+        }
+        return;
+      }
+      // excursion or no curve → the flat target write below, exactly as before
+    }
     if (this.dryRun) {
       await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
       console.log(`[autopilot] ${this.lastResult}`);

@@ -104,3 +104,31 @@ async function main(): Promise<void> {
   console.log("curve.test.ts: all assertions passed");
 }
 main().catch((e) => { console.error(e); process.exit(1); });
+
+// ── #133 steps 3–4: Phase B's curve lead and the auto-pilot's curve decision (pure) ──
+import { curveLeadF } from "./phaseb";
+import { curveDecision } from "./autopilot";
+
+(async () => {
+  // Phase B leads the curve's output over now AND the next hour: a colder next hour raises the lead.
+  const cfg = { dot: 20, wwsd: 125, dbt: 127, mbt: 120 };
+  assert.equal(curveLeadF(cfg, 125, 125), 120);
+  assert.ok(Math.abs(curveLeadF(cfg, 35, 35)! - 126) < 0.01);
+  assert.ok(curveLeadF(cfg, 35, 20)! > curveLeadF(cfg, 35, 35)!, "next-hour cold raises the lead");
+  assert.equal(curveLeadF(cfg, 0, null), 127, "below dot the curve holds dbt");
+  assert.equal(curveLeadF({ dot: 20, wwsd: 125, dbt: "x", mbt: 120 }, 35, 35), null);
+  assert.equal(curveLeadF(null, 35, 35), null);
+  assert.equal(curveLeadF(cfg, null, null), null);
+  // The auto-pilot: excursion hours keep the flat target; other hours command the curve; no curve → flat.
+  const shaped = { dot: 20, wwsd: 125, dbt: 127, mbt: 120, basis: {} };
+  assert.equal(curveDecision({ reason: "DHW window floor", shaped_curve: shaped }).kind, "curve");
+  assert.equal(curveDecision({ reason: "binding zone: Living Room Baseboard needs 124°F (winter solver shadow)", shaped_curve: shaped }).kind, "curve");
+  assert.equal(curveDecision({ reason: "daily sanitize to 140°F = 60°C (I8 pasteurization, warmest hour)", sani: true, shaped_curve: shaped }).kind, "excursion");
+  assert.equal(curveDecision({ reason: "afternoon bank to 128°F (warmest hour, 71°F outdoor)", bank: true, shaped_curve: shaped }).kind, "excursion");
+  assert.equal(curveDecision({ reason: "storm mode: banking heat (extreme-cold)", shaped_curve: shaped }).kind, "excursion");
+  assert.equal(curveDecision({ reason: "pre-charge for 06:00 window (warmest lead hour, 62°F)", shaped_curve: shaped }).kind, "excursion");
+  assert.equal(curveDecision({ reason: "DHW window floor" }).kind, "no_curve");
+  assert.equal(curveDecision({ reason: "DHW window floor", shaped_curve: { dot: 20 } }).kind, "no_curve");
+  assert.equal(curveDecision(null).kind, "no_curve");
+  console.log("curve.test.ts (phase B lead + autopilot decision): all assertions passed");
+})().catch((e) => { console.error(e); process.exit(1); });

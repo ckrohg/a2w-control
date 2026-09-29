@@ -19,6 +19,7 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { shapeCurve, curveOutputF } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
@@ -174,6 +175,8 @@ let lastOutdoorF: number | null = null; // freshest outdoor from the poll — th
  * endpoint is the wrong default. Setpoints ride along free: checkI1 already fetches hub state
  * every poll.
  */
+let lastShapedCurve: ReturnType<typeof shapeCurve> | null = null; // #133 (b): the curve the latest plan implies
+let lastDeviceCurve: { dot: number; wwsd: number; dbt: number; mbt: number } | null = null; // #133 acceptance 3: the curve IN FORCE
 let lastThermal: {
   at: string | null;
   tank_f: number | null;
@@ -1187,6 +1190,43 @@ async function shadowOnce(): Promise<void> {
     console.warn("cap-adequacy watch failed:", (e as Error).message);
   }
 
+  // #133 (b): the demand-shaped curve this plan implies, anchored at the coldest outdoor in the next
+
+  // 24 h of forecast. Stamped on every block so the auto-pilot (and Phase B's lead) read it from the
+
+  // plan they already read. Degraded demand feed → conservative (all buffer-served zones) curve.
+
+  try {
+
+    const wwsd = typeof (cfg as { wwsd?: unknown } | null)?.wwsd === "number" ? (cfg as { wwsd: number }).wwsd : 125;
+
+    const aheadF = forecast.slice(0, 24).map((f) => f.outdoorF).filter((v) => Number.isFinite(v));
+
+    const shaped = shapeCurve({
+
+      zones: demandFeed ? demandFeed.zones() : [],
+
+      callingZoneIds: demandFeed ? demandFeed.callingZoneIds() : null,
+
+      wwsd, anchorOutdoorF: aheadF.length ? Math.min(...aheadF) : undefined,
+
+      hbxBaseline: baseline, dhwFloorF: opts.dhwFloorF, capF: DEFAULT_OPTS.strictCapF,
+
+      learnedSupply: true, policy: DEMAND_FLOOR_POLICY,
+
+    });
+
+    for (const b of plan) (b as unknown as Record<string, unknown>).shaped_curve = shaped;
+
+    lastShapedCurve = shaped;
+
+  } catch (e) {
+
+    console.warn("shaped curve not computed:", (e as Error).message);
+
+  }
+
+
   await store.insertShadowPlan(plan, {
     dhw_windows: opts.dhwWindows,
     windows_learned: !!learned,
@@ -1243,7 +1283,12 @@ async function scoreOnce(): Promise<void> {
 // Module-scope so both pollOnce (boost expiry) and the HTTP routes share one instance.
 const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO_SANITIZE_ENABLED,
   WRITER_LEASE_ENABLED ? { instanceId: INSTANCE_ID, staleMs: INSTANCE_FRESH_MS } : null);
-const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy) : null;
+// #133 (b): SHAPED_CURVE=1 makes the auto-pilot command the plan's demand-shaped reset curve for
+// non-excursion hours (a few writes a season) so the HBX weather-compensates on its own between
+// writes and after a planner death. Off = today's flat per-hour target. The curve itself is computed
+// in shadowOnce (it needs the demand feed + the 24 h forecast) and stamped on every plan block.
+const SHAPED_CURVE = process.env.SHAPED_CURVE === "1";
+const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy, SHAPED_CURVE) : null;
 
 // Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs
 // RANDOMISED supply-water probes drawn from TempIQ's identification plan so U4 can MEASURE each
@@ -1360,6 +1405,11 @@ async function pollOnce(): Promise<void> {
   // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
   const config = extractConfig(dev);
   const prevConfig = await store.latestConfig();
+  {
+    const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
+    lastDeviceCurve = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number")
+      ? { dot: c.dot as number, wwsd: c.wwsd as number, dbt: c.dbt as number, mbt: c.mbt as number } : null;
+  }
   // Record a FOREIGN curve change NOW — before any controller acts this poll — so store.latestConfig()
   // (which writer.status() and the auto-pilot's "already commanded there" check read) is current.
   // Previously this ran at the end of the poll, one full cycle behind the device (codex pass 7 on
@@ -1558,6 +1608,13 @@ async function main(): Promise<void> {
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
             tempiq_windows: tempiqWindows ? tempiqWindows.status() : "disabled",
             identification: identification ? identification.status() : "disabled",
+            // #133 acceptance 3: the curve IN FORCE on the device + its output at the live outdoor, and the
+            // shaped curve the latest plan implies — not just the last commanded scalar.
+            curve: {
+              mode: SHAPED_CURVE ? "shaped" : "flat-target",
+              in_force: lastDeviceCurve ? { ...lastDeviceCurve, output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastDeviceCurve, lastThermal.outdoor_f) * 10) / 10 : null, shaped: lastDeviceCurve.dbt - lastDeviceCurve.mbt > 4 } : null,
+              plan_implies: lastShapedCurve ? { dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis } : null,
+            },
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
