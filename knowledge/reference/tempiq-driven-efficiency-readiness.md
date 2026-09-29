@@ -359,3 +359,87 @@ Do **not** rebuild per-zone call prediction (gated STOP, §4.6).
 - **The HBX's live config** beyond what the poll loop records: `lagT=180` and `numStg=2` are from
   journal entries, not from a reading taken today. Drift detection is relative, so a *change* would
   have alerted; a deliberately-wrong value is invisible.
+
+---
+
+## 9 · Revised scope after W0 — 2026-09-29
+
+Written after W0 ran. W0 was budgeted as the small wave; it absorbed a full session because every
+layer under it was broken. The dependency graph changed shape as a result.
+
+### 9.1 What W0 found (each verified read-only against prod)
+
+1. **U4 — the per-zone supply-water learner — had written 0 rows since July**, for three independent
+   reasons: its duty CTE matched four signal keys that exist nowhere in `readings`; its setpoint CTE
+   INNER-joined on `thermostat_heat_setpoint`, which is 0 rows for all 7 hydronic zones; and the query
+   could not finish (below). Any one alone yields zero rows for ever. gtm#1595 implemented as
+   specified would have wired an empty table and closed clean.
+2. **Repaired, U4 returns the wrong answer.** Replayed over the as-found era it "identified"
+   151.6–164.4 °F — the as-found tank temperature read back. Passive AWT variation is *endogenous*:
+   the buffer sags because demand is high, so low water and high duty share a cause. **A working U4
+   on observational data is more dangerous than a broken one.** It now refuses to fit any sample not
+   marked as a deliberate, externally-commanded perturbation (`exogenous`), and refuses thin
+   one-sided evidence (≥5 samples and ≥2 distinct levels each side of a threshold).
+3. **`public.readings` (58.6M rows, 33 GB) heap-fetched every row on every index-only scan.** Recent
+   data never received visibility-map bits — the insert autovacuum trigger needed ~11.7M new rows
+   to fire. Every trailing-window learner paid ~4–6 ms per row. Catch-up VACUUM (owner-authorised,
+   took 28 s): 7-day probe **23.9 s → 0.16 s**. Migration 0188 fixes the cadence. **gtm#1615.**
+4. After (3), the remaining U4 cost was planner choice: the `COALESCE(signalKey, metricType)`
+   alias predicate matches no index, so the plant CTEs scanned the whole window by timestamp.
+   Zone CTEs went 162k → 3–14k cost once `equipment_id` was pre-resolved; tank/outdoor needed the
+   exact single-key predicate (single-sourced from `plant-anchor.ts`). Measurement in flight.
+
+### 9.2 What W0 changes in the plan
+
+- **W3 (wire U4) is hard-blocked on W2 (the experiment)**, not merely sequenced after it.
+- **gtm#1596 inverted**: from "quarantine A2W's perturbed windows" to "those windows are the *only*
+  valid identification data." It moves from companion to prerequisite.
+- **"Commanded" ≠ "exogenous."** The planner raises the target *because* zones call, so its writes
+  are demand-responsive. W2 must be a true switchback with a recorded randomised assignment, and the
+  arm log must carry assignment mechanism, commanded target, schedule/probability, achieved-AWT
+  compliance and washout. This also kills most of #137's *backfill* value — July→now writes are
+  quarantine data, not identification data.
+- **The down-probe safety envelope is computed, not a threshold** (owner direction 2026-09-28):
+  time-to-deficit from learned UA, thermal mass, tank C_eff, room margin, outdoor forecast and
+  emitter curve, refused when shorter than abort latency + recovery. Recorded on a2w#137.
+
+### 9.3 Decisions taken
+
+| decision | outcome |
+|---|---|
+| catch-up VACUUM on `readings` | run 2026-09-29 05:23Z, 27.8 s, acceptance passed |
+| gtm#1594 (Nest setpoint on OFF) | **Option 3** — emit both bounds tagged `resumeTarget`, mode-aware reader, control path byte-identical. PR TempIQv2#2044 |
+| #132 `lagT` | keep 180 until #135 pre-boost is live and proven, then 60 |
+| W2 probe floor | no hard-coded outdoor threshold; physics-derived `safe_to_probe` |
+
+### 9.4 Three tiers of "ready", with dates
+
+| tier | meaning | deadline |
+|---|---|---|
+| **Safe** | no cold house, failsafes armed, alerts reach a human | before sustained cold — **~Nov 15** |
+| **Learning** | randomised perturbation live, arm log flowing, U4 identifying cold bands honestly | infrastructure live by **Nov 15**; Dec–Feb is the only window that produces cold-band data |
+| **Optimised** | measured per-zone requirements driving the curve; arbitrage relaxing the max | **next winter** — cannot precede the data |
+
+### 9.5 Remaining scope (revised estimate: 75–110 focused hours, not 50)
+
+- **W0 finish** (~3 h + CI): merge TempIQv2#2043; verify the nightly run writes
+  `attempted_none_identified` honestly; confirm the 30-day window fits the 290 s cron budget.
+- **W1** (~15–20 h, TempIQ): gtm#1594 (PR open), gtm#1590 provenance (unlocks Master Bathroom,
+  60 % duty, no ceiling today), and the **mini-split co-serving map** — `space_service_weights`
+  has 0 rows; seed from the 38-edge spatial graph + owner confirmation. Least-started, load-bearing.
+- **W2** (~20–28 h, highest risk): gtm#1596 arm-log seam with the randomisation record and the
+  quarantine split; identification-plan endpoint with computed `safe_to_probe`; #137 (A2W half);
+  the switchback driver — randomised two-sided steps ≤5 °F, up-first in cold bands, abort on room
+  deficit / call streak, DHW windows as blackouts, mini-split-aware, on `/autopilot` before
+  shipping. Owner chose **armed-from-start**; the care goes here.
+- **W3** (~6–8 h, blocked on W2 + cold data): gtm#1595 precedence with a higher bar for
+  `duty_only`; refuse `endogenousOverride`; gtm#1601 ratchet guard.
+- **W4** (~25–30 h, one planner deploy): #133 shaped-curve fallback; #134 escalation headroom;
+  #135 DHW pre-boost (before #132's `lagT` drop); #136 floor cadence; #22 recommend-only,
+  energy-weighted.
+- **W5** (~8 h): scoreboard + go-live gates.
+- **Owner, gating tier 1**: #117 FINDING-1; #138 physical measurements; `RESEND_*` repo secrets;
+  #76; backup restore.
+
+Critical path to **tier 1 by Nov 15**: W0 merge → gtm#1594/1590 → #133/#135/#132 → owner items.
+Tier 2 adds the whole of W2.
