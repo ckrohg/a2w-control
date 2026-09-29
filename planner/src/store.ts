@@ -1063,13 +1063,31 @@ export class Store {
     return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
   }
 
-  /** Persist the last good forecast (single row) so an hourly fetch failure can fall back to it. */
+  /**
+   * Persist the last good forecast (single row) so an hourly fetch failure can fall back to it.
+   * Bounded SERVER-SIDE (SET LOCAL statement_timeout / lock_timeout on a dedicated client): a row lock
+   * or a slow server ends the statement in Postgres, so the pooled connection is released and the
+   * planner's other queries are never starved by a stuck cache write (codex, #147 pass 2). The caller
+   * does not await this on the live path; a failure here only warns.
+   */
   async saveForecast(hours: { ts: Date; outdoorF: number }[]): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO forecast_cache (id, fetched_at, hours) VALUES (1, now(), $1)
-       ON CONFLICT (id) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, hours = EXCLUDED.hours`,
-      [JSON.stringify(hours.map((h) => ({ ts: h.ts.toISOString(), outdoorF: h.outdoorF })))],
-    );
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL statement_timeout = '5s'");
+      await client.query("SET LOCAL lock_timeout = '2s'");
+      await client.query(
+        `INSERT INTO forecast_cache (id, fetched_at, hours) VALUES (1, now(), $1)
+         ON CONFLICT (id) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, hours = EXCLUDED.hours`,
+        [JSON.stringify(hours.map((h) => ({ ts: h.ts.toISOString(), outdoorF: h.outdoorF })))],
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   async loadForecast(): Promise<{ fetchedAt: Date; hours: { ts: Date; outdoorF: number }[] } | null> {

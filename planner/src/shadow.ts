@@ -296,8 +296,10 @@ export async function forecastWithFallback(
 ): Promise<ForecastResult> {
   try {
     const hours = await fetchLive();
-    // The cache write is off the critical path: fire-and-forget with a bound, so a locked row or a slow
-    // pool can never hold up a live plan (codex: the pool has no statement timeout of its own).
+    // The cache write is off the critical path: fire-and-forget, and the store bounds the statement
+    // SERVER-SIDE (SET LOCAL statement_timeout / lock_timeout) so a stuck write releases its pooled
+    // connection instead of holding one of the planner's three (codex). The race here only bounds how
+    // long the warning waits.
     void Promise.race([
       cache.save(hours),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error("forecast cache save timed out")), saveTimeoutMs).unref?.()),
