@@ -5,7 +5,7 @@
  * lead) runs the soak exactly when the caller says a pasteurization is due — and skips it otherwise.
  */
 import assert from "node:assert/strict";
-import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, type ForecastHour } from "./shadow";
+import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
 
 // A flat summer day: 24 hours, all warm (no winter guard, no natural ≥sanitizeF hour). Timestamps use
 // LOCAL components so day-grouping + warmest-hour selection are deterministic regardless of machine TZ.
@@ -157,3 +157,44 @@ const asFoundCfg = { dot: 5, wwsd: 125, dbt: 165, mbt: 145 };
 }
 
 console.log("shadow.test.ts: all assertions passed ✓");
+
+// Forecast fallback: an open-meteo failure reuses the last good forecast instead of aborting the hour.
+(async () => {
+  const now = Date.UTC(2026, 0, 10, 12, 30);
+  const hour = (k: number, f: number): ForecastHour => ({ ts: new Date(now + k * 3600_000), outdoorF: f });
+  const live = [hour(0, 30), hour(1, 31)];
+  let saved: ForecastHour[] | null = null;
+  const cacheOf = (fetchedAt: number | null, hours: ForecastHour[]) => ({
+    load: async () => (fetchedAt == null ? null : { fetchedAt: new Date(fetchedAt), hours }),
+    save: async (h: ForecastHour[]) => { saved = h; },
+  });
+  // live success → live + cache refreshed
+  const r1 = await forecastWithFallback(async () => live, cacheOf(null, []), now);
+  assert.equal(r1.source, "live");
+  assert.deepEqual(saved, live);
+  // live failure + fresh cache → cached, past hours trimmed (keep the current partial hour), error carried
+  const stale = [hour(-3, 20), hour(-1, 25), hour(0, 28), hour(2, 33)];
+  const r2 = await forecastWithFallback(async () => { throw new Error("open-meteo: HTTP 429"); }, cacheOf(now - 2 * 3600_000, stale), now);
+  assert.equal(r2.source, "cached");
+  assert.deepEqual(r2.hours.map((h) => h.outdoorF), [25, 28, 33], "hours older than one hour are dropped, like the live parser");
+  assert.equal(r2.error, "open-meteo: HTTP 429");
+  // live failure + cache older than the max age → the ORIGINAL error propagates
+  await assert.rejects(
+    () => forecastWithFallback(async () => { throw new Error("open-meteo: HTTP 429"); }, cacheOf(now - FORECAST_CACHE_MAX_AGE_MS - 1, stale), now),
+    /HTTP 429/,
+  );
+  // live failure + no cache → propagates
+  await assert.rejects(() => forecastWithFallback(async () => { throw new Error("boom"); }, cacheOf(null, []), now), /boom/);
+  // live failure + cache whose hours are all in the past → propagates (an empty forecast is not a forecast)
+  await assert.rejects(() => forecastWithFallback(async () => { throw new Error("boom"); }, cacheOf(now - 1000, [hour(-5, 20)]), now), /boom/);
+  // a failing cache save never fails a live result
+  const r3 = await forecastWithFallback(async () => live, { load: async () => null, save: async () => { throw new Error("db down"); } }, now);
+  assert.equal(r3.source, "live");
+  // a HANGING cache save never delays a live result (bounded, off the critical path)
+  const t0 = Date.now();
+  const r4 = await forecastWithFallback(async () => live, { load: async () => null, save: () => new Promise<void>(() => {}) }, now, FORECAST_CACHE_MAX_AGE_MS, 50);
+  assert.equal(r4.source, "live");
+  assert.ok(Date.now() - t0 < 1000, "live result must not wait on the cache write");
+  await new Promise((r) => setTimeout(r, 80)); // let the bounded save time out and log, not throw
+  console.log("shadow.test.ts (forecast fallback): all assertions passed");
+})().catch((e) => { console.error(e); process.exit(1); });

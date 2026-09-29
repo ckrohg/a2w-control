@@ -18,7 +18,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -905,8 +905,16 @@ async function stormTick(): Promise<void> {
   await stormEvaluate(outage ? outage.hasActiveOutage : null);
 }
 
+/** The forecast the latest plan was built from: live, or the cache standing in for a failed fetch (/health.forecast). */
+let lastForecast: { source: "live" | "cached"; fetched_at: string; hours: number; error: string | null; at: string } | null = null;
+
 async function shadowOnce(): Promise<void> {
-  const forecast = await fetchForecast(LAT, LON);
+  const fc = await forecastWithFallback(
+    () => fetchForecast(LAT, LON),
+    { load: () => store.loadForecast(), save: (h) => store.saveForecast(h) },
+    Date.now(),
+  );
+  const forecast = fc.hours;
   // #58: when the operative curve is one the autopilot wrote (near-flat band on the last
   // commanded target), the plan's ceiling, winter curve-mimic, and storm ceiling must all
   // reference the AS-FOUND baseline curve — judging any of them against our own write is
@@ -1244,6 +1252,8 @@ async function shadowOnce(): Promise<void> {
 
 
   await store.insertShadowPlan(plan, {
+    forecast_source: fc.source,
+    forecast_fetched_at: fc.fetchedAt.toISOString(),
     dhw_windows: opts.dhwWindows,
     windows_learned: !!learned,
     learn_days: learned?.days ?? 0,
@@ -1252,6 +1262,9 @@ async function shadowOnce(): Promise<void> {
     ...(dpMeta ? { winter_dp: dpMeta } : {}),
     ...(preheatMeta ? { preheat: preheatMeta } : {}),
   });
+  // Published only now — after the plan built from this forecast is persisted — so /health.forecast
+  // always describes the LATEST STORED plan, never an attempt that failed further down (codex).
+  lastForecast = { source: fc.source, fetched_at: fc.fetchedAt.toISOString(), hours: forecast.length, error: fc.error ?? null, at: new Date().toISOString() };
   lastShadowAt = new Date().toISOString();
   const targets = plan.map((b) => b.tank_target_f);
   console.log(
@@ -1610,6 +1623,9 @@ async function main(): Promise<void> {
           const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+            // Which forecast the latest plan was built from — "cached" means open-meteo failed this hour
+            // and the last good forecast (≤ 6 h old) stood in, so the plan + demand floor still refreshed.
+            forecast: lastForecast,
             instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
             // #121: storm windows and shadow.ts's DHW windows are both correct ONLY because this
             // process runs with TZ set to Eastern — shadow.ts:120 relies on getHours() being local,

@@ -63,6 +63,14 @@ export class Store {
         plan        jsonb NOT NULL
       );
       ALTER TABLE shadow_plans ADD COLUMN IF NOT EXISTS meta jsonb;
+      -- The last GOOD open-meteo forecast. An hourly step that cannot fetch (HTTP 429 after a deploy
+      -- burst, 2026-09-29: four deploys in two hours, then "shadow failed" and a degraded demand feed
+      -- for the hour) reuses this instead of skipping the plan + demand-floor refresh.
+      CREATE TABLE IF NOT EXISTS forecast_cache (
+        id          int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        fetched_at  timestamptz NOT NULL,
+        hours       jsonb NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS plan_scores (
         hour_ts          timestamptz PRIMARY KEY,
         shadow_target_f  real,
@@ -1053,6 +1061,43 @@ export class Store {
       `SELECT config FROM hbx_config_versions ORDER BY id ASC LIMIT 1`,
     );
     return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
+  }
+
+  /**
+   * Persist the last good forecast (single row) so an hourly fetch failure can fall back to it.
+   * Bounded SERVER-SIDE (SET LOCAL statement_timeout / lock_timeout on a dedicated client): a row lock
+   * or a slow server ends the statement in Postgres, so the pooled connection is released and the
+   * planner's other queries are never starved by a stuck cache write (codex, #147 pass 2). The caller
+   * does not await this on the live path; a failure here only warns.
+   */
+  async saveForecast(hours: { ts: Date; outdoorF: number }[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL statement_timeout = '5s'");
+      await client.query("SET LOCAL lock_timeout = '2s'");
+      await client.query(
+        `INSERT INTO forecast_cache (id, fetched_at, hours) VALUES (1, now(), $1)
+         ON CONFLICT (id) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, hours = EXCLUDED.hours`,
+        [JSON.stringify(hours.map((h) => ({ ts: h.ts.toISOString(), outdoorF: h.outdoorF })))],
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async loadForecast(): Promise<{ fetchedAt: Date; hours: { ts: Date; outdoorF: number }[] } | null> {
+    const res = await this.pool.query(`SELECT fetched_at, hours FROM forecast_cache WHERE id = 1`);
+    if (!res.rowCount) return null;
+    const raw = res.rows[0].hours as { ts: string; outdoorF: number }[];
+    return {
+      fetchedAt: new Date(res.rows[0].fetched_at),
+      hours: raw.map((h) => ({ ts: new Date(h.ts), outdoorF: Number(h.outdoorF) })).filter((h) => Number.isFinite(h.ts.getTime()) && Number.isFinite(h.outdoorF)),
+    };
   }
 
   async insertShadowPlan(plan: unknown, meta: unknown): Promise<void> {
