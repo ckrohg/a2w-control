@@ -47,8 +47,11 @@ import { DEFAULT_OPTS } from "./shadow";
 
 export type WindowKind = "autopilot" | "sanitize" | "storm" | "bank" | "boost" | "manual";
 
-const BATCH = 500;               // TempIQ's per-POST ceiling (experimentWindowsBodySchema: max 500)
-const MAX_BATCHES_PER_TICK = 10; // the backfill drains ≤5000 windows per tick; steady state is 0–1
+// TempIQ's schema allows 500 per POST, but its JSON body limit does not: the first live tick
+// (2026-09-29 18:30Z) got HTTP 413 on a 500-window batch (~200 KB). 100 windows ≈ 40 KB clears
+// the limit with margin; 20 batches/tick keeps the backfill at ≤2000 windows per tick.
+const BATCH = 100;
+const MAX_BATCHES_PER_TICK = 20;
 const WASHOUT_MIN = 30;          // the buffer adoption lag — the device re-reads the curve next reheat cycle
 export const WINDOW_SOURCE = "a2w-planner";
 
