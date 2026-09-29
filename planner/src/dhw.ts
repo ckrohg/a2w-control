@@ -83,3 +83,64 @@ export function learnDhwWindows(
   }
   return { windows, days, drawEvents, hourScores };
 }
+
+// ─── #135: how deep does a draw sag the tank, per learned window ────────────────────────────────
+/** After a draw starts, the trough is looked for within this many minutes. */
+export const SAG_HORIZON_MIN = 60;
+/** Consecutive ≥ DROP_F samples closer than this belong to ONE draw (a shower is several samples of fall). */
+export const DRAW_MERGE_MIN = 15;
+
+export interface WindowSag {
+  windowStart: number;   // local hour
+  windowEnd: number;     // local hour, exclusive
+  n: number;             // draws observed inside the window
+  sagP75F: number;       // 75th-percentile fall from the pre-draw level to the trough (°F)
+  sagMedianF: number;
+  preDrawMedianF: number;
+  troughMedianF: number;
+}
+
+/**
+ * One draw event = the first ≥ DROP_F fall (detectDrawTimes' definition) not within DRAW_MERGE_MIN of
+ * the previous event. Its sag = tank just before the fall − the minimum in the next SAG_HORIZON_MIN.
+ * Grouped by the local hour the draw started in. Windows with no draws come back with n = 0 and zero
+ * sags (the plan then boosts nothing for them). Same rows the window learner reads: no extra query.
+ */
+export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: [number, number][]): WindowSag[] {
+  const sagsByWindow = windows.map(() => ({ sags: [] as number[], pre: [] as number[], trough: [] as number[] }));
+  let lastEventMs = -Infinity;
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1], cur = rows[i];
+    const dtMin = (cur.ts.getTime() - prev.ts.getTime()) / 60_000;
+    if (dtMin <= 0 || dtMin > MAX_SAMPLE_GAP_MIN) continue;
+    if (prev.tankF - cur.tankF < DROP_F) continue;
+    if (cur.ts.getTime() - lastEventMs < DRAW_MERGE_MIN * 60_000) { lastEventMs = cur.ts.getTime(); continue; }
+    lastEventMs = cur.ts.getTime();
+    const h = cur.ts.getHours(); // TZ env → local hour, as learnDhwWindows
+    const w = windows.findIndex(([a, b]) => h >= a && h < b);
+    if (w < 0) continue;
+    let trough = cur.tankF;
+    for (let j = i; j < rows.length && rows[j].ts.getTime() - cur.ts.getTime() <= SAG_HORIZON_MIN * 60_000; j++) {
+      if (rows[j].tankF < trough) trough = rows[j].tankF;
+    }
+    sagsByWindow[w].sags.push(prev.tankF - trough);
+    sagsByWindow[w].pre.push(prev.tankF);
+    sagsByWindow[w].trough.push(trough);
+  }
+  const q = (xs: number[], p: number) => {
+    if (!xs.length) return 0;
+    const a = [...xs].sort((x, y) => x - y);
+    const k = Math.min(a.length - 1, Math.max(0, Math.ceil(p * a.length) - 1));
+    return a[k];
+  };
+  return windows.map(([windowStart, windowEnd], w) => {
+    const g = sagsByWindow[w];
+    return {
+      windowStart, windowEnd, n: g.sags.length,
+      sagP75F: Math.round(q(g.sags, 0.75) * 10) / 10,
+      sagMedianF: Math.round(q(g.sags, 0.5) * 10) / 10,
+      preDrawMedianF: Math.round(q(g.pre, 0.5) * 10) / 10,
+      troughMedianF: Math.round(q(g.trough, 0.5) * 10) / 10,
+    };
+  });
+}

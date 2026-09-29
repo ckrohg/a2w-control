@@ -553,3 +553,13 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
+
+// #135: a planned pre-boost within the look-ahead is a plan conflict, exactly like a bank.
+(() => {
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const plan = [{ ts: "2026-11-20T13:00:00Z", reason: "pre-boost to 126°F for 17:00 window (sag p75 6.2°F over 11 draws; warmest lead hour, 44°F)" }];
+  assert.equal(planConflictAhead(plan, now, 3), true, "pre-boost reason conflicts");
+  assert.equal(planConflictAhead([{ ts: "2026-11-20T13:00:00Z", reason: "DHW window floor", boost: true }], now, 3), true, "the boost flag conflicts");
+  assert.equal(planConflictAhead([{ ts: "2026-11-20T13:00:00Z", reason: "DHW window floor" }], now, 3), false);
+  console.log("identify.test.ts (#135 pre-boost conflict): all assertions passed");
+})();

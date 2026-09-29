@@ -20,6 +20,26 @@ writer** of the reset curve; see [§Single-writer invariant](#single-writer-inva
   consecutive poll failures, and recovery. Same topic the Pi/hub use.
 - `GET /health` → `{ok, lastPollAt, lastDriftAt, consecutiveFailures}` (503 when failing).
 
+## DHW pre-boost (#135)
+
+The flat 120 °F DHW floor does not hold a hard draw: measured 2026-08-07, evening showers sagged the
+tank to 102–117 °F with both pumps at full call, and the 16.5 kW backup element paid for the shortfall
+(~21 kWh/week at COP 1.0). `lagT` 60 → 180 only made the element slower to join; the shortfall stayed.
+
+The plan now anticipates it. For each **learned** draw window (`dhw.ts learnDhwWindows`) the same tank
+history yields the window's draw **sag** — pre-draw level minus the trough in the next 60 min, per draw,
+p75 over the window (`measureWindowSags`). When a window has ≥ 3 measured draws and a sag ≥ 3 °F, the
+warmest non-window hour in the `prechargeLookbackH` lead is raised to `dhwFloorF + sag p75 + 2.4 °F ×
+hours of standby before the bell` (capped at `strictCapF`; if the allowance would breach the cap the
+hour right before the window is used instead). Reason: `pre-boost to 126°F for 17:00 window (sag p75
+6.2°F over 11 draws; …)`. It is an excursion like the bank: Phase B leads the pump setpoints off it (I1),
+the auto-pilot writes it as a flat target under the shaped curve, the identification driver treats it as
+a plan conflict, and the TempIQ window poster files it as `bank`. `/health.dhw.windows[]` shows the
+measurement behind every window (draws, sag p75/median, pre-draw and trough medians, `boost_f`), and
+the plan's `meta.pre_boosts` records what was applied. Raises only — a pre-boost can never make a
+shower colder. Acceptance (#135): evening-window troughs ≥ `dhwFloorF` on normal days, element minutes
+attributable to DHW sags → ~0 without relying on `lagT`, whole-system daily kWh not up.
+
 ## Single-writer invariant
 
 **The deployed Railway planner (`a2w-hub` → service `a2w-planner`) is the SOLE authorized

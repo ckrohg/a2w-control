@@ -39,7 +39,7 @@ import {
 import { DemandFeed, requiredAwtF, type FloorPolicy } from "./demand";
 import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
-import { learnDhwWindows, detectDrawTimes } from "./dhw";
+import { learnDhwWindows, detectDrawTimes, measureWindowSags, type WindowSag } from "./dhw";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -534,6 +534,8 @@ let i8HoursSinceDwell: number | null = null;
 // nothing here gates the soak (issue #51 rule 4 — only a real thermal dwell resets the clock).
 const DRAW_WINDOW_DAYS = 14;
 let dhwDraws: ReturnType<typeof drawGapStats> | null = null;
+/** #135: the measured per-window sags behind the latest plan's pre-boosts (/health.dhw). */
+let dhwPreBoosts: WindowSag[] = [];
 async function checkI8(): Promise<void> {
   const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
   const res = await store.getRecentSeries(intervalH);
@@ -925,15 +927,20 @@ async function shadowOnce(): Promise<void> {
 
   // learned DHW windows once ≥5 days of tank history exist; fixed defaults until then
   let learned = null;
+  let sags: WindowSag[] = [];
   try {
     const tankHistory = await store.getTankHistory(DRAW_WINDOW_DAYS);
     learned = learnDhwWindows(tankHistory);
-    // Same rows, no extra query: the draw-gap picture for /health (see dhwDraws).
+    // Same rows, no extra query: the draw-gap picture for /health (see dhwDraws) and, per learned
+    // window, how deep the draws sag the tank — the #135 pre-boost is sized from that.
     dhwDraws = drawGapStats(detectDrawTimes(tankHistory), Date.now());
+    if (learned) sags = measureWindowSags(tankHistory, learned.windows);
   } catch (e) {
     console.warn("dhw learner failed, using default windows:", (e as Error).message);
   }
-  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows } : DEFAULT_OPTS), bankF: BANK_F };
+  const preBoosts = sags.map((w) => ({ windowStart: w.windowStart, boostF: Math.max(0, Math.round(w.sagP75F)), sagP75F: w.sagP75F, n: w.n }));
+  dhwPreBoosts = sags;
+  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F };
 
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
   let demandFloor: DemandFloor | null = null;
@@ -1255,6 +1262,7 @@ async function shadowOnce(): Promise<void> {
     forecast_source: fc.source,
     forecast_fetched_at: fc.fetchedAt.toISOString(),
     dhw_windows: opts.dhwWindows,
+    pre_boosts: opts.preBoosts ?? [],
     windows_learned: !!learned,
     learn_days: learned?.days ?? 0,
     draw_events: learned?.drawEvents ?? 0,
@@ -1698,6 +1706,16 @@ async function main(): Promise<void> {
             // I8 thermal hygiene — runtime ground truth for go-live verification. auto_sanitize=true
             // means checkI8 owns the soak (shadow boost stood down); effective_interval_h reflects the
             // current season; last_satisfied=true confirms the coil's potable slug was pasteurized.
+            // #135: per learned window, the measured draw sag and the pre-boost the plan sizes from it
+            // (boost 0 / n < 3 = nothing planned for that window — the honest "not enough draws yet").
+            dhw: {
+              windows: dhwPreBoosts.map((w) => ({
+                window: [w.windowStart, w.windowEnd], draws: w.n, sag_p75_f: w.sagP75F, sag_median_f: w.sagMedianF,
+                pre_draw_median_f: w.preDrawMedianF, trough_median_f: w.troughMedianF,
+                boost_f: w.n >= 3 && Math.round(w.sagP75F) >= 3 ? Math.round(w.sagP75F) : 0,
+              })),
+              min_draws: 3, min_boost_f: 3, standby_f_per_h: 2.4,
+            },
             hygiene: {
               auto_sanitize: autoSanitizeLive,
               base_interval_h: HYGIENE_BASE_INTERVAL_H,

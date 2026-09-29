@@ -198,3 +198,51 @@ console.log("shadow.test.ts: all assertions passed ✓");
   await new Promise((r) => setTimeout(r, 80)); // let the bounded save time out and log, not throw
   console.log("shadow.test.ts (forecast fallback): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// #135 pre-boost: sized from the window's sag, placed in the warmest lead hour with a standby allowance.
+{
+  // Cold-enough day (no winter guard): 40..50 °F, warmest at h=23. Windows 6–9 and 17–22; the 17:00
+  // window's lead hours are 14, 15, 16 (all non-window). Outdoor rises with h, so 16 is the warmest lead.
+  const fc: ForecastHour[] = Array.from({ length: 24 }, (_, h) => ({ ts: new Date(2026, 9, 15, h, 0, 0), outdoorF: 55 + h * 0.5 }));
+  const opts = { ...DEFAULT_OPTS, dhwWindows: [[6, 9], [17, 22]] as [number, number][], preBoosts: [
+    { windowStart: 17, boostF: 6, sagP75F: 6.2, n: 11 },
+    { windowStart: 6, boostF: 2, sagP75F: 2.0, n: 9 },   // below MIN_PREBOOST_F → nothing
+  ] };
+  const plan = computeShadowPlan(fc, null, opts, null, false);
+  const boosts = plan.filter((b) => b.boost === true);
+  assert.equal(boosts.length, 1, "exactly one pre-boost (the 06:00 window's 2 °F is below the floor)");
+  const b = boosts[0];
+  assert.equal(new Date(b.ts).getHours(), 16, "the warmest lead hour (16:00) is chosen");
+  assert.equal(b.tank_target_f, 126, "floor 120 + sag 6, no standby allowance for the hour right before the bell");
+  assert.match(b.reason, /pre-boost to 126°F for 17:00 window \(sag p75 6.2°F over 11 draws; warmest lead hour/);
+  assert.ok(b.hp1_setpoint_f >= b.tank_target_f + DEFAULT_OPTS.i1MarginF, "Phase B leads the pump setpoints off the boost (I1)");
+  assert.equal(plan.filter((x) => x.reason.includes("pre-charge")).length, 0, "the dormant pre-charge label is gone");
+
+  // Warmest lead hour two hours early → +2.4 °F/h standby allowance for the 1 h of coasting.
+  const fc2: ForecastHour[] = fc.map((f, h) => ({ ...f, outdoorF: h === 14 ? 90 : f.outdoorF }));
+  const b2 = computeShadowPlan(fc2, null, opts, null, false).filter((x) => x.boost)[0];
+  assert.equal(new Date(b2.ts).getHours(), 14);
+  assert.equal(b2.tank_target_f, Math.round(120 + 6 + 2.4 * 2), "two hours ahead: 1 h charging + 2 h standby … allowance per elapsed hour");
+  assert.match(b2.reason, /standby over 2 h/);
+
+  // If the allowance would breach strictCap, the hour before the bell is used instead.
+  const big = { ...opts, preBoosts: [{ windowStart: 17, boostF: 13, sagP75F: 13, n: 6 }] };
+  const b3 = computeShadowPlan(fc2, null, big, null, false).filter((x) => x.boost)[0];
+  assert.equal(new Date(b3.ts).getHours(), 16, "14:00 would need 120+13+4.8 = 137.8 > 135 → the hour before the bell");
+  assert.equal(b3.tank_target_f, 133);
+  assert.match(b3.reason, /hour before the bell/);
+
+  // Too few draws → no boost; no preBoosts at all → byte-identical to the pre-#135 plan.
+  const few = { ...opts, preBoosts: [{ windowStart: 17, boostF: 6, sagP75F: 6, n: 2 }] };
+  assert.equal(computeShadowPlan(fc, null, few, null, false).filter((x) => x.boost).length, 0);
+  const before = computeShadowPlan(fc, null, { ...DEFAULT_OPTS, dhwWindows: opts.dhwWindows }, null, false);
+  const without = computeShadowPlan(fc, null, { ...opts, preBoosts: [] }, null, false);
+  assert.deepEqual(without, before, "no preBoosts → identical plan");
+
+  // A soak / bank that already sits higher in the lead hour IS the pre-boost: not overwritten.
+  const soaked = computeShadowPlan(fc, null, opts, null, true);
+  const soakHour = soaked.find((x) => x.sani)!;
+  assert.ok(soakHour, "due soak present");
+  for (const x of soaked) if (x.sani) assert.equal(x.boost, undefined, "the soak block keeps its identity");
+  console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
+}

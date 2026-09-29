@@ -136,7 +136,7 @@ export function classifyKind(w: KindInputs, strictCapF: number = DEFAULT_OPTS.st
     // Order matters: "storm mode: banking heat (…)" names both — the storm is the cause.
     if (/sanitize|pasteuriz|soak/i.test(r)) return "sanitize";
     if (/storm/i.test(r)) return "storm";
-    if (/\bbank|pre-?charge/i.test(r)) return "bank";
+    if (/\bbank|pre-?charge|pre-?boost/i.test(r)) return "bank"; // the #135 pre-boost is a deliberate DHW bank
     // autopilot_log dedups unchanged decisions, so a write can lack a correlated reason. Only the
     // sanitize soak sits above the everyday strictCap, so the target alone still separates it.
     if (w.reason === null && w.commandedTargetF !== null && w.commandedTargetF > strictCapF) return "sanitize";
