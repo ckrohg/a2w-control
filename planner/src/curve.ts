@@ -168,3 +168,23 @@ export function curveOutputF(c: Pick<ShapedCurve, "dbt" | "mbt" | "dot" | "wwsd"
 export function sameCurve(x: Pick<ShapedCurve, "dbt" | "mbt">, y: Pick<ShapedCurve, "dbt" | "mbt"> | null, toleranceF = 2): boolean {
   return y != null && Math.abs(x.dbt - y.dbt) <= toleranceF && Math.abs(x.mbt - y.mbt) <= toleranceF;
 }
+
+/**
+ * #133 (b) rollout switch. `SHAPED_CURVE` is read as:
+ *   - off     (unset / "0")   — byte-identical to the pre-#133 planner: nothing computed or stamped;
+ *   - shadow  ("shadow")      — the plan computes and stamps the shaped curve and /health.curve reports
+ *                               what it IMPLIES next to what is IN FORCE, but the auto-pilot keeps
+ *                               commanding flat targets and Phase B leads nothing extra. Acceptance #1/#2
+ *                               are read from /health.curve without a single curve write;
+ *   - live    ("1" / "live")  — the auto-pilot commands the shaped curve for non-excursion hours and
+ *                               Phase B leads its output.
+ * A live auto-pilot (AUTOPILOT_DRY_RUN=0) writes the moment a shaped block appears, so the shadow
+ * value exists to look before that happens.
+ */
+export type ShapedCurveMode = "off" | "shadow" | "live";
+export function parseShapedCurveMode(raw: string | undefined | null): ShapedCurveMode {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (v === "1" || v === "live" || v === "on") return "live";
+  if (v === "shadow") return "shadow";
+  return "off";
+}

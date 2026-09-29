@@ -19,7 +19,7 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
-import { shapeCurve, curveOutputF, canShapeFromFeed } from "./curve";
+import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, sameCurve } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
@@ -188,7 +188,11 @@ const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").ma
 // #133 (b): SHAPED_CURVE=1 makes the auto-pilot command the plan's demand-shaped reset curve for
 // non-excursion hours and Phase B lead its output. Off = byte-identical to the pre-#133 planner: no
 // curve is computed, no plan block is stamped, /health.curve.plan_implies stays null.
-const SHAPED_CURVE = process.env.SHAPED_CURVE === "1";
+// SHAPED_CURVE=shadow computes + stamps + reports (/health.curve.plan_implies) but writes nothing —
+// the auto-pilot is live on the pilot, so "1" would command the first shaped curve within a poll.
+const SHAPED_CURVE_MODE = parseShapedCurveMode(process.env.SHAPED_CURVE);
+const SHAPED_CURVE = SHAPED_CURVE_MODE === "live";
+const SHAPED_CURVE_STAMP = SHAPED_CURVE_MODE !== "off";
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE)
   : null;
@@ -1208,7 +1212,7 @@ async function shadowOnce(): Promise<void> {
 
   lastShapedCurve = null;
 
-  if (SHAPED_CURVE && demandFeed && canShapeFromFeed(demandFeed.isHealthy(), demandFeed.zones())) try {
+  if (SHAPED_CURVE_STAMP && demandFeed && canShapeFromFeed(demandFeed.isHealthy(), demandFeed.zones())) try {
 
     const wwsd = typeof (cfgLive as { wwsd?: unknown } | null)?.wwsd === "number" ? (cfgLive as { wwsd: number }).wwsd : 125;
 
@@ -1622,9 +1626,14 @@ async function main(): Promise<void> {
             // #133 acceptance 3: the curve IN FORCE on the device + its output at the live outdoor, and the
             // shaped curve the latest plan implies — not just the last commanded scalar.
             curve: {
-              mode: SHAPED_CURVE ? "shaped" : "flat-target",
+              mode: SHAPED_CURVE_MODE === "live" ? "shaped" : SHAPED_CURVE_MODE === "shadow" ? "shadow" : "flat-target",
               in_force: lastDeviceCurve ? { ...lastDeviceCurve, output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastDeviceCurve, lastThermal.outdoor_f) * 10) / 10 : null, shaped: lastDeviceCurve.dbt - lastDeviceCurve.mbt > 4 } : null,
-              plan_implies: lastShapedCurve ? { dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis } : null,
+              plan_implies: lastShapedCurve ? {
+                dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis,
+                output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastShapedCurve, lastThermal.outdoor_f) * 10) / 10 : null,
+                // acceptance #1: would the live auto-pilot write this curve now? (false = already in force)
+                would_write: lastDeviceCurve ? !sameCurve(lastShapedCurve, lastDeviceCurve) : null,
+              } : null,
             },
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
