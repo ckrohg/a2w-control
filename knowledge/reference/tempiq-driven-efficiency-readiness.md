@@ -86,7 +86,7 @@ Per-zone duty, Nov 2025 – Jan 2026 (TempIQv2#2009 Phase 0, from Nest `hvacStat
 | Mud Room | radiant | ✅ | 25.8 % |
 | Upstairs Bathroom | radiant | ❌ | 24.3 % |
 | Dining | radiant | ✅ | 5.1 % |
-| **Living Room Baseboard** (= the Xmas Room) | **baseboard** | ✅ | **4.7 %** |
+| **Living Room Baseboard** (a DISTRIBUTED loop: Den/Office + Xmas Room + entryway — owner, 2026-09-29) | **baseboard** | ✅ | **4.7 %** |
 | **Upstairs Baseboard** | **baseboard** | ✅ | **4.4 %** |
 | Kitchen Radiant | radiant | ❌ | 2.0 % |
 
@@ -134,8 +134,9 @@ evidence can.
 1. **Verify the radiant manifolds have tempering/injection.** Assumed, never inspected, after two
    months in §10 — and the tank has run 150 °F+ into those loops for years. If mixing exists,
    radiant is decoupled and only the baseboards ever justify a hot tank. → #138 item 1.
-2. **Source-substitute the baseboard spaces on design-cold days.** Living Room Baseboard *is* the
-   Xmas Room and it has its own Kumo. → #22.
+2. **Source-substitute the baseboard spaces on design-cold days.** Living Room Baseboard is one loop
+   through Den/Office + Xmas Room + an entryway (owner, 2026-09-29), so relieving it takes the
+   Den/Office AND Xmas Room Kumos together, not one head. → #22.
 3. **Add injection mixing on the baseboard loop.** Hardware; the honest third option.
 
 ---
