@@ -274,7 +274,8 @@ export function planConflictAhead(plan: any[] | null, nowMs: number, hours: numb
     const t = Date.parse(String(b?.ts));
     if (!Number.isFinite(t) || t < nowMs - 3600_000 || t > end) return false;
     const reason = String(b?.reason ?? "");
-    return b?.sani === true || b?.bank === true || /sanitize|storm|bank/i.test(reason);
+    // A deliberate raise (soak, bank, storm, #135 pre-boost) would confound a probe drawn beside it.
+    return b?.sani === true || b?.bank === true || b?.boost === true || /sanitize|storm|bank|pre-?boost/i.test(reason);
   });
 }
 

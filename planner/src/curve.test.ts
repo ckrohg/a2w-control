@@ -165,6 +165,11 @@ import { curveDecision, curveAlreadyInForce } from "./autopilot";
   assert.equal(canShapeFromFeed(false, zones), false, "stale feed");
   assert.equal(canShapeFromFeed(true, []), false, "empty feed");
   assert.equal(canShapeFromFeed(true, [z("kumo", "mini_split")]), false, "no buffer-served zone");
+  // #135: the emitted boost flag is an excursion even when the winter floor rewrote the reason and a
+  // shaped curve is present — otherwise shaped-curve mode would run the curve through the boost hour.
+  const shapedForBoost = { dot: 20, wwsd: 125, dbt: 127, mbt: 120 };
+  assert.equal(curveDecision({ reason: "binding zone: baseboard needs 128°F (winter solver shadow)", boost: true, shaped_curve: shapedForBoost }).kind, "excursion");
+  assert.equal(curveDecision({ reason: "binding zone: baseboard needs 128°F (winter solver shadow)", shaped_curve: shapedForBoost }).kind, "curve");
   // The rollout switch: anything but an explicit live/shadow value is OFF (fail-closed on a typo).
   assert.equal(parseShapedCurveMode(undefined), "off");
   assert.equal(parseShapedCurveMode(""), "off");

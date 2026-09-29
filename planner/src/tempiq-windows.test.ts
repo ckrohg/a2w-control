@@ -279,3 +279,10 @@ console.log("tempiq-windows.test.ts: all assertions passed");
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
+
+// #135: the pre-boost is filed as a bank — a deliberate DHW charge the learner must quarantine as such.
+(() => {
+  const k = classifyKind({ source: "autopilot", reason: "pre-boost to 126°F for 17:00 window (sag p75 6.2°F over 11 draws; warmest lead hour, 44°F)", stormActive: false, boostMatched: false, commandedTargetF: 126 });
+  assert.equal(k, "bank");
+  console.log("tempiq-windows.test.ts (#135 pre-boost kind): all assertions passed");
+})();
