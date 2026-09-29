@@ -154,3 +154,22 @@ export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: 
     };
   });
 }
+
+/**
+ * #135: the PEAK draw hours — where at least `threshold` of observed days had a draw — merged into
+ * unpadded [start, endExclusive) ranges. The learner's `windows` (threshold 0.25, padded ±1 h) say
+ * where the DHW floor must hold and on this house cover nearly the whole day (measured 2026-09-29:
+ * [[0,21],[22,24]] from 137 draws in 15 d); a pre-boost keyed to those starts would fire once a day
+ * before midnight. The shower peaks are what the sag is measured over and what the boost precedes.
+ */
+export const PEAK_THRESHOLD = 0.5;
+export function peakWindows(hourScores: number[], threshold = PEAK_THRESHOLD): [number, number][] {
+  const out: [number, number][] = [];
+  let start: number | null = null;
+  for (let h = 0; h <= 24; h++) {
+    const hot = h < 24 && (hourScores[h] ?? 0) >= threshold;
+    if (hot && start === null) start = h;
+    if (!hot && start !== null) { out.push([start, h]); start = null; }
+  }
+  return out;
+}

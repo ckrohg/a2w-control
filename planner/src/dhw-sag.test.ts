@@ -3,7 +3,7 @@
  * Run with: npx tsx planner/src/dhw-sag.test.ts
  */
 import assert from "node:assert/strict";
-import { measureWindowSags, SAG_HORIZON_MIN } from "./dhw";
+import { measureWindowSags, peakWindows, SAG_HORIZON_MIN } from "./dhw";
 
 // Five days of 5-min samples at 120 °F. Each evening at 18:10 local a shower: three consecutive 2.5 °F
 // drops (one draw, merged), trough 112.5, recovering 1 °F per sample after 30 min. Mornings: one 2 °F
@@ -48,4 +48,9 @@ const gapped = rows.filter((r) => !(r.ts.getHours() === 18 && r.ts.getMinutes() 
 for (const r of gapped) if (r.ts.getHours() === 18 && r.ts.getMinutes() === 55) r.tankF = 95; // a low reading right after the hole
 const sags3 = measureWindowSags(gapped, [[17, 22]]);
 assert.equal(sags3[0].sagP75F, 7.5, "the scan stops at the gap; 95 °F after the hole is not counted");
+// peak windows: unpadded runs of hours at/above the threshold; the padded 25 % windows can span the day
+const scores = Array.from({ length: 24 }, (_, h) => (h >= 17 && h <= 19 ? 0.8 : h === 7 ? 0.6 : h === 20 ? 0.4 : 0.3));
+assert.deepEqual(peakWindows(scores), [[7, 8], [17, 20]], "two peaks, no padding, 20:00 at 0.4 is not a peak");
+assert.deepEqual(peakWindows(scores, 0.3), [[0, 24]], "at the floor threshold everything merges — the reason peaks exist");
+assert.deepEqual(peakWindows(Array(24).fill(0)), []);
 console.log("dhw-sag.test.ts: all assertions passed");

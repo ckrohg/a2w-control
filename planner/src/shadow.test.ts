@@ -205,8 +205,8 @@ console.log("shadow.test.ts: all assertions passed ✓");
   // window's lead hours are 14, 15, 16 (all non-window). Outdoor rises with h, so 16 is the warmest lead.
   const fc: ForecastHour[] = Array.from({ length: 24 }, (_, h) => ({ ts: new Date(2026, 9, 15, h, 0, 0), outdoorF: 55 + h * 0.5 }));
   const opts = { ...DEFAULT_OPTS, dhwWindows: [[6, 9], [17, 22]] as [number, number][], preBoosts: [
-    { windowStart: 17, boostF: 6, sagP75F: 6.2, n: 11 },
-    { windowStart: 6, boostF: 2, sagP75F: 2.0, n: 9 },   // below MIN_PREBOOST_F → nothing
+    { windowStart: 17, windowEnd: 20, boostF: 6, sagP75F: 6.2, n: 11 },
+    { windowStart: 6, windowEnd: 8, boostF: 2, sagP75F: 2.0, n: 9 },   // below MIN_PREBOOST_F → nothing
   ] };
   // (soak OFF in these plans — sanitizeDue=false — so the pre-boost is observed alone)
   const plan = computeShadowPlan(fc, null, opts, null, false);
@@ -227,21 +227,29 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.match(b2.reason, /standby over 2 h/);
 
   // If the allowance would breach strictCap, the hour before the bell is used instead.
-  const big = { ...opts, preBoosts: [{ windowStart: 17, boostF: 12, sagP75F: 12, n: 6 }] };
+  const big = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 12, sagP75F: 12, n: 6 }] };
   const b3 = computeShadowPlan(fc2, null, big, null, false).filter((x) => x.boost)[0];
   assert.equal(new Date(b3.ts).getHours(), 16, "14:00 would need 120+12+4.8 = 136.8 > 135 → the hour before the bell");
   assert.equal(b3.tank_target_f, 132);
   assert.match(b3.reason, /hour before the bell/);
 
   // Too few draws (< 6) → no boost; no preBoosts at all → byte-identical to the pre-#135 plan.
-  const few = { ...opts, preBoosts: [{ windowStart: 17, boostF: 6, sagP75F: 6, n: 5 }] };
+  const few = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 6, sagP75F: 6, n: 5 }] };
   assert.equal(computeShadowPlan(fc, null, few, null, false).filter((x) => x.boost).length, 0);
   const before = computeShadowPlan(fc, null, { ...DEFAULT_OPTS, dhwWindows: opts.dhwWindows }, null, false);
   const without = computeShadowPlan(fc, null, { ...opts, preBoosts: [] }, null, false);
   assert.deepEqual(without, before, "no preBoosts → identical plan");
 
+  // The lead may lie INSIDE the padded floor window (on this house the floor window is nearly all day);
+  // only hours inside a PEAK are excluded from the lead.
+  const allDay = { ...opts, dhwWindows: [[0, 21], [22, 24]] as [number, number][] };
+  const ad = computeShadowPlan(fc, null, allDay, null, false).filter((x) => x.boost)[0];
+  assert.ok(ad, "a pre-boost is placed even though every lead hour sits in the floor window");
+  assert.equal(new Date(ad.ts).getHours(), 16);
+  assert.equal(ad.tank_target_f, 126);
+
   // A contaminated sag cannot chase strictCap: the boost is capped at MAX_PREBOOST_F and says so.
-  const huge = { ...opts, preBoosts: [{ windowStart: 17, boostF: 40, sagP75F: 40, n: 8 }] };
+  const huge = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 40, sagP75F: 40, n: 8 }] };
   const b4 = computeShadowPlan(fc, null, huge, null, false).filter((x) => x.boost)[0];
   assert.equal(b4.tank_target_f, 132, "120 + 12 (cap), placed at 16:00 with no standby allowance");
   assert.match(b4.reason, /capped at \+12/);
@@ -263,13 +271,13 @@ console.log("shadow.test.ts: all assertions passed ✓");
   // WINTER: the demand floor takes a block's reason only when it raises the target. A pre-boost that
   // sits above the floor keeps its reason (so the poster files it as a bank) and its flag; a floor
   // above the boost wins the target and the reason, and the flag still marks the intended excursion.
-  const winter: ForecastHour[] = fc.map((f) => ({ ...f, outdoorF: 30 }));
+  const winter: ForecastHour[] = fc.map((f, h) => ({ ...f, outdoorF: 20 + h * 0.5 })); // 20..31.5 °F, warmest lead still 16:00
   const floorLow = { tankTargetF: 122, bindingZone: "baseboard", awtF: 118 };
   const w1 = computeShadowPlan(winter, null, opts, floorLow, false);
   const wb = w1.filter((x) => x.boost)[0];
   assert.ok(wb, "the pre-boost survives the winter pass");
   assert.match(wb.reason, /pre-boost to 126°F/, "the floor (122) did not raise a 126 block, so the reason is kept");
-  assert.ok(w1.filter((x) => !x.boost).every((x) => /binding zone/.test(x.reason) && x.tank_target_f === 122), "every other block took the floor");
+  assert.ok(w1.filter((x) => !x.boost).every((x) => /binding zone/.test(x.reason) && x.tank_target_f >= 122), "every other block took the floor (the I4 band lifts the coldest hours a little higher)");
   const floorHigh = { tankTargetF: 130, bindingZone: "baseboard", awtF: 126 };
   const w2 = computeShadowPlan(winter, null, opts, floorHigh, false).filter((x) => x.boost)[0];
   assert.equal(w2.tank_target_f, 130);

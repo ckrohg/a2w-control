@@ -39,7 +39,7 @@ import {
 import { DemandFeed, requiredAwtF, type FloorPolicy } from "./demand";
 import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
-import { learnDhwWindows, detectDrawTimes, measureWindowSags, type WindowSag } from "./dhw";
+import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -536,6 +536,7 @@ const DRAW_WINDOW_DAYS = 14;
 let dhwDraws: ReturnType<typeof drawGapStats> | null = null;
 /** #135: the measured per-window sags behind the latest plan's pre-boosts (/health.dhw). */
 let dhwPreBoosts: WindowSag[] = [];
+let learnedWindowsForHealth: [number, number][] | null = null;
 async function checkI8(): Promise<void> {
   const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
   const res = await store.getRecentSeries(intervalH);
@@ -934,12 +935,13 @@ async function shadowOnce(): Promise<void> {
     // Same rows, no extra query: the draw-gap picture for /health (see dhwDraws) and, per learned
     // window, how deep the draws sag the tank — the #135 pre-boost is sized from that.
     dhwDraws = drawGapStats(detectDrawTimes(tankHistory), Date.now());
-    if (learned) sags = measureWindowSags(tankHistory, learned.windows);
+    if (learned) sags = measureWindowSags(tankHistory, peakWindows(learned.hourScores));
   } catch (e) {
     console.warn("dhw learner failed, using default windows:", (e as Error).message);
   }
-  const preBoosts = sags.map((w) => ({ windowStart: w.windowStart, boostF: Math.max(0, Math.round(w.sagP75F)), sagP75F: w.sagP75F, n: w.n }));
+  const preBoosts = sags.map((w) => ({ windowStart: w.windowStart, windowEnd: w.windowEnd, boostF: Math.max(0, Math.round(w.sagP75F)), sagP75F: w.sagP75F, n: w.n }));
   dhwPreBoosts = sags;
+  learnedWindowsForHealth = learned ? learned.windows : null;
   const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F };
 
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
@@ -1076,7 +1078,7 @@ async function shadowOnce(): Promise<void> {
           const byTs = new Map(dp.blocks.map((b) => [b.ts, b]));
           for (const block of plan) {
             const d = byTs.get(block.ts);
-            if (!d || /sanitize/i.test(block.reason)) continue;
+            if (!d || block.sani || /sanitize/i.test(block.reason)) continue;
             const band = bandFor(block.outdoor_f, cfg, opts.strictCapF);
             const raised = Math.round(Math.min(Math.max(block.tank_target_f, d.targetF), band.hi));
             if (raised <= block.tank_target_f) continue;
@@ -1084,7 +1086,9 @@ async function shadowOnce(): Promise<void> {
             // Same leading-setpoint treatment as bank/sanitize blocks: the advisory HP line
             // must cover the raised target or the plan draws an I1-violating hour.
             block.hp1_setpoint_f = Math.round(Math.min(Math.max(raised + opts.i1MarginF, opts.hpMinF), opts.strictCapF + opts.i1MarginF));
-            block.reason = d.reason;
+            // An excursion block (bank / #135 pre-boost) keeps its identity in the reason — the poster
+            // classifies from it — and records the DP's raise alongside (codex, #148).
+            block.reason = (block.bank || block.boost) ? `${block.reason}; DP raised to ${raised}°F` : d.reason;
           }
         }
       }
@@ -1710,11 +1714,13 @@ async function main(): Promise<void> {
             // (boost 0 / n < 3 = nothing planned for that window — the honest "not enough draws yet").
             dhw: {
               windows: dhwPreBoosts.map((w) => ({
-                window: [w.windowStart, w.windowEnd], draws: w.n, sag_p75_f: w.sagP75F, sag_median_f: w.sagMedianF,
+                peak: [w.windowStart, w.windowEnd], draws: w.n, sag_p75_f: w.sagP75F, sag_median_f: w.sagMedianF,
                 pre_draw_median_f: w.preDrawMedianF, trough_median_f: w.troughMedianF,
                 boost_f: w.n >= MIN_PREBOOST_DRAWS && Math.round(w.sagP75F) >= MIN_PREBOOST_F ? Math.min(Math.round(w.sagP75F), MAX_PREBOOST_F) : 0,
               })),
               min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F, standby_f_per_h: STANDBY_F_PER_H,
+              // peaks = hours where ≥ 50 % of observed days had a draw (unpadded); the floor windows are the padded 25 % ones
+              peak_threshold: 0.5, floor_windows: learnedWindowsForHealth,
             },
             hygiene: {
               auto_sanitize: autoSanitizeLive,

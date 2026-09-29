@@ -26,8 +26,10 @@ The flat 120 °F DHW floor does not hold a hard draw: measured 2026-08-07, eveni
 tank to 102–117 °F with both pumps at full call, and the 16.5 kW backup element paid for the shortfall
 (~21 kWh/week at COP 1.0). `lagT` 60 → 180 only made the element slower to join; the shortfall stayed.
 
-The plan now anticipates it. For each **learned** draw window (`dhw.ts learnDhwWindows`) the same tank
-history yields the window's draw **sag** — pre-draw level minus the trough in the next 60 min, per draw,
+The plan now anticipates it. The learner's floor windows (threshold 25 % of days, padded ±1 h) cover
+nearly the whole day on this house (`[[0,21],[22,24]]` from 137 draws in 15 d), so the boost is keyed
+to the **peak** draw windows instead — hours where ≥ 50 % of observed days had a draw, unpadded
+(`dhw.ts peakWindows`). For each peak the same tank history yields the window's draw **sag** — pre-draw level minus the trough in the next 60 min, per draw,
 p75 over the window (`measureWindowSags`). When a window has ≥ 6 measured draws (so the p75 is never one
 sample) and a sag ≥ 3 °F, the warmest non-window hour in the `prechargeLookbackH` lead is raised to
 `dhwFloorF + min(sag p75, 12) + 2.4 °F × hours of standby before the bell` (capped at `strictCapF`; if
@@ -37,7 +39,7 @@ and in winter a zone call can read as a draw: the 6-draw floor and the 12 °F ca
 6.2°F over 11 draws; …)`. It is an excursion like the bank: Phase B leads the pump setpoints off it (I1),
 the auto-pilot writes it as a flat target under the shaped curve, the identification driver treats it as
 a plan conflict, and the TempIQ window poster files it as `bank`. `/health.dhw.windows[]` shows the
-measurement behind every window (draws, sag p75/median, pre-draw and trough medians, `boost_f`), and
+measurement behind every peak (and `floor_windows` the padded ones) (draws, sag p75/median, pre-draw and trough medians, `boost_f`), and
 the plan's `meta.pre_boosts` records what was applied. Raises only — a pre-boost can never make a
 shower colder. Acceptance (#135): evening-window troughs ≥ `dhwFloorF` on normal days, element minutes
 attributable to DHW sags → ~0 without relying on `lagT`, whole-system daily kWh not up.

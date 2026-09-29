@@ -31,7 +31,8 @@ export interface ShadowBlock {
 
 /** #135: a learned draw window's boost, sized from the measured sag (see dhw.ts measureWindowSags). */
 export interface PreBoost {
-  windowStart: number; // local hour the window opens
+  windowStart: number; // local hour the PEAK draw window opens (dhw.ts peakWindows, not the padded floor window)
+  windowEnd: number;   // local hour, exclusive
   boostF: number;      // the rise above dhwFloorF the trough needs (sag p75), before decay allowance
   sagP75F: number;
   n: number;           // draws it was measured from
@@ -226,15 +227,17 @@ export function computeShadowPlan(
   // Scheduled AFTER the soak and the bank so a deliberate excursion already in the lead interval is
   // seen: a soak or bank anywhere in the lead hours IS the pre-boost (it banks more), and a draft that
   // carries sani/bank is never re-labelled (one excursion identity per block; codex, #148).
-  const boostFor = new Map<number, PreBoost>();
-  for (const b of opts.preBoosts ?? []) if (b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F) boostFor.set(b.windowStart, b);
-  for (const [start] of opts.dhwWindows) {
-    const pb = boostFor.get(start);
-    if (!pb) continue;
+  // Keyed to the PEAK draw windows the boosts were measured over (dhw.ts peakWindows), not the padded
+  // floor windows: on this house those cover nearly the whole day, so "before the window" would mean
+  // "before midnight". A lead hour must not itself lie inside a peak (that is where the draws are).
+  const peaks = (opts.preBoosts ?? []).filter((b) => b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F);
+  const inPeak = (h: number) => peaks.some((b) => h >= b.windowStart && h < b.windowEnd);
+  for (const pb of peaks) {
+    const start = pb.windowStart;
     const idx = draft.findIndex((d) => d.localH === start);
     if (idx <= 0) continue;
     const lead = draft.slice(Math.max(0, idx - opts.prechargeLookbackH), idx)
-      .filter((d) => !inWindow(d.localH));
+      .filter((d) => !inPeak(d.localH));
     if (!lead.length) continue;
     if (lead.some((d) => d.sani || d.bank)) continue; // the soak / bank in the lead IS the pre-boost
     const boostF = Math.min(pb.boostF, MAX_PREBOOST_F);
