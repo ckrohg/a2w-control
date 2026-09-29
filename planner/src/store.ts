@@ -307,9 +307,17 @@ export class Store {
       -- (codex pass 4: a backfilled write_accepted row with cleanup_state 'none' was never cleaned). Only
       -- the newest can still be operative; cleanup() itself checks the device and is a no-op when the
       -- plant has since moved on.
-      UPDATE identification_windows SET cleanup_state = 'pending'
-        WHERE id = (SELECT max(id) FROM identification_windows
-                    WHERE state = 'ended' AND arm = 'probe' AND NOT dry_run AND write_id IS NOT NULL AND cleanup_state = 'none');
+      -- ONE-TIME in effect (codex pass 5): every legacy candidate leaves 'none' in the same statement — the
+      -- newest becomes 'pending', all older ones become 'done' (superseded) — so a later restart finds no
+      -- candidate and can never replay a stale historical probe over current intent.
+      UPDATE identification_windows
+        SET cleanup_state = CASE WHEN id = (SELECT max(id) FROM identification_windows
+                                            WHERE state = 'ended' AND arm = 'probe' AND NOT dry_run AND write_id IS NOT NULL AND cleanup_state = 'none')
+                                 THEN 'pending' ELSE 'done' END,
+            cleanup_detail = CASE WHEN id = (SELECT max(id) FROM identification_windows
+                                             WHERE state = 'ended' AND arm = 'probe' AND NOT dry_run AND write_id IS NOT NULL AND cleanup_state = 'none')
+                                  THEN cleanup_detail ELSE 'superseded by a later window (legacy backfill)' END
+        WHERE state = 'ended' AND arm = 'probe' AND NOT dry_run AND write_id IS NOT NULL AND cleanup_state = 'none';
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
