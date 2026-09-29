@@ -14,6 +14,7 @@ import { extractConfig, diffConfig } from "./drift";
 import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
+import { TempiqWindowPoster } from "./tempiq-windows";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
@@ -218,6 +219,17 @@ const tempiqRead = TEMPIQ_READ_ENABLED && TEMPIQ_SURFACE_TOKEN
   ? new TempiqReader(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
   : null;
 if (TEMPIQ_READ_ENABLED && !tempiqRead) console.warn("TEMPIQ_READ_ENABLED but TEMPIQ_SURFACE_TOKEN missing — reader disabled");
+
+// TempIQ perturbation-window seam (a2w#137 — our half of gtm#1596 / gtm#1616 Part C). Posts the
+// episodes in which WE were driving the buffer target so TempIQ quarantines them from passive
+// learning (and, later, U4 fits only labelled probes). Quarantine-only kinds — no assignment is
+// ever claimed here. Inert without the flag+token; same seam as the pusher.
+const TEMPIQ_WINDOWS_ENABLED = process.env.TEMPIQ_WINDOWS_ENABLED === "1";
+const TEMPIQ_WINDOWS_EVERY_MIN = Number(process.env.TEMPIQ_WINDOWS_EVERY_MIN ?? "5");
+const tempiqWindows = TEMPIQ_WINDOWS_ENABLED && TEMPIQ_SURFACE_TOKEN
+  ? new TempiqWindowPoster(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  : null;
+if (TEMPIQ_WINDOWS_ENABLED && !tempiqWindows) console.warn("TEMPIQ_WINDOWS_ENABLED but TEMPIQ_SURFACE_TOKEN missing — window poster disabled");
 
 // Winter-solver shadow seam (§6.9, W0-4). SHADOW ONLY: proposes demand floors to the
 // shadow planner and snapshots them; flag off = today's behavior byte-for-byte.
@@ -1455,6 +1467,7 @@ async function main(): Promise<void> {
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
     if (tempiq) await tempiq.tick();
     if (tempiqRead) await tempiqRead.tick();
+    if (tempiqWindows) await tempiqWindows.tick();
     console.log("POLL_ONCE ok");
     await store.close();
     return;
@@ -1496,6 +1509,7 @@ async function main(): Promise<void> {
             i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
+            tempiq_windows: tempiqWindows ? tempiqWindows.status() : "disabled",
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
@@ -1772,6 +1786,10 @@ async function main(): Promise<void> {
   if (tempiqRead) {
     void tempiqRead.tick();
     setInterval(() => void tempiqRead.tick(), TEMPIQ_READ_EVERY_MIN * 60 * 1000);
+  }
+  if (tempiqWindows) {
+    void tempiqWindows.tick();
+    setInterval(() => void tempiqWindows.tick(), TEMPIQ_WINDOWS_EVERY_MIN * 60 * 1000);
   }
   const shadowLoop = () =>
     shadowOnce()

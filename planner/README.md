@@ -101,6 +101,8 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
 | `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
+| `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
+| `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway
@@ -200,6 +202,35 @@ override + synthetic Xmas Room baseboard zone).
 
 Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed).
 `/health.winter_solver` = off | shadow | degraded.
+
+## TempIQ perturbation windows (a2w#137, FLAG-OFF)
+
+`tempiq-windows.ts` tells TempIQ WHEN we were driving the buffer, so its passive thermal
+learners quarantine those hours instead of fitting our perturbation as the house behaving
+(TempIQ's U4 fitted the as-found tank temperature back as a zone "requirement" from exactly
+this contamination — TempIQv2#2043; their half is `awt_perturbation_windows` +
+`POST /api/insights/experiment-windows`, TempIQv2#2050).
+
+Grain is one window per commanded-target **episode**: opens at an accepted `set_target`
+(autopilot / dashboard / boost all funnel through `writes.ts`), closes at the next event that
+replaces the curve — our next accepted `set_target` or `restore`, or a **foreign** dbt/mbt
+change the drift detector recorded. The device holds our curve through a planner outage, so an
+open window (`endedAt: null`, "active until now") is the honest state, not a gap. Kind names
+what a learner must treat differently — `autopilot | sanitize | storm | bank` from the plan
+reason, `storm | boost | manual` for dashboard writes — and every window carries the dose
+(`commandedTargetF`, mean `achievedAwtF`, adoption `compliance`, outdoor band, calling zones).
+
+**Every window is quarantine-only (`assignment: null`).** None of these writes is a randomised
+probe — the autopilot raises the target *because* zones are calling — so TempIQ must never fit
+them as exogenous; the identification arm is a separate driver (gtm#1616 A/B). Phase B is not
+posted: it tracks the tank target and adds no independent AWT perturbation.
+
+Idempotent and durable: `tempiq_window_posts` remembers what was posted and which windows are
+open; the July→now backfill drains in ≤500-window batches on the first ticks, then each tick
+posts only new episodes and newly-closable ones. Fail-soft like every TempIQ hop — a POST
+failure logs, counts a streak and retries; a per-window validation rejection is recorded and
+not retried. `/status.tempiq_windows` reports it. Local proof of the four queries against a
+synthetic history: `scripts/tempiq-windows-local-check.ts` (localhost only, never prod).
 
 ## Storm mode (W0, NOTIFY-FIRST; plan §6.11)
 
