@@ -89,9 +89,10 @@ async function main(): Promise<void> {
   // ── windowPayload ──
   {
     const w: IdentWindow = {
-      id: 7, state: "active", arm: "probe", direction: "up", zoneIds: ["z-lr", "z-mud"], bandLo: 30, bandHi: 45, magnitudeF: 8, baseF: 135, targetF: 143, capF: 145,
-      drawProbability: 0.5, drawSeed: "0.2", startedAt: T0, endedAt: null, endReason: null, durationMin: 120, writeId: 11, dryRun: false,
+      id: 7, createdAt: T0, state: "active", arm: "probe", direction: "up", zoneIds: ["z-lr", "z-mud"], bandLo: 30, bandHi: 45, magnitudeF: 8, baseF: 135, targetF: 143, capF: 145,
+      drawProbability: 0.5, drawSeed: "0.2", startedAt: T0, endedAt: null, endReason: null, durationMin: 120, writeId: 11, writeAccepted: true, dryRun: false,
       postedOpen: false, postedClosed: false, cell: { x: 1 }, safeToProbe: { ok: true }, armingTicks: 0, writeAttempts: 1,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const open = windowPayload(w, null);
     assert.equal(open.externalId, "a2w-ident-7");
@@ -109,8 +110,8 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number }) {
-    const rows: IdentWindow[] = [];
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedSince?: { id: number; ts: Date; targetF: number | null } | null; seedRows?: IdentWindow[] }) {
+    const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
     const restores: string[] = [];
@@ -132,6 +133,7 @@ async function main(): Promise<void> {
       async unpostedIdentificationWindows() { return rows.filter((r) => !r.dryRun && ((r.state === "ended" && !r.postedClosed) || (r.state === "active" && !r.postedOpen))); },
       async cleanupPendingIdentificationWindows() { return rows.filter((r) => r.state === "ended" && r.cleanupState === "pending"); },
       async latestAcceptedWriteId() { return 99; },
+      async acceptedIdentificationWriteSince() { return over.acceptedSince ?? null; },
       async windowStats() { return { achievedAwtF: 140, compliance: 0.8, outdoorLowF: 38, outdoorHighF: 42, samples: 20 }; },
     };
     const deps: IdentDeps = {
@@ -300,6 +302,94 @@ async function main(): Promise<void> {
     assert.equal(h.rows[0].cleanupState, "none", "nothing was written, nothing to return");
     assert.equal(h.restores.length, 0);
   }
+  // 5b. CRASH RECOVERY (codex pass 2, critical): a row left in pending_write whose write the device DID
+  //     accept (an audit row exists since the draw) is promoted to active on restart — not retried, not
+  //     ended as unwritten — and cleanup later returns the plant to base.
+  {
+    const seed: IdentWindow = {
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 5 * 60_000), endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      armingTicks: 0, writeAttempts: 3, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    };
+    const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed], acceptedSince: { id: 77, ts: new Date(T0.getTime() - 4 * 60_000), targetF: 124 } });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "active", "promoted, not retried");
+    assert.equal(h.rows[0].writeId, 77);
+    assert.equal(h.rows[0].writeAccepted, true);
+    assert.equal(h.rows[0].startedAt!.getTime(), T0.getTime() - 4 * 60_000, "startedAt = the audit row's time");
+    assert.equal(h.writes.length, 0, "no second write");
+    assert.equal(h.posts.length, 1, "posted open on promotion");
+    h.advance(130);
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "ended");
+    assert.equal(h.rows[0].cleanupState, "done");
+  }
+  // 5c. …and with no audit row but the device already commanding the probe target, the commanded target reconciles it.
+  {
+    const seed: IdentWindow = {
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    };
+    const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed] });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "active");
+    assert.equal(h.rows[0].writeAccepted, true);
+    assert.equal(h.writes.length, 0);
+  }
+  // 5d. A pending_write row with NO accepted write and a base still commanded simply retries (the normal path).
+  {
+    const seed: IdentWindow = {
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    };
+    const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed] });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "active");
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
+  }
+  // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope) falls back to
+  //     the as-found restore immediately instead of retrying the impossible command forever…
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 422] });
+    await h.driver.tick(); await h.driver.tick();
+    h.advance(121);
+    await h.driver.tick();
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.deepEqual(h.restores, ["identification-end"]);
+    assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
+  }
+  // …transient failures (5xx) are retried, but after CLEANUP_TRANSIENT_MAX the restore is used anyway…
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 503, 503, 503, 503, 503, 503] });
+    await h.driver.tick(); await h.driver.tick();
+    h.advance(121);
+    await h.driver.tick();                       // attempt 1 → transient, pending
+    assert.equal(h.rows[0].cleanupState, "pending");
+    for (let i = 0; i < 4; i++) await h.driver.tick();   // attempts 2–5 → still pending
+    assert.equal(h.rows[0].cleanupState, "pending");
+    assert.equal(h.rows[0].cleanupAttempts, 5);
+    await h.driver.tick();                       // attempt 6 → permanent by count → restore
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.deepEqual(h.restores, ["identification-end"]);
+  }
+  // …and while ANY live probe is still unreturned, no new window opens.
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 503, 503], restoreFails: 3, lastEnd: null });
+    await h.driver.tick(); await h.driver.tick();
+    h.advance(121);
+    await h.driver.tick();
+    assert.equal(h.rows[0].cleanupState, "pending");
+    h.advance(120); // well past MIN_GAP
+    await h.driver.tick();
+    assert.equal(h.rows.length, 1, "no second window while #1 is unreturned");
+    assert.match(h.driver.status().lastResult ?? "", /not yet returned to base/);
+  }
+
   // 6. A non-429 rejection (I4 envelope 422) ends the window immediately, no restore (nothing was written).
   {
     const h = harness({ plan: downPlan, commanded: 130, writeFails: [422] });

@@ -291,7 +291,9 @@ export class Store {
         arming_ticks     integer NOT NULL DEFAULT 0,
         write_attempts   integer NOT NULL DEFAULT 0,
         cleanup_state    text NOT NULL DEFAULT 'none',
-        cleanup_detail   text
+        cleanup_detail   text,
+        cleanup_attempts integer NOT NULL DEFAULT 0,
+        write_accepted   boolean NOT NULL DEFAULT false
       );
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
@@ -891,15 +893,16 @@ export class Store {
   private rowToIdentWindow(r: any): IdentWindow {
     const num = (v: unknown) => (v == null ? null : Number(v));
     return {
-      id: Number(r.id), state: r.state, arm: r.arm, direction: r.direction,
+      id: Number(r.id), createdAt: new Date(r.created_at), state: r.state, arm: r.arm, direction: r.direction,
       zoneIds: Array.isArray(r.zone_ids) ? r.zone_ids.map(String) : [],
       bandLo: Number(r.band_lo), bandHi: Number(r.band_hi), magnitudeF: Number(r.magnitude_f), baseF: Number(r.base_f),
       targetF: Number(r.target_f), capF: Number(r.cap_f), drawProbability: Number(r.draw_probability), drawSeed: String(r.draw_seed),
       startedAt: r.started_at ? new Date(r.started_at) : null, endedAt: r.ended_at ? new Date(r.ended_at) : null,
       endReason: r.end_reason == null ? null : String(r.end_reason), durationMin: Number(r.duration_min),
-      writeId: num(r.write_id), dryRun: r.dry_run === true, postedOpen: r.posted_open === true, postedClosed: r.posted_closed === true,
+      writeId: num(r.write_id), writeAccepted: r.write_accepted === true, dryRun: r.dry_run === true, postedOpen: r.posted_open === true, postedClosed: r.posted_closed === true,
       cell: r.cell ?? null, safeToProbe: r.safe_to_probe ?? null, armingTicks: Number(r.arming_ticks ?? 0), writeAttempts: Number(r.write_attempts ?? 0),
       cleanupState: (r.cleanup_state ?? "none") as IdentWindow["cleanupState"], cleanupDetail: r.cleanup_detail == null ? null : String(r.cleanup_detail),
+      cleanupAttempts: Number(r.cleanup_attempts ?? 0),
     };
   }
   async openIdentificationWindow(): Promise<IdentWindow | null> {
@@ -913,14 +916,14 @@ export class Store {
   async insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number> {
     const r = await this.pool.query(
       `INSERT INTO identification_windows
-         (state, arm, direction, zone_ids, band_lo, band_hi, magnitude_f, base_f, target_f, cap_f, draw_probability, draw_seed,
+         (created_at, state, arm, direction, zone_ids, band_lo, band_hi, magnitude_f, base_f, target_f, cap_f, draw_probability, draw_seed,
           started_at, ended_at, end_reason, duration_min, write_id, dry_run, posted_open, posted_closed, cell, safe_to_probe, arming_ticks, write_attempts,
-          cleanup_state, cleanup_detail)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) RETURNING id`,
-      [w.state, w.arm, w.direction, w.zoneIds, w.bandLo, w.bandHi, w.magnitudeF, w.baseF, w.targetF, w.capF, w.drawProbability, w.drawSeed,
+          cleanup_state, cleanup_detail, cleanup_attempts, write_accepted)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING id`,
+      [w.createdAt ?? new Date(), w.state, w.arm, w.direction, w.zoneIds, w.bandLo, w.bandHi, w.magnitudeF, w.baseF, w.targetF, w.capF, w.drawProbability, w.drawSeed,
        w.startedAt, w.endedAt, w.endReason, w.durationMin, w.writeId, w.dryRun, w.postedOpen, w.postedClosed,
        JSON.stringify(w.cell ?? null), JSON.stringify(w.safeToProbe ?? null), w.armingTicks, w.writeAttempts,
-       w.cleanupState ?? "none", w.cleanupDetail ?? null],
+       w.cleanupState ?? "none", w.cleanupDetail ?? null, w.cleanupAttempts ?? 0, w.writeAccepted === true],
     );
     return Number(r.rows[0].id);
   }
@@ -928,7 +931,7 @@ export class Store {
     const cols: Record<string, string> = {
       state: "state", endedAt: "ended_at", endReason: "end_reason", startedAt: "started_at", writeId: "write_id",
       postedOpen: "posted_open", postedClosed: "posted_closed", armingTicks: "arming_ticks", writeAttempts: "write_attempts",
-      cleanupState: "cleanup_state", cleanupDetail: "cleanup_detail",
+      cleanupState: "cleanup_state", cleanupDetail: "cleanup_detail", cleanupAttempts: "cleanup_attempts", writeAccepted: "write_accepted",
     };
     const sets: string[] = []; const vals: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) {
@@ -949,12 +952,24 @@ export class Store {
   }
   /** Ended LIVE probes whose plant has not been confirmed back at base (identify.ts cleanup retry). */
   async cleanupPendingIdentificationWindows(): Promise<IdentWindow[]> {
-    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state = 'ended' AND cleanup_state = 'pending' ORDER BY id LIMIT 5`);
+    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state = 'ended' AND cleanup_state = 'pending' ORDER BY id LIMIT 20`);
     return r.rows.map((x) => this.rowToIdentWindow(x));
   }
   async recentIdentificationWindows(n: number): Promise<IdentWindow[]> {
     const r = await this.pool.query(`SELECT * FROM identification_windows ORDER BY id DESC LIMIT $1`, [n]);
     return r.rows.map((x) => this.rowToIdentWindow(x));
+  }
+  /** identify.ts restart reconciliation: the newest accepted identification write at/after `since`. */
+  async acceptedIdentificationWriteSince(since: Date): Promise<{ id: number; ts: Date; targetF: number | null } | null> {
+    const r = await this.pool.query(
+      `SELECT id, ts, detail FROM hbx_writes
+       WHERE source = 'identification' AND action = 'set_target' AND result = 'accepted' AND ts >= $1
+       ORDER BY id DESC LIMIT 1`,
+      [since],
+    );
+    if (!r.rowCount) return null;
+    const m = String(r.rows[0].detail ?? "").match(/^target (-?\d+(?:\.\d+)?)°F commanded/);
+    return { id: Number(r.rows[0].id), ts: new Date(r.rows[0].ts), targetF: m ? Number(m[1]) : null };
   }
   async latestAcceptedWriteId(source: string): Promise<number | null> {
     const r = await this.pool.query(`SELECT id FROM hbx_writes WHERE source = $1 AND result = 'accepted' ORDER BY id DESC LIMIT 1`, [source]);

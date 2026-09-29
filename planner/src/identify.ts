@@ -66,6 +66,8 @@ const PLAN_MAX_AGE_MIN = 180;         // beyond this the plan is not trusted for
 const MIN_GAP_MIN = 60;               // washout + normal operation between windows
 const ARMING_MAX_TICKS = 4;           // ~20 min for Phase B to lead the setpoints, else give up
 const WRITE_RETRY_MAX = 3;            // 429 (rate limit) retries, one per poll
+const CLEANUP_TRANSIENT_MAX = 6;      // transient cleanup failures tolerated before falling back to the as-found restore
+const CLEANUP_ALERT_EVERY = 12;       // a cleanup that will not resolve pages every N ticks (~1 h)
 const MIN_STEP_F = 3;                 // below the 3 °F adoption tolerance a step is not a perturbation
 const DEFICIT_F = 1;                  // room below setpoint − this = deficit (thermostat hysteresis)
 const DRAW_LOOKBACK_MIN = 12;
@@ -99,6 +101,7 @@ export interface IdentPlan {
 
 export interface IdentWindow {
   id: number;
+  createdAt: Date;
   state: IdentState;
   arm: IdentArm;
   direction: IdentDirection;
@@ -116,6 +119,12 @@ export interface IdentWindow {
   endReason: string | null;
   durationMin: number;
   writeId: number | null;
+  /**
+   * TRUE once the device has ACCEPTED the probe write — the fact cleanup keys on. Kept separate from
+   * writeId because a crash between the device accepting and the row being updated must be
+   * reconciled from the audit log on restart (codex 2026-09-29 pass 2, critical).
+   */
+  writeAccepted: boolean;
   dryRun: boolean;
   postedOpen: boolean;
   postedClosed: boolean;
@@ -131,6 +140,7 @@ export interface IdentWindow {
    */
   cleanupState: CleanupState;
   cleanupDetail: string | null;
+  cleanupAttempts: number;
 }
 
 /** The store surface the driver needs — structural so the assertion suite can hand it a fake. */
@@ -146,6 +156,8 @@ export interface IdentStore {
   unpostedIdentificationWindows(): Promise<IdentWindow[]>;
   cleanupPendingIdentificationWindows(): Promise<IdentWindow[]>;
   latestAcceptedWriteId(source: string): Promise<number | null>;
+  /** The newest ACCEPTED identification write at or after `since` — the audit row a crashed tick may have left behind. */
+  acceptedIdentificationWriteSince(since: Date): Promise<{ id: number; ts: Date; targetF: number | null } | null>;
   windowStats(from: Date, to: Date | null, commandedTargetF: number | null): Promise<{ achievedAwtF: number | null; compliance: number | null; outdoorLowF: number | null; outdoorHighF: number | null; samples: number }>;
 }
 
@@ -369,6 +381,8 @@ export class IdentificationDriver {
     // ARMED identification needs the auto-pilot LIVE: it is what returns the plant to its plan after a
     // window, and the explicit cleanup below is the belt to that brace, not a replacement for it.
     if (this.mode === "armed" && this.d.autopilot.isDryRun) { this.lastResult = "idle: auto-pilot is in shadow — armed identification requires it live (Off/Armed switch)"; return; }
+    const unreturned = await this.d.store.cleanupPendingIdentificationWindows();
+    if (unreturned.length) { this.lastResult = `idle: ${unreturned.length} ended probe(s) not yet returned to base (#${unreturned.map((w) => w.id).join(", #")}) — no new window until they are`; return; }
     const lastEnd = await this.d.store.lastIdentificationWindowEnd();
     if (lastEnd && nowMs - lastEnd.getTime() < MIN_GAP_MIN * 60_000) { this.lastResult = `idle: ${Math.round((MIN_GAP_MIN * 60_000 - (nowMs - lastEnd.getTime())) / 60_000)} min until the next window may open`; return; }
     const plans = await this.d.store.recentPlans(6);
@@ -401,14 +415,15 @@ export class IdentificationDriver {
     const zoneIds = [...new Set(this.plan.cells.filter((c) => c.status !== "not_probeable" || c.deliveryTypeSource === "owner_verified").map((c) => c.zoneId))];
     const dryRun = this.mode === "shadow";
     const row: Omit<IdentWindow, "id"> = {
+      createdAt: this.now(),
       state: arm === "hold" ? "active" : cell.suggest.direction === "down" ? "pending_write" : "arming",
       arm, direction: cell.suggest.direction, zoneIds, bandLo: cell.band[0], bandHi: cell.band[1],
       magnitudeF: tgt.stepF, baseF, targetF: arm === "probe" ? tgt.targetF : baseF, capF: tgt.capF,
       drawProbability: cell.suggest.assignmentProbability, drawSeed: seed,
       startedAt: this.now(), endedAt: null, endReason: null, durationMin: cell.suggest.durationMin,
-      writeId: null, dryRun, postedOpen: false, postedClosed: false,
+      writeId: null, writeAccepted: false, dryRun, postedOpen: false, postedClosed: false,
       cell, safeToProbe: cell.suggest.safeToProbe, armingTicks: 0, writeAttempts: 0,
-      cleanupState: "none", cleanupDetail: null,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const id = await this.d.store.insertIdentificationWindow(row);
     const w: IdentWindow = { id, ...row };
@@ -467,8 +482,34 @@ export class IdentificationDriver {
     // Keep the hold and the Phase B lead alive while the write is pending.
     this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
     if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
+    // RECONCILE before retrying (codex 2026-09-29 pass 2, critical): the device may have ACCEPTED the
+    // last attempt while this process died before the row was updated. The writer audits every
+    // accepted write, so an accepted 'identification' row since this window was drawn IS the probe
+    // write — promote the window instead of retrying (a retry would 429, read as terminal, and the
+    // plant would sit at the probe target with no cleanup and no record).
+    if (!w.dryRun) {
+      const acc = await this.d.store.acceptedIdentificationWriteSince(w.createdAt);
+      if (acc && (acc.targetF == null || Math.abs(acc.targetF - w.targetF) <= 1)) {
+        await this.promoteToActive(w, acc.id, acc.ts, `reconciled from audit row #${acc.id} after a restart`);
+        return;
+      }
+      // Belt to that brace: the device already commands the probe target though no audit row matched.
+      const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
+      if (typeof st.commanded_target_f === "number" && Math.abs((st.commanded_target_f as number) - w.targetF) <= 1) {
+        await this.promoteToActive(w, await this.d.store.latestAcceptedWriteId("identification"), this.now(), "reconciled from the commanded target after a restart");
+        return;
+      }
+    }
     if (this.d.isI1Violated() || this.d.isStormActive()) { await this.end(w, "aborted:before_write"); return; }
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
+  }
+
+  private async promoteToActive(w: IdentWindow, writeId: number | null, startedAt: Date, how: string): Promise<void> {
+    await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt, writeId, writeAccepted: true });
+    w.state = "active"; w.startedAt = startedAt; w.writeId = writeId; w.writeAccepted = true;
+    this.lastResult = `ACTIVE #${w.id}: ${how}`;
+    console.log(`[identify] ${this.lastResult}`);
+    await this.postOpen(w);
   }
 
   private async writeProbe(w: IdentWindow, label: string): Promise<void> {
@@ -496,8 +537,8 @@ export class IdentificationDriver {
     }
     const writeId = await this.d.store.latestAcceptedWriteId("identification");
     const startedAt = this.now();
-    await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt, writeId });
-    w.state = "active"; w.startedAt = startedAt; w.writeId = writeId;
+    await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt, writeId, writeAccepted: true });
+    w.state = "active"; w.startedAt = startedAt; w.writeId = writeId; w.writeAccepted = true;
     this.lastResult = `ACTIVE #${w.id}: wrote ${w.targetF} °F (cap ${w.capF}) — ${label}`;
     console.log(`[identify] ${this.lastResult}`);
     await this.d.notify("Identification probe started", `${label}\nWindow ${w.durationMin} min; the auto-pilot is held; aborts on I1 / room deficit / DHW draw.`, "default");
@@ -541,7 +582,7 @@ export class IdentificationDriver {
     // A LIVE probe (a write was accepted) must be returned to its base by THIS driver — the auto-pilot
     // is not assumed to be live, and even live it may be rate-limited or rejected. Durable: 'pending'
     // is retried every tick until confirmed (codex 2026-09-29 critical).
-    const wasLive = w.arm === "probe" && !w.dryRun && w.writeId != null;
+    const wasLive = w.arm === "probe" && !w.dryRun && w.writeAccepted;
     const cleanupState: CleanupState = wasLive ? "pending" : "none";
     await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState });
     w.state = "ended"; w.endedAt = endedAt; w.endReason = reason; w.cleanupState = cleanupState;
@@ -555,7 +596,7 @@ export class IdentificationDriver {
     // Only a window that HAPPENED is closed on TempIQ: a hold arm (opened at the draw) or a probe whose
     // write was accepted. A probe that never got written is not evidence of anything — posting it
     // would file an awt_identification window with an assignment and no perturbation behind it.
-    if (w.arm === "hold" || w.writeId != null) {
+    if (w.arm === "hold" || w.writeAccepted) {
       await this.postClose(w);
     } else if (!w.dryRun) {
       await this.d.store.updateIdentificationWindow(w.id, { postedOpen: true, postedClosed: true }); // nothing to post
@@ -571,6 +612,9 @@ export class IdentificationDriver {
    * failure stays 'pending' and is retried next tick.
    */
   private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
+    const attempts = w.cleanupAttempts + 1;
+    await this.d.store.updateIdentificationWindow(w.id, { cleanupAttempts: attempts });
+    w.cleanupAttempts = attempts;
     const done = async (detail: string): Promise<string> => {
       await this.d.store.updateIdentificationWindow(w.id, { cleanupState: "done", cleanupDetail: detail });
       w.cleanupState = "done"; w.cleanupDetail = detail;
@@ -580,19 +624,30 @@ export class IdentificationDriver {
     const stillPending = async (detail: string): Promise<null> => {
       await this.d.store.updateIdentificationWindow(w.id, { cleanupDetail: detail });
       w.cleanupDetail = detail;
-      console.error(`[identify] cleanup #${w.id}: ${detail} — will retry`);
+      console.error(`[identify] cleanup #${w.id} (attempt ${attempts}): ${detail} — will retry`);
+      if (attempts % CLEANUP_ALERT_EVERY === 0) {
+        await this.d.notify("Identification cleanup stuck", `#${w.id}: the plant has NOT been returned to base after ${attempts} attempts — ${detail}. Check the HBX / SensorLinx.`, "high");
+      }
       return null;
     };
+    // 1. The guarded re-command of the base. A 429 (rate limit) or any other 4xx guard rejection
+    //    (422 envelope: the saved base may be outside I4 at the new outdoor; 409 I1; 423 lease) is
+    //    PERMANENT for this tick — retrying it forever would leave the plant at the probe target
+    //    (codex pass 2, high). Those fall through to the restore. 5xx/network are transient and are
+    //    retried up to CLEANUP_TRANSIENT_MAX before the restore is used anyway.
+    let permanent = urgent;
     try {
       await this.d.writer.setTarget(w.baseF, "identification-end", DEFAULT_OPTS.strictCapF);
       return await done(`re-commanded base ${w.baseF} °F`);
     } catch (e) {
-      const rateLimited = e instanceof WriteError && e.status === 429;
-      if (!rateLimited && !urgent) return stillPending(`re-command failed: ${(e as Error).message.slice(0, 120)}`);
+      const status = e instanceof WriteError ? e.status : 0;
+      permanent = permanent || (status >= 400 && status < 500) || attempts >= CLEANUP_TRANSIENT_MAX;
+      if (!permanent) return stillPending(`re-command failed (transient): ${(e as Error).message.slice(0, 120)}`);
     }
+    // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
     try {
       await this.d.writer.restore(urgent ? "identification-abort" : "identification-end");
-      return await done(`as-found curve restored (rate limit refused the base re-command${urgent ? "; abort" : ""})`);
+      return await done(`as-found curve restored (base re-command refused${urgent ? "; abort" : ""})`);
     } catch (e) {
       return stillPending(`restore failed: ${(e as Error).message.slice(0, 120)}`);
     }
