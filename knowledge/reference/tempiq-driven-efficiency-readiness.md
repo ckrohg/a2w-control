@@ -444,3 +444,34 @@ layer under it was broken. The dependency graph changed shape as a result.
 
 Critical path to **tier 1 by Nov 15**: W0 merge → gtm#1594/1590 → #133/#135/#132 → owner items.
 Tier 2 adds the whole of W2.
+
+## 10 · Status 2026-09-29 (evening) — W0 done, W1 done, W2 built, first live seams
+
+Everything below was verified against the running systems, not inferred.
+
+### 10.1 Landed
+
+| where | what | proof |
+|---|---|---|
+| TempIQ | #2043 U4 repaired (dead duty predicate, absent setpoint channel, unfinishable query) + exogeneity guard; #2044 Nest OFF-mode setpoints; #2045 provenance tier; #2046/#2047 zone-requirements + spaces repair; #2048 early-return diagnostics; **#2049 U4 hoisted** (the 4th independent cause: deadline-starved); **#2050 Part C** (`awt_perturbation_windows`, `POST /experiment-windows`, U4 exogenous join, exclusion 4th source) | U4 phase ran 3× today (31–93 s) and wrote **7 `supply_water_requirement` rows** (one per hydronic zone, all `no_exogenous_variation`) — `/zone-requirements` is `attempted_none_identified`, the honest state, instead of `no_rows` |
+| TempIQ | **#2051 Parts A+B** — `GET /identification-plan` + computed `safeToProbe` (no outdoor threshold: time-to-deficit over window + recovery vs abort + reheat; unknown inputs fail closed) | four Codex adversarial passes (NaN fail-open, forecast continuity, nested bounds, safety horizon, hours off-by-one) → **approve**; prod replay: 35 cells, acceptance #1 holds |
+| A2W | **#139 merged + live** — the quarantine poster (`tempiq-windows.ts`, one window per commanded-target episode, foreign-write closers, dose fields, July→now backfill) | `TEMPIQ_WINDOWS_ENABLED=1` at 18:29Z; first tick **HTTP 413** (500-window batch ≈ 200 KB > body limit) → #142 batches of 100; nothing lost |
+| A2W | **#140 merged** — deploy-gate deadline 900→1500 s | the #139 deploy measured a 20-min lease handover (old container + 12-min freshness + 5-min poll); the gate's REGRESSION was false |
+| A2W | **#141 open** — the identification driver (`identify.ts`) | two Codex passes: driver-owned durable cleanup, `pending_write` state, settled operative base, audit reconciliation on restart, permanent-vs-transient cleanup; third pass running |
+
+### 10.2 Findings that changed the plan
+
+1. **Every hydronic zone's envelope resolves to resolver DEFAULTS.** The `zone_envelope` rows exist (2026-09-28) but carry confidence 0.007–0.02, under the learned threshold → UA ~60–90, C 800. Part B refuses every down-probe as `envelope_unlearned` (fail closed). Radiant zones probe **up** from the 120 °F floor — safe, and the first live probes.
+2. **Baseboard sits AT the 135 °F cap in every band ≤ 45 °F** — the up arm was unwritable, the down arm unpriceable: the a2w#89 cells had **no safe arm**. Owner decision: identification probes may exceed strictCap up to sanitizeCapF **145** (I1 + rate limit still guard); the driver writes them with that ceiling. Everyday cap stays 135.
+3. `getZoneStatesForProperty` costs 10–13 s per call (18 zones) — the plan endpoint (and `/zones`) pay it; loads are now concurrent (28.8 → 10.3 s). A TempIQ follow-up.
+4. `[reset-params]` reports the plant anchor 52 h old — another phase the starved scheduler is not reaching; post-loop `PL:*` phases are `aborted` even in succeeded cycles.
+
+### 10.3 What "ready" looks like now
+
+| tier | state 2026-09-29 |
+|---|---|
+| **Safe** | unchanged: #117 FINDING-1 (no lease armed on the Pi — still visible in every Phase B log line), #138 measurements, #133/#135 still open |
+| **Learning** | seam live (poster), instrument built (plan + safety), driver built (#141) — armed once #141 deploys, `IDENTIFICATION_ENABLED=1`, a day in shadow, then armed. Cold-band baseboard evidence needs the 145 headroom (in) **and** a learned envelope (TempIQ follow-up) before down-probes can ever be priced |
+| **Optimised** | next winter, as before |
+
+Next: merge #2051 → gate-merge #142 → #141 → shadow → armed; a2w pushes `tank_reheat_rate_a2w` (unblocks priced down-probes); TempIQ envelope-learner confidence for hydronic zones; gtm#1617 co-serving learner + UI; then W4 (#133/#134/#135/#136/#132).
