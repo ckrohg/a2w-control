@@ -42,6 +42,7 @@ import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
+import { pushTankReheat } from "./tank-reheat-push";
 import { RealizedSavings } from "./realized";
 
 const env = (name: string, fallback?: string): string => {
@@ -1465,6 +1466,7 @@ async function main(): Promise<void> {
     await decayScanOnce(store);
     await realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message));
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
+    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
     if (tempiq) await tempiq.tick();
     if (tempiqRead) await tempiqRead.tick();
     if (tempiqWindows) await tempiqWindows.tick();
@@ -1797,6 +1799,10 @@ async function main(): Promise<void> {
       .then(() => decayScanOnce(store).then(() => {}))
       .then(() => (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN
         ? pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
+        : undefined))
+      // gtm#1616 Part B: the measured reheat rate TempIQ prices down-probe recovery from.
+      .then(() => (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN
+        ? pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
         : undefined))
       .then(() => checkI8())
       .then(() => realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message)))

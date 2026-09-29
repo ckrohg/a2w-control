@@ -582,6 +582,20 @@ export class Store {
   }
 
   /** Recent tank series with call flags — for quiet-window (decay) detection. */
+  /** gtm#1616: tank + outdoor series for the reheat-rate scan (tank-reheat-push.ts). */
+  async getRecentTankSeries(hours: number): Promise<{ ts: Date; tankF: number | null; outdoorF: number | null }[]> {
+    const res = await this.pool.query(
+      `SELECT ts, tank_f, outdoor_f FROM slx_readings
+       WHERE ts >= now() - ($1 || ' hours')::interval
+       ORDER BY ts ASC`,
+      [hours],
+    );
+    return res.rows.map((r) => ({
+      ts: new Date(r.ts),
+      tankF: r.tank_f == null ? null : Number(r.tank_f),
+      outdoorF: r.outdoor_f == null ? null : Number(r.outdoor_f),
+    }));
+  }
   async getRecentSeries(hours: number): Promise<
     { ts: Date; tankF: number | null; anyCall: boolean }[]
   > {
