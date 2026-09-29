@@ -139,6 +139,13 @@ proves insufficient.
 
 ## Deploys
 
+> 2026-09-29: Railway created no deployment for the #142 merge (657cd8a) — the docs push that
+> followed it minutes later was evaluated instead and SKIPPED ("no changes to watched files").
+> When a planner merge shows no deployment in `railway deployment list -s a2w-planner`, a
+> follow-up commit under `planner/**` (this note) is the sanctioned nudge — merged through
+> `scripts/deploy-gate.sh` like any other deploying change.
+
+
 Git-linked (2026-07-14): pushes to `main` touching `planner/**` auto-deploy this service
 on Railway. The hub only redeploys on `hub/**` changes; the Vercel mirror only rebuilds
 when `analytics-mirror/` changes. The Pi keeps its deliberate `release-*` tag flow.
