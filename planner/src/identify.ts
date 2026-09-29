@@ -172,6 +172,13 @@ export interface IdentDeps {
   notify: (title: string, body: string, priority?: string) => Promise<void>;
   isI1Violated: () => boolean;
   isStormActive: () => boolean;
+  /**
+   * The target the DEVICE commands right now, read fresh from SensorLinx (curve midpoint) — not the
+   * planner's last recorded config. writer.status() derives commanded_target_f from store.latestConfig(),
+   * which lags a foreign curve change by a poll (codex pass 7): cleanup must not re-command a base over
+   * a human's newer curve. null = could not read → cleanup fails closed (non-urgent).
+   */
+  liveCommandedTargetF: () => Promise<number | null>;
   /** Query knobs for the plan — the actuator tells TempIQ its own bounds. */
   planQuery?: { abortLatencyMin: number; dhwFloorF: number; plantCapF: number; identificationCapF: number };
   fetchImpl?: typeof fetch;
@@ -647,13 +654,13 @@ export class IdentificationDriver {
     //    fall through to overwriting a later human or auto-pilot command). If the status cannot be read,
     //    a non-urgent cleanup stays pending and retries; an urgent abort still restores the as-found
     //    curve — that write depends on no saved base and hotter is the safe direction.
-    const st = await this.d.writer.status().catch(() => null as Record<string, unknown> | null);
-    const commanded = st && typeof st.commanded_target_f === "number" && Number.isFinite(st.commanded_target_f as number) ? (st.commanded_target_f as number) : null;
+    const live = await this.d.liveCommandedTargetF().catch(() => null);
+    const commanded = live != null && Number.isFinite(live) ? live : null;
     if (commanded != null && Math.round(commanded) !== Math.round(w.targetF)) {
       return done(`plant no longer at the probe target (commanded ${commanded} °F, probe ${w.targetF} °F) — nothing to return`);
     }
     if (commanded == null && !urgent) {
-      return stillPending("commanded target unavailable — cannot confirm the plant is still at the probe target; not re-commanding blind");
+      return stillPending("live device curve unreadable — cannot confirm the plant is still at the probe target; not re-commanding blind");
     }
     // 1. The guarded re-command of the base. A 429 (rate limit) or any other 4xx guard rejection
     //    (422 envelope: the saved base may be outside I4 at the new outdoor; 409 I1; 423 lease) is

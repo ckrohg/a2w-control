@@ -1261,6 +1261,12 @@ const identification = IDENTIFICATION_ENABLED && autopilot && phaseB && demandFe
       baseUrl: TEMPIQ_BASE_URL, token: TEMPIQ_SURFACE_TOKEN, notify: ntfy,
       isI1Violated: () => i1Violated,
       isStormActive: () => stormState.kind !== "idle",
+      // Fresh from the device, not store.latestConfig(): the same midpoint writer.status() reports, but read
+      // now — so cleanup can never mistake a human's newer curve for the probe it wrote (codex pass 7).
+      liveCommandedTargetF: async () => {
+        const cfg = extractConfig(await slx.getDevice(BUILDING_ID, SYNC_CODE)) as { dbt?: unknown; mbt?: unknown };
+        return typeof cfg.dbt === "number" && typeof cfg.mbt === "number" ? Math.round((cfg.dbt + cfg.mbt) / 2) : null;
+      },
     }, IDENTIFICATION_MODE_SEED)
   : null;
 if (IDENTIFICATION_ENABLED && !identification) {
@@ -1353,6 +1359,43 @@ async function pollOnce(): Promise<void> {
   // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
   const config = extractConfig(dev);
   const prevConfig = await store.latestConfig();
+  // Record a FOREIGN curve change NOW — before any controller acts this poll — so store.latestConfig()
+  // (which writer.status() and the auto-pilot's "already commanded there" check read) is current.
+  // Previously this ran at the end of the poll, one full cycle behind the device (codex pass 7 on
+  // the identification driver: cleanup could re-command a base over a human's newer curve).
+  if (prevConfig === null) {
+    await store.insertConfigVersion(config, null);
+    console.log("seeded initial hbx_config_versions row");
+  } else {
+    // prevConfig was read just above, before this poll's own writes — so any diff is a FOREIGN
+    // writer (the planner records its own writes separately, via writes.ts patch()).
+    const changes = diffConfig(prevConfig, config);
+    if (changes) {
+      await store.insertConfigVersion(config, changes);
+      lastDriftAt = new Date().toISOString();
+      const summary = Object.entries(changes)
+        .map(([k, c]) => `${k}: ${c.old} -> ${c.new}`)
+        .join("\n");
+      // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
+      // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
+      // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
+      // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
+      const curveViolation = "dbt" in changes || "mbt" in changes;
+      if (curveViolation) {
+        console.warn(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${summary}`);
+        await ntfy(
+          "⚠ Foreign HBX curve write — single-writer invariant",
+          `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${summary}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).`,
+          "high",
+        );
+      } else {
+        console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
+        // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
+        // history and the /hbx page, not in a daily email that would dilute the warn tier.
+        await ntfy("HBX config changed (outside the planner)", summary, "high", { email: false });
+      }
+    }
+  }
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
@@ -1407,39 +1450,7 @@ async function pollOnce(): Promise<void> {
   }).catch((e) => console.error("controller status heartbeat failed:", (e as Error).message));
 
   await checkAdoption(reading, config as Record<string, number>).catch((e) => console.error("adoption check failed:", (e as Error).message));
-  if (prevConfig === null) {
-    await store.insertConfigVersion(config, null);
-    console.log("seeded initial hbx_config_versions row");
-  } else {
-    // prevConfig was read at the TOP of this poll, before our own writes — so any diff is a
-    // FOREIGN writer (the planner records its own writes separately, via writes.ts patch()).
-    const changes = diffConfig(prevConfig, config);
-    if (changes) {
-      await store.insertConfigVersion(config, changes);
-      lastDriftAt = new Date().toISOString();
-      const summary = Object.entries(changes)
-        .map(([k, c]) => `${k}: ${c.old} -> ${c.new}`)
-        .join("\n");
-      // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
-      // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
-      // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
-      // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
-      const curveViolation = "dbt" in changes || "mbt" in changes;
-      if (curveViolation) {
-        console.warn(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${summary}`);
-        await ntfy(
-          "⚠ Foreign HBX curve write — single-writer invariant",
-          `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${summary}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).`,
-          "high",
-        );
-      } else {
-        console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
-        // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
-        // history and the /hbx page, not in a daily email that would dilute the warn tier.
-        await ntfy("HBX config changed (outside the planner)", summary, "high", { email: false });
-      }
-    }
-  }
+
 }
 
 async function loop(): Promise<void> {

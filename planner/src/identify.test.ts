@@ -110,7 +110,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -167,6 +167,12 @@ async function main(): Promise<void> {
       notify: async (t, b) => { notes.push(t); },
       isI1Violated: () => over.i1 ?? false,
       isStormActive: () => false,
+      // the live device mirrors the last accepted write unless a test overrides it (a human moved the curve)
+      liveCommandedTargetF: over.liveCommanded ?? (async () => {
+        if (over.statusFailsAfterWrite && writes.length) throw new Error("SensorLinx unreachable");
+        const last = writes.at(-1);
+        return last ? last.targetF : (over.commanded === undefined ? 135 : over.commanded);
+      }),
       fetchImpl: (async (url: any, init: any) => {
         const u = String(url);
         if (u.includes("/identification-plan")) return { ok: true, status: 200, json: async () => over.plan ?? { generatedAt: now().toISOString(), cells: [] } } as any;
@@ -396,6 +402,21 @@ async function main(): Promise<void> {
     assert.equal(h.writes.length, 0, "nothing re-commanded");
     assert.equal(h.restores.length, 0);
   }
+  // 4f. Cleanup reads the LIVE device, not the planner's last recorded config (codex pass 7): a human moved the
+  //     curve between polls → the live curve is not the probe target → cleanup is done with no write.
+  {
+    let liveNow = 143; // starts at the probe target
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, liveCommanded: async () => liveNow });
+    await h.driver.tick(); await h.driver.tick();
+    assert.equal(h.rows[0].state, "active");
+    liveNow = 150; // a human wrote a hotter curve during the window
+    h.advance(121);
+    await h.driver.tick();
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /no longer at the probe target \(commanded 150/);
+    assert.equal(h.writes.length, 1, "the human's curve is left alone");
+    assert.equal(h.restores.length, 0);
+  }
   // 4e. Cleanup FAILS CLOSED when the device's commanded target cannot be read (codex pass 6): a non-urgent
   //     cleanup stays pending with no write and no restore; an urgent abort still restores (hotter is safe).
   {
@@ -406,7 +427,7 @@ async function main(): Promise<void> {
     await h.driver.tick();                                  // completed → cleanup cannot confirm → pending
     assert.equal(h.rows[0].state, "ended");
     assert.equal(h.rows[0].cleanupState, "pending");
-    assert.match(h.rows[0].cleanupDetail ?? "", /commanded target unavailable/);
+    assert.match(h.rows[0].cleanupDetail ?? "", /live device curve unreadable/);
     assert.equal(h.writes.length, 1, "no re-command without confirmation");
     assert.equal(h.restores.length, 0, "no blind restore for a non-urgent cleanup");
     for (let i = 0; i < 3; i++) await h.driver.tick();
