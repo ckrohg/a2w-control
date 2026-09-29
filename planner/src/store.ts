@@ -1117,6 +1117,77 @@ export class Store {
     return res.rows.map((r) => ({ ts: new Date(r.ts), tankF: Number(r.tank_f) }));
   }
 
+  /**
+   * #136: raise ONE block of the LATEST shadow plan in place (the block with this `ts`), so every
+   * reader of the plan — auto-pilot, Phase B lead, the poster, /health — sees the same raised target.
+   *
+   * ATOMIC and RAISES-ONLY by construction: a single conditional UPDATE whose WHERE (the stored block is
+   * still below `tank_target_f`) and SET (rebuilt from the row's own `plan`) are both evaluated on the
+   * row version the UPDATE locks — under READ COMMITTED a concurrent raise that committed first makes
+   * this one re-evaluate against the new version and no-op if it is no longer a raise. Two overlapping
+   * raises therefore leave the MAXIMUM, never a stale lower copy (codex, #149). If the hourly replan
+   * inserted a newer plan between our "latest" read and the update, the raise is re-applied to that
+   * plan under the same condition (it may already carry the floor from its own sample, in which case
+   * it is a no-op). A bank / pre-boost the floor overtakes loses its flag (one identity per block, #148).
+   */
+  async raiseLatestPlanBlock(
+    ts: string,
+    patch: { tank_target_f: number; hp1_setpoint_f: number; reason: string },
+    note: Record<string, unknown>,
+  ): Promise<{ applied: boolean; planId: number | null; movedToNewerPlan: boolean }> {
+    const patchJson = JSON.stringify({ tank_target_f: patch.tank_target_f, hp1_setpoint_f: patch.hp1_setpoint_f, reason: patch.reason });
+    // `from` is filled in SQL from the row's own block (the value the raise actually replaced), not from the caller.
+    const noteJson = JSON.stringify({ ts, to: patch.tank_target_f, ...note });
+    let movedToNewerPlan = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const latest = await this.pool.query(`SELECT id FROM shadow_plans ORDER BY computed_at DESC LIMIT 1`);
+      if (!latest.rowCount) return { applied: false, planId: null, movedToNewerPlan };
+      const id = latest.rows[0].id as number;
+      const res = await this.pool.query(
+        `UPDATE shadow_plans p SET
+           plan = (SELECT jsonb_agg(CASE WHEN e->>'ts' = $1 THEN ((e - 'bank' - 'boost') || $2::jsonb) ELSE e END ORDER BY o)
+                   FROM jsonb_array_elements(p.plan) WITH ORDINALITY AS t(e, o)),
+           meta = coalesce(p.meta, '{}'::jsonb)
+                  || jsonb_build_object('floor_raises', coalesce(p.meta->'floor_raises', '[]'::jsonb)
+                       || ($3::jsonb || jsonb_build_object('from', (SELECT (e->>'tank_target_f')::float8 FROM jsonb_array_elements(p.plan) e WHERE e->>'ts' = $1 LIMIT 1))))
+         WHERE p.id = $4
+           AND EXISTS (SELECT 1 FROM jsonb_array_elements(p.plan) e
+                       WHERE e->>'ts' = $1 AND (e->>'tank_target_f')::float8 < $5)
+         RETURNING p.id`,
+        [ts, patchJson, noteJson, id, patch.tank_target_f],
+      );
+      const applied = (res.rowCount ?? 0) > 0;
+      // Still the latest plan? If the hourly replan slipped a newer one in, apply there too.
+      const again = await this.pool.query(`SELECT id FROM shadow_plans ORDER BY computed_at DESC LIMIT 1`);
+      if (again.rows[0]?.id === id) return { applied, planId: id, movedToNewerPlan };
+      movedToNewerPlan = true;
+    }
+    return { applied: false, planId: null, movedToNewerPlan };
+  }
+
+  /**
+   * #136: the floor raises recorded in plan meta over the last `hours` — the PERSISTED history behind
+   * /health.demand_floor_cadence, so it survives a redeploy and expires without a later raise (codex).
+   */
+  async recentFloorRaises(hours: number): Promise<{ at: string; ts: string; from: number; to: number }[]> {
+    // The time filter on `at` is done here, not in SQL: a malformed `at` must drop that entry, never
+    // fail the whole read (a ::timestamptz cast would). Plans older than the window + 1 h cannot hold
+    // a raise inside it, so the row scan is bounded by computed_at.
+    const res = await this.pool.query(
+      `SELECT r AS raise
+       FROM shadow_plans p, jsonb_array_elements(coalesce(p.meta->'floor_raises', '[]'::jsonb)) AS r
+       WHERE p.computed_at >= now() - ($1 || ' hours')::interval - interval '1 hour'
+         AND jsonb_typeof(coalesce(p.meta->'floor_raises', '[]'::jsonb)) = 'array'`,
+      [hours],
+    );
+    const since = Date.now() - hours * 3600_000;
+    return res.rows
+      .map((row) => row.raise as { at?: unknown; ts?: unknown; from?: unknown; to?: unknown })
+      .filter((r) => r && typeof r.at === "string" && Number.isFinite(Date.parse(r.at)) && Date.parse(r.at) >= since && typeof r.ts === "string")
+      .map((r) => ({ at: String(r.at), ts: String(r.ts), from: Number(r.from), to: Number(r.to) }))
+      .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  }
+
   /** All shadow plans computed in the last N hours (ascending). */
   async recentPlans(hours: number): Promise<{ computedAt: Date; plan: any[] }[]> {
     const res = await this.pool.query(

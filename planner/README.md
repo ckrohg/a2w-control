@@ -20,6 +20,22 @@ writer** of the reset curve; see [§Single-writer invariant](#single-writer-inva
   consecutive poll failures, and recovery. Same topic the Pi/hub use.
 - `GET /health` → `{ok, lastPollAt, lastDriftAt, consecutiveFailures}` (503 when failing).
 
+## Demand-floor cadence (#136)
+
+The demand floor used to be computed once per shadow cycle (60 min) and escalate +6 °F per **cycle**;
+a zone starting to call at :05 waited up to an hour, then climbed at one step per hour. Now `pollOnce`
+runs `floorReCheckOnce` every `POLL_SECONDS` before Phase B: refresh the feed, advance each zone's
+**unbroken-calling minutes** by the elapsed time (capped at 15 min so a telemetry gap is not credited),
+propose the floor at the current outdoor, and if it exceeds the plan's current block by
+`FLOOR_RAISE_MIN_F` (3) raise that block **in place** (`store.raiseLatestPlanBlock`: raises only, band-
+clamped, never over a soak, only below the winter guard where the hourly plan applies the floor; a bank /
+pre-boost it overtakes loses its flag — one identity per block). Phase B and the auto-pilot read the plan
+on the same poll, so the pump setpoints lead and the write follows within the 15-minute write rate limit.
+Escalation is `ESCALATE_STEP_F` per elapsed **hour** after a free first hour — identical slope to the old
+per-cycle rule at a 60-minute cadence, unchanged by the 5-minute one (the issue's prerequisite). The
+hourly replan (DP, bank, soak, storm, pre-boost) is untouched; downward moves only ever happen there.
+`/health.demand_floor_cadence` shows the last check, floor vs block, the decision, and the raises in 24 h.
+
 ## DHW pre-boost (#135)
 
 The flat 120 °F DHW floor does not hold a hard draw: measured 2026-08-07, evening showers sagged the
@@ -130,6 +146,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
 | `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. `shadow` computes and stamps the curve and reports it at `/health.curve.plan_implies` (with `would_write`) but writes nothing — the step before `1` on a live auto-pilot. Default off = the flat per-hour target. |
+| `FLOOR_CADENCE` | no | `0` disables the per-poll demand-floor re-check (#136). Default on: every poll the floor is recomputed and, if it exceeds the plan's current block by ≥ 3 °F (below the winter guard, never over a soak, band-clamped), the block is raised in place so Phase B leads it and the auto-pilot writes it on the same poll. Raises only. Escalation is per elapsed HOUR of unbroken calling (was per cycle), so the cadence change does not steepen it. `/health.demand_floor_cadence`. |
 | *(forecast cache)* | — | The hourly plan reads open-meteo; on failure (HTTP 429 after a deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed) so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`; the plan's `meta.forecast_source` records which. No cache → the hour fails as before. |
 | `PORT` | no | Railway injects it; default 8080 |
 
