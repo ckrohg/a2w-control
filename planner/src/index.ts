@@ -40,6 +40,7 @@ import { DemandFeed, requiredAwtF, type FloorPolicy } from "./demand";
 import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
+import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -142,7 +143,12 @@ const capWatchStreaks = new Map<string, number>();
 // still calling after a full cycle is not keeping up at the current supply temp, whatever
 // the room telemetry says (demand.setpointF is null whenever a zone is off, and has never
 // been observed populated in a heating season — the policy must not depend on it).
-const zoneCallStreaks = new Map<string, number>();
+// #136: unbroken calling MINUTES per zone (was cycles) — advanced on every sample from the elapsed time.
+const zoneCallMinutes = new Map<string, number>();
+let lastCallSampleAt: number | null = null;
+/** #136: the demand floor is re-checked every poll and the current plan block raised in place when it lags. */
+const FLOOR_CADENCE_ENABLED = process.env.FLOOR_CADENCE !== "0";
+const floorCadence = { lastCheckAt: null as string | null, lastFloorF: null as number | null, lastBlockF: null as number | null, lastDecision: null as string | null, raises: [] as { at: string; ts: string; from: number; to: number }[] };
 let capWatchLatched = false;
 
 // Phase 3 v2: narrow daily auto-sanitize. The FIRST automated write to the pumps.
@@ -908,6 +914,62 @@ async function stormTick(): Promise<void> {
   await stormEvaluate(outage ? outage.hasActiveOutage : null);
 }
 
+/**
+ * #136: ONE definition of "the live demand floor now", shared by the hourly replan and the per-poll
+ * re-check: refresh the feed, advance the unbroken-calling clock by the ELAPSED time since the last
+ * sample (so escalation is per hour whatever the cadence), propose the floor at the current outdoor.
+ * learnedSupply (TempIQ#1632): the LIVE floor is evaluated at now-outdoor, so it may prefer TempIQ's
+ * learned per-zone reset curve; the DP's per-hour future floors stay on the local parametric model.
+ */
+async function sampleDemandFloor(outdoorHint: number | null): Promise<{ floor: ReturnType<DemandFeed["proposeFloor"]>; outdoorF: number | null }> {
+  if (!demandFeed) return { floor: null, outdoorF: null };
+  await demandFeed.refresh(); // never throws
+  const latest = await store.getLatestSlx().catch(() => null);
+  const outdoorF = latest?.outdoorF ?? outdoorHint;
+  const now = Date.now();
+  const elapsedMin = lastCallSampleAt == null ? 0 : (now - lastCallSampleAt) / 60_000;
+  lastCallSampleAt = now;
+  advanceCallMinutes(zoneCallMinutes, demandFeed.callingZoneIds(), elapsedMin);
+  const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF, undefined, true, DEMAND_FLOOR_POLICY, zoneCallMinutes) : null;
+  return { floor, outdoorF };
+}
+
+/**
+ * #136: the per-poll floor re-check. If the floor now exceeds the plan's CURRENT block by
+ * FLOOR_RAISE_MIN_F, raise that block in place (raises only, band-clamped, never over a soak, only
+ * below the winter guard where the hourly plan applies the floor) — the auto-pilot and Phase B read
+ * the plan on this same poll and act on it. The hourly replan is untouched.
+ */
+async function floorReCheckOnce(): Promise<void> {
+  if (!demandFeed || !FLOOR_CADENCE_ENABLED) return;
+  const { floor, outdoorF } = await sampleDemandFloor(lastThermal.outdoor_f);
+  floorCadence.lastCheckAt = new Date().toISOString();
+  floorCadence.lastFloorF = floor?.tankTargetF ?? null;
+  const plans = await store.recentPlans(6).catch(() => []);
+  const latest = plans.at(-1);
+  const nowMs = Date.now();
+  const block = latest?.plan?.filter((b: { ts: string }) => new Date(b.ts).getTime() <= nowMs).at(-1) ?? null;
+  floorCadence.lastBlockF = block ? Number(block.tank_target_f) : null;
+  const cfgLive = await store.latestConfig().catch(() => null);
+  const baseline = await store.baselineConfig().catch(() => null);
+  const cfg = curveOverridden(cfgLive, baseline) ? baseline : cfgLive;
+  const bandHiF = outdoorF != null ? bandFor(outdoorF, cfg, DEFAULT_OPTS.strictCapF).hi : DEFAULT_OPTS.strictCapF;
+  const d = decideFloorRaise({
+    block, floorF: floor?.tankTargetF ?? null, bindingZone: floor?.bindingZone ?? null, awtF: floor?.bindingAwtF ?? null,
+    outdoorF, winterGuardF: DEFAULT_OPTS.winterGuardF, bandHiF,
+  });
+  if (!d.raise) { floorCadence.lastDecision = d.why; return; }
+  const hp1 = Math.round(Math.min(Math.max(d.toF + DEFAULT_OPTS.i1MarginF, DEFAULT_OPTS.hpMinF), DEFAULT_OPTS.strictCapF + DEFAULT_OPTS.i1MarginF));
+  const ok = await store.raiseLatestPlanBlock(d.ts, { tank_target_f: d.toF, hp1_setpoint_f: hp1, reason: d.reason }, { at: floorCadence.lastCheckAt, binding_zone: floor?.bindingZone ?? null, awt_f: floor?.bindingAwtF ?? null }).catch((e) => { console.error("floor re-check: raise failed:", (e as Error).message); return false; });
+  floorCadence.lastDecision = ok ? `raised ${d.fromF} → ${d.toF}°F` : `raise refused by store (${d.fromF} → ${d.toF})`;
+  if (ok) {
+    floorCadence.raises.push({ at: floorCadence.lastCheckAt, ts: d.ts, from: d.fromF, to: d.toF });
+    const dayAgo = nowMs - 86_400_000;
+    floorCadence.raises = floorCadence.raises.filter((r) => Date.parse(r.at) >= dayAgo);
+    console.log(`[floor-cadence] raised the current block ${d.fromF} → ${d.toF}°F — ${d.reason}`);
+  }
+}
+
 /** The forecast the latest plan was built from: live, or the cache standing in for a failed fetch (/health.forecast). */
 let lastForecast: { source: "live" | "cached"; fetched_at: string; hours: number; error: string | null; at: string } | null = null;
 
@@ -947,20 +1009,8 @@ async function shadowOnce(): Promise<void> {
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
   let demandFloor: DemandFloor | null = null;
   if (demandFeed) {
-    await demandFeed.refresh(); // never throws
-    const latest = await store.getLatestSlx().catch(() => null);
-    const outdoorF = latest?.outdoorF ?? forecast[0]?.outdoorF ?? null;
-    // learnedSupply (TempIQ#1632): the LIVE floor is evaluated at now-outdoor, so it may
-    // prefer TempIQ's learned per-zone reset curve; the DP's per-hour future floors below
-    // stay on the local parametric model (the learned value is now-conditions only).
-    // Update call streaks BEFORE computing the floor so a zone that has been calling since
-    // last cycle escalates on this one. Zones that stopped calling reset to zero.
-    const callingNow = demandFeed.callingZoneIds();
-    if (callingNow !== null) {
-      for (const id of callingNow) zoneCallStreaks.set(id, (zoneCallStreaks.get(id) ?? 0) + 1);
-      for (const id of [...zoneCallStreaks.keys()]) if (!callingNow.includes(id)) zoneCallStreaks.delete(id);
-    }
-    const floor = outdoorF != null ? demandFeed.proposeFloor(outdoorF, undefined, true, DEMAND_FLOOR_POLICY, zoneCallStreaks) : null;
+    const outdoorHint = forecast[0]?.outdoorF ?? null;
+    const { floor, outdoorF } = await sampleDemandFloor(outdoorHint);
     // SHADOW (#33): what would the floor be if warm-adjacent zones borrowed heat? Logs only; the live
     // `demandFloor` below is untouched. Never throws / blocks the cycle.
     if (floor && ADJACENCY_SETBACK_SHADOW && TEMPIQ_SURFACE_TOKEN) {
@@ -1517,6 +1567,9 @@ async function pollOnce(): Promise<void> {
     identification.setMode(((IDENT_MODES as readonly string[]).includes(m) ? m : "off") as IdentMode);
   }
 
+  // #136: the demand floor is re-checked every poll and the current block raised in place BEFORE Phase B
+  // (so the pump setpoints lead the raised target on this same poll) and the auto-pilot (which writes it).
+  await floorReCheckOnce().catch((e) => console.error("floor re-check failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
   // The driver runs BETWEEN Phase B (which may be leading a probe target) and the auto-pilot (which
   // it holds for the window): a window opened here is respected by the auto-pilot in the same poll.
@@ -1668,6 +1721,8 @@ async function main(): Promise<void> {
             phase_b: phaseB
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
+            // #136: the per-poll floor re-check — last decision and the raises it made in the past 24 h.
+            demand_floor_cadence: { enabled: FLOOR_CADENCE_ENABLED && !!demandFeed, poll_seconds: POLL_SECONDS, min_raise_f: FLOOR_RAISE_MIN_F, ...floorCadence, raises_24h: floorCadence.raises.length },
             winter_solver: demandFeed
               ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
               : "off",

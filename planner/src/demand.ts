@@ -153,7 +153,9 @@ export function requiredAwtF(deliveryType: string, outdoorF: number, roomF = 68)
  */
 export const ESCALATE_DEADBAND_F = 0.5; // ignore sub-half-degree noise around setpoint
 export const ESCALATE_F_PER_DEG = 6;    // supply °F granted per °F of room deficit
-export const ESCALATE_STEP_F = 6;       // supply °F per extra cycle of unbroken calling
+export const ESCALATE_STEP_F = 6;       // supply °F per extra HOUR of unbroken calling (#136: per elapsed time, not per cycle)
+/** #136: the first hour of calling is free — that is normal operation, not evidence of under-supply. */
+export const ESCALATE_FREE_MIN = 60;
 
 /**
  * TWO independent kinds of evidence, because either can be missing:
@@ -161,9 +163,11 @@ export const ESCALATE_STEP_F = 6;       // supply °F per extra cycle of unbroke
  *  - room deficit (setpoint − room). Precise, but the live payload's `demand.setpointF` is
  *    null whenever a zone is off, and we have never seen it populated in a heating season.
  *    Never assume it will be there.
- *  - call persistence. A zone still calling after N consecutive planner cycles is BY
- *    DEFINITION not keeping up, whatever the telemetry says. This is the backstop that
- *    makes the policy safe when room data is absent, stale, or null.
+ *  - call persistence. A zone still calling after an hour of UNBROKEN calling is BY DEFINITION
+ *    not keeping up, whatever the telemetry says. This is the backstop that makes the policy
+ *    safe when room data is absent, stale, or null. Measured in MINUTES of unbroken calling
+ *    (#136), not planner cycles: the floor is now re-checked every poll, and a per-cycle step
+ *    would have turned +6 °F/h into +6 °F per 5 min.
  *
  * Whichever asks for more heat wins. With neither available the zone simply pays the cheap
  * local number, and the unconditional DHW floor plus HBX/backup-element remain underneath.
@@ -173,7 +177,7 @@ export function costFirstAwtF(
   learnedF: number | null,
   roomF: number | null,
   setpointF: number | null,
-  callStreak = 0, // consecutive cycles this zone has been calling (0 = not calling / unknown)
+  callMinutes = 0, // minutes this zone has been calling without a break (0 = not calling / unknown)
 ): { awtF: number | null; escalatedF: number; deficitF: number } {
   // No local model (non-hydronic) → nothing to floor on either path.
   if (localF === null) return { awtF: null, escalatedF: 0, deficitF: 0 };
@@ -181,9 +185,10 @@ export function costFirstAwtF(
   const ceilingF = learnedF ?? localF;
   const deficitF = roomF != null && setpointF != null ? setpointF - roomF : 0;
   const fromDeficit = deficitF > ESCALATE_DEADBAND_F ? deficitF * ESCALATE_F_PER_DEG : 0;
-  // First cycle of calling is free — that is just normal operation. Each ADDITIONAL
-  // unbroken cycle says the current supply temp is not getting the room there.
-  const fromStreak = Math.max(0, callStreak - 1) * ESCALATE_STEP_F;
+  // The first hour of calling is free — that is just normal operation. Every further hour of
+  // unbroken calling says the current supply temp is not getting the room there: +ESCALATE_STEP_F
+  // per elapsed hour, pro rata, so the slope is the same whether it is sampled hourly or every poll.
+  const fromStreak = (Math.max(0, callMinutes - ESCALATE_FREE_MIN) / 60) * ESCALATE_STEP_F;
   const bump = Math.max(fromDeficit, fromStreak);
   if (bump <= 0) {
     return { awtF: Math.min(localF, ceilingF), escalatedF: 0, deficitF: Math.max(0, deficitF) };
@@ -208,7 +213,7 @@ export function computeFloors(
   outdoorF: number,
   learnedSupply = false,
   policy: FloorPolicy = "escalate",
-  callStreaks?: Map<string, number> | null,
+  callMinutes?: Map<string, number> | null, // #136: unbroken calling minutes per zone id
 ): FloorResult {
   const perZone: ZoneFloor[] = zones.map((z) => {
     const localF = requiredAwtF(z.deliveryType, outdoorF);
@@ -222,7 +227,7 @@ export function computeFloors(
     let escalatedF = 0;
     let deficitF = 0;
     if (useLearned && policy === "escalate") {
-      const r = costFirstAwtF(localF, z.requiredSupplyF, z.roomF, z.setpointF, callStreaks?.get(z.id) ?? 0);
+      const r = costFirstAwtF(localF, z.requiredSupplyF, z.roomF, z.setpointF, callMinutes?.get(z.id) ?? 0);
       awtF = r.awtF; escalatedF = r.escalatedF; deficitF = r.deficitF;
     } else if (useLearned && policy === "learned") {
       awtF = z.requiredSupplyF as number;
@@ -431,12 +436,12 @@ export class DemandFeed {
     return this.cached;
   }
 
-  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null, learnedSupply = false, policy: FloorPolicy = "escalate", callStreaks?: Map<string, number> | null): FloorResult | null {
+  proposeFloor(outdoorF: number, callingZoneIds?: string[] | null, learnedSupply = false, policy: FloorPolicy = "escalate", callMinutes?: Map<string, number> | null): FloorResult | null {
     if (!this.isHealthy()) return null; // degraded mode: A2W never depends on TempIQ
     // Explicit arg wins (tests); otherwise ride the live call feed, falling back to the
     // conservative all-zones posture (null) when /calls is unhealthy.
     const calling = callingZoneIds !== undefined ? callingZoneIds : this.callingZoneIds();
-    return computeFloors(this.cached, calling ?? null, outdoorF, learnedSupply, policy, callStreaks);
+    return computeFloors(this.cached, calling ?? null, outdoorF, learnedSupply, policy, callMinutes);
   }
 
   status(): {

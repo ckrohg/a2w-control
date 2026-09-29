@@ -140,7 +140,9 @@ console.log("demand.test.ts: all assertions passed ✓");
   });
   const OUT = 30;
   const local = requiredAwtF("baseboard", OUT) as number;
-  const streaks = (n: number) => new Map([["bb", n]]);
+  // #136: the backstop is measured in unbroken-calling MINUTES (per elapsed hour), not planner cycles.
+  // streaks(n) = n hourly cycles of calling, expressed as minutes, so the assertions below keep their meaning.
+  const streaks = (n: number) => new Map([["bb", n * 60]]);
 
   const c1 = computeFloors([z({})], ["bb"], OUT, true, "escalate", streaks(1));
   assert.equal(c1.perZone[0].escalatedF, 0, "first calling cycle is free");
@@ -154,6 +156,15 @@ console.log("demand.test.ts: all assertions passed ✓");
   // Whichever evidence asks for MORE heat wins.
   const both = computeFloors([z({ roomF: 66, setpointF: 70 })], ["bb"], OUT, true, "escalate", streaks(2));
   assert.ok((both.bindingAwtF as number) >= (c2.bindingAwtF as number), "deficit and streak combine by max");
+  // #136 cadence invariance: 120 unbroken minutes escalate the same whether sampled hourly or every 5 min,
+  // and a partial hour escalates pro rata (65 min → +0.5 °F, not a full +6 step).
+  const perHour = computeFloors([z({})], ["bb"], OUT, true, "escalate", new Map([["bb", 120]]));
+  assert.equal(perHour.bindingAwtF, c2.bindingAwtF, "120 min == 2 hourly cycles");
+  const partial = computeFloors([z({})], ["bb"], OUT, true, "escalate", new Map([["bb", 65]]));
+  const base = computeFloors([z({})], ["bb"], OUT, true, "escalate", new Map([["bb", 60]]));
+  assert.ok((partial.bindingAwtF as number) > (base.bindingAwtF as number), "65 min escalates a little");
+  assert.ok((partial.bindingAwtF as number) - (base.bindingAwtF as number) <= 0.6, "…pro rata, not a full step");
+  assert.equal(computeFloors([z({})], ["bb"], OUT, true, "escalate", new Map([["bb", 59]])).bindingAwtF, base.bindingAwtF, "the first hour is free");
   console.log("demand.test.ts: #90 call-persistence backstop assertions passed ✓");
 }
 
