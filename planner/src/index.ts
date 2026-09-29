@@ -1919,20 +1919,23 @@ async function main(): Promise<void> {
     void tempiqWindows.tick();
     setInterval(() => void tempiqWindows.tick(), TEMPIQ_WINDOWS_EVERY_MIN * 60 * 1000);
   }
-  const shadowLoop = () =>
-    shadowOnce()
-      .then(() => scoreOnce())
-      .then(() => decayScanOnce(store).then(() => {}))
-      .then(() => (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN
-        ? pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
-        : undefined))
+  // Each hourly step runs on its own: a failed forecast fetch (open-meteo 429 after three deploys in an
+  // hour, 2026-09-29 19:2xZ) used to abort the whole chain, so the decay scan, both TempIQ pushes, the
+  // I8 check and the realized-savings engine all silently skipped an hour. None of them needs the plan.
+  const step = (label: string, fn: () => Promise<unknown>) =>
+    fn().then(() => {}, (e) => console.error(`${label} failed:`, (e as Error).message));
+  const shadowLoop = async () => {
+    await step("shadow", shadowOnce);
+    await step("score", scoreOnce);
+    await step("decay scan", () => decayScanOnce(store));
+    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) {
+      await step("tempiq-ua-push", () => pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
       // gtm#1616 Part B: the measured reheat rate TempIQ prices down-probe recovery from.
-      .then(() => (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN
-        ? pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN).then(() => {})
-        : undefined))
-      .then(() => checkI8())
-      .then(() => realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message)))
-      .catch((e) => console.error("shadow/score/decay/i8 failed:", (e as Error).message));
+      await step("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
+    }
+    await step("i8", checkI8);
+    await step("realized-savings", () => realized.computeAndStore());
+  };
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
 }
