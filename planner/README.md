@@ -106,6 +106,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
 | `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. `shadow` computes and stamps the curve and reports it at `/health.curve.plan_implies` (with `would_write`) but writes nothing — the step before `1` on a live auto-pilot. Default off = the flat per-hour target. |
+| *(forecast cache)* | — | The hourly plan reads open-meteo; on failure (HTTP 429 after a deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed) so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`; the plan's `meta.forecast_source` records which. No cache → the hour fails as before. |
 | `PORT` | no | Railway injects it; default 8080 |
 
 ## Deploy to Railway

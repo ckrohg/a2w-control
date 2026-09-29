@@ -266,6 +266,48 @@ export function parseForecastBody(body: unknown, nowMs: number): ForecastHour[] 
 }
 
 /** OpenMeteo hourly forecast, °F, local timezone (keyless, free). */
+/** How old a cached forecast may be and still stand in for a failed fetch (two open-meteo refresh cycles). */
+export const FORECAST_CACHE_MAX_AGE_MS = 6 * 3600_000;
+
+export interface ForecastResult {
+  hours: ForecastHour[];
+  source: "live" | "cached";
+  /** When the hours were fetched from open-meteo (for a cached result: the cache's fetch time). */
+  fetchedAt: Date;
+  /** The live fetch's failure, when the result is cached. */
+  error?: string;
+}
+
+/**
+ * Live forecast, else the last good one. A fetch failure (open-meteo returns HTTP 429 after a burst of
+ * deploys, each instance fetching on boot) used to abort the whole hourly step: no plan, no demand-floor
+ * refresh, a degraded feed for an hour — for a 48-hour forecast that changes little in an hour. Now the
+ * cached forecast (≤ maxAgeMs old, past hours trimmed the same way the live parser trims them) stands in
+ * and the plan records `forecast_source: "cached"`; only when there is no usable cache does the original
+ * error propagate. A live success refreshes the cache; a cache write failure never fails the step.
+ */
+export async function forecastWithFallback(
+  fetchLive: () => Promise<ForecastHour[]>,
+  cache: { load: () => Promise<{ fetchedAt: Date; hours: ForecastHour[] } | null>; save: (hours: ForecastHour[]) => Promise<void> },
+  nowMs: number,
+  maxAgeMs: number = FORECAST_CACHE_MAX_AGE_MS,
+): Promise<ForecastResult> {
+  try {
+    const hours = await fetchLive();
+    try { await cache.save(hours); } catch (e) { console.warn("forecast cache save failed:", (e as Error).message); }
+    return { hours, source: "live", fetchedAt: new Date(nowMs) };
+  } catch (e) {
+    const error = (e as Error).message;
+    let cached: { fetchedAt: Date; hours: ForecastHour[] } | null = null;
+    try { cached = await cache.load(); } catch (le) { console.warn("forecast cache load failed:", (le as Error).message); }
+    if (!cached || nowMs - cached.fetchedAt.getTime() > maxAgeMs) throw e;
+    const hours = cached.hours.filter((h) => h.ts.getTime() >= nowMs - 3600_000); // keep the current (partial) hour, like the live parser
+    if (hours.length === 0) throw e;
+    console.warn(`forecast fetch failed (${error}); using the cached forecast from ${cached.fetchedAt.toISOString()}`);
+    return { hours, source: "cached", fetchedAt: cached.fetchedAt, error };
+  }
+}
+
 export async function fetchForecast(lat: string, lon: string): Promise<ForecastHour[]> {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
