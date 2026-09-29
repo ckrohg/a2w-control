@@ -1120,24 +1120,47 @@ export class Store {
   /**
    * #136: raise ONE block of the LATEST shadow plan in place (the block with this `ts`), so every
    * reader of the plan — auto-pilot, Phase B lead, the poster, /health — sees the same raised target.
-   * Raises only (a patch that would lower the block is refused); records the raise in the plan meta.
-   * Returns false when there is no plan or no such block.
+   *
+   * ATOMIC and RAISES-ONLY by construction: a single conditional UPDATE whose WHERE (the stored block is
+   * still below `tank_target_f`) and SET (rebuilt from the row's own `plan`) are both evaluated on the
+   * row version the UPDATE locks — under READ COMMITTED a concurrent raise that committed first makes
+   * this one re-evaluate against the new version and no-op if it is no longer a raise. Two overlapping
+   * raises therefore leave the MAXIMUM, never a stale lower copy (codex, #149). If the hourly replan
+   * inserted a newer plan between our "latest" read and the update, the raise is re-applied to that
+   * plan under the same condition (it may already carry the floor from its own sample, in which case
+   * it is a no-op). A bank / pre-boost the floor overtakes loses its flag (one identity per block, #148).
    */
-  async raiseLatestPlanBlock(ts: string, patch: { tank_target_f: number; hp1_setpoint_f: number; reason: string }, note: Record<string, unknown>): Promise<boolean> {
-    const res = await this.pool.query(`SELECT id, plan, meta FROM shadow_plans ORDER BY computed_at DESC LIMIT 1`);
-    if (!res.rowCount) return false;
-    const row = res.rows[0];
-    const plan: any[] = Array.isArray(row.plan) ? row.plan : [];
-    const idx = plan.findIndex((b) => b && b.ts === ts);
-    if (idx < 0) return false;
-    const cur = Number(plan[idx].tank_target_f);
-    if (!(patch.tank_target_f > cur)) return false; // raises only
-    const next = { ...plan[idx], tank_target_f: patch.tank_target_f, hp1_setpoint_f: patch.hp1_setpoint_f, reason: patch.reason };
-    delete next.bank; delete next.boost; // a floor above a bank / pre-boost subsumes it (one identity per block, #148)
-    plan[idx] = next;
-    const meta = { ...(row.meta ?? {}), floor_raises: [...(((row.meta ?? {}) as any).floor_raises ?? []), { ts, from: cur, to: patch.tank_target_f, ...note }] };
-    await this.pool.query(`UPDATE shadow_plans SET plan = $1, meta = $2 WHERE id = $3`, [JSON.stringify(plan), JSON.stringify(meta), row.id]);
-    return true;
+  async raiseLatestPlanBlock(
+    ts: string,
+    patch: { tank_target_f: number; hp1_setpoint_f: number; reason: string },
+    note: Record<string, unknown>,
+  ): Promise<{ applied: boolean; planId: number | null; movedToNewerPlan: boolean }> {
+    const patchJson = JSON.stringify({ tank_target_f: patch.tank_target_f, hp1_setpoint_f: patch.hp1_setpoint_f, reason: patch.reason });
+    const noteJson = JSON.stringify({ ts, to: patch.tank_target_f, ...note });
+    let movedToNewerPlan = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const latest = await this.pool.query(`SELECT id FROM shadow_plans ORDER BY computed_at DESC LIMIT 1`);
+      if (!latest.rowCount) return { applied: false, planId: null, movedToNewerPlan };
+      const id = latest.rows[0].id as number;
+      const res = await this.pool.query(
+        `UPDATE shadow_plans p SET
+           plan = (SELECT jsonb_agg(CASE WHEN e->>'ts' = $1 THEN ((e - 'bank' - 'boost') || $2::jsonb) ELSE e END ORDER BY o)
+                   FROM jsonb_array_elements(p.plan) WITH ORDINALITY AS t(e, o)),
+           meta = coalesce(p.meta, '{}'::jsonb)
+                  || jsonb_build_object('floor_raises', coalesce(p.meta->'floor_raises', '[]'::jsonb) || $3::jsonb)
+         WHERE p.id = $4
+           AND EXISTS (SELECT 1 FROM jsonb_array_elements(p.plan) e
+                       WHERE e->>'ts' = $1 AND (e->>'tank_target_f')::float8 < $5)
+         RETURNING p.id`,
+        [ts, patchJson, noteJson, id, patch.tank_target_f],
+      );
+      const applied = (res.rowCount ?? 0) > 0;
+      // Still the latest plan? If the hourly replan slipped a newer one in, apply there too.
+      const again = await this.pool.query(`SELECT id FROM shadow_plans ORDER BY computed_at DESC LIMIT 1`);
+      if (again.rows[0]?.id === id) return { applied, planId: id, movedToNewerPlan };
+      movedToNewerPlan = true;
+    }
+    return { applied: false, planId: null, movedToNewerPlan };
   }
 
   /** All shadow plans computed in the last N hours (ascending). */

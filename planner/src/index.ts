@@ -960,8 +960,11 @@ async function floorReCheckOnce(): Promise<void> {
   });
   if (!d.raise) { floorCadence.lastDecision = d.why; return; }
   const hp1 = Math.round(Math.min(Math.max(d.toF + DEFAULT_OPTS.i1MarginF, DEFAULT_OPTS.hpMinF), DEFAULT_OPTS.strictCapF + DEFAULT_OPTS.i1MarginF));
-  const ok = await store.raiseLatestPlanBlock(d.ts, { tank_target_f: d.toF, hp1_setpoint_f: hp1, reason: d.reason }, { at: floorCadence.lastCheckAt, binding_zone: floor?.bindingZone ?? null, awt_f: floor?.bindingAwtF ?? null }).catch((e) => { console.error("floor re-check: raise failed:", (e as Error).message); return false; });
-  floorCadence.lastDecision = ok ? `raised ${d.fromF} → ${d.toF}°F` : `raise refused by store (${d.fromF} → ${d.toF})`;
+  const r = await store.raiseLatestPlanBlock(d.ts, { tank_target_f: d.toF, hp1_setpoint_f: hp1, reason: d.reason }, { at: floorCadence.lastCheckAt, binding_zone: floor?.bindingZone ?? null, awt_f: floor?.bindingAwtF ?? null }).catch((e) => { console.error("floor re-check: raise failed:", (e as Error).message); return { applied: false, planId: null, movedToNewerPlan: false }; });
+  const ok = r.applied;
+  floorCadence.lastDecision = ok
+    ? `raised ${d.fromF} → ${d.toF}°F${r.movedToNewerPlan ? " (on the plan the hourly replan had just inserted)" : ""}`
+    : `no-op: the block was already ≥ ${d.toF}°F when the update ran${r.movedToNewerPlan ? " (a newer plan arrived meanwhile)" : ""}`;
   if (ok) {
     floorCadence.raises.push({ at: floorCadence.lastCheckAt, ts: d.ts, from: d.fromF, to: d.toF });
     const dayAgo = nowMs - 86_400_000;
