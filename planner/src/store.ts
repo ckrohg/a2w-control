@@ -1170,18 +1170,22 @@ export class Store {
    * /health.demand_floor_cadence, so it survives a redeploy and expires without a later raise (codex).
    */
   async recentFloorRaises(hours: number): Promise<{ at: string; ts: string; from: number; to: number }[]> {
+    // The time filter on `at` is done here, not in SQL: a malformed `at` must drop that entry, never
+    // fail the whole read (a ::timestamptz cast would). Plans older than the window + 1 h cannot hold
+    // a raise inside it, so the row scan is bounded by computed_at.
     const res = await this.pool.query(
       `SELECT r AS raise
        FROM shadow_plans p, jsonb_array_elements(coalesce(p.meta->'floor_raises', '[]'::jsonb)) AS r
        WHERE p.computed_at >= now() - ($1 || ' hours')::interval - interval '1 hour'
-         AND (r->>'at')::timestamptz >= now() - ($1 || ' hours')::interval
-       ORDER BY (r->>'at')::timestamptz ASC`,
+         AND jsonb_typeof(coalesce(p.meta->'floor_raises', '[]'::jsonb)) = 'array'`,
       [hours],
     );
+    const since = Date.now() - hours * 3600_000;
     return res.rows
-      .map((row) => row.raise as { at?: string; ts?: string; from?: number; to?: number })
-      .filter((r) => r && typeof r.at === "string" && typeof r.ts === "string")
-      .map((r) => ({ at: String(r.at), ts: String(r.ts), from: Number(r.from), to: Number(r.to) }));
+      .map((row) => row.raise as { at?: unknown; ts?: unknown; from?: unknown; to?: unknown })
+      .filter((r) => r && typeof r.at === "string" && Number.isFinite(Date.parse(r.at)) && Date.parse(r.at) >= since && typeof r.ts === "string")
+      .map((r) => ({ at: String(r.at), ts: String(r.ts), from: Number(r.from), to: Number(r.to) }))
+      .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   }
 
   /** All shadow plans computed in the last N hours (ascending). */

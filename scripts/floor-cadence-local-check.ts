@@ -29,7 +29,7 @@ async function main() {
   const id = await latestId();
 
   // 1. a raise applies, records meta, keeps other blocks byte-identical
-  const r1 = await store.raiseLatestPlanBlock(tsIso, { tank_target_f: 128, hp1_setpoint_f: 133, reason: "binding zone: bb needs 124°F (re-check)" }, { at: "t1" });
+  const r1 = await store.raiseLatestPlanBlock(tsIso, { tank_target_f: 128, hp1_setpoint_f: 133, reason: "binding zone: bb needs 124°F (re-check)" }, { at: new Date().toISOString() });
   assert.equal(r1.applied, true); assert.equal(r1.planId, id);
   let row = await block(id);
   assert.equal(row.plan[0].tank_target_f, 128); assert.equal(row.plan[0].hp1_setpoint_f, 133);
@@ -38,15 +38,15 @@ async function main() {
   assert.equal(row.meta.floor_raises.length, 1); assert.equal(row.meta.floor_raises[0].to, 128);
 
   // 2. raises only: a lower or equal value is refused and changes nothing
-  const r2 = await store.raiseLatestPlanBlock(tsIso, { tank_target_f: 125, hp1_setpoint_f: 130, reason: "stale" }, { at: "t2" });
+  const r2 = await store.raiseLatestPlanBlock(tsIso, { tank_target_f: 125, hp1_setpoint_f: 130, reason: "stale" }, { at: new Date().toISOString() });
   assert.equal(r2.applied, false);
   row = await block(id);
   assert.equal(row.plan[0].tank_target_f, 128); assert.equal(row.meta.floor_raises.length, 1, "a refused raise records nothing");
 
   // 3. two overlapping raises: the maximum wins, both attempts are serialised by the row lock
   const [a, b] = await Promise.all([
-    store.raiseLatestPlanBlock(tsIso, { tank_target_f: 132, hp1_setpoint_f: 137, reason: "A" }, { at: "A" }),
-    store.raiseLatestPlanBlock(tsIso, { tank_target_f: 130, hp1_setpoint_f: 135, reason: "B" }, { at: "B" }),
+    store.raiseLatestPlanBlock(tsIso, { tank_target_f: 132, hp1_setpoint_f: 137, reason: "A" }, { at: new Date().toISOString() }),
+    store.raiseLatestPlanBlock(tsIso, { tank_target_f: 130, hp1_setpoint_f: 135, reason: "B" }, { at: new Date().toISOString() }),
   ]);
   row = await block(id);
   assert.equal(row.plan[0].tank_target_f, 132, "the higher raise stands whatever the order");
@@ -56,7 +56,7 @@ async function main() {
 
   // 4. a floor that overtakes a bank drops the flag (one identity per block)
   const ts2 = plan[1].ts;
-  const r4 = await store.raiseLatestPlanBlock(ts2, { tank_target_f: 130, hp1_setpoint_f: 135, reason: "binding zone: bb (re-check)" }, { at: "t4" });
+  const r4 = await store.raiseLatestPlanBlock(ts2, { tank_target_f: 130, hp1_setpoint_f: 135, reason: "binding zone: bb (re-check)" }, { at: new Date().toISOString() });
   assert.equal(r4.applied, true);
   row = await block(id);
   assert.equal(row.plan[1].bank, undefined); assert.equal(row.plan[1].tank_target_f, 130);
@@ -70,6 +70,12 @@ async function main() {
   const mine = hist.filter((h) => h.ts === tsIso || h.ts === ts2);
   assert.ok(mine.some((h) => h.to === 132) && mine.some((h) => h.to === 130 && h.ts === ts2), "history carries the raises with their targets");
   assert.ok(mine.every((h) => typeof h.at === "string" && Number.isFinite(h.from)), "every entry has at/from");
+  assert.equal(mine.find((h) => h.to === 128)?.from, 120, "'from' is the block value the raise replaced, recorded in SQL");
+  assert.equal(mine.find((h) => h.to === 132)?.from, b.applied ? 130 : 128, "…and follows the actual order of overlapping raises");
+  // a malformed `at` in meta drops that entry, never the read
+  await pool.query(`UPDATE shadow_plans SET meta = meta || jsonb_build_object('floor_raises', (meta->'floor_raises') || '[{"at":"not a time","ts":"x","from":1,"to":2}]'::jsonb) WHERE id = $1`, [id]);
+  const hist2 = await store.recentFloorRaises(24);
+  assert.ok(hist2.length >= mine.length && !hist2.some((h) => h.ts === "x"), "malformed entries are skipped");
 
   await pool.query(`DELETE FROM shadow_plans WHERE id = $1`, [id]);
   console.log("floor-cadence-local-check: all assertions passed");
