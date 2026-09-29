@@ -19,7 +19,7 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
-import { shapeCurve, curveOutputF } from "./curve";
+import { shapeCurve, curveOutputF, canShapeFromFeed } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
@@ -1200,7 +1200,15 @@ async function shadowOnce(): Promise<void> {
 
   // plan they already read. Degraded demand feed → conservative (all buffer-served zones) curve.
 
-  if (SHAPED_CURVE) try {
+  // Only a HEALTHY feed with buffer-served zones may shape the curve (codex pass 2): an empty or stale
+
+  // zone list would derive a floor-only curve and under-serve space heat exactly while TempIQ is down.
+
+  // Otherwise the blocks stay unstamped and the degraded-mode curve-mimic targets remain authoritative.
+
+  lastShapedCurve = null;
+
+  if (SHAPED_CURVE && demandFeed && canShapeFromFeed(demandFeed.isHealthy(), demandFeed.zones())) try {
 
     const wwsd = typeof (cfgLive as { wwsd?: unknown } | null)?.wwsd === "number" ? (cfgLive as { wwsd: number }).wwsd : 125;
 

@@ -3,7 +3,7 @@
  * npx tsx planner/src/curve.test.ts — exits non-zero on failure.
  */
 import assert from "node:assert/strict";
-import { shapeCurve, curveOutputF, sameCurve, demandTargetF, curveWriteGuard, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
+import { shapeCurve, curveOutputF, sameCurve, demandTargetF, curveWriteGuard, canShapeFromFeed, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
 import type { InsightZone } from "./demand";
 import { requiredAwtF, BUFFER_MARGIN_F } from "./demand";
 
@@ -130,7 +130,7 @@ main().catch((e) => { console.error(e); process.exit(1); });
 
 // ── #133 steps 3–4: Phase B's curve lead and the auto-pilot's curve decision (pure) ──
 import { curveLeadF } from "./phaseb";
-import { curveDecision } from "./autopilot";
+import { curveDecision, curveAlreadyInForce } from "./autopilot";
 
 (async () => {
   // Phase B leads the curve's output over now AND the next hour: a colder next hour raises the lead.
@@ -153,5 +153,17 @@ import { curveDecision } from "./autopilot";
   assert.equal(curveDecision({ reason: "DHW window floor" }).kind, "no_curve");
   assert.equal(curveDecision({ reason: "DHW window floor", shaped_curve: { dot: 20 } }).kind, "no_curve");
   assert.equal(curveDecision(null).kind, "no_curve");
+  // The held-curve comparison needs all FOUR endpoints — a wwsd drift must fall through to setCurve's 409.
+  const want = { dot: 20, wwsd: 125, dbt: 127, mbt: 120 } as any;
+  assert.equal(curveAlreadyInForce(want, { dot: 21, wwsd: 125, dbt: 128, mbt: 119 }), true);
+  assert.equal(curveAlreadyInForce(want, { dot: 20, wwsd: 110, dbt: 127, mbt: 120 }), false, "wwsd drift is not 'held'");
+  assert.equal(curveAlreadyInForce(want, { dot: 20, dbt: 127, mbt: 120 }), false, "missing wwsd is not 'held'");
+  assert.equal(curveAlreadyInForce(want, { dot: 25, wwsd: 125, dbt: 127, mbt: 120 }), false);
+  assert.equal(curveAlreadyInForce(want, null), false);
+  // A curve may be shaped only from a healthy feed with buffer-served zones.
+  assert.equal(canShapeFromFeed(true, zones), true);
+  assert.equal(canShapeFromFeed(false, zones), false, "stale feed");
+  assert.equal(canShapeFromFeed(true, []), false, "empty feed");
+  assert.equal(canShapeFromFeed(true, [z("kumo", "mini_split")]), false, "no buffer-served zone");
   console.log("curve.test.ts (phase B lead + autopilot decision): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
