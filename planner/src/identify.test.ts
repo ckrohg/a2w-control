@@ -152,8 +152,10 @@ async function main(): Promise<void> {
           restores.push(source); return { ok: true };
         },
         async status() {
-          const c = over.commanded === undefined ? 135 : over.commanded;
-          return { commanded_target_f: c, target_f: over.operative === undefined ? c : over.operative, adoption_pending: over.adoptionPending ?? false };
+          // the device commands the last ACCEPTED write when there was one, else the configured base
+          const last = writes.at(-1);
+          const c = last ? last.targetF : (over.commanded === undefined ? 135 : over.commanded);
+          return { commanded_target_f: c, target_f: last ? last.targetF : (over.operative === undefined ? c : over.operative), adoption_pending: over.adoptionPending ?? false };
         },
       } as any,
       autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false } as any,
@@ -376,6 +378,22 @@ async function main(): Promise<void> {
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
     assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#1", capF: 135 }]);
+  }
+  // 4d. Cleanup is a NO-OP when the device no longer commands the probe target (a legacy/backfilled row, or
+  //     something else already moved the plant) — codex pass 4.
+  {
+    const legacy: IdentWindow = {
+      id: 1, createdAt: new Date(T0.getTime() - 300 * 60_000), state: "ended", arm: "probe", direction: "up", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 8, baseF: 135, targetF: 143, capF: 145, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 200 * 60_000),
+      endedAt: new Date(T0.getTime() - 80 * 60_000), endReason: "completed", durationMin: 120, writeId: 40, writeAccepted: true, dryRun: false,
+      postedOpen: true, postedClosed: true, cell: null, safeToProbe: null, armingTicks: 0, writeAttempts: 1, cleanupState: "pending", cleanupDetail: null, cleanupAttempts: 0,
+    };
+    const h = harness({ plan: upPlan, commanded: 135, seedRows: [legacy], lastEnd: new Date(T0.getTime() - 80 * 60_000) });
+    await h.driver.tick();
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /no longer at the probe target/);
+    assert.equal(h.writes.length, 0, "nothing re-commanded");
+    assert.equal(h.restores.length, 0);
   }
   // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope) falls back to
   //     the as-found restore immediately instead of retrying the impossible command forever…

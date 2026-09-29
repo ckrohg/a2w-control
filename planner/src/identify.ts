@@ -642,6 +642,13 @@ export class IdentificationDriver {
       }
       return null;
     };
+    // 0. Is there anything to return? If the device no longer commands this window's probe target — a
+    //    later window, the auto-pilot, or a human already moved it — cleanup is a no-op. This is what
+    //    makes replaying cleanup for a legacy/backfilled row safe (codex pass 4).
+    const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
+    if (typeof st.commanded_target_f === "number" && Math.round(st.commanded_target_f as number) !== Math.round(w.targetF)) {
+      return done(`plant no longer at the probe target (commanded ${st.commanded_target_f} °F, probe ${w.targetF} °F) — nothing to return`);
+    }
     // 1. The guarded re-command of the base. A 429 (rate limit) or any other 4xx guard rejection
     //    (422 envelope: the saved base may be outside I4 at the new outdoor; 409 I1; 423 lease) is
     //    PERMANENT for this tick — retrying it forever would leave the plant at the probe target

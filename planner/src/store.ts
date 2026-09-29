@@ -303,6 +303,13 @@ export class Store {
       ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_attempts integer NOT NULL DEFAULT 0;
       ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS write_accepted   boolean NOT NULL DEFAULT false;
       UPDATE identification_windows SET write_accepted = true WHERE write_id IS NOT NULL AND NOT write_accepted;
+      -- …and the NEWEST already-ended live probe that predates cleanup tracking enters the cleanup queue
+      -- (codex pass 4: a backfilled write_accepted row with cleanup_state 'none' was never cleaned). Only
+      -- the newest can still be operative; cleanup() itself checks the device and is a no-op when the
+      -- plant has since moved on.
+      UPDATE identification_windows SET cleanup_state = 'pending'
+        WHERE id = (SELECT max(id) FROM identification_windows
+                    WHERE state = 'ended' AND arm = 'probe' AND NOT dry_run AND write_id IS NOT NULL AND cleanup_state = 'none');
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
