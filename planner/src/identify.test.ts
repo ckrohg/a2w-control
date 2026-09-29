@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import {
-  pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload,
+  pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource,
   IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps,
 } from "./identify";
 import { WriteError } from "./writes";
@@ -110,7 +110,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedSince?: { id: number; ts: Date; targetF: number | null } | null; seedRows?: IdentWindow[] }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[] }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -132,8 +132,11 @@ async function main(): Promise<void> {
       async updateIdentificationWindow(id, patch) { Object.assign(rows.find((r) => r.id === id)!, patch); },
       async unpostedIdentificationWindows() { return rows.filter((r) => !r.dryRun && ((r.state === "ended" && !r.postedClosed) || (r.state === "active" && !r.postedOpen))); },
       async cleanupPendingIdentificationWindows() { return rows.filter((r) => r.state === "ended" && r.cleanupState === "pending"); },
-      async latestAcceptedWriteId() { return 99; },
-      async acceptedIdentificationWriteSince() { return over.acceptedSince ?? null; },
+      async acceptedWriteFor(source) {
+        if (over.acceptedFor && source in over.acceptedFor) return over.acceptedFor[source];
+        // after a successful fake write, the audit row for that source exists
+        return writes.some((x) => x.source === source) ? { id: 99, ts: now(), targetF: writes.find((x) => x.source === source)!.targetF } : null;
+      },
       async windowStats() { return { achievedAwtF: 140, compliance: 0.8, outdoorLowF: 38, outdoorHighF: 42, samples: 20 }; },
     };
     const deps: IdentDeps = {
@@ -198,7 +201,7 @@ async function main(): Promise<void> {
     await h.driver.tick();                 // arming
     await h.driver.tick();                 // covered → write
     assert.equal(h.rows[0].state, "active");
-    assert.deepEqual(h.writes, [{ targetF: 143, source: "identification", capF: 145 }]);
+    assert.deepEqual(h.writes, [{ targetF: 143, source: "identification#1", capF: 145 }]);
     assert.equal(h.rows[0].writeId, 99);
     assert.equal(h.posts.length, 1);
     assert.equal(h.posts[0].body.windows[0].externalId, "a2w-ident-1");
@@ -218,7 +221,7 @@ async function main(): Promise<void> {
     assert.equal(h.posts[1].body.windows[0].achievedAwtF, 140);
     assert.equal(h.rows[0].postedClosed, true);
     // the driver returns the plant to its base ITSELF (codex critical): a guarded re-command of baseF
-    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end", capF: 135 });
+    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end#1", capF: 135 });
     assert.equal(h.rows[0].cleanupState, "done");
     assert.match(h.rows[0].cleanupDetail ?? "", /re-commanded base 135/);
     assert.equal(h.restores.length, 0, "the base re-command succeeded, so no as-found restore");
@@ -249,14 +252,14 @@ async function main(): Promise<void> {
     const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], writeFails: [null, 429] });
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
-    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#1", capF: 135 }]);
     assert.equal(h.rows[0].zoneIds.includes("z-lr"), true);
     assert.equal(h.posts.length, 1, "posted open after the ACCEPTED write");
     h.advance(10);
     await h.driver.tick();
     assert.equal(h.rows[0].state, "ended");
     assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
-    assert.deepEqual(h.restores, ["identification-abort"]);
+    assert.deepEqual(h.restores, ["identification-abort#1"]);
     assert.equal(h.rows[0].cleanupState, "done");
     assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
     assert.ok(h.notes.includes("Identification probe aborted"));
@@ -273,7 +276,7 @@ async function main(): Promise<void> {
     assert.match(h.rows[0].cleanupDetail ?? "", /re-command failed/);
     await h.driver.tick();                                  // cleanupPending retries → succeeds
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end", capF: 135 });
+    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end#1", capF: 135 });
   }
   // 5. Rate limit (codex high): a 429 keeps the row in pending_write — NOT posted, NOT active — and is
   //    retried on the next ticks; it becomes active (startedAt = acceptance) only once a write is accepted.
@@ -290,7 +293,7 @@ async function main(): Promise<void> {
     h.advance(5); await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
     assert.equal(h.rows[0].startedAt!.getTime(), T0.getTime() + 10 * 60_000, "startedAt is the acceptance, not the draw");
-    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#1", capF: 135 }]);
     assert.equal(h.posts.length, 1);
   }
   {
@@ -312,7 +315,7 @@ async function main(): Promise<void> {
       durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
       armingTicks: 0, writeAttempts: 3, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
-    const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed], acceptedSince: { id: 77, ts: new Date(T0.getTime() - 4 * 60_000), targetF: 124 } });
+    const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed], acceptedFor: { "identification#1": { id: 77, ts: new Date(T0.getTime() - 4 * 60_000), targetF: 124 } } });
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active", "promoted, not retried");
     assert.equal(h.rows[0].writeId, 77);
@@ -337,7 +340,29 @@ async function main(): Promise<void> {
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
     assert.equal(h.rows[0].writeAccepted, true);
+    assert.equal(h.rows[0].writeId, null, "no audit row is ours — none is attached");
     assert.equal(h.writes.length, 0);
+  }
+  // 5e. An UNRELATED accepted identification write (another window's token, or a ±1 °F neighbour) does NOT
+  //     reconcile this window (codex pass 3, high): it retries its own write instead.
+  {
+    const seed: IdentWindow = {
+      id: 2, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    };
+    const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed], acceptedFor: {
+      "identification#1": { id: 50, ts: new Date(T0.getTime() - 3 * 60_000), targetF: 125 }, // another window's write, 1 °F off
+    } });
+    await h.driver.tick();
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#2", capF: 135 }], "wrote its own probe");
+    assert.equal(h.rows[0].writeId, 99);
+  }
+  {
+    assert.equal(probeSource(7), "identification#7");
+    assert.equal(cleanupSource(7, true), "identification-abort#7");
+    assert.equal(cleanupSource(7, false), "identification-end#7");
   }
   // 5d. A pending_write row with NO accepted write and a base still commanded simply retries (the normal path).
   {
@@ -350,7 +375,7 @@ async function main(): Promise<void> {
     const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed] });
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
-    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#1", capF: 135 }]);
   }
   // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope) falls back to
   //     the as-found restore immediately instead of retrying the impossible command forever…
@@ -360,7 +385,7 @@ async function main(): Promise<void> {
     h.advance(121);
     await h.driver.tick();
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.deepEqual(h.restores, ["identification-end"]);
+    assert.deepEqual(h.restores, ["identification-end#1"]);
     assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
   }
   // …transient failures (5xx) are retried, but after CLEANUP_TRANSIENT_MAX the restore is used anyway…
@@ -375,7 +400,7 @@ async function main(): Promise<void> {
     assert.equal(h.rows[0].cleanupAttempts, 5);
     await h.driver.tick();                       // attempt 6 → permanent by count → restore
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.deepEqual(h.restores, ["identification-end"]);
+    assert.deepEqual(h.restores, ["identification-end#1"]);
   }
   // …and while ANY live probe is still unreturned, no new window opens.
   {

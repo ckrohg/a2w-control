@@ -265,7 +265,7 @@ export class TempiqWindowPoster {
             restores++;
             continue;
           }
-          if (w.source === "identification" || w.source === "identification-abort") {
+          if (w.source.startsWith("identification")) {
             // A randomised probe (identify.ts) is posted by the driver itself as kind awt_identification
             // WITH its drawn assignment — the only kind U4 may fit. Filing the same minutes here as a
             // quarantine window would delete the one fittable interval. It still closes the previous

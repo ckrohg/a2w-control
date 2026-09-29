@@ -155,9 +155,8 @@ export interface IdentStore {
   updateIdentificationWindow(id: number, patch: Partial<Omit<IdentWindow, "id">>): Promise<void>;
   unpostedIdentificationWindows(): Promise<IdentWindow[]>;
   cleanupPendingIdentificationWindows(): Promise<IdentWindow[]>;
-  latestAcceptedWriteId(source: string): Promise<number | null>;
-  /** The newest ACCEPTED identification write at or after `since` — the audit row a crashed tick may have left behind. */
-  acceptedIdentificationWriteSince(since: Date): Promise<{ id: number; ts: Date; targetF: number | null } | null>;
+  /** The ACCEPTED audit row for THIS window's probe write, if any — exact, by the per-window source token. */
+  acceptedWriteFor(source: string): Promise<{ id: number; ts: Date; targetF: number | null } | null>;
   windowStats(from: Date, to: Date | null, commandedTargetF: number | null): Promise<{ achievedAwtF: number | null; compliance: number | null; outdoorLowF: number | null; outdoorHighF: number | null; samples: number }>;
 }
 
@@ -181,6 +180,15 @@ export interface IdentDeps {
 }
 
 // ─────────────────────────────────────────────── pure decision helpers ───────────────────────────
+
+/**
+ * The audit `source` of a window's writes carries the window id, so a restart can correlate an
+ * accepted write to EXACTLY this window (codex 2026-09-29 pass 3: matching by time and ±1 °F could
+ * adopt an unrelated identification write and file it as this window's evidence). The quarantine
+ * poster skips every source starting with "identification".
+ */
+export const probeSource = (windowId: number) => `identification#${windowId}`;
+export const cleanupSource = (windowId: number, urgent: boolean) => `${urgent ? "identification-abort" : "identification-end"}#${windowId}`;
 
 /** Top safe, owner-verified, unidentified cell whose band contains the current outdoor. */
 export function pickCell(plan: IdentPlan, outdoorF: number): PlanCell | null {
@@ -488,15 +496,19 @@ export class IdentificationDriver {
     // write — promote the window instead of retrying (a retry would 429, read as terminal, and the
     // plant would sit at the probe target with no cleanup and no record).
     if (!w.dryRun) {
-      const acc = await this.d.store.acceptedIdentificationWriteSince(w.createdAt);
-      if (acc && (acc.targetF == null || Math.abs(acc.targetF - w.targetF) <= 1)) {
+      // Exact: the audit row carries this window's own source token, and the target must parse and
+      // equal what this window commands. Nothing else is this window's write.
+      const acc = await this.d.store.acceptedWriteFor(probeSource(w.id));
+      if (acc && acc.targetF != null && Math.round(acc.targetF) === Math.round(w.targetF)) {
         await this.promoteToActive(w, acc.id, acc.ts, `reconciled from audit row #${acc.id} after a restart`);
         return;
       }
-      // Belt to that brace: the device already commands the probe target though no audit row matched.
+      // The one gap the audit cannot cover: the device accepted the PATCH and the process died before
+      // patch() inserted its audit row. The commanded target then equals the probe target exactly.
+      // Treat the write as accepted so cleanup runs — but attach NO write id: none is ours.
       const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
-      if (typeof st.commanded_target_f === "number" && Math.abs((st.commanded_target_f as number) - w.targetF) <= 1) {
-        await this.promoteToActive(w, await this.d.store.latestAcceptedWriteId("identification"), this.now(), "reconciled from the commanded target after a restart");
+      if (typeof st.commanded_target_f === "number" && Math.round(st.commanded_target_f as number) === Math.round(w.targetF)) {
+        await this.promoteToActive(w, null, this.now(), "reconciled from the commanded target after a restart (no audit row — the process died inside the write)");
         return;
       }
     }
@@ -525,7 +537,7 @@ export class IdentificationDriver {
     await this.d.store.updateIdentificationWindow(w.id, { writeAttempts: attempts });
     w.writeAttempts = attempts;
     try {
-      await this.d.writer.setTarget(w.targetF, "identification", w.capF);
+      await this.d.writer.setTarget(w.targetF, probeSource(w.id), w.capF);
     } catch (e) {
       if (e instanceof WriteError && e.status === 429 && attempts < WRITE_RETRY_MAX) {
         // Stays pending_write: the next poll retries. Nothing is posted — an unwritten arm is not evidence.
@@ -535,7 +547,7 @@ export class IdentificationDriver {
       await this.end(w, `write_rejected:${e instanceof WriteError ? e.status : "error"}:${(e as Error).message.slice(0, 80)}`);
       return;
     }
-    const writeId = await this.d.store.latestAcceptedWriteId("identification");
+    const writeId = (await this.d.store.acceptedWriteFor(probeSource(w.id)))?.id ?? null;
     const startedAt = this.now();
     await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt, writeId, writeAccepted: true });
     w.state = "active"; w.startedAt = startedAt; w.writeId = writeId; w.writeAccepted = true;
@@ -637,7 +649,7 @@ export class IdentificationDriver {
     //    retried up to CLEANUP_TRANSIENT_MAX before the restore is used anyway.
     let permanent = urgent;
     try {
-      await this.d.writer.setTarget(w.baseF, "identification-end", DEFAULT_OPTS.strictCapF);
+      await this.d.writer.setTarget(w.baseF, cleanupSource(w.id, false), DEFAULT_OPTS.strictCapF);
       return await done(`re-commanded base ${w.baseF} °F`);
     } catch (e) {
       const status = e instanceof WriteError ? e.status : 0;
@@ -646,7 +658,7 @@ export class IdentificationDriver {
     }
     // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
     try {
-      await this.d.writer.restore(urgent ? "identification-abort" : "identification-end");
+      await this.d.writer.restore(cleanupSource(w.id, urgent));
       return await done(`as-found curve restored (base re-command refused${urgent ? "; abort" : ""})`);
     } catch (e) {
       return stillPending(`restore failed: ${(e as Error).message.slice(0, 120)}`);

@@ -295,6 +295,14 @@ export class Store {
         cleanup_attempts integer NOT NULL DEFAULT 0,
         write_accepted   boolean NOT NULL DEFAULT false
       );
+      -- Columns added after the table's first cut (codex pass 3: CREATE TABLE IF NOT EXISTS never
+      -- alters an existing table). Idempotent; the backfill marks any already-written probe as
+      -- accepted so its cleanup is not skipped on upgrade.
+      ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_state    text NOT NULL DEFAULT 'none';
+      ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_detail   text;
+      ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_attempts integer NOT NULL DEFAULT 0;
+      ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS write_accepted   boolean NOT NULL DEFAULT false;
+      UPDATE identification_windows SET write_accepted = true WHERE write_id IS NOT NULL AND NOT write_accepted;
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
@@ -959,13 +967,13 @@ export class Store {
     const r = await this.pool.query(`SELECT * FROM identification_windows ORDER BY id DESC LIMIT $1`, [n]);
     return r.rows.map((x) => this.rowToIdentWindow(x));
   }
-  /** identify.ts restart reconciliation: the newest accepted identification write at/after `since`. */
-  async acceptedIdentificationWriteSince(since: Date): Promise<{ id: number; ts: Date; targetF: number | null } | null> {
+  /** identify.ts: the ACCEPTED audit row for one window's probe write, by its per-window source token (exact). */
+  async acceptedWriteFor(source: string): Promise<{ id: number; ts: Date; targetF: number | null } | null> {
     const r = await this.pool.query(
       `SELECT id, ts, detail FROM hbx_writes
-       WHERE source = 'identification' AND action = 'set_target' AND result = 'accepted' AND ts >= $1
+       WHERE source = $1 AND action = 'set_target' AND result = 'accepted'
        ORDER BY id DESC LIMIT 1`,
-      [since],
+      [source],
     );
     if (!r.rowCount) return null;
     const m = String(r.rows[0].detail ?? "").match(/^target (-?\d+(?:\.\d+)?)°F commanded/);
