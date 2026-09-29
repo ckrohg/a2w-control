@@ -289,7 +289,9 @@ export class Store {
         cell             jsonb,
         safe_to_probe    jsonb,
         arming_ticks     integer NOT NULL DEFAULT 0,
-        write_attempts   integer NOT NULL DEFAULT 0
+        write_attempts   integer NOT NULL DEFAULT 0,
+        cleanup_state    text NOT NULL DEFAULT 'none',
+        cleanup_detail   text
       );
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
@@ -897,10 +899,11 @@ export class Store {
       endReason: r.end_reason == null ? null : String(r.end_reason), durationMin: Number(r.duration_min),
       writeId: num(r.write_id), dryRun: r.dry_run === true, postedOpen: r.posted_open === true, postedClosed: r.posted_closed === true,
       cell: r.cell ?? null, safeToProbe: r.safe_to_probe ?? null, armingTicks: Number(r.arming_ticks ?? 0), writeAttempts: Number(r.write_attempts ?? 0),
+      cleanupState: (r.cleanup_state ?? "none") as IdentWindow["cleanupState"], cleanupDetail: r.cleanup_detail == null ? null : String(r.cleanup_detail),
     };
   }
   async openIdentificationWindow(): Promise<IdentWindow | null> {
-    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state IN ('arming','active') ORDER BY id DESC LIMIT 1`);
+    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state IN ('arming','pending_write','active') ORDER BY id DESC LIMIT 1`);
     return r.rowCount ? this.rowToIdentWindow(r.rows[0]) : null;
   }
   async lastIdentificationWindowEnd(): Promise<Date | null> {
@@ -911,11 +914,13 @@ export class Store {
     const r = await this.pool.query(
       `INSERT INTO identification_windows
          (state, arm, direction, zone_ids, band_lo, band_hi, magnitude_f, base_f, target_f, cap_f, draw_probability, draw_seed,
-          started_at, ended_at, end_reason, duration_min, write_id, dry_run, posted_open, posted_closed, cell, safe_to_probe, arming_ticks, write_attempts)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,
+          started_at, ended_at, end_reason, duration_min, write_id, dry_run, posted_open, posted_closed, cell, safe_to_probe, arming_ticks, write_attempts,
+          cleanup_state, cleanup_detail)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) RETURNING id`,
       [w.state, w.arm, w.direction, w.zoneIds, w.bandLo, w.bandHi, w.magnitudeF, w.baseF, w.targetF, w.capF, w.drawProbability, w.drawSeed,
        w.startedAt, w.endedAt, w.endReason, w.durationMin, w.writeId, w.dryRun, w.postedOpen, w.postedClosed,
-       JSON.stringify(w.cell ?? null), JSON.stringify(w.safeToProbe ?? null), w.armingTicks, w.writeAttempts],
+       JSON.stringify(w.cell ?? null), JSON.stringify(w.safeToProbe ?? null), w.armingTicks, w.writeAttempts,
+       w.cleanupState ?? "none", w.cleanupDetail ?? null],
     );
     return Number(r.rows[0].id);
   }
@@ -923,6 +928,7 @@ export class Store {
     const cols: Record<string, string> = {
       state: "state", endedAt: "ended_at", endReason: "end_reason", startedAt: "started_at", writeId: "write_id",
       postedOpen: "posted_open", postedClosed: "posted_closed", armingTicks: "arming_ticks", writeAttempts: "write_attempts",
+      cleanupState: "cleanup_state", cleanupDetail: "cleanup_detail",
     };
     const sets: string[] = []; const vals: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) {
@@ -939,6 +945,11 @@ export class Store {
        WHERE NOT dry_run AND ((state = 'ended' AND NOT posted_closed) OR (state = 'active' AND NOT posted_open))
        ORDER BY id LIMIT 20`,
     );
+    return r.rows.map((x) => this.rowToIdentWindow(x));
+  }
+  /** Ended LIVE probes whose plant has not been confirmed back at base (identify.ts cleanup retry). */
+  async cleanupPendingIdentificationWindows(): Promise<IdentWindow[]> {
+    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state = 'ended' AND cleanup_state = 'pending' ORDER BY id LIMIT 5`);
     return r.rows.map((x) => this.rowToIdentWindow(x));
   }
   async recentIdentificationWindows(n: number): Promise<IdentWindow[]> {

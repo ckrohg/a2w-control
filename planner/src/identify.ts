@@ -49,7 +49,16 @@ import { detectDrawTimes } from "./dhw";
 export type IdentMode = "off" | "shadow" | "armed";
 export type IdentArm = "probe" | "hold";
 export type IdentDirection = "up" | "down";
-export type IdentState = "arming" | "active" | "ended";
+/**
+ * arming        up-probe waiting for Phase B to lead the setpoints (no write yet)
+ * pending_write the arm is drawn and the target is due, but the write has not been ACCEPTED yet
+ *               (a 429 rate limit retries here; codex 2026-09-29 high: a rate-limited down-probe
+ *               used to sit in 'active' with nothing written and close as "completed")
+ * active        the target is on the device (or it is a hold arm) — the window is running and posted
+ * ended         closed; `cleanupState` says whether the plant has been returned to its base
+ */
+export type IdentState = "arming" | "pending_write" | "active" | "ended";
+export type CleanupState = "none" | "pending" | "done";
 
 export const IDENT_MODES: readonly IdentMode[] = ["off", "shadow", "armed"];
 const PLAN_REFRESH_MIN = 60;          // the plan is hourly-grained; a stale plan is not re-drawn against
@@ -114,6 +123,14 @@ export interface IdentWindow {
   safeToProbe: unknown;
   armingTicks: number;
   writeAttempts: number;
+  /**
+   * Returning the plant to its base after a LIVE probe is the driver's job, not the auto-pilot's
+   * (codex 2026-09-29 critical: with the auto-pilot in shadow a completed 145 °F probe stayed
+   * commanded indefinitely). 'pending' retries every tick until a guarded re-command of baseF —
+   * or, when the rate limit refuses it, the as-found restore — is confirmed.
+   */
+  cleanupState: CleanupState;
+  cleanupDetail: string | null;
 }
 
 /** The store surface the driver needs — structural so the assertion suite can hand it a fake. */
@@ -127,6 +144,7 @@ export interface IdentStore {
   insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number>;
   updateIdentificationWindow(id: number, patch: Partial<Omit<IdentWindow, "id">>): Promise<void>;
   unpostedIdentificationWindows(): Promise<IdentWindow[]>;
+  cleanupPendingIdentificationWindows(): Promise<IdentWindow[]>;
   latestAcceptedWriteId(source: string): Promise<number | null>;
   windowStats(from: Date, to: Date | null, commandedTargetF: number | null): Promise<{ achievedAwtF: number | null; compliance: number | null; outdoorLowF: number | null; outdoorHighF: number | null; samples: number }>;
 }
@@ -134,7 +152,7 @@ export interface IdentStore {
 export interface IdentDeps {
   store: IdentStore;
   writer: Pick<HbxWriter, "setTarget" | "restore" | "status">;
-  autopilot: Pick<AutoPilot, "setHold">;
+  autopilot: Pick<AutoPilot, "setHold" | "isDryRun">;
   phaseB: Pick<PhaseB, "setProbeTarget">;
   demandFeed: Pick<DemandFeed, "zones" | "refresh" | "isHealthy">;
   hub: Pick<HubClient, "getState">;
@@ -318,12 +336,14 @@ export class IdentificationDriver {
   async tick(): Promise<void> {
     this.lastTickAt = this.now().toISOString();
     try {
+      await this.cleanupPending();
       await this.postPending();
       const open = await this.d.store.openIdentificationWindow();
       this.currentWindow = open;
       if (open) {
         if (this.mode === "off") { await this.end(open, "mode_off"); return; }
         if (open.state === "arming") await this.continueArming(open);
+        else if (open.state === "pending_write") await this.continuePendingWrite(open);
         else await this.continueActive(open);
         return;
       }
@@ -346,6 +366,9 @@ export class IdentificationDriver {
     if (this.d.isI1Violated()) { this.lastResult = "idle: I1 violated"; return; }
     if (this.d.isStormActive()) { this.lastResult = "idle: storm armed/active"; return; }
     if (await this.d.store.activeBoost()) { this.lastResult = "idle: boost active"; return; }
+    // ARMED identification needs the auto-pilot LIVE: it is what returns the plant to its plan after a
+    // window, and the explicit cleanup below is the belt to that brace, not a replacement for it.
+    if (this.mode === "armed" && this.d.autopilot.isDryRun) { this.lastResult = "idle: auto-pilot is in shadow — armed identification requires it live (Off/Armed switch)"; return; }
     const lastEnd = await this.d.store.lastIdentificationWindowEnd();
     if (lastEnd && nowMs - lastEnd.getTime() < MIN_GAP_MIN * 60_000) { this.lastResult = `idle: ${Math.round((MIN_GAP_MIN * 60_000 - (nowMs - lastEnd.getTime())) / 60_000)} min until the next window may open`; return; }
     const plans = await this.d.store.recentPlans(6);
@@ -356,10 +379,18 @@ export class IdentificationDriver {
     this.eligibleNow = this.plan.cells.filter((c) => c.status === "unidentified" && c.suggest?.safeToProbe.ok && c.deliveryTypeSource === "owner_verified" && slx.outdoorF! >= c.band[0] && slx.outdoorF! < c.band[1]).length;
     if (!cell || !cell.suggest) { this.lastResult = `idle: no safe cell for ${slx.outdoorF} °F outdoor`; return; }
 
-    // The base is what the auto-pilot commands NOW; TempIQ's estimate is the fallback.
+    // The base is the target the device is ACTUALLY driving to (temp1.target), and only when the last
+    // command has been adopted: commanded and operative differ until the next reheat cycle, and a
+    // window opened on a pending command records a base the plant never delivered and gets an
+    // unlabelled transition mid-window (codex 2026-09-29 high). TempIQ's estimate is never the base
+    // of a real window — with no settled operative target there is no window.
     const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
     const commanded = typeof st.commanded_target_f === "number" ? (st.commanded_target_f as number) : null;
-    const baseF = commanded ?? Math.round(cell.suggest.baseAwtF);
+    const operative = typeof st.target_f === "number" ? (st.target_f as number) : null;
+    if (st.adoption_pending === true) { this.lastResult = `idle: last command (${commanded ?? "?"} °F) not yet adopted (operative ${operative ?? "?"} °F) — base not settled`; return; }
+    if (operative == null || !Number.isFinite(operative)) { this.lastResult = "idle: no operative tank target from SensorLinx — base unknown"; return; }
+    if (commanded != null && Math.abs(commanded - operative) > 3) { this.lastResult = `idle: commanded ${commanded} °F vs operative ${operative} °F disagree — base not settled`; return; }
+    const baseF = Math.round(operative);
     const tgt = probeTarget({
       direction: cell.suggest.direction, baseF, magnitudeF: cell.suggest.magnitudeF,
       dhwFloorF: this.planQuery.dhwFloorF, strictCapF: this.planQuery.plantCapF, identificationCapF: this.planQuery.identificationCapF,
@@ -370,13 +401,14 @@ export class IdentificationDriver {
     const zoneIds = [...new Set(this.plan.cells.filter((c) => c.status !== "not_probeable" || c.deliveryTypeSource === "owner_verified").map((c) => c.zoneId))];
     const dryRun = this.mode === "shadow";
     const row: Omit<IdentWindow, "id"> = {
-      state: arm === "hold" || cell.suggest.direction === "down" ? "active" : "arming",
+      state: arm === "hold" ? "active" : cell.suggest.direction === "down" ? "pending_write" : "arming",
       arm, direction: cell.suggest.direction, zoneIds, bandLo: cell.band[0], bandHi: cell.band[1],
       magnitudeF: tgt.stepF, baseF, targetF: arm === "probe" ? tgt.targetF : baseF, capF: tgt.capF,
       drawProbability: cell.suggest.assignmentProbability, drawSeed: seed,
       startedAt: this.now(), endedAt: null, endReason: null, durationMin: cell.suggest.durationMin,
       writeId: null, dryRun, postedOpen: false, postedClosed: false,
       cell, safeToProbe: cell.suggest.safeToProbe, armingTicks: 0, writeAttempts: 0,
+      cleanupState: "none", cleanupDetail: null,
     };
     const id = await this.d.store.insertIdentificationWindow(row);
     const w: IdentWindow = { id, ...row };
@@ -425,6 +457,17 @@ export class IdentificationDriver {
       this.lastResult = `arming #${w.id}: setpoints not yet ≥ ${w.targetF + DEFAULT_OPTS.i1MarginF} °F (tick ${ticks}/${ARMING_MAX_TICKS})`;
       return;
     }
+    await this.d.store.updateIdentificationWindow(w.id, { state: "pending_write" });
+    w.state = "pending_write";
+    await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
+  }
+
+  /** A drawn probe whose write has not been accepted yet: retry (429) or give up (limit reached). */
+  private async continuePendingWrite(w: IdentWindow): Promise<void> {
+    // Keep the hold and the Phase B lead alive while the write is pending.
+    this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
+    if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
+    if (this.d.isI1Violated() || this.d.isStormActive()) { await this.end(w, "aborted:before_write"); return; }
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
   }
 
@@ -444,6 +487,7 @@ export class IdentificationDriver {
       await this.d.writer.setTarget(w.targetF, "identification", w.capF);
     } catch (e) {
       if (e instanceof WriteError && e.status === 429 && attempts < WRITE_RETRY_MAX) {
+        // Stays pending_write: the next poll retries. Nothing is posted — an unwritten arm is not evidence.
         this.lastResult = `rate-limited writing ${w.targetF} °F for #${w.id} — retry next poll (${attempts}/${WRITE_RETRY_MAX})`;
         return;
       }
@@ -494,21 +538,69 @@ export class IdentificationDriver {
     const endedAt = this.now();
     this.d.phaseB.setProbeTarget(null);
     this.d.autopilot.setHold(null, "");
-    // A down-probe that had to abort restores the as-found curve NOW: the one write the rate limit
-    // never blocks, and hotter is the safe direction. The auto-pilot re-commands its plan afterwards.
-    if (reason.startsWith("aborted:") && w.arm === "probe" && w.direction === "down" && !w.dryRun && w.state === "active") {
-      try { await this.d.writer.restore("identification-abort"); }
-      catch (e) { console.error(`[identify] restore after abort failed: ${(e as Error).message}`); }
-    }
-    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason });
-    w.state = "ended"; w.endedAt = endedAt; w.endReason = reason;
+    // A LIVE probe (a write was accepted) must be returned to its base by THIS driver — the auto-pilot
+    // is not assumed to be live, and even live it may be rate-limited or rejected. Durable: 'pending'
+    // is retried every tick until confirmed (codex 2026-09-29 critical).
+    const wasLive = w.arm === "probe" && !w.dryRun && w.writeId != null;
+    const cleanupState: CleanupState = wasLive ? "pending" : "none";
+    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState });
+    w.state = "ended"; w.endedAt = endedAt; w.endReason = reason; w.cleanupState = cleanupState;
     this.currentWindow = null;
     this.lastResult = `ended #${w.id} (${reason})`;
     console.log(`[identify] ${this.lastResult}`);
+    const cleaned = wasLive ? await this.cleanup(w, reason.startsWith("aborted:")) : null;
     if (reason.startsWith("aborted:") && !w.dryRun) {
-      await this.d.notify("Identification probe aborted", `#${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F: ${reason}`, "high");
+      await this.d.notify("Identification probe aborted", `#${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F: ${reason}${wasLive ? (cleaned ? ` — ${cleaned}` : " — plant NOT yet returned to base; retrying every poll") : ""}`, "high");
     }
-    await this.postClose(w);
+    // Only a window that HAPPENED is closed on TempIQ: a hold arm (opened at the draw) or a probe whose
+    // write was accepted. A probe that never got written is not evidence of anything — posting it
+    // would file an awt_identification window with an assignment and no perturbation behind it.
+    if (w.arm === "hold" || w.writeId != null) {
+      await this.postClose(w);
+    } else if (!w.dryRun) {
+      await this.d.store.updateIdentificationWindow(w.id, { postedOpen: true, postedClosed: true }); // nothing to post
+      w.postedOpen = true; w.postedClosed = true;
+    }
+  }
+
+  /**
+   * Return the plant to the window's base. First choice: a guarded re-command of baseF through the
+   * same writer (I4/I1/rate limit/audit). When the rate limit refuses it — an abort inside 15 min of
+   * the probe write — fall back to the as-found restore, the one write the rate limit never blocks;
+   * for a down-probe abort that is the safe direction and for an up-probe it is only cost. Any other
+   * failure stays 'pending' and is retried next tick.
+   */
+  private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
+    const done = async (detail: string): Promise<string> => {
+      await this.d.store.updateIdentificationWindow(w.id, { cleanupState: "done", cleanupDetail: detail });
+      w.cleanupState = "done"; w.cleanupDetail = detail;
+      console.log(`[identify] cleanup #${w.id}: ${detail}`);
+      return detail;
+    };
+    const stillPending = async (detail: string): Promise<null> => {
+      await this.d.store.updateIdentificationWindow(w.id, { cleanupDetail: detail });
+      w.cleanupDetail = detail;
+      console.error(`[identify] cleanup #${w.id}: ${detail} — will retry`);
+      return null;
+    };
+    try {
+      await this.d.writer.setTarget(w.baseF, "identification-end", DEFAULT_OPTS.strictCapF);
+      return await done(`re-commanded base ${w.baseF} °F`);
+    } catch (e) {
+      const rateLimited = e instanceof WriteError && e.status === 429;
+      if (!rateLimited && !urgent) return stillPending(`re-command failed: ${(e as Error).message.slice(0, 120)}`);
+    }
+    try {
+      await this.d.writer.restore(urgent ? "identification-abort" : "identification-end");
+      return await done(`as-found curve restored (rate limit refused the base re-command${urgent ? "; abort" : ""})`);
+    } catch (e) {
+      return stillPending(`restore failed: ${(e as Error).message.slice(0, 120)}`);
+    }
+  }
+
+  private async cleanupPending(): Promise<void> {
+    const rows = await this.d.store.cleanupPendingIdentificationWindows();
+    for (const w of rows) await this.cleanup(w, false);
   }
 
   // ── TempIQ posting (fail-soft; unposted rows are retried each tick) ──

@@ -109,7 +109,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null> }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number }) {
     const rows: IdentWindow[] = [];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -130,6 +130,7 @@ async function main(): Promise<void> {
       async insertIdentificationWindow(w) { const id = rows.length + 1; rows.push({ id, ...w }); return id; },
       async updateIdentificationWindow(id, patch) { Object.assign(rows.find((r) => r.id === id)!, patch); },
       async unpostedIdentificationWindows() { return rows.filter((r) => !r.dryRun && ((r.state === "ended" && !r.postedClosed) || (r.state === "active" && !r.postedOpen))); },
+      async cleanupPendingIdentificationWindows() { return rows.filter((r) => r.state === "ended" && r.cleanupState === "pending"); },
       async latestAcceptedWriteId() { return 99; },
       async windowStats() { return { achievedAwtF: 140, compliance: 0.8, outdoorLowF: 38, outdoorHighF: 42, samples: 20 }; },
     };
@@ -141,10 +142,16 @@ async function main(): Promise<void> {
           if (f != null) throw new WriteError(f, f === 429 ? "rate limited" : "rejected");
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
-        async restore(source: string) { restores.push(source); return { ok: true }; },
-        async status() { return { commanded_target_f: over.commanded === undefined ? 135 : over.commanded }; },
+        async restore(source: string) {
+          if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
+          restores.push(source); return { ok: true };
+        },
+        async status() {
+          const c = over.commanded === undefined ? 135 : over.commanded;
+          return { commanded_target_f: c, target_f: over.operative === undefined ? c : over.operative, adoption_pending: over.adoptionPending ?? false };
+        },
       } as any,
-      autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); } } as any,
+      autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false } as any,
       phaseB: { setProbeTarget: (t) => { probeTargets.push(t); } } as any,
       demandFeed: { zones: () => over.zones ?? [], refresh: async () => {}, isHealthy: () => true } as any,
       hub: { getState: async () => ({ pumps: [{ id: "pump1", online: true, setpoint_c: ((over.pumpsCoverF ?? 150) - 32) * 5 / 9 }] }) } as any,
@@ -208,7 +215,11 @@ async function main(): Promise<void> {
     assert.equal(typeof h.posts[1].body.windows[0].endedAt, "string");
     assert.equal(h.posts[1].body.windows[0].achievedAwtF, 140);
     assert.equal(h.rows[0].postedClosed, true);
-    assert.equal(h.restores.length, 0, "a completed up-probe restores nothing — the auto-pilot re-plans");
+    // the driver returns the plant to its base ITSELF (codex critical): a guarded re-command of baseF
+    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end", capF: 135 });
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /re-commanded base 135/);
+    assert.equal(h.restores.length, 0, "the base re-command succeeded, so no as-found restore");
   }
   // 2. Arming times out after ARMING_MAX_TICKS without setpoint coverage.
   {
@@ -230,40 +241,64 @@ async function main(): Promise<void> {
     assert.equal(h.posts[0].body.windows[0].assignment.arm, "hold");
     assert.equal(h.posts[0].body.windows[0].commandedTargetF, 135);
   }
-  // 4. DOWN probe: writes immediately; a room deficit aborts it, RESTORES the as-found curve, and posts the close.
+  // 4. DOWN probe: pending_write → written → active; a room deficit aborts it; the base re-command is
+  //    rate-limited (inside 15 min of the probe write) so the as-found curve is RESTORED; close posted.
   {
-    const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }] });
+    const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], writeFails: [null, 429] });
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
     assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
     assert.equal(h.rows[0].zoneIds.includes("z-lr"), true);
+    assert.equal(h.posts.length, 1, "posted open after the ACCEPTED write");
     h.advance(10);
     await h.driver.tick();
     assert.equal(h.rows[0].state, "ended");
     assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
     assert.deepEqual(h.restores, ["identification-abort"]);
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
     assert.ok(h.notes.includes("Identification probe aborted"));
     assert.equal(h.posts.length, 2);
   }
-  // 5. Rate limit: 429 retries on later ticks, then gives up after WRITE_RETRY_MAX.
+  // 4b. Cleanup is DURABLE: a re-command that fails for a non-rate-limit reason stays pending and is retried on later ticks.
   {
-    const h = harness({ plan: downPlan, commanded: 130, writeFails: [429, 429] });
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 503, null] });
+    await h.driver.tick(); await h.driver.tick();          // arming → active
+    h.advance(121);
+    await h.driver.tick();                                  // completed; re-command fails 503 → pending
+    assert.equal(h.rows[0].state, "ended");
+    assert.equal(h.rows[0].cleanupState, "pending");
+    assert.match(h.rows[0].cleanupDetail ?? "", /re-command failed/);
+    await h.driver.tick();                                  // cleanupPending retries → succeeds
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.deepEqual(h.writes.at(-1), { targetF: 135, source: "identification-end", capF: 135 });
+  }
+  // 5. Rate limit (codex high): a 429 keeps the row in pending_write — NOT posted, NOT active — and is
+  //    retried on the next ticks; it becomes active (startedAt = acceptance) only once a write is accepted.
+  {
+    const h = harness({ plan: downPlan, commanded: 130, writeFails: [429, 429, null] });
     await h.driver.tick();
-    assert.equal(h.rows[0].state, "active"); // down-probes go straight to active state, write pending
+    assert.equal(h.rows[0].state, "pending_write");
     assert.equal(h.writes.length, 0);
+    assert.equal(h.posts.length, 0, "an unwritten arm is not evidence");
     assert.match(h.driver.status().lastResult ?? "", /rate-limited/);
-    await h.driver.tick(); // second 429 — still active, still no write
-    assert.equal(h.writes.length, 0);
+    h.advance(5); await h.driver.tick();
+    assert.equal(h.rows[0].state, "pending_write");
+    assert.equal(h.rows[0].writeAttempts, 2);
+    h.advance(5); await h.driver.tick();
+    assert.equal(h.rows[0].state, "active");
+    assert.equal(h.rows[0].startedAt!.getTime(), T0.getTime() + 10 * 60_000, "startedAt is the acceptance, not the draw");
+    assert.deepEqual(h.writes, [{ targetF: 124, source: "identification", capF: 135 }]);
+    assert.equal(h.posts.length, 1);
   }
   {
     const h = harness({ plan: downPlan, commanded: 130, writeFails: [429, 429, 429] });
     await h.driver.tick(); await h.driver.tick(); await h.driver.tick();
-    // NB: a down-probe row is 'active' from the draw, so its writes are attempted from continueActive?
-    // No — writes happen in maybeStart (first tick) and the row stays state=active with writeAttempts;
-    // the retry path is exercised through writeProbe only on the first tick. Pin the contract we DO
-    // have: the third consecutive 429 ends the window as write_rejected.
-    const r = h.rows[0];
-    assert.ok(r.writeAttempts >= 1);
+    assert.equal(h.rows[0].state, "ended");
+    assert.match(h.rows[0].endReason ?? "", /^write_rejected:429/);
+    assert.equal(h.posts.length, 0, "never written → never posted");
+    assert.equal(h.rows[0].cleanupState, "none", "nothing was written, nothing to return");
+    assert.equal(h.restores.length, 0);
   }
   // 6. A non-429 rejection (I4 envelope 422) ends the window immediately, no restore (nothing was written).
   {
@@ -303,6 +338,26 @@ async function main(): Promise<void> {
     assert.match((await (async () => { const h = harness({ plan: upPlan, lastEnd: new Date(T0.getTime() - 10 * 60_000) }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /until the next window/);
     assert.match((await (async () => { const h = harness({ plan: upPlan, commanded: 144 }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /would be < 3/);
     assert.match((await (async () => { const h = harness({ plan: upPlan, outdoorF: 55 }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /no safe cell/);
+    // codex: the base must be the SETTLED operative target
+    assert.match((await (async () => { const h = harness({ plan: upPlan, commanded: 135, operative: 128, adoptionPending: true }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /not yet adopted/);
+    assert.match((await (async () => { const h = harness({ plan: upPlan, commanded: 135, operative: 128 }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /disagree/);
+    assert.match((await (async () => { const h = harness({ plan: upPlan, commanded: 135, operative: null }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /no operative tank target/);
+    // codex: ARMED identification requires the auto-pilot live
+    assert.match((await (async () => { const h = harness({ plan: upPlan, autopilotDryRun: true }); await h.driver.tick(); return h.driver.status().lastResult!; })()), /auto-pilot is in shadow/);
+    // …but SHADOW identification does not
+    {
+      const h = harness({ plan: upPlan, autopilotDryRun: true, mode: "shadow" });
+      await h.driver.tick();
+      assert.equal(h.rows.length, 1);
+      assert.equal(h.rows[0].dryRun, true);
+    }
+    // the base is the OPERATIVE target (settled), so a 2 °F commanded/operative gap uses the operative
+    {
+      const h = harness({ plan: upPlan, commanded: 135, operative: 133, pumpsCoverF: 150 });
+      await h.driver.tick();
+      assert.equal(h.rows[0].baseF, 133);
+      assert.equal(h.rows[0].targetF, 141);
+    }
   }
   // 10. The plan is fetched with the actuator's bounds as query knobs.
   {
