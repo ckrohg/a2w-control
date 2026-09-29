@@ -9,6 +9,7 @@
  */
 
 import { Pool } from "pg";
+import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { HbxConfig, FieldChange } from "./drift";
 
 export interface SlxReading {
@@ -254,6 +255,18 @@ export class Store {
         hour timestamptz PRIMARY KEY,
         kwh  real NOT NULL,
         updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      -- a2w#137: which accepted curve writes have been posted to TempIQ as perturbation windows
+      -- (tempiq-windows.ts). closed_at NULL = the window is still OPEN on TempIQ's side and will be
+      -- re-posted with its closing fields once a later write or a foreign curve change ends it.
+      -- last_error records a per-window validation rejection (deterministic — not retried).
+      CREATE TABLE IF NOT EXISTS tempiq_window_posts (
+        write_id    integer PRIMARY KEY,
+        external_id text NOT NULL,
+        kind        text NOT NULL,
+        posted_at   timestamptz NOT NULL DEFAULT now(),
+        closed_at   timestamptz,
+        last_error  text
       );
     `);
   }
@@ -727,6 +740,121 @@ export class Store {
     await this.pool.query(
       `INSERT INTO hbx_writes (source, action, requested, result, detail) VALUES ($1,$2,$3,$4,$5)`,
       [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail],
+    );
+  }
+
+  /**
+   * a2w#137: accepted curve writes that still need a TempIQ post — never posted, or posted OPEN and
+   * now closable. Each row carries its closer (the next accepted set_target/restore, or the next
+   * FOREIGN dbt/mbt change the drift detector recorded — a config version without `_source`) and
+   * the correlates the classifier needs. Only the newest accepted write can lack a closer, so a
+   * posted-open row without one is at most a single row and is filtered out here, not re-posted.
+   */
+  async pendingCurveWrites(limit: number): Promise<PendingCurveWrite[]> {
+    const res = await this.pool.query(
+      `WITH w AS (
+         SELECT h.id, h.ts, h.source, h.action, h.requested, h.detail, p.write_id AS posted_id,
+                NULLIF(substring(h.detail from '^target (-?[0-9]+)'), '')::real AS commanded_f,
+                LEAST(
+                  (SELECT s.ts FROM hbx_writes s
+                     WHERE s.id > h.id AND s.result = 'accepted' AND s.action IN ('set_target','restore')
+                     ORDER BY s.id LIMIT 1),
+                  (SELECT v.observed_at FROM hbx_config_versions v
+                     WHERE v.observed_at > h.ts
+                       AND (v.changed_fields ? 'dbt' OR v.changed_fields ? 'mbt')
+                       AND NOT (v.changed_fields ? '_source')
+                     ORDER BY v.observed_at LIMIT 1)
+                ) AS closed_at
+         FROM hbx_writes h
+         LEFT JOIN tempiq_window_posts p ON p.write_id = h.id
+         WHERE h.result = 'accepted' AND h.action IN ('set_target','restore')
+           AND (p.write_id IS NULL OR p.closed_at IS NULL)
+       )
+       SELECT w.*,
+              (SELECT a.reason FROM autopilot_log a
+                 WHERE a.result = 'set'
+                   AND a.ts BETWEEN w.ts - interval '24 hours' AND w.ts + interval '10 seconds'
+                   AND (w.commanded_f IS NULL OR a.target_f IS NULL OR abs(a.target_f - w.commanded_f) <= 0.5)
+                 ORDER BY a.ts DESC LIMIT 1) AS reason,
+              EXISTS (SELECT 1 FROM storm_events e
+                        WHERE e.started_at <= w.ts AND (e.ended_at IS NULL OR e.ended_at >= w.ts)) AS storm_active,
+              EXISTS (SELECT 1 FROM hbx_boosts b
+                        WHERE b.created_at BETWEEN w.ts - interval '5 seconds' AND w.ts + interval '60 seconds'
+                          AND (w.commanded_f IS NULL OR abs(b.target_f - w.commanded_f) <= 0.5)) AS boost_matched
+       FROM w
+       WHERE w.posted_id IS NULL OR w.closed_at IS NOT NULL
+       ORDER BY w.id
+       LIMIT $1`,
+      [limit],
+    );
+    return res.rows.map((r) => ({
+      id: Number(r.id),
+      ts: new Date(r.ts),
+      source: String(r.source),
+      action: r.action === "restore" ? "restore" : "set_target",
+      requested: r.requested ?? null,
+      detail: r.detail == null ? null : String(r.detail),
+      commandedTargetF: r.commanded_f == null ? null : Number(r.commanded_f),
+      closedAt: r.closed_at == null ? null : new Date(r.closed_at),
+      reason: r.reason == null ? null : String(r.reason),
+      stormActive: r.storm_active === true,
+      boostMatched: r.boost_matched === true,
+    }));
+  }
+
+  /** a2w#137: the dose actually delivered over a window — mean tank temp, adoption compliance
+   *  (operative target within 3 °F of the commanded one), outdoor band. `to` null = until now. */
+  async windowStats(from: Date, to: Date | null, commandedTargetF: number | null): Promise<WindowStats> {
+    const res = await this.pool.query(
+      `SELECT avg(tank_f)::float8 AS achieved_awt_f,
+              min(outdoor_f)::float8 AS outdoor_low_f,
+              max(outdoor_f)::float8 AS outdoor_high_f,
+              CASE WHEN $3::real IS NULL THEN NULL
+                   ELSE avg(CASE WHEN tank_target_f IS NULL THEN NULL
+                                 WHEN abs(tank_target_f - $3::real) <= 3 THEN 1.0 ELSE 0.0 END)::float8 END AS compliance,
+              count(*)::int AS samples
+       FROM slx_readings
+       WHERE ts >= $1 AND ts < COALESCE($2::timestamptz, now())`,
+      [from, to, commandedTargetF],
+    );
+    const r = res.rows[0] ?? {};
+    const num = (v: unknown): number | null => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+    return {
+      achievedAwtF: num(r.achieved_awt_f),
+      compliance: num(r.compliance),
+      outdoorLowF: num(r.outdoor_low_f),
+      outdoorHighF: num(r.outdoor_high_f),
+      samples: Number(r.samples ?? 0),
+    };
+  }
+
+  /** a2w#137: the floor snapshot nearest a write (±15 min) — its `zones` jsonb names who was calling. */
+  async zoneFloorSnapshotNear(ts: Date): Promise<unknown | null> {
+    const res = await this.pool.query(
+      `SELECT zones FROM zone_floor_snapshots
+       WHERE ts BETWEEN $1::timestamptz - interval '15 minutes' AND $1::timestamptz + interval '15 minutes'
+       ORDER BY abs(extract(epoch from (ts - $1::timestamptz))) LIMIT 1`,
+      [ts],
+    );
+    return res.rowCount ? res.rows[0].zones ?? null : null;
+  }
+
+  /** a2w#137: record what was posted (upsert — a close re-posts the same write_id). */
+  async markWindowPosts(posts: WindowPost[]): Promise<void> {
+    if (!posts.length) return;
+    await this.pool.query(
+      `INSERT INTO tempiq_window_posts (write_id, external_id, kind, posted_at, closed_at, last_error)
+       SELECT * FROM unnest($1::int[], $2::text[], $3::text[], $4::timestamptz[], $5::timestamptz[], $6::text[])
+       ON CONFLICT (write_id) DO UPDATE
+         SET posted_at = EXCLUDED.posted_at, closed_at = EXCLUDED.closed_at, last_error = EXCLUDED.last_error`,
+      [
+        posts.map((p) => p.writeId),
+        posts.map((p) => p.externalId),
+        posts.map((p) => p.kind),
+        posts.map(() => new Date()),
+        posts.map((p) => p.closedAt),
+        posts.map((p) => p.lastError),
+      ],
     );
   }
 
