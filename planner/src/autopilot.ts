@@ -28,6 +28,19 @@ export type CurveDecision =
  * of the curve; every other hour the SHAPED curve is the command — written only when its endpoints
  * differ from the commanded ones (sameCurve, dot included), which is a few times a season, not hourly.
  */
+/**
+ * Is the plan's curve already the one the device holds? All FOUR endpoints must agree — dot, dbt, mbt
+ * within the adoption tolerance and wwsd within 0.5 °F (codex pass 2 on #145: comparing three of them
+ * let a wwsd drift read as "held" and never reach setCurve's stale-plan guard).
+ */
+export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null | undefined, toleranceF = APPLY_TOLERANCE_F): boolean {
+  if (!inForce) return false;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
+  return sameCurve(curve, { dbt: n(inForce.dbt), mbt: n(inForce.mbt) }, toleranceF)
+    && Math.abs(n(inForce.dot) - curve.dot) <= toleranceF
+    && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
+}
+
 export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
   const reason = String(block?.reason ?? "");
   if (block?.sani === true || block?.bank === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
@@ -122,8 +135,7 @@ export class AutoPilot {
     if (curveHour) {
       const d = curveHour;
       if (d.kind === "curve") {
-        const inForce = status.curve_in_force as { dot?: number; dbt?: number; mbt?: number } | null;
-        const same = inForce != null && sameCurve(d.curve, { dbt: inForce.dbt ?? NaN, mbt: inForce.mbt ?? NaN }) && Math.abs((inForce.dot ?? NaN) - d.curve.dot) <= APPLY_TOLERANCE_F;
+        const same = curveAlreadyInForce(d.curve, status.curve_in_force as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null);
         const label = `curve ${d.curve.dbt}@${d.curve.dot}→${d.curve.mbt}@${d.curve.wwsd}`;
         if (same) {
           await this.record(target, reason, "held-curve", `holding ${label} (${reason}) — already commanded`);

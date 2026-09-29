@@ -21,7 +21,7 @@
  * Every endpoint is floored by dhwFloorF and clamped to the I4 envelope AT ITS OWN OUTDOOR (bandFor
  * against the as-found baseline curve, exactly as setTarget does). Pure; no I/O.
  */
-import { computeFloors, type InsightZone, type FloorPolicy } from "./demand";
+import { computeFloors, requiredAwtF, type InsightZone, type FloorPolicy } from "./demand";
 import { bandFor, curveTargetF, DEFAULT_OPTS } from "./shadow";
 
 export const MIN_CURVE_SPREAD_F = 2;   // the device ignores a degenerate curve (dbt == mbt)
@@ -67,6 +67,17 @@ function clampToEnvelope(targetF: number, outdoorF: number, hbxBaseline: Record<
   if (targetF > band.hi) return { value: band.hi, clampedBy: "envelope_hi" };
   if (targetF < band.lo) return { value: band.lo, clampedBy: "envelope_lo" };
   return { value: targetF, clampedBy: null };
+}
+
+/**
+ * May a shaped curve be built from this feed? Only when the zone feed is HEALTHY and carries at least one
+ * buffer-served zone (codex pass 2 on #145): an empty or expired zone list would otherwise read as
+ * "conservative demand" and derive a floor-only curve — under-serving space heat precisely while the
+ * dependency is down. Off this predicate the plan stays unstamped and the existing degraded-mode
+ * curve-mimic targets remain authoritative.
+ */
+export function canShapeFromFeed(feedHealthy: boolean, zones: InsightZone[]): boolean {
+  return feedHealthy && zones.some((z) => requiredAwtF(z.deliveryType, 40) !== null);
 }
 
 /** Demand at one outdoor: the binding calling zone's required AWT + buffer margin, floored by the DHW floor. */
