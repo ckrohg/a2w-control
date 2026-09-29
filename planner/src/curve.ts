@@ -184,7 +184,7 @@ export function sameCurve(x: Pick<ShapedCurve, "dbt" | "mbt">, y: Pick<ShapedCur
 export type ShapedCurveMode = "off" | "shadow" | "live";
 export function parseShapedCurveMode(raw: string | undefined | null): ShapedCurveMode {
   const v = (raw ?? "").trim().toLowerCase();
-  if (v === "1" || v === "live" || v === "on") return "live";
+  if (v === "1" || v === "live") return "live";
   if (v === "shadow") return "shadow";
   return "off";
 }

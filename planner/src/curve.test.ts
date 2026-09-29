@@ -170,6 +170,8 @@ import { curveDecision, curveAlreadyInForce } from "./autopilot";
   assert.equal(parseShapedCurveMode(""), "off");
   assert.equal(parseShapedCurveMode("0"), "off");
   assert.equal(parseShapedCurveMode("true"), "off", "a typo must not arm the writer");
+  assert.equal(parseShapedCurveMode("on"), "off", "a generic boolean must not arm the writer (codex)");
+  assert.equal(parseShapedCurveMode("yes"), "off");
   assert.equal(parseShapedCurveMode("shadow"), "shadow");
   assert.equal(parseShapedCurveMode(" Shadow "), "shadow");
   assert.equal(parseShapedCurveMode("1"), "live");

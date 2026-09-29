@@ -19,11 +19,11 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
-import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, sameCurve } from "./curve";
+import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
-import { AutoPilot } from "./autopilot";
+import { AutoPilot, curveAlreadyInForce } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
   fetchNwsAlerts,
@@ -1631,8 +1631,10 @@ async function main(): Promise<void> {
               plan_implies: lastShapedCurve ? {
                 dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis,
                 output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastShapedCurve, lastThermal.outdoor_f) * 10) / 10 : null,
-                // acceptance #1: would the live auto-pilot write this curve now? (false = already in force)
-                would_write: lastDeviceCurve ? !sameCurve(lastShapedCurve, lastDeviceCurve) : null,
+                // acceptance #1: would the live auto-pilot write this curve now? Same four-field
+                // predicate the auto-pilot uses (dot / dbt / mbt / wwsd), so shadow and live agree
+                // on configuration drift too (codex): false = already in force.
+                would_write: !curveAlreadyInForce(lastShapedCurve, lastDeviceCurve),
               } : null,
             },
             phase_b: phaseB
