@@ -28,10 +28,12 @@ tank to 102–117 °F with both pumps at full call, and the 16.5 kW backup eleme
 
 The plan now anticipates it. For each **learned** draw window (`dhw.ts learnDhwWindows`) the same tank
 history yields the window's draw **sag** — pre-draw level minus the trough in the next 60 min, per draw,
-p75 over the window (`measureWindowSags`). When a window has ≥ 3 measured draws and a sag ≥ 3 °F, the
-warmest non-window hour in the `prechargeLookbackH` lead is raised to `dhwFloorF + sag p75 + 2.4 °F ×
-hours of standby before the bell` (capped at `strictCapF`; if the allowance would breach the cap the
-hour right before the window is used instead). Reason: `pre-boost to 126°F for 17:00 window (sag p75
+p75 over the window (`measureWindowSags`). When a window has ≥ 6 measured draws (so the p75 is never one
+sample) and a sag ≥ 3 °F, the warmest non-window hour in the `prechargeLookbackH` lead is raised to
+`dhwFloorF + min(sag p75, 12) + 2.4 °F × hours of standby before the bell` (capped at `strictCapF`; if
+the allowance would breach the cap the hour right before the window is used instead). A soak or bank
+already in the lead hours IS the pre-boost — none is added. The trough scan stops at a telemetry gap,
+and in winter a zone call can read as a draw: the 6-draw floor and the 12 °F cap bound that. Reason: `pre-boost to 126°F for 17:00 window (sag p75
 6.2°F over 11 draws; …)`. It is an excursion like the bank: Phase B leads the pump setpoints off it (I1),
 the auto-pilot writes it as a flat target under the shaped curve, the identification driver treats it as
 a plan conflict, and the TempIQ window poster files it as `bank`. `/health.dhw.windows[]` shows the

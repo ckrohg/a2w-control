@@ -63,8 +63,17 @@ export interface ShadowOpts {
 
 /** #135: a pre-boost below this is noise (one sample of standby drift) and is not planned. */
 export const MIN_PREBOOST_F = 3;
-/** #135: a window needs at least this many measured draws before its sag sizes a boost. */
-export const MIN_PREBOOST_DRAWS = 3;
+/**
+ * #135: a window needs at least this many measured draws before its sag sizes a boost — at 6 the
+ * nearest-rank p75 is the 5th value, so one contaminated observation (a telemetry hole, a winter
+ * zone call read as a draw) cannot set the boost by itself (codex, #148).
+ */
+export const MIN_PREBOOST_DRAWS = 6;
+/**
+ * #135: the most a pre-boost may add above the floor. A shower is ~9 °F of this buffer (20 gal at
+ * 105 °F over C_eff 917 Btu/°F); a measured sag beyond this is not a draw the plan should chase.
+ */
+export const MAX_PREBOOST_F = 12;
 /**
  * #135: standby loss the boosted heat suffers per hour before the window opens (dhw.ts: 0.65 kW over
  * C_eff ≈ 110 gal ⇒ ~2.4 °F/h, measured). A boost placed h hours ahead is raised by this much per hour
@@ -153,45 +162,6 @@ export function computeShadowPlan(
       : { f, localH, target: Math.max(opts.idleF, opts.dhwFloorF), reason: "off-window DHW-ready floor (draws possible any hour)" };
   });
 
-  // #135 pre-boost: the flat DHW floor does not hold a hard draw (measured 2026-08-07: 102–117 °F with
-  // both pumps at full call; the 16.5 kW element paid for the shortfall at COP 1.0). For each learned
-  // window present in the horizon, the boost is SIZED FROM THE DRAW — the window's measured sag p75
-  // (dhw.ts measureWindowSags) — and PLACED in the warmest of the preceding non-window hours (up to
-  // prechargeLookbackH; flat rate + net metering ⇒ ambient is the only cost lever), raised by the
-  // standby loss it will suffer before the bell so the trough, not the pre-draw peak, stays at the
-  // floor. If that decay allowance would push the warmest hour past strictCap, the hour right before
-  // the window (least decay) is used instead. Raises only, band-clamped below like every block; Phase B
-  // leads the pump setpoints off it as it does for the bank. A pre-boost can never make a shower colder.
-  // (This replaces the dormant pre-charge branch that could not fire since idleF == dhwFloorF, #58.)
-  const boostFor = new Map<number, PreBoost>();
-  for (const b of opts.preBoosts ?? []) if (b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F) boostFor.set(b.windowStart, b);
-  for (const [start] of opts.dhwWindows) {
-    const pb = boostFor.get(start);
-    if (!pb) continue;
-    const idx = draft.findIndex((d) => d.localH === start);
-    if (idx <= 0) continue;
-    const lead = draft.slice(Math.max(0, idx - opts.prechargeLookbackH), idx)
-      .filter((d) => !inWindow(d.localH));
-    if (!lead.length) continue;
-    const place = (d: Draft) => {
-      const hoursAhead = Math.max(0, ((draft[idx].f.ts.getTime() - d.f.ts.getTime()) / 3600_000) - 1); // the lead hour itself is spent charging
-      const raw = opts.dhwFloorF + pb.boostF + STANDBY_F_PER_H * hoursAhead;
-      return { d, hoursAhead, raw, to: Math.min(raw, opts.strictCapF) };
-    };
-    const warmest = place(lead.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a)));
-    const chosen = warmest.raw > opts.strictCapF ? place(lead[lead.length - 1]) : warmest;
-    if (chosen.to <= chosen.d.target) continue; // a bank / soak already sits higher — it IS the pre-boost
-    chosen.d.target = chosen.to;
-    chosen.d.boost = true;
-    chosen.d.reason = `pre-boost to ${Math.round(chosen.to)}°F for ${String(start).padStart(2, "0")}:00 window (sag p75 ${pb.sagP75F}°F over ${pb.n} draws${chosen.hoursAhead > 0 ? `, +${Math.round(STANDBY_F_PER_H * chosen.hoursAhead)}°F standby over ${chosen.hoursAhead} h` : ""}; ${chosen === warmest ? "warmest lead hour" : "hour before the bell"}, ${chosen.d.f.outdoorF.toFixed(0)}°F)`;
-  }
-
-  // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
-  // plan→autopilot→Phase B path — Phase B leads the pump setpoints off THIS block's current-hour target
-  // (phaseb.ts), so the 140°F soak clears I1 instead of deadlocking. Gated on `sanitizeDue`: the caller
-  // passes true for the conservative daily soak (auto-sanitize OFF) or when a pasteurization is actually
-  // due (auto-sanitize ON, demand-aware), and false to skip a redundant soak. checkI8 only alarms; it
-  // never actuates — so the setpoint coordination is never bypassed.
   const byDay = new Map<string, Draft[]>();
   for (const d of draft) {
     const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
@@ -242,6 +212,51 @@ export function computeShadowPlan(
       warmest.reason = `afternoon bank to ${bankTo}°F (warmest hour, ${warmest.f.outdoorF.toFixed(0)}°F outdoor)`;
     }
   }
+
+  // #135 pre-boost: the flat DHW floor does not hold a hard draw (measured 2026-08-07: 102–117 °F with
+  // both pumps at full call; the 16.5 kW element paid for the shortfall at COP 1.0). For each learned
+  // window present in the horizon, the boost is SIZED FROM THE DRAW — the window's measured sag p75
+  // (dhw.ts measureWindowSags) — and PLACED in the warmest of the preceding non-window hours (up to
+  // prechargeLookbackH; flat rate + net metering ⇒ ambient is the only cost lever), raised by the
+  // standby loss it will suffer before the bell so the trough, not the pre-draw peak, stays at the
+  // floor. If that decay allowance would push the warmest hour past strictCap, the hour right before
+  // the window (least decay) is used instead. Raises only, band-clamped below like every block; Phase B
+  // leads the pump setpoints off it as it does for the bank. A pre-boost can never make a shower colder.
+  // (This replaces the dormant pre-charge branch that could not fire since idleF == dhwFloorF, #58.)
+  // Scheduled AFTER the soak and the bank so a deliberate excursion already in the lead interval is
+  // seen: a soak or bank anywhere in the lead hours IS the pre-boost (it banks more), and a draft that
+  // carries sani/bank is never re-labelled (one excursion identity per block; codex, #148).
+  const boostFor = new Map<number, PreBoost>();
+  for (const b of opts.preBoosts ?? []) if (b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F) boostFor.set(b.windowStart, b);
+  for (const [start] of opts.dhwWindows) {
+    const pb = boostFor.get(start);
+    if (!pb) continue;
+    const idx = draft.findIndex((d) => d.localH === start);
+    if (idx <= 0) continue;
+    const lead = draft.slice(Math.max(0, idx - opts.prechargeLookbackH), idx)
+      .filter((d) => !inWindow(d.localH));
+    if (!lead.length) continue;
+    if (lead.some((d) => d.sani || d.bank)) continue; // the soak / bank in the lead IS the pre-boost
+    const boostF = Math.min(pb.boostF, MAX_PREBOOST_F);
+    const place = (d: Draft) => {
+      const hoursAhead = Math.max(0, ((draft[idx].f.ts.getTime() - d.f.ts.getTime()) / 3600_000) - 1); // the lead hour itself is spent charging
+      const raw = opts.dhwFloorF + boostF + STANDBY_F_PER_H * hoursAhead;
+      return { d, hoursAhead, raw, to: Math.min(raw, opts.strictCapF) };
+    };
+    const warmest = place(lead.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a)));
+    const chosen = warmest.raw > opts.strictCapF ? place(lead[lead.length - 1]) : warmest;
+    if (chosen.to <= chosen.d.target) continue; // a bank / soak already sits higher — it IS the pre-boost
+    chosen.d.target = chosen.to;
+    chosen.d.boost = true;
+    chosen.d.reason = `pre-boost to ${Math.round(chosen.to)}°F for ${String(start).padStart(2, "0")}:00 window (sag p75 ${pb.sagP75F}°F over ${pb.n} draws${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}${chosen.hoursAhead > 0 ? `, +${Math.round(STANDBY_F_PER_H * chosen.hoursAhead)}°F standby over ${chosen.hoursAhead} h` : ""}; ${chosen === warmest ? "warmest lead hour" : "hour before the bell"}, ${chosen.d.f.outdoorF.toFixed(0)}°F)`;
+  }
+
+  // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
+  // plan→autopilot→Phase B path — Phase B leads the pump setpoints off THIS block's current-hour target
+  // (phaseb.ts), so the 140°F soak clears I1 instead of deadlocking. Gated on `sanitizeDue`: the caller
+  // passes true for the conservative daily soak (auto-sanitize OFF) or when a pasteurization is actually
+  // due (auto-sanitize ON, demand-aware), and false to skip a redundant soak. checkI8 only alarms; it
+  // never actuates — so the setpoint coordination is never bypassed.
 
   return draft.map((d) => {
     let target = d.target;

@@ -208,6 +208,7 @@ console.log("shadow.test.ts: all assertions passed ✓");
     { windowStart: 17, boostF: 6, sagP75F: 6.2, n: 11 },
     { windowStart: 6, boostF: 2, sagP75F: 2.0, n: 9 },   // below MIN_PREBOOST_F → nothing
   ] };
+  // (soak OFF in these plans — sanitizeDue=false — so the pre-boost is observed alone)
   const plan = computeShadowPlan(fc, null, opts, null, false);
   const boosts = plan.filter((b) => b.boost === true);
   assert.equal(boosts.length, 1, "exactly one pre-boost (the 06:00 window's 2 °F is below the floor)");
@@ -226,23 +227,37 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.match(b2.reason, /standby over 2 h/);
 
   // If the allowance would breach strictCap, the hour before the bell is used instead.
-  const big = { ...opts, preBoosts: [{ windowStart: 17, boostF: 13, sagP75F: 13, n: 6 }] };
+  const big = { ...opts, preBoosts: [{ windowStart: 17, boostF: 12, sagP75F: 12, n: 6 }] };
   const b3 = computeShadowPlan(fc2, null, big, null, false).filter((x) => x.boost)[0];
-  assert.equal(new Date(b3.ts).getHours(), 16, "14:00 would need 120+13+4.8 = 137.8 > 135 → the hour before the bell");
-  assert.equal(b3.tank_target_f, 133);
+  assert.equal(new Date(b3.ts).getHours(), 16, "14:00 would need 120+12+4.8 = 136.8 > 135 → the hour before the bell");
+  assert.equal(b3.tank_target_f, 132);
   assert.match(b3.reason, /hour before the bell/);
 
-  // Too few draws → no boost; no preBoosts at all → byte-identical to the pre-#135 plan.
-  const few = { ...opts, preBoosts: [{ windowStart: 17, boostF: 6, sagP75F: 6, n: 2 }] };
+  // Too few draws (< 6) → no boost; no preBoosts at all → byte-identical to the pre-#135 plan.
+  const few = { ...opts, preBoosts: [{ windowStart: 17, boostF: 6, sagP75F: 6, n: 5 }] };
   assert.equal(computeShadowPlan(fc, null, few, null, false).filter((x) => x.boost).length, 0);
   const before = computeShadowPlan(fc, null, { ...DEFAULT_OPTS, dhwWindows: opts.dhwWindows }, null, false);
   const without = computeShadowPlan(fc, null, { ...opts, preBoosts: [] }, null, false);
   assert.deepEqual(without, before, "no preBoosts → identical plan");
 
-  // A soak / bank that already sits higher in the lead hour IS the pre-boost: not overwritten.
+  // A contaminated sag cannot chase strictCap: the boost is capped at MAX_PREBOOST_F and says so.
+  const huge = { ...opts, preBoosts: [{ windowStart: 17, boostF: 40, sagP75F: 40, n: 8 }] };
+  const b4 = computeShadowPlan(fc, null, huge, null, false).filter((x) => x.boost)[0];
+  assert.equal(b4.tank_target_f, 132, "120 + 12 (cap), placed at 16:00 with no standby allowance");
+  assert.match(b4.reason, /capped at \+12/);
+
+  // A soak in the lead interval IS the pre-boost: with the soak due it lands at the day's warmest hour
+  // (h=23 here, not in the lead) → the boost still happens; force the soak into the lead and it is suppressed.
   const soaked = computeShadowPlan(fc, null, opts, null, true);
-  const soakHour = soaked.find((x) => x.sani)!;
-  assert.ok(soakHour, "due soak present");
   for (const x of soaked) if (x.sani) assert.equal(x.boost, undefined, "the soak block keeps its identity");
+  const fcSoakInLead: ForecastHour[] = fc.map((f, h) => ({ ...f, outdoorF: h === 15 ? 95 : 55 + h * 0.5 })); // warmest = 15:00 → soak lands in the lead
+  const s2 = computeShadowPlan(fcSoakInLead, null, opts, null, true);
+  assert.ok(s2.some((x) => x.sani && new Date(x.ts).getHours() === 15), "soak sits in the 17:00 window's lead");
+  assert.equal(s2.filter((x) => x.boost).length, 0, "no pre-boost beside a soak in the lead — the soak banks more");
+  // same with the #58 bank in the lead
+  const banked = computeShadowPlan(fcSoakInLead, null, { ...opts, bankF: 8 }, null, false);
+  assert.ok(banked.some((x) => x.bank && new Date(x.ts).getHours() === 15), "bank sits in the lead");
+  assert.equal(banked.filter((x) => x.boost).length, 0, "no pre-boost beside a bank in the lead");
+  for (const x of [...s2, ...banked]) assert.ok(!(x.boost && (x.sani || x.bank)), "one excursion identity per block");
   console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
 }

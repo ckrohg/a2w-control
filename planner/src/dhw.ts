@@ -102,9 +102,15 @@ export interface WindowSag {
 
 /**
  * One draw event = the first ≥ DROP_F fall (detectDrawTimes' definition) not within DRAW_MERGE_MIN of
- * the previous event. Its sag = tank just before the fall − the minimum in the next SAG_HORIZON_MIN.
- * Grouped by the local hour the draw started in. Windows with no draws come back with n = 0 and zero
- * sags (the plan then boosts nothing for them). Same rows the window learner reads: no extra query.
+ * the previous event. Its sag = tank just before the fall − the minimum of the contiguous samples in
+ * the next SAG_HORIZON_MIN. Grouped by the local hour the draw started in. Windows with no draws come
+ * back with n = 0 and zero sags (the plan then boosts nothing for them). Same rows the window learner
+ * reads: no extra query.
+ *
+ * WINTER CAVEAT (same as detectDrawTimes): a space-heat call also pulls the buffer, so a heating-season
+ * "sag" may be a zone call, not a shower. The plan side bounds the damage — a window needs ≥ 6 draws
+ * (nearest-rank p75 of 6 is the 5th value, never the maximum) and the boost is capped at
+ * MAX_PREBOOST_F — and the reason text names the measurement so the plan-vs-actual ledger can be read.
  */
 export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: [number, number][]): WindowSag[] {
   const sagsByWindow = windows.map(() => ({ sags: [] as number[], pre: [] as number[], trough: [] as number[] }));
@@ -119,8 +125,12 @@ export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: 
     const h = cur.ts.getHours(); // TZ env → local hour, as learnDhwWindows
     const w = windows.findIndex(([a, b]) => h >= a && h < b);
     if (w < 0) continue;
+    // The trough is the minimum of the CONTIGUOUS samples after the fall: the scan stops at the first
+    // sample gap wider than MAX_SAMPLE_GAP_MIN (a reading after a telemetry hole is not this draw's
+    // trough) and at the horizon (codex, #148).
     let trough = cur.tankF;
-    for (let j = i; j < rows.length && rows[j].ts.getTime() - cur.ts.getTime() <= SAG_HORIZON_MIN * 60_000; j++) {
+    for (let j = i + 1; j < rows.length && rows[j].ts.getTime() - cur.ts.getTime() <= SAG_HORIZON_MIN * 60_000; j++) {
+      if ((rows[j].ts.getTime() - rows[j - 1].ts.getTime()) / 60_000 > MAX_SAMPLE_GAP_MIN) break;
       if (rows[j].tankF < trough) trough = rows[j].tankF;
     }
     sagsByWindow[w].sags.push(prev.tankF - trough);

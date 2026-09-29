@@ -43,4 +43,9 @@ for (const r of late) if (r.ts.getHours() === 19 && r.ts.getMinutes() >= 20) r.t
 const sags2 = measureWindowSags(late, [[17, 22]]);
 assert.equal(sags2[0].n, 5, "the slow sag is not a new draw");
 assert.equal(sags2[0].sagP75F, 7.5, `a sag ${SAG_HORIZON_MIN}+ min later is not this draw's trough`);
+// a telemetry gap inside the horizon ends the trough scan: the low reading after the hole is not this draw's trough
+const gapped = rows.filter((r) => !(r.ts.getHours() === 18 && r.ts.getMinutes() >= 30 && r.ts.getMinutes() <= 50)); // 25-min hole after the draw
+for (const r of gapped) if (r.ts.getHours() === 18 && r.ts.getMinutes() === 55) r.tankF = 95; // a low reading right after the hole
+const sags3 = measureWindowSags(gapped, [[17, 22]]);
+assert.equal(sags3[0].sagP75F, 7.5, "the scan stops at the gap; 95 °F after the hole is not counted");
 console.log("dhw-sag.test.ts: all assertions passed");

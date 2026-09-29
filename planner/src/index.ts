@@ -18,7 +18,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -1712,9 +1712,9 @@ async function main(): Promise<void> {
               windows: dhwPreBoosts.map((w) => ({
                 window: [w.windowStart, w.windowEnd], draws: w.n, sag_p75_f: w.sagP75F, sag_median_f: w.sagMedianF,
                 pre_draw_median_f: w.preDrawMedianF, trough_median_f: w.troughMedianF,
-                boost_f: w.n >= 3 && Math.round(w.sagP75F) >= 3 ? Math.round(w.sagP75F) : 0,
+                boost_f: w.n >= MIN_PREBOOST_DRAWS && Math.round(w.sagP75F) >= MIN_PREBOOST_F ? Math.min(Math.round(w.sagP75F), MAX_PREBOOST_F) : 0,
               })),
-              min_draws: 3, min_boost_f: 3, standby_f_per_h: 2.4,
+              min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F, standby_f_per_h: STANDBY_F_PER_H,
             },
             hygiene: {
               auto_sanitize: autoSanitizeLive,
