@@ -475,3 +475,14 @@ Everything below was verified against the running systems, not inferred.
 | **Optimised** | next winter, as before |
 
 Next: merge #2051 → gate-merge #142 → #141 → shadow → armed; a2w pushes `tank_reheat_rate_a2w` (unblocks priced down-probes); TempIQ envelope-learner confidence for hydronic zones; gtm#1617 co-serving learner + UI; then W4 (#133/#134/#135/#136/#132).
+
+### 10.4 Addendum — later on 2026-09-29
+
+| what | state |
+|---|---|
+| **#141 identification driver** | **merged 19:37Z** after eight Codex adversarial passes (driver-owned durable cleanup; `pending_write`; settled operative base; per-window audit tokens; idempotent ALTERs + one-time backfill; cleanup reads the LIVE device curve; foreign drift recorded before the controllers run). Rollout: `IDENTIFICATION_ENABLED=1` → shadow → armed. |
+| **Reheat rate** | a2w #144 (rising-run scanner, conservative p25 + per-band) and TempIQ #2052 (ingest) merged — the number Part B prices down-probe recovery from. |
+| **τ prices Part B** | TempIQ #2053 (stacked on #2051): every hydronic zone has a learned thermal time constant (0.79–0.91) though no learned UA/C; with the inferred design load C cancels, so τ alone determines the deficit trajectory. Replay: `tau_learned 7 / default 0`. Mild-band down-probes now bind on the DHW floor (the honest reason). |
+| **#133 (b) shaped curve** | built as #145 (flag-off). Design correction: the I4 lower bound pins any 5 °F endpoint at 135, so the design point *moves* to forecast-min − 10 °F; `wwsd` never moves. Codex pass 1: classify before the scalar hold, validate against the live `wwsd`, refuse to move `dot` the baseline cannot restore, flag-off byte-identical — fixed; pass 2 running. Live acceptance #1/#2 after shadow. |
+| **Quarantine seam** | live; backfill drained in one tick: 427 windows, 0 rejected (autopilot 216, bank 148, sanitize 57, manual 5, storm 2). |
+| **Ops findings** | Railway created no deployment for the #142 merge (a docs push minutes later was evaluated and SKIPPED) → planner nudge #143 and a README rule. The deploy gate's 900 s handover deadline was a false regression (measured 20 min) → 1500 s (#140). TempIQ's CI workflow cancels in-progress runs per PR: re-running an *old* run cancels the *newer* one — rerun the latest only. An open-meteo 429 after three deploys in an hour aborted the whole hourly chain (pushes included) → #145 decouples the steps. |
