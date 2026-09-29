@@ -109,6 +109,45 @@ export function shapeCurve(a: ShapeCurveArgs): ShapedCurve {
   };
 }
 
+/**
+ * The guard rules setCurve applies, as a pure function so they can be tested without a SensorLinx
+ * client (codex 2026-09-29 on #145). Returns the first rejection, or null when the write may proceed.
+ *  - the candidate's wwsd must equal the LIVE device wwsd: the guards describe a line over wwsd, and the
+ *    PATCH carries dot/dbt/mbt only — a foreign wwsd edit between plan and write would make the device
+ *    execute a different line than the one validated (codex, high);
+ *  - the as-found baseline must carry a numeric dot, or the design point must not be moved at all —
+ *    restore() could not put it back (codex, medium);
+ *  - I4 at BOTH endpoints, each against the envelope at its own outdoor;
+ *  - I1 is checked by the caller against curveOutputF at the live outdoor.
+ */
+export function curveWriteGuard(a: {
+  curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">;
+  liveCfg: Record<string, any> | null;
+  baseline: Record<string, any> | null;
+  envelopeCfg: Record<string, any> | null;
+  capF: number;
+}): { status: number; detail: string } | null {
+  const { curve } = a;
+  for (const [k, v] of Object.entries({ dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd })) {
+    if (!Number.isFinite(v)) return { status: 422, detail: `${k} must be a number` };
+  }
+  if (curve.dbt <= curve.mbt) return { status: 422, detail: `degenerate curve: dbt ${curve.dbt} must exceed mbt ${curve.mbt} (the device ignores a flat curve)` };
+  if (curve.dot >= curve.wwsd) return { status: 422, detail: `dot ${curve.dot} must be below wwsd ${curve.wwsd}` };
+  const liveWwsd = a.liveCfg?.wwsd;
+  if (typeof liveWwsd !== "number") return { status: 503, detail: "live HBX config has no wwsd — cannot validate the curve the device would execute" };
+  if (Math.abs(liveWwsd - curve.wwsd) > 0.5) return { status: 409, detail: `stale curve: planned over wwsd ${curve.wwsd}°F but the device's wwsd is ${liveWwsd}°F — regenerate the plan` };
+  if (typeof a.baseline?.dot !== "number" && curve.dot !== a.liveCfg?.dot) {
+    return { status: 422, detail: "refusing to move the design outdoor: the as-found baseline records no dot, so restore() could not put it back" };
+  }
+  for (const [label, outdoorF, targetF] of [["dbt", curve.dot, curve.dbt], ["mbt", curve.wwsd, curve.mbt]] as const) {
+    const band = bandFor(outdoorF, a.envelopeCfg, a.capF);
+    if (targetF < band.lo - 0.5 || targetF > band.hi + 0.5) {
+      return { status: 422, detail: `${label} ${targetF}°F outside the I4 envelope [${Math.round(band.lo)}–${Math.round(band.hi)}]°F at ${outdoorF}°F outdoor` };
+    }
+  }
+  return null;
+}
+
 /** The shaped curve's output at an outdoor temperature — what the HBX will drive to. */
 export function curveOutputF(c: Pick<ShapedCurve, "dbt" | "mbt" | "dot" | "wwsd">, outdoorF: number): number {
   return curveTargetF({ dot: c.dot, wwsd: c.wwsd, dbt: c.dbt, mbt: c.mbt }, outdoorF) ?? c.mbt;

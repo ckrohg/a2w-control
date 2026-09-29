@@ -3,7 +3,7 @@
  * npx tsx planner/src/curve.test.ts — exits non-zero on failure.
  */
 import assert from "node:assert/strict";
-import { shapeCurve, curveOutputF, sameCurve, demandTargetF, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
+import { shapeCurve, curveOutputF, sameCurve, demandTargetF, curveWriteGuard, MIN_CURVE_SPREAD_F, ANCHOR_MARGIN_F } from "./curve";
 import type { InsightZone } from "./demand";
 import { requiredAwtF, BUFFER_MARGIN_F } from "./demand";
 
@@ -94,6 +94,29 @@ async function main(): Promise<void> {
   {
     assert.equal(shapeCurve({ ...base, callingZoneIds: ["baseboard"], anchorOutdoorF: -30 }).dot, 5);
     assert.equal(shapeCurve({ ...base, callingZoneIds: ["baseboard"], anchorOutdoorF: 200 }).dot, 125 - 20);
+  }
+  // 5b. curveWriteGuard — the rules setCurve applies, pure (codex on #145).
+  {
+    const live = { dot: 5, wwsd: 125, dbt: 137, mbt: 133 };       // a near-flat setTarget curve in force
+    const ok = { curve: { dot: 20, dbt: 127, mbt: 120, wwsd: 125 }, liveCfg: live, baseline, envelopeCfg: baseline, capF: 135 };
+    assert.equal(curveWriteGuard(ok), null);
+    // stale plan: the device's wwsd moved after the plan was stamped → 409, never "validate one line, execute another"
+    assert.equal(curveWriteGuard({ ...ok, liveCfg: { ...live, wwsd: 110 } })!.status, 409);
+    // no live wwsd at all → 503
+    assert.equal(curveWriteGuard({ ...ok, liveCfg: { dot: 5, dbt: 137, mbt: 133 } })!.status, 503);
+    // the baseline records no dot → moving the design point is refused (restore could not put it back)…
+    const noDotBaseline = { wwsd: 125, dbt: 165, mbt: 140 };
+    assert.equal(curveWriteGuard({ ...ok, baseline: noDotBaseline, envelopeCfg: noDotBaseline })!.status, 422);
+    // …but a curve that keeps the live dot is fine
+    assert.equal(curveWriteGuard({ ...ok, curve: { ...ok.curve, dot: 5, dbt: 135 }, baseline: noDotBaseline, envelopeCfg: noDotBaseline }), null);
+    // degenerate / inverted / non-numeric
+    assert.equal(curveWriteGuard({ ...ok, curve: { ...ok.curve, mbt: 127 } })!.status, 422);
+    assert.equal(curveWriteGuard({ ...ok, curve: { ...ok.curve, dot: 130 } })!.status, 422);
+    assert.equal(curveWriteGuard({ ...ok, curve: { ...ok.curve, dbt: NaN } })!.status, 422);
+    // I4 at each endpoint against the envelope at its own outdoor: 150 at 20 °F is above the cap
+    assert.match(curveWriteGuard({ ...ok, curve: { ...ok.curve, dbt: 150 } })!.detail, /dbt 150°F outside the I4 envelope/);
+    // …and a warm end below the envelope's lower bound at wwsd (95) is refused too
+    assert.match(curveWriteGuard({ ...ok, curve: { ...ok.curve, mbt: 90 } })!.detail, /mbt 90°F outside/);
   }
   // 6. sameCurve: endpoint tolerance.
   {

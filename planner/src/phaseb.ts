@@ -88,6 +88,8 @@ export class PhaseB {
     private readonly pumpIds: string[],
     private dryRun: boolean,
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    /** #133 (b): lead the shaped curve's output (SHAPED_CURVE=1). Off = the pre-#133 tracking, byte-identical. */
+    private readonly shapedCurve = false,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A) — flipped from the dashboard Off/Armed switch via
@@ -137,8 +139,7 @@ export class PhaseB {
     const { targetF: planTarget, nextOutdoorF } = await this.currentPlanTarget();
     // #133 (b): the commanded CURVE's output now and next hour — with a shaped curve the operative target
     // will climb on its own as it gets colder; the setpoints must already cover where it is going.
-    const cfg = await this.store.latestConfig().catch(() => null);
-    const curveLead = curveLeadF(cfg, latest.outdoorF, nextOutdoorF);
+    const curveLead = this.shapedCurve ? curveLeadF(await this.store.latestConfig().catch(() => null), latest.outdoorF, nextOutdoorF) : null;
     const effectiveTarget = Math.max(opTarget, planTarget ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();

@@ -185,8 +185,12 @@ let lastThermal: {
   setpoints_f: Record<string, number | null>;
 } = { at: null, tank_f: null, tank_target_f: null, outdoor_f: null, setpoints_f: {} };
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
+// #133 (b): SHAPED_CURVE=1 makes the auto-pilot command the plan's demand-shaped reset curve for
+// non-excursion hours and Phase B lead its output. Off = byte-identical to the pre-#133 planner: no
+// curve is computed, no plan block is stamped, /health.curve.plan_implies stays null.
+const SHAPED_CURVE = process.env.SHAPED_CURVE === "1";
 const phaseB = PHASE_B_ENABLED && hub
-  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy)
+  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE)
   : null;
 
 // SPAN backup-element power alarm — an INDEPENDENT net (vs the HBX's own backup_called decision
@@ -1196,9 +1200,9 @@ async function shadowOnce(): Promise<void> {
 
   // plan they already read. Degraded demand feed → conservative (all buffer-served zones) curve.
 
-  try {
+  if (SHAPED_CURVE) try {
 
-    const wwsd = typeof (cfg as { wwsd?: unknown } | null)?.wwsd === "number" ? (cfg as { wwsd: number }).wwsd : 125;
+    const wwsd = typeof (cfgLive as { wwsd?: unknown } | null)?.wwsd === "number" ? (cfgLive as { wwsd: number }).wwsd : 125;
 
     const aheadF = forecast.slice(0, 24).map((f) => f.outdoorF).filter((v) => Number.isFinite(v));
 
@@ -1287,7 +1291,6 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
 // non-excursion hours (a few writes a season) so the HBX weather-compensates on its own between
 // writes and after a planner death. Off = today's flat per-hour target. The curve itself is computed
 // in shadowOnce (it needs the demand feed + the 24 h forecast) and stamped on every plan block.
-const SHAPED_CURVE = process.env.SHAPED_CURVE === "1";
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy, SHAPED_CURVE) : null;
 
 // Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs

@@ -20,7 +20,7 @@ import { Store } from "./store";
 import { HubClient } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
 import { extractConfig, diffConfig } from "./drift";
-import { curveOutputF, type ShapedCurve } from "./curve";
+import { curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
 const SLX_FRESH_MS = 20 * 60 * 1000;
@@ -212,16 +212,13 @@ export class HbxWriter {
    * identification probes) stay setTarget writes on top; restore() puts the as-found curve back.
    */
   async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
-    const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt };
+    // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
+    // validated (the guard already refused a wwsd that differs from the live one).
+    const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
     const reject = async (status: number, detail: string) => {
       await this.store.insertHbxWrite({ source, action: "set_curve", requested, result: "rejected", detail });
       throw new WriteError(status, detail);
     };
-    for (const [k, v] of Object.entries(requested)) {
-      if (!Number.isFinite(v)) await reject(422, `${k} must be a number`);
-    }
-    if (curve.dbt <= curve.mbt) await reject(422, `degenerate curve: dbt ${curve.dbt} must exceed mbt ${curve.mbt} (the device ignores a flat curve)`);
-    if (curve.dot >= curve.wwsd) await reject(422, `dot ${curve.dot} must be below wwsd ${curve.wwsd}`);
     const latest = await this.store.getLatestSlx();
     if (!latest || Date.now() - latest.ts.getTime() > SLX_FRESH_MS || latest.outdoorF == null) {
       await reject(503, "no fresh SensorLinx reading — cannot evaluate the outdoor-indexed envelope");
@@ -229,13 +226,8 @@ export class HbxWriter {
     const cfg = await this.store.latestConfig();
     const baseline = await this.store.baselineConfig();
     const envelopeCfg = curveOverridden(cfg, baseline) ? baseline : cfg;
-    // I4 at each endpoint, against the envelope at that endpoint's outdoor.
-    for (const [label, outdoorF, targetF] of [["dbt", curve.dot, curve.dbt], ["mbt", curve.wwsd, curve.mbt]] as const) {
-      const band = bandFor(outdoorF, envelopeCfg, capF);
-      if (targetF < band.lo - 0.5 || targetF > band.hi + 0.5) {
-        await reject(422, `${label} ${targetF}°F outside the I4 envelope [${Math.round(band.lo)}–${Math.round(band.hi)}]°F at ${outdoorF}°F outdoor`);
-      }
-    }
+    const guard = curveWriteGuard({ curve, liveCfg: cfg, baseline, envelopeCfg, capF });
+    if (guard) await reject(guard.status, guard.detail);
     // I1 against the curve's output at the LIVE outdoor.
     const outputNow = curveOutputF(curve, latest!.outdoorF as number);
     if (this.hub) {

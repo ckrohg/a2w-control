@@ -104,10 +104,14 @@ export class AutoPilot {
       await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`);
       return;
     }
-    // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
     const status = await this.writer.status();
     const commanded = status.commanded_target_f as number | null;
-    if (commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
+    // #133 (b): in shaped mode classify the block FIRST. The scalar "already commanded" check below must
+    // never decide a curve hour: after an excursion's near-flat write, a plan target within 2 °F of that
+    // flat midpoint would otherwise read as held forever and the curve would never come back (codex).
+    const curveHour = this.shapedCurve ? curveDecision(block) : null;
+    // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
+    if (curveHour?.kind !== "curve" && commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
       await this.record(target, reason, "held", `holding ${target}°F (${reason}) — already commanded`);
       return;
     }
@@ -115,8 +119,8 @@ export class AutoPilot {
     // #133 (b): in shaped-curve mode a non-excursion hour commands the CURVE, not a flat target. The
     // comparison is on the endpoints (dot/dbt/mbt) the device holds, so the curve is rewritten only when
     // it changes — a few times a season.
-    if (this.shapedCurve) {
-      const d = curveDecision(block);
+    if (curveHour) {
+      const d = curveHour;
       if (d.kind === "curve") {
         const inForce = status.curve_in_force as { dot?: number; dbt?: number; mbt?: number } | null;
         const same = inForce != null && sameCurve(d.curve, { dbt: inForce.dbt ?? NaN, mbt: inForce.mbt ?? NaN }) && Math.abs((inForce.dot ?? NaN) - d.curve.dot) <= APPLY_TOLERANCE_F;
