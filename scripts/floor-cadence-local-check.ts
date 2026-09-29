@@ -65,6 +65,12 @@ async function main() {
   const r5 = await store.raiseLatestPlanBlock("2000-01-01T00:00:00.000Z", { tank_target_f: 200, hp1_setpoint_f: 205, reason: "x" }, {});
   assert.equal(r5.applied, false);
 
+  // 6. the persisted 24 h history reads back every raise recorded above (and would expire on its own)
+  const hist = await store.recentFloorRaises(24);
+  const mine = hist.filter((h) => h.ts === tsIso || h.ts === ts2);
+  assert.ok(mine.some((h) => h.to === 132) && mine.some((h) => h.to === 130 && h.ts === ts2), "history carries the raises with their targets");
+  assert.ok(mine.every((h) => typeof h.at === "string" && Number.isFinite(h.from)), "every entry has at/from");
+
   await pool.query(`DELETE FROM shadow_plans WHERE id = $1`, [id]);
   console.log("floor-cadence-local-check: all assertions passed");
   process.exit(0);

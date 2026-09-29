@@ -1136,6 +1136,7 @@ export class Store {
     note: Record<string, unknown>,
   ): Promise<{ applied: boolean; planId: number | null; movedToNewerPlan: boolean }> {
     const patchJson = JSON.stringify({ tank_target_f: patch.tank_target_f, hp1_setpoint_f: patch.hp1_setpoint_f, reason: patch.reason });
+    // `from` is filled in SQL from the row's own block (the value the raise actually replaced), not from the caller.
     const noteJson = JSON.stringify({ ts, to: patch.tank_target_f, ...note });
     let movedToNewerPlan = false;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1147,7 +1148,8 @@ export class Store {
            plan = (SELECT jsonb_agg(CASE WHEN e->>'ts' = $1 THEN ((e - 'bank' - 'boost') || $2::jsonb) ELSE e END ORDER BY o)
                    FROM jsonb_array_elements(p.plan) WITH ORDINALITY AS t(e, o)),
            meta = coalesce(p.meta, '{}'::jsonb)
-                  || jsonb_build_object('floor_raises', coalesce(p.meta->'floor_raises', '[]'::jsonb) || $3::jsonb)
+                  || jsonb_build_object('floor_raises', coalesce(p.meta->'floor_raises', '[]'::jsonb)
+                       || ($3::jsonb || jsonb_build_object('from', (SELECT (e->>'tank_target_f')::float8 FROM jsonb_array_elements(p.plan) e WHERE e->>'ts' = $1 LIMIT 1))))
          WHERE p.id = $4
            AND EXISTS (SELECT 1 FROM jsonb_array_elements(p.plan) e
                        WHERE e->>'ts' = $1 AND (e->>'tank_target_f')::float8 < $5)
@@ -1161,6 +1163,25 @@ export class Store {
       movedToNewerPlan = true;
     }
     return { applied: false, planId: null, movedToNewerPlan };
+  }
+
+  /**
+   * #136: the floor raises recorded in plan meta over the last `hours` — the PERSISTED history behind
+   * /health.demand_floor_cadence, so it survives a redeploy and expires without a later raise (codex).
+   */
+  async recentFloorRaises(hours: number): Promise<{ at: string; ts: string; from: number; to: number }[]> {
+    const res = await this.pool.query(
+      `SELECT r AS raise
+       FROM shadow_plans p, jsonb_array_elements(coalesce(p.meta->'floor_raises', '[]'::jsonb)) AS r
+       WHERE p.computed_at >= now() - ($1 || ' hours')::interval - interval '1 hour'
+         AND (r->>'at')::timestamptz >= now() - ($1 || ' hours')::interval
+       ORDER BY (r->>'at')::timestamptz ASC`,
+      [hours],
+    );
+    return res.rows
+      .map((row) => row.raise as { at?: string; ts?: string; from?: number; to?: number })
+      .filter((r) => r && typeof r.at === "string" && typeof r.ts === "string")
+      .map((r) => ({ at: String(r.at), ts: String(r.ts), from: Number(r.from), to: Number(r.to) }));
   }
 
   /** All shadow plans computed in the last N hours (ascending). */

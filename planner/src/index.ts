@@ -944,6 +944,9 @@ async function floorReCheckOnce(): Promise<void> {
   if (!demandFeed || !FLOOR_CADENCE_ENABLED) return;
   const { floor, outdoorF } = await sampleDemandFloor(lastThermal.outdoor_f);
   floorCadence.lastCheckAt = new Date().toISOString();
+  // The 24 h raise history is the PERSISTED one (plan meta), refreshed every check: it survives a
+  // redeploy and expires on its own when no raise follows — not a process-local list (codex, #149).
+  floorCadence.raises = await store.recentFloorRaises(24).catch(() => floorCadence.raises);
   floorCadence.lastFloorF = floor?.tankTargetF ?? null;
   const plans = await store.recentPlans(6).catch(() => []);
   const latest = plans.at(-1);
@@ -967,8 +970,6 @@ async function floorReCheckOnce(): Promise<void> {
     : `no-op: the block was already ≥ ${d.toF}°F when the update ran${r.movedToNewerPlan ? " (a newer plan arrived meanwhile)" : ""}`;
   if (ok) {
     floorCadence.raises.push({ at: floorCadence.lastCheckAt, ts: d.ts, from: d.fromF, to: d.toF });
-    const dayAgo = nowMs - 86_400_000;
-    floorCadence.raises = floorCadence.raises.filter((r) => Date.parse(r.at) >= dayAgo);
     console.log(`[floor-cadence] raised the current block ${d.fromF} → ${d.toF}°F — ${d.reason}`);
   }
 }
@@ -1725,7 +1726,11 @@ async function main(): Promise<void> {
               ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
               : "disabled",
             // #136: the per-poll floor re-check — last decision and the raises it made in the past 24 h.
-            demand_floor_cadence: { enabled: FLOOR_CADENCE_ENABLED && !!demandFeed, poll_seconds: POLL_SECONDS, min_raise_f: FLOOR_RAISE_MIN_F, ...floorCadence, raises_24h: floorCadence.raises.length },
+            demand_floor_cadence: (() => {
+              const dayAgo = Date.now() - 86_400_000;
+              const raises = floorCadence.raises.filter((r) => Date.parse(r.at) >= dayAgo); // pruned on read as well
+              return { enabled: FLOOR_CADENCE_ENABLED && !!demandFeed, poll_seconds: POLL_SECONDS, min_raise_f: FLOOR_RAISE_MIN_F, ...floorCadence, raises, raises_24h: raises.length, raises_source: "shadow_plans.meta.floor_raises (persisted, rolling 24 h)" };
+            })(),
             winter_solver: demandFeed
               ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
               : "off",
