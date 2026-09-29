@@ -42,6 +42,8 @@
  * Phase B is deliberately NOT posted: it drives the pump setpoint to (operative tank target + I1
  * margin), so it carries no AWT perturbation independent of the tank-target window that already
  * covers the same minutes. Posting a window per lease renewal would be noise with no new information.
+ * Writes with source 'identification' are NOT posted either: the identification driver posts those
+ * minutes itself as awt_identification windows with their drawn assignment (identify.ts).
  */
 import { DEFAULT_OPTS } from "./shadow";
 
@@ -260,6 +262,15 @@ export class TempiqWindowPoster {
             // A restore re-applies the as-found curve: it CLOSES the previous window (its ts is that
             // window's closer) and opens nothing — the plant is back on the human's curve.
             marks.push({ writeId: w.id, externalId: externalIdFor(w.id), kind: "restore", closedAt: w.ts, lastError: null });
+            restores++;
+            continue;
+          }
+          if (w.source === "identification" || w.source === "identification-abort") {
+            // A randomised probe (identify.ts) is posted by the driver itself as kind awt_identification
+            // WITH its drawn assignment — the only kind U4 may fit. Filing the same minutes here as a
+            // quarantine window would delete the one fittable interval. It still closes the previous
+            // episode (its ts is that window's closer), so it is marked, not posted.
+            marks.push({ writeId: w.id, externalId: externalIdFor(w.id), kind: "identification", closedAt: w.closedAt ?? w.ts, lastError: null });
             restores++;
             continue;
           }

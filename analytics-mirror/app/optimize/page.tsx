@@ -98,6 +98,20 @@ export default async function OptimizePage() {
     /* auto_sanitize column not migrated yet — default off */
   }
 
+  // Identification-driver mode (identify.ts, gtm#1616) — from the RUNTIME controller_flags row, with
+  // the heartbeat's last result for "what it is doing now". Own try/catch: both columns arrive with the
+  // planner deploy that adds the driver, and a not-yet-migrated column must not blank the page.
+  let initialIdentification: "off" | "shadow" | "armed" = "off";
+  let identificationResult: string | null = null;
+  try {
+    const f = await sql<{ m: string | null }>`SELECT identification_mode AS m FROM controller_flags WHERE id = 1`;
+    const m = f.rowCount ? f.rows[0].m : null;
+    if (m === "off" || m === "shadow" || m === "armed") initialIdentification = m;
+    const r = await sql<{ r: string | null }>`SELECT identification_result AS r FROM controller_status WHERE id = 1`;
+    if (r.rowCount) identificationResult = r.rows[0].r;
+  } catch {
+    /* identification columns not migrated yet — default off, no result */
+  }
   return (
     <>
       <I1Banner />
@@ -116,6 +130,8 @@ export default async function OptimizePage() {
         autonomy={autonomy}
         initialMode={initialMode}
         initialAutoSanitize={initialAutoSanitize}
+        initialIdentification={initialIdentification}
+        identificationResult={identificationResult}
       />
     </>
   );

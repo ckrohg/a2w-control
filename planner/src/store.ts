@@ -10,6 +10,7 @@
 
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
+import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange } from "./drift";
 
 export interface SlxReading {
@@ -260,6 +261,39 @@ export class Store {
       -- (tempiq-windows.ts). closed_at NULL = the window is still OPEN on TempIQ's side and will be
       -- re-posted with its closing fields once a later write or a foreign curve change ends it.
       -- last_error records a per-window validation rejection (deterministic — not retried).
+      -- identify.ts: every randomised AWT identification window, persisted so a planner restart resumes
+      -- or closes it and so the dashboard can show what was drawn. posted_* = TempIQ has the window.
+      CREATE TABLE IF NOT EXISTS identification_windows (
+        id               serial PRIMARY KEY,
+        created_at       timestamptz NOT NULL DEFAULT now(),
+        state            text NOT NULL,
+        arm              text NOT NULL,
+        direction        text NOT NULL,
+        zone_ids         text[] NOT NULL,
+        band_lo          real NOT NULL,
+        band_hi          real NOT NULL,
+        magnitude_f      real NOT NULL,
+        base_f           real NOT NULL,
+        target_f         real NOT NULL,
+        cap_f            real NOT NULL,
+        draw_probability real NOT NULL,
+        draw_seed        text NOT NULL,
+        started_at       timestamptz,
+        ended_at         timestamptz,
+        end_reason       text,
+        duration_min     integer NOT NULL,
+        write_id         integer,
+        dry_run          boolean NOT NULL DEFAULT false,
+        posted_open      boolean NOT NULL DEFAULT false,
+        posted_closed    boolean NOT NULL DEFAULT false,
+        cell             jsonb,
+        safe_to_probe    jsonb,
+        arming_ticks     integer NOT NULL DEFAULT 0,
+        write_attempts   integer NOT NULL DEFAULT 0
+      );
+      ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
+      ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
+      ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
       CREATE TABLE IF NOT EXISTS tempiq_window_posts (
         write_id    integer PRIMARY KEY,
         external_id text NOT NULL,
@@ -397,23 +431,31 @@ export class Store {
 
   /** Seed the runtime autonomy row from the env defaults IF it doesn't exist yet (first boot only).
    *  After that the DB row is authoritative and env changes don't clobber a live choice. */
-  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean }): Promise<void> {
+  async seedControllerFlags(seed: { mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean; identificationMode?: string }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize, updated_by)
-       VALUES (1, $1, $2, $3, $4, 'env-seed')
+      `INSERT INTO controller_flags (id, mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize, identification_mode, updated_by)
+       VALUES (1, $1, $2, $3, $4, $5, 'env-seed')
        ON CONFLICT (id) DO NOTHING`,
-      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun, seed.autoSanitize],
+      [seed.mode, seed.autopilotDryRun, seed.phasebDryRun, seed.autoSanitize, seed.identificationMode ?? "off"],
     );
   }
 
   /** The current effective autonomy flags (runtime override). null before the row is seeded. */
-  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean } | null> {
+  async getControllerFlags(): Promise<{ mode: string; autopilotDryRun: boolean; phasebDryRun: boolean; autoSanitize: boolean; identificationMode: string } | null> {
     const r = await this.pool.query(
-      `SELECT mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize FROM controller_flags WHERE id = 1`,
+      `SELECT mode, autopilot_dry_run, phaseb_dry_run, auto_sanitize, identification_mode FROM controller_flags WHERE id = 1`,
     );
     if (!r.rowCount) return null;
     const x = r.rows[0];
-    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run, autoSanitize: x.auto_sanitize };
+    return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run, autoSanitize: x.auto_sanitize, identificationMode: x.identification_mode ?? "off" };
+  }
+
+  /** identify.ts: the runtime identification mode (off | shadow | armed), independent of the autonomy switch. */
+  async setIdentificationMode(mode: string, updatedBy: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE controller_flags SET identification_mode = $1, updated_at = now(), updated_by = $2 WHERE id = 1`,
+      [mode, updatedBy],
+    );
   }
 
   /** Set the runtime autonomy mode (dashboard Off/Armed switch). Returns the stored row. */
@@ -492,12 +534,13 @@ export class Store {
   async upsertControllerStatus(s: {
     autopilotEnabled: boolean; autopilotDryRun: boolean; autopilotResult: string | null; autopilotTargetF: number | null;
     phasebEnabled: boolean; phasebDryRun: boolean; phasebResult: string | null; autoSanitize: boolean;
+    identificationMode?: string | null; identificationResult?: string | null;
   }): Promise<void> {
     await this.pool.query(
       `INSERT INTO controller_status
          (id, updated_at, autopilot_enabled, autopilot_dry_run, autopilot_result, autopilot_target_f,
-          phaseb_enabled, phaseb_dry_run, phaseb_result, auto_sanitize)
-       VALUES (1, now(), $1,$2,$3,$4,$5,$6,$7,$8)
+          phaseb_enabled, phaseb_dry_run, phaseb_result, auto_sanitize, identification_mode, identification_result)
+       VALUES (1, now(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT (id) DO UPDATE SET
          updated_at = now(),
          autopilot_enabled = EXCLUDED.autopilot_enabled,
@@ -507,9 +550,12 @@ export class Store {
          phaseb_enabled = EXCLUDED.phaseb_enabled,
          phaseb_dry_run = EXCLUDED.phaseb_dry_run,
          phaseb_result = EXCLUDED.phaseb_result,
-         auto_sanitize = EXCLUDED.auto_sanitize`,
+         auto_sanitize = EXCLUDED.auto_sanitize,
+         identification_mode = EXCLUDED.identification_mode,
+         identification_result = EXCLUDED.identification_result`,
       [s.autopilotEnabled, s.autopilotDryRun, s.autopilotResult, s.autopilotTargetF,
-       s.phasebEnabled, s.phasebDryRun, s.phasebResult, s.autoSanitize],
+       s.phasebEnabled, s.phasebDryRun, s.phasebResult, s.autoSanitize,
+       s.identificationMode ?? null, s.identificationResult ?? null],
     );
   }
 
@@ -837,6 +883,71 @@ export class Store {
       [ts],
     );
     return res.rowCount ? res.rows[0].zones ?? null : null;
+  }
+
+  // ── identify.ts: identification windows ──
+  private rowToIdentWindow(r: any): IdentWindow {
+    const num = (v: unknown) => (v == null ? null : Number(v));
+    return {
+      id: Number(r.id), state: r.state, arm: r.arm, direction: r.direction,
+      zoneIds: Array.isArray(r.zone_ids) ? r.zone_ids.map(String) : [],
+      bandLo: Number(r.band_lo), bandHi: Number(r.band_hi), magnitudeF: Number(r.magnitude_f), baseF: Number(r.base_f),
+      targetF: Number(r.target_f), capF: Number(r.cap_f), drawProbability: Number(r.draw_probability), drawSeed: String(r.draw_seed),
+      startedAt: r.started_at ? new Date(r.started_at) : null, endedAt: r.ended_at ? new Date(r.ended_at) : null,
+      endReason: r.end_reason == null ? null : String(r.end_reason), durationMin: Number(r.duration_min),
+      writeId: num(r.write_id), dryRun: r.dry_run === true, postedOpen: r.posted_open === true, postedClosed: r.posted_closed === true,
+      cell: r.cell ?? null, safeToProbe: r.safe_to_probe ?? null, armingTicks: Number(r.arming_ticks ?? 0), writeAttempts: Number(r.write_attempts ?? 0),
+    };
+  }
+  async openIdentificationWindow(): Promise<IdentWindow | null> {
+    const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state IN ('arming','active') ORDER BY id DESC LIMIT 1`);
+    return r.rowCount ? this.rowToIdentWindow(r.rows[0]) : null;
+  }
+  async lastIdentificationWindowEnd(): Promise<Date | null> {
+    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND NOT dry_run`);
+    return r.rows[0]?.t ? new Date(r.rows[0].t) : null;
+  }
+  async insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number> {
+    const r = await this.pool.query(
+      `INSERT INTO identification_windows
+         (state, arm, direction, zone_ids, band_lo, band_hi, magnitude_f, base_f, target_f, cap_f, draw_probability, draw_seed,
+          started_at, ended_at, end_reason, duration_min, write_id, dry_run, posted_open, posted_closed, cell, safe_to_probe, arming_ticks, write_attempts)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,
+      [w.state, w.arm, w.direction, w.zoneIds, w.bandLo, w.bandHi, w.magnitudeF, w.baseF, w.targetF, w.capF, w.drawProbability, w.drawSeed,
+       w.startedAt, w.endedAt, w.endReason, w.durationMin, w.writeId, w.dryRun, w.postedOpen, w.postedClosed,
+       JSON.stringify(w.cell ?? null), JSON.stringify(w.safeToProbe ?? null), w.armingTicks, w.writeAttempts],
+    );
+    return Number(r.rows[0].id);
+  }
+  async updateIdentificationWindow(id: number, patch: Partial<Omit<IdentWindow, "id">>): Promise<void> {
+    const cols: Record<string, string> = {
+      state: "state", endedAt: "ended_at", endReason: "end_reason", startedAt: "started_at", writeId: "write_id",
+      postedOpen: "posted_open", postedClosed: "posted_closed", armingTicks: "arming_ticks", writeAttempts: "write_attempts",
+    };
+    const sets: string[] = []; const vals: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      const col = cols[k]; if (!col) continue;
+      vals.push(v); sets.push(`${col} = $${vals.length}`);
+    }
+    if (!sets.length) return;
+    vals.push(id);
+    await this.pool.query(`UPDATE identification_windows SET ${sets.join(", ")} WHERE id = $${vals.length}`, vals);
+  }
+  async unpostedIdentificationWindows(): Promise<IdentWindow[]> {
+    const r = await this.pool.query(
+      `SELECT * FROM identification_windows
+       WHERE NOT dry_run AND ((state = 'ended' AND NOT posted_closed) OR (state = 'active' AND NOT posted_open))
+       ORDER BY id LIMIT 20`,
+    );
+    return r.rows.map((x) => this.rowToIdentWindow(x));
+  }
+  async recentIdentificationWindows(n: number): Promise<IdentWindow[]> {
+    const r = await this.pool.query(`SELECT * FROM identification_windows ORDER BY id DESC LIMIT $1`, [n]);
+    return r.rows.map((x) => this.rowToIdentWindow(x));
+  }
+  async latestAcceptedWriteId(source: string): Promise<number | null> {
+    const r = await this.pool.query(`SELECT id FROM hbx_writes WHERE source = $1 AND result = 'accepted' ORDER BY id DESC LIMIT 1`, [source]);
+    return r.rowCount ? Number(r.rows[0].id) : null;
   }
 
   /** a2w#137: record what was posted (upsert — a close re-posts the same write_id). */

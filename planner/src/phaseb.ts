@@ -82,6 +82,13 @@ export class PhaseB {
   setDryRun(v: boolean): void { this.dryRun = v; }
   get isDryRun(): boolean { return this.dryRun; }
 
+  // Identification probe target (identify.ts): an UP-probe above the operative target must be LED by
+  // the setpoints exactly like the daily sanitize is led by the plan block — otherwise I1 rejects the
+  // HBX write. Tracked through the same max() below, so it can only ever raise the setpoint.
+  private probeTargetF: number | null = null;
+  setProbeTarget(t: number | null): void { this.probeTargetF = t; }
+  get probeTarget(): number | null { return this.probeTargetF; }
+
   /** Current-hour tank target from the latest shadow plan — setpoints must LEAD the plan up (esp.
    *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan. */
   private async currentPlanTarget(): Promise<number | null> {
@@ -111,7 +118,7 @@ export class PhaseB {
     // drops the setpoint below tracking the operative target, so I1 is only ever strengthened.
     const opTarget = latest.targetF;
     const planTarget = await this.currentPlanTarget();
-    const effectiveTarget = planTarget != null ? Math.max(opTarget, planTarget) : opTarget;
+    const effectiveTarget = Math.max(opTarget, planTarget ?? -Infinity, this.probeTargetF ?? -Infinity);
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();
 

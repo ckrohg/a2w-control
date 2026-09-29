@@ -104,6 +104,7 @@ function hh(h: number): string {
 const MONO = 'ui-monospace,"SF Mono",Menlo,monospace';
 
 // ---- autonomy copy (ported from the mockup's COPY object) -----------------------------
+type IdentMode = "off" | "shadow" | "armed";
 type Mode = "off" | "set" | "req" | "arm";
 type ModeCopy = { name: string; chip: string; chipClass: string; desc: string; trade: string };
 const COPY: Record<Mode, ModeCopy> = {
@@ -478,6 +479,8 @@ export default function OptimizeClient({
   autonomy,
   initialMode = "off",
   initialAutoSanitize = false,
+  initialIdentification = "off",
+  identificationResult = null,
 }: {
   rate: number;
   dailyKwh: number;
@@ -486,6 +489,8 @@ export default function OptimizeClient({
   autonomy: Autonomy;
   initialMode?: Mode;
   initialAutoSanitize?: boolean;
+  initialIdentification?: IdentMode;
+  identificationResult?: string | null;
 }) {
   const router = useRouter();
   // ---- autonomy + boost view state --------------------------------------------------
@@ -498,6 +503,11 @@ export default function OptimizeClient({
   const [autoSani, setAutoSani] = useState(initialAutoSanitize);
   const [saniBusy, setSaniBusy] = useState(false);
   const [saniMsg, setSaniMsg] = useState("");
+  // Identification driver (gtm#1616 / #137) — off | shadow | armed; seeds from the RUNTIME
+  // controller_flags row; independent of Off/Armed and of auto-sanitize.
+  const [identMode, setIdentMode] = useState<IdentMode>(initialIdentification);
+  const [identBusy, setIdentBusy] = useState(false);
+  const [identMsg, setIdentMsg] = useState("");
   const [boost, setBoost] = useState<Boost | null>(null);
   const [customOpen, setCustomOpen] = useState(false);
   const [customDeg, setCustomDeg] = useState(8);
@@ -640,6 +650,51 @@ export default function OptimizeClient({
       setAutoBusy(false);
     }
   }
+
+  // Identification-driver mode actuator. POSTs off | shadow | armed to the planner (token-holding
+  // proxy). Arming lets the planner run randomised supply-water probes inside the I4/I1 guardrails
+  // (up to the 145°F identification ceiling — owner decision 2026-09-29); Shadow decides and logs
+  // without writing; Off ends any open window on the next cycle.
+  const setIdentification = async (next: IdentMode) => {
+    if (identBusy || next === identMode) return;
+    if (
+      next === "armed" &&
+      !window.confirm(
+        "Arm identification probes? The planner will run randomised supply-water probes (up to the 145°F identification ceiling, inside I1 and the rate limit), one 2-hour window at a time, and abort on any room deficit, DHW draw, or I1 conflict. This is how TempIQ measures what each zone actually needs. Continue?",
+      )
+    )
+      return;
+    const prev = identMode;
+    setIdentMode(next); // optimistic
+    setIdentBusy(true);
+    setIdentMsg("");
+    try {
+      const res = await fetch("/api/planner/identification", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: next }),
+      });
+      const out: { ok?: boolean; mode?: string; error?: string } = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setIdentMsg(
+          next === "armed"
+            ? "Identification armed — the planner will draw its first window at the next eligible poll."
+            : next === "shadow"
+              ? "Identification in shadow — decisions and draws are logged, nothing is written."
+              : "Identification off — any open window ends on the next cycle.",
+        );
+        router.refresh();
+      } else {
+        setIdentMode(prev);
+        setIdentMsg(`Couldn't change identification mode: ${out.error ?? `HTTP ${res.status}`}`);
+      }
+    } catch (e) {
+      setIdentMode(prev);
+      setIdentMsg(`Network error: ${String(e)}`);
+    } finally {
+      setIdentBusy(false);
+    }
+  };
 
   // I8 auto-sanitize toggle actuator. POSTs on/off to the planner (token-holding proxy). Arming is
   // confirmed (it hands the daily pasteurizing soak to the planner) but fully reversible. Optimistic
@@ -876,6 +931,53 @@ export default function OptimizeClient({
                 }}
               >
                 {saniMsg}
+              </p>
+            )}
+          </div>
+
+          {/* ============ Identification probes (gtm#1616 / #137) — independent of Off/Armed ============ */}
+          <div className="plan-sani">
+            <div className="plan-sani-head">
+              <span className="pl-eyebrow2">Identification probes</span>
+              <div role="radiogroup" aria-label="Identification mode" style={{ display: "flex", gap: 6 }}>
+                {(["off", "shadow", "armed"] as IdentMode[]).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    role="radio"
+                    aria-checked={identMode === m}
+                    className={`sani-switch ${identMode === m ? "on" : ""}`}
+                    disabled={identBusy}
+                    onClick={() => void setIdentification(m)}
+                  >
+                    <span className="sani-txt">{m === "off" ? "Off" : m === "shadow" ? "Shadow" : "Armed"}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="pl-summary" style={{ borderTop: "none", paddingTop: 0, margin: 0 }}>
+              Randomised supply-water probes so TempIQ can <b>measure</b> what each zone needs instead of
+              reading a textbook curve. One 2-hour window at a time, drawn (not scheduled) from TempIQ&apos;s
+              identification plan; the auto-pilot is held for the window; up-probes may exceed the everyday
+              135°F cap up to the 145°F identification ceiling, inside I1 and the write rate limit; a
+              down-probe aborts and restores the as-found curve on any room deficit or DHW draw.{" "}
+              <b>Shadow</b> decides and logs without writing.
+              {identificationResult && (
+                <>
+                  {" "}
+                  <span className="dim">Now:</span> <b>{identificationResult}</b>.
+                </>
+              )}
+            </p>
+            {identMsg && (
+              <p
+                className="pm-desc"
+                style={{
+                  color: identMsg.startsWith("Couldn't") || identMsg.startsWith("Network") ? "var(--warm)" : "var(--ok)",
+                  marginTop: 6,
+                }}
+              >
+                {identMsg}
               </p>
             )}
           </div>

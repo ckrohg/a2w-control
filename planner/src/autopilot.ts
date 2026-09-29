@@ -34,6 +34,18 @@ export class AutoPilot {
   setDryRun(v: boolean): void { this.dryRun = v; }
   get isDryRun(): boolean { return this.dryRun; }
 
+  // Identification hold (identify.ts): while a randomised AWT window runs, the auto-pilot must not
+  // overwrite the arm — a probe that gets re-commanded to the plan target after 10 min is not a
+  // perturbation, and a hold arm that the plan moves is not a control. Time-bounded so a crashed
+  // driver cannot freeze the auto-pilot: past `until` the hold lapses on its own.
+  private holdUntil: number | null = null;
+  private holdReason = "";
+  setHold(until: Date | null, reason: string): void {
+    this.holdUntil = until ? until.getTime() : null;
+    this.holdReason = reason;
+  }
+  get holdActive(): boolean { return this.holdUntil != null && Date.now() < this.holdUntil; }
+
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
   private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {
     this.lastResult = verbose;
@@ -64,6 +76,10 @@ export class AutoPilot {
     const reason = String(block?.reason ?? "");
     this.lastRunAt = new Date().toISOString();
 
+    if (this.holdActive) {
+      await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`);
+      return;
+    }
     // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
     const status = await this.writer.status();
     const commanded = status.commanded_target_f as number | null;
