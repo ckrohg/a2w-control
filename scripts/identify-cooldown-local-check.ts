@@ -9,8 +9,20 @@ import assert from "node:assert/strict";
 import { Store } from "../planner/src/store";
 import type { IdentWindow } from "../planner/src/identify";
 
+// DESTRUCTIVE (TRUNCATEs identification_windows): the URL is parsed structurally and must name the dedicated
+// local database `a2w_local` on a literal loopback host with no connection options — a tunnel or proxy that
+// happens to listen on localhost must not be reachable from here (codex on #153).
 const url = process.env.LOCAL_DATABASE_URL ?? "";
-if (!/^postgres(ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) { console.error("refusing: LOCAL_DATABASE_URL must point at localhost"); process.exit(2); }
+let parsed: URL | null = null;
+try { parsed = new URL(url); } catch { parsed = null; }
+const okScheme = parsed != null && /^postgres(ql)?:$/.test(parsed.protocol);
+const okHost = parsed != null && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+const okDb = parsed != null && parsed.pathname === "/a2w_local";
+const okOpts = parsed != null && parsed.search === "" && parsed.hash === "";
+if (!parsed || !okScheme || !okHost || !okDb || !okOpts) {
+  console.error("refusing: LOCAL_DATABASE_URL must be postgres://<user>@localhost[:port]/a2w_local with no options (loopback host, the dedicated local database, nothing else)");
+  process.exit(2);
+}
 const store = new Store(url);
 const pool = (store as unknown as { pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: any[] }> } }).pool;
 
@@ -27,6 +39,16 @@ async function lastEnd(includeDryRun: boolean) { return (await store.lastIdentif
 
 async function main() {
   await store.ensureSchema();
+  try {
+    await run();
+  } finally {
+    // Fixtures never outlive the check, whichever assertion fails.
+    await pool.query(`TRUNCATE identification_windows RESTART IDENTITY`).catch(() => undefined);
+    await store.close().catch(() => undefined);
+  }
+}
+
+async function run() {
   await pool.query(`TRUNCATE identification_windows RESTART IDENTITY`);
   // 1. Nothing → null.
   assert.equal(await lastEnd(false), null);
@@ -51,8 +73,6 @@ async function main() {
   assert.equal(await lastEnd(true), T0 + 6000, "shadow rows count for shadow draws");
   await store.insertIdentificationWindow(row({ dryRun: true, endedAt: new Date(T0 + 7000), endReason: "interlock:switchback_active:arm_log" }));
   assert.equal(await lastEnd(true), T0 + 6000, "a shadow interlock refusal never counts");
-  await pool.query(`TRUNCATE identification_windows RESTART IDENTITY`);
-  await store.close();
   console.log("identify-cooldown-local-check: all assertions passed");
 }
-main().catch(async (e) => { console.error(e); try { await store.close(); } catch {} process.exit(1); });
+main().catch((e) => { console.error(e); process.exit(1); });

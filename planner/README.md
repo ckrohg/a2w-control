@@ -358,7 +358,8 @@ all mean **no draw** — fail closed, with the reason in `/health.identification
 shadow ledger shows what armed would have done. A window the interlock refused before anything was commanded is
 ended as `interlock:…`, is never posted to TempIQ, and never starts the 60-min cooldown (only windows that
 happened do — a hold arm, a probe whose write was accepted, or in shadow a shadow window). That cooldown rule
-lives in SQL; `scripts/identify-cooldown-local-check.ts` proves it against a local Postgres:
+lives in SQL; `scripts/identify-cooldown-local-check.ts` proves it against a local Postgres — it TRUNCATEs
+`identification_windows`, so it refuses any URL other than the dedicated `a2w_local` database on a loopback host:
 
 ```sh
 LOCAL_DATABASE_URL=postgres://$(whoami)@localhost:5432/a2w_local npx tsx ../scripts/identify-cooldown-local-check.ts

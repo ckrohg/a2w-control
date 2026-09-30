@@ -537,13 +537,16 @@ export class IdentificationDriver {
   }
 
   private async continueArming(w: IdentWindow): Promise<void> {
+    // The calendar is asked BEFORE any preparatory side effect of this tick (arming counter, Phase B lead), not
+    // just before the write: a window TempIQ's switchback has overtaken must not keep leading the pumps for
+    // another tick (codex on #153). Arming is bounded by ARMING_MAX_TICKS, so this is a handful of calls at most.
+    if (!(await this.interlockClearForWrite(w))) return;
     const ticks = w.armingTicks + 1;
     await this.d.store.updateIdentificationWindow(w.id, { armingTicks: ticks });
     w.armingTicks = ticks;
     if (w.dryRun) {
-      // In shadow there is no setpoint lead to wait for — record what would have been written. The calendar is
-      // still asked again here, so the shadow ledger shows exactly what armed would have done (codex on #153).
-      if (!(await this.interlockClearForWrite(w))) return;
+      // In shadow there is no setpoint lead to wait for — record what would have been written. The calendar was
+      // asked above, so the shadow ledger shows exactly what armed would have done.
       await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt: this.now() });
       w.state = "active"; w.startedAt = this.now();
       this.lastResult = `SHADOW would write ${w.targetF} °F (cap ${w.capF}) for #${w.id}`;
@@ -563,7 +566,6 @@ export class IdentificationDriver {
       this.lastResult = `arming #${w.id}: setpoints not yet ≥ ${w.targetF + DEFAULT_OPTS.i1MarginF} °F (tick ${ticks}/${ARMING_MAX_TICKS})`;
       return;
     }
-    if (!(await this.interlockClearForWrite(w))) return;
     await this.d.store.updateIdentificationWindow(w.id, { state: "pending_write" });
     w.state = "pending_write";
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
@@ -571,9 +573,6 @@ export class IdentificationDriver {
 
   /** A drawn probe whose write has not been accepted yet: retry (429) or give up (limit reached). */
   private async continuePendingWrite(w: IdentWindow): Promise<void> {
-    // Keep the hold and the Phase B lead alive while the write is pending (live windows only).
-    if (!w.dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
-    if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
     // RECONCILE before retrying (codex 2026-09-29 pass 2, critical): the device may have ACCEPTED the
     // last attempt while this process died before the row was updated. The writer audits every
     // accepted write, so an accepted 'identification' row since this window was drawn IS the probe
@@ -596,8 +595,12 @@ export class IdentificationDriver {
         return;
       }
     }
-    if (this.d.isI1Violated() || this.d.isStormActive()) { await this.end(w, "aborted:before_write"); return; }
+    // Not yet written: ask the calendar BEFORE renewing the hold / Phase B lead for another tick (codex on #153),
+    // then keep them alive while the retry is attempted.
     if (!(await this.interlockClearForWrite(w))) return;
+    if (!w.dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
+    if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
+    if (this.d.isI1Violated() || this.d.isStormActive()) { await this.end(w, "aborted:before_write"); return; }
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
   }
 
