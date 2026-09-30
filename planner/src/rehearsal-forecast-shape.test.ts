@@ -58,21 +58,18 @@ assert.equal(placeWarmestAhead([30, 29, 28], ["D0", "D0", "D0"], 0).nudge, null)
   // and the horizon is exactly computeShadowPlan's slice
   assert.equal(HORIZON_H, 24);
 }
-// 8. the shaped day has < 6 blocks INSIDE THE HORIZON even though the series continues into it → the plan (which
-//    only holds the horizon) skips that day's soak → no nudge. The unbounded pass-1 shaper saw 20 D1 blocks here.
+// 8. the 6-block rule counts only blocks INSIDE THE HORIZON (codex pass 2): with a short horizon the shaped day shows
+//    5 blocks → the plan would skip its soak → no nudge, although the day has 47 blocks in the series (the unbounded
+//    pass-1 shaper counted those and nudged). With the real 24-block horizon the target's day always shows ≥ 20 blocks,
+//    so the branch only matters for series that END early — covered by the same call with a full horizon below.
 {
-  const f = Array.from({ length: 50 }, (_, i) => 20 + i); // rising: the last visible block is always the warmest
-  const day = f.map((_, i) => (i < 22 ? "D0" : "D1")); // D1 spans indices 22..49 (28 blocks in the series)
-  // nowIdx 20 → target 24 (D1); the horizon ends at index 44 → D1 shows 22 blocks → a soak is possible; its warmest
-  // (index 43) is after the target → nothing to nudge
-  assert.equal(placeWarmestAhead(f, day, 20).nudge, null);
-  // nowIdx 0 → horizon [0, 24) → D1 shows only indices 22, 23 → fewer than 6 → no soak in the plan → no nudge, even
-  // though D1's series-wide maximum (index 49) exists and the series-wide count is 28
-  const g = f.map((_, i) => (i < 20 ? 40 - i : 20 + i)); // D0 falls, D1 rises
-  const day2 = g.map((_, i) => (i < 20 ? "D0" : "D1"));
-  assert.equal(placeWarmestAhead(g, day2, 0, 4, 24).nudge, null, "D1 has 30 blocks in the series but only 4 inside the horizon");
-  // and the same series with a wider horizon DOES see ≥ 6 D1 blocks whose warmest is at the end → still no nudge (target 4 is D0)
-  assert.equal(placeWarmestAhead(g, day2, 0, 4, 30).nudge?.day, undefined);
+  const f = Array.from({ length: 50 }, (_, i) => (i === 3 ? 60 : 30 - i * 0.1)); // D1's warmest is index 3, before the target 4
+  const day = f.map((_, i) => (i < 3 ? "D0" : "D1"));
+  assert.equal(placeWarmestAhead(f, day, 0, 4, 8).nudge, null, "5 visible D1 blocks (3..7) → no soak → no nudge, series length notwithstanding");
+  const r = placeWarmestAhead(f, day, 0, 4, 24);
+  assert.deepEqual(r.nudge, { index: 4, from: 29.6, to: 60.5, day: "D1", warmestWas: 3 }, "21 visible D1 blocks → soak possible → nudge");
+  // a series that ends early: the target's day has only 5 blocks at all → no nudge
+  assert.equal(placeWarmestAhead(f.slice(0, 8), day.slice(0, 8), 0).nudge, null);
 }
 // 9. ties: an EARLIER hour tying the target still wins the planner's first-strict-maximum reduce → the target is nudged
 {
