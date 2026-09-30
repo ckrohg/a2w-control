@@ -107,9 +107,10 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }}) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
+    const interlockCalls: string[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
     const restores: string[] = [];
     const holds: Array<{ until: Date | null; reason: string }> = [];
@@ -184,6 +185,12 @@ async function main(): Promise<void> {
       fetchImpl: (async (url: any, init: any) => {
         const u = String(url);
         if (u.includes("/identification-plan")) return { ok: true, status: 200, json: async () => over.plan ?? { generatedAt: now().toISOString(), cells: [] } } as any;
+        if (u.includes("/probe-interlock")) {
+          interlockCalls.push(u);
+          const il = over.interlock ?? { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } };
+          if (il.status !== 200) return { ok: false, status: il.status, json: async () => ({ source: "unavailable" }) } as any;
+          return { ok: true, status: 200, json: async () => il.body } as any;
+        }
         posts.push({ url: u, body: JSON.parse(init.body) });
         return { ok: true, status: 200, json: async () => ({ upserted: 1, rejected: [] }) } as any;
       }) as any,
@@ -191,9 +198,37 @@ async function main(): Promise<void> {
       now,
     };
     const driver = new IdentificationDriver(deps, over.mode ?? "armed");
-    return { driver, rows, posts, writes, restores, holds, probeTargets, notes, advance: (min: number) => { clock += min * 60_000; } };
+    return { driver, rows, posts, writes, restores, holds, probeTargets, notes, interlockCalls, advance: (min: number) => { clock += min * 60_000; } };
   }
   const upPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] })] };
+
+  // gtm#1618 / #151: the just-in-time experiment calendar is asked right before EVERY draw, in every mode.
+  {
+    const free = harness({ plan: upPlan, commanded: 135 });
+    await free.driver.tick();
+    assert.equal(free.rows.length, 1, "not_armed → draws");
+    assert.equal(free.interlockCalls.length, 1); assert.match(free.interlockCalls[0], /\/api\/insights\/probe-interlock\?horizonMin=155$/); // 120 + 35
+    const stepped = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: ["T-xmas"] } } });
+    await stepped.driver.tick();
+    assert.equal(stepped.rows.length, 0, "the cell's room is being stepped → no draw");
+    assert.match(stepped.driver.status().lastResult ?? "", /switchback active on Living Room Baseboard's room \(T-xmas\) — no draw/);
+    assert.equal(stepped.holds.filter((h) => h.until != null).length, 0, "and no hold");
+    const other = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-other"], steppedThermostatZoneIds: ["T-up"] } } });
+    await other.driver.tick();
+    assert.equal(other.rows.length, 1, "another loop's room is stepped → this cell still draws");
+    for (const status of [503, 500, 429]) {
+      const down = harness({ plan: upPlan, commanded: 135, interlock: { status } });
+      await down.driver.tick();
+      assert.equal(down.rows.length, 0, `HTTP ${status} → fail closed, no draw`);
+      assert.match(down.driver.status().lastResult ?? "", new RegExp(`interlock unreadable \\(HTTP ${status}\\)`));
+    }
+    const bad = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { nope: true } } });
+    await bad.driver.tick();
+    assert.equal(bad.rows.length, 0, "malformed → no draw");
+    const shadow = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: [] } } });
+    await shadow.driver.tick();
+    assert.equal(shadow.rows.length, 0, "shadow obeys the calendar too — the shadow ledger shows what armed would do");
+  }
 
   // 0. The base must be where the PLAN wants the plant (cold-day rehearsal finding): the driver ticks before
   //    the auto-pilot, so a freshly raised floor is not written yet — drawing would freeze the old target.

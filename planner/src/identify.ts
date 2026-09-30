@@ -63,7 +63,9 @@ export type CleanupState = "none" | "pending" | "done";
 export const IDENT_MODES: readonly IdentMode[] = ["off", "shadow", "armed"];
 const PLAN_REFRESH_MIN = 60;          // the plan is hourly-grained; a stale plan is not re-drawn against
 const PLAN_MAX_AGE_MIN = 180;         // beyond this the plan is not trusted for a NEW window
-const MIN_GAP_MIN = 60;               // washout + normal operation between windows
+const MIN_GAP_MIN = 60;
+/** gtm#1618: the just-in-time interlock is two indexed statements on TempIQ; anything slower means "do not draw". */
+const INTERLOCK_TIMEOUT_MS = 10_000;               // washout + normal operation between windows
 const ARMING_MAX_TICKS = 4;           // ~20 min for Phase B to lead the setpoints, else give up
 const WRITE_RETRY_MAX = 3;            // 429 (rate limit) retries, one per poll
 const CLEANUP_TRANSIENT_MAX = 6;      // transient cleanup failures tolerated before falling back to the as-found restore
@@ -480,6 +482,17 @@ export class IdentificationDriver {
       aboveEverydayCap: cell.suggest.aboveEverydayCap === true || baseF + cell.suggest.magnitudeF > this.planQuery.plantCapF,
     });
     if (!tgt) { this.lastResult = `idle: ${cell.zoneName} ${cell.band}: step from ${baseF} °F would be < ${MIN_STEP_F} °F inside the bounds`; return; }
+    // gtm#1618 / #151 — the experiment calendar, just in time. The plan is refreshed at most hourly, so a room
+    // TempIQ's heating switchback stepped since the fetch would still look probeable. Ask TempIQ NOW; a
+    // switchback-stepped room, an unreadable answer or a non-200 all mean no draw (fail closed). The
+    // dispatcher's own gate stands its rooms down while our window is open, so this is the only side that must
+    // ask before acting. Shadow asks too — the shadow ledger must show what armed would have done.
+    const interlock = await this.probeInterlock(cell.suggest.durationMin + this.planQuery.abortLatencyMin);
+    if (!interlock.ok) { this.lastResult = `idle: TempIQ probe interlock unreadable (${interlock.error}) — no draw`; return; }
+    if (interlock.blocked.has(cell.zoneId)) {
+      this.lastResult = `idle: TempIQ heating switchback active on ${cell.zoneName}'s room (${[...interlock.stepped].join(", ") || "stepped thermostat"}) — no draw`;
+      return;
+    }
     const { arm, seed } = drawArm(cell.suggest.assignmentProbability, this.rng);
     const zoneIds = [...new Set(this.plan.cells.filter((c) => c.status !== "not_probeable" || c.deliveryTypeSource === "owner_verified").map((c) => c.zoneId))];
     const dryRun = this.mode === "shadow";
@@ -770,6 +783,28 @@ export class IdentificationDriver {
         await this.d.store.updateIdentificationWindow(w.id, { handoffTargetF: planNowF });
       }
       await this.cleanup(w, false);
+    }
+  }
+
+  /**
+   * GET /api/insights/probe-interlock — which hydronic zones share a room with a thermostat TempIQ's heating
+   * switchback has stepped today (gtm#1618). `ok: false` on any non-200, malformed body or network error.
+   */
+  private async probeInterlock(horizonMin: number): Promise<{ ok: true; source: string; blocked: Set<string>; stepped: Set<string> } | { ok: false; error: string }> {
+    try {
+      const res = await this.fetchImpl(`${this.d.baseUrl}/api/insights/probe-interlock?horizonMin=${Math.max(0, Math.round(horizonMin))}`, {
+        headers: { Authorization: `Bearer ${this.d.token}` }, signal: AbortSignal.timeout(INTERLOCK_TIMEOUT_MS),
+      });
+      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+      const body = (await res.json()) as { source?: unknown; switchbackActiveHydronicZoneIds?: unknown; steppedThermostatZoneIds?: unknown };
+      if (!Array.isArray(body?.switchbackActiveHydronicZoneIds) || typeof body?.source !== "string") return { ok: false, error: "malformed body" };
+      return {
+        ok: true, source: body.source,
+        blocked: new Set((body.switchbackActiveHydronicZoneIds as unknown[]).map(String)),
+        stepped: new Set(((Array.isArray(body.steppedThermostatZoneIds) ? body.steppedThermostatZoneIds : []) as unknown[]).map(String)),
+      };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
   }
 
