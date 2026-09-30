@@ -9,8 +9,7 @@
 import assert from "node:assert/strict";
 import {
   pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource,
-  IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps,
-} from "./identify";
+  IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF } from "./identify";
 import { WriteError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
@@ -110,7 +109,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -124,7 +123,7 @@ async function main(): Promise<void> {
     const store: IdentStore = {
       async getLatestSlx() { return { ts: new Date(clock - (over.slxAgeMs ?? 60_000)), tankF: 130, targetF: over.commanded ?? 135, outdoorF: over.outdoorF ?? 40 }; },
       async activeBoost() { return null; },
-      async recentPlans() { return [{ computedAt: now(), plan: [] }]; },
+      async recentPlans() { return [{ computedAt: now(), plan: over.planBlocks ?? [] }]; },
       async getRecentSeries() { return []; },
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
       async lastIdentificationWindowEnd() { return over.lastEnd ?? null; },
@@ -186,6 +185,28 @@ async function main(): Promise<void> {
     return { driver, rows, posts, writes, restores, holds, probeTargets, notes, advance: (min: number) => { clock += min * 60_000; } };
   }
   const upPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] })] };
+
+  // 0. The base must be where the PLAN wants the plant (cold-day rehearsal finding): the driver ticks before
+  //    the auto-pilot, so a freshly raised floor is not written yet — drawing would freeze the old target.
+  {
+    const blockNow = { ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 38, tank_target_f: 132, hp1_setpoint_f: 137, reason: "binding zone: Living Room Baseboard needs 137°F" };
+    const blockLater = { ts: new Date(T0.getTime() + 40 * 60_000).toISOString(), outdoor_f: 37, tank_target_f: 140, hp1_setpoint_f: 145, reason: "later" };
+    assert.equal(currentPlanTargetF([blockLater, blockNow], T0.getTime()), 132, "the block in force is the newest one at or before now");
+    assert.equal(currentPlanTargetF([], T0.getTime()), null);
+    assert.equal(currentPlanTargetF(null, T0.getTime()), null);
+    const unsettled = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: [blockNow, blockLater] });
+    await unsettled.driver.tick();
+    assert.equal(unsettled.rows.length, 0, "no window while the plan (132) is above the plant (128)");
+    assert.match(unsettled.driver.status().lastResult ?? "", /plan wants 132 °F but the plant is at 128 °F/);
+    assert.equal(unsettled.holds.filter((h) => h.until != null).length, 0, "the auto-pilot is NOT held (only the routine hold-clear ran) — it must be free to write the floor");
+    const settled = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: [blockNow, blockLater] });
+    await settled.driver.tick();
+    assert.equal(settled.rows.length, 1, "once the plant sits at the plan target, the window opens");
+    assert.equal(settled.rows[0].baseF, 132);
+    const within = harness({ plan: upPlan, commanded: 130, operative: 130, planBlocks: [blockNow, blockLater] });
+    await within.driver.tick();
+    assert.equal(within.rows.length, 1, "a difference below MIN_STEP_F is settled enough (the auto-pilot would not write it either)");
+  }
   const downPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] }, { direction: "down", baseAwtF: 130, aboveEverydayCap: false, magnitudeF: 6 })] };
 
   // 1. UP probe: arming (Phase B lead, autopilot held, no write) → active once setpoints cover → write with the identification cap → posted open.

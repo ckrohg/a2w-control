@@ -64,7 +64,7 @@ const RETIME_MIN_SHIFT_MS = 1 * H;
 const NWS_EVENT_RE = /winter storm|ice storm|blizzard|high wind|extreme cold|wind chill/i;
 
 export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAlert[]> {
-  const url = `https://api.weather.gov/alerts/active?point=${lat},${lon}`;
+  const url = `${process.env.NWS_URL ?? "https://api.weather.gov"}/alerts/active?point=${lat},${lon}`;
   const res = await fetch(url, {
     headers: {
       "User-Agent": "a2w-control-planner (ckrohg@me.com)",
@@ -163,7 +163,7 @@ export function parseStormForecast(body: any): StormForecastHour[] {
 
 export async function fetchStormForecast(lat: string, lon: string): Promise<StormForecastHour[]> {
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `${process.env.OPEN_METEO_URL ?? "https://api.open-meteo.com"}/v1/forecast?latitude=${lat}&longitude=${lon}` +
     `&hourly=temperature_2m,wind_gusts_10m,snowfall,weather_code` +
     `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch` +
     `&forecast_days=3&timezone=auto`;

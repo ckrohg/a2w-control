@@ -1,0 +1,232 @@
+{
+  "name": "warm-evening",
+  "_comment": "62 \u00b0F, nothing calling, device already at the 120 flat curve \u2192 the planner must write NOTHING to the HBX and idle honestly. Pi leases armed.",
+  "outdoorF": 62,
+  "forecastF": [
+    62,
+    61,
+    60,
+    58,
+    57,
+    56,
+    55,
+    55,
+    56,
+    58,
+    61,
+    64,
+    66,
+    68,
+    69,
+    69,
+    68,
+    66,
+    64,
+    62,
+    60,
+    59,
+    58,
+    57,
+    62,
+    61,
+    60,
+    58,
+    57,
+    56,
+    55,
+    55,
+    56,
+    58,
+    61,
+    64,
+    66,
+    68,
+    69,
+    69,
+    68,
+    66,
+    64,
+    62,
+    60,
+    59,
+    58,
+    57
+  ],
+  "tank": {
+    "actualF": 121,
+    "targetF": 120
+  },
+  "device": {
+    "dot": 48,
+    "wwsd": 125,
+    "dbt": 120,
+    "mbt": 118,
+    "htDif": 6,
+    "numStg": 2,
+    "hpStg": 2,
+    "lagT": 180,
+    "lagOff": 5,
+    "bkLag": 60,
+    "bkDif": 10,
+    "bkTemp": 100,
+    "bkOd": 0,
+    "bkTk": 1,
+    "permHD": 1,
+    "permCD": 0,
+    "dhwOn": 1,
+    "dhwT": 120,
+    "units": 1
+  },
+  "zones": [
+    {
+      "zoneId": "z-lrb",
+      "zoneName": "Living Room Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 340,
+        "thermalMass": 5200,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 152,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 66.2,
+        "setpointF": 69
+      }
+    },
+    {
+      "zoneId": "z-upb",
+      "zoneName": "Upstairs Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 290,
+        "thermalMass": 4600,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 146,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 68.4,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-bsb",
+      "zoneName": "Basement Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 210,
+        "thermalMass": 6000,
+        "confidence": 0.7,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 138,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 62.5,
+        "setpointF": 62
+      }
+    },
+    {
+      "zoneId": "z-kr",
+      "zoneName": "Kitchen Radiant",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 180,
+        "thermalMass": 9000,
+        "confidence": 0.75,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 112,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 67.1,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-mbr",
+      "zoneName": "Master Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 90,
+        "thermalMass": 3000,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 110,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 69.0,
+        "setpointF": 70
+      }
+    },
+    {
+      "zoneId": "z-ubr",
+      "zoneName": "Upstairs Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 70,
+        "thermalMass": 2500,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 108,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 68.0,
+        "setpointF": 68
+      }
+    }
+  ],
+  "calling": [],
+  "hub": {
+    "pi_connected": true,
+    "leaseMinutes": 90,
+    "pumps": [
+      {
+        "id": "pump1",
+        "name": "Pump 1"
+      },
+      {
+        "id": "pump2",
+        "name": "Pump 2"
+      }
+    ]
+  },
+  "plan": {
+    "magnitudeF": 8,
+    "durationMin": 120,
+    "baseboardBaseF": 135,
+    "radiantBaseF": 120,
+    "safe": true
+  },
+  "expect": {
+    "maxCurrentBlockTargetF": 120,
+    "autopilotWrites": false,
+    "phaseBCommands": 2,
+    "probeDrawn": false,
+    "maxAnyWriteF": 145,
+    "noUnhandledUpstreamCalls": true
+  }
+}

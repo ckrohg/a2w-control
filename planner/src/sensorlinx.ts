@@ -6,7 +6,9 @@
  * see knowledge/reference/hbx-write-api.md). The polling loop never writes.
  */
 
-const BASE = "https://api.sensorlinx.co";
+// Overridable ONLY so the cold-day rehearsal (scripts/rehearsal) can point the real planner at a fake
+// upstream on localhost. Production never sets it; the default is the live SensorLinx API.
+const BASE = process.env.SLX_BASE_URL ?? "https://api.sensorlinx.co";
 const FETCH_TIMEOUT_MS = 30_000;
 
 export class SensorLinxClient {

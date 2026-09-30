@@ -267,6 +267,17 @@ export function deficitZones(zones: InsightZone[], zoneIds: string[]): string[] 
 }
 
 /** True when a plan block flagged sanitize/bank/storm sits inside the next `hours`. */
+/** The plan block in force at `nowMs` (newest block with ts ≤ now) and its tank target, or null. */
+export function currentPlanTargetF(plan: any[] | null, nowMs: number): number | null {
+  if (!Array.isArray(plan)) return null;
+  const block = plan
+    .filter((b) => b && typeof b.ts === "string" && new Date(b.ts).getTime() <= nowMs)
+    .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+    .at(-1);
+  const t = block ? Number(block.tank_target_f) : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+
 export function planConflictAhead(plan: any[] | null, nowMs: number, hours: number): boolean {
   if (!plan) return false;
   const end = nowMs + hours * 3600_000;
@@ -420,6 +431,16 @@ export class IdentificationDriver {
     if (st.adoption_pending === true) { this.lastResult = `idle: last command (${commanded ?? "?"} °F) not yet adopted (operative ${operative ?? "?"} °F) — base not settled`; return; }
     if (operative == null || !Number.isFinite(operative)) { this.lastResult = "idle: no operative tank target from SensorLinx — base unknown"; return; }
     if (commanded != null && Math.abs(commanded - operative) > 3) { this.lastResult = `idle: commanded ${commanded} °F vs operative ${operative} °F disagree — base not settled`; return; }
+    // The base must also be where the PLAN wants the plant right now. The driver ticks before the
+    // auto-pilot in the same poll, so a floor the hourly plan or the 5-min re-check just raised has not
+    // been written yet: drawing here would freeze the OLD target as a "hold" (or probe from it) and the
+    // auto-pilot's hold would keep the house under its own demand floor for the whole window. Found by the
+    // cold-day rehearsal (scripts/rehearsal): plan 132 °F, device 128 °F, hold arm at 128, auto-pilot held.
+    const planTargetF = currentPlanTargetF(plans.at(-1)?.plan ?? null, nowMs);
+    if (planTargetF != null && Math.abs(planTargetF - operative) >= MIN_STEP_F) {
+      this.lastResult = `idle: plan wants ${planTargetF} °F but the plant is at ${Math.round(operative)} °F — letting the auto-pilot settle the base first`;
+      return;
+    }
     const baseF = Math.round(operative);
     const tgt = probeTarget({
       direction: cell.suggest.direction, baseF, magnitudeF: cell.suggest.magnitudeF,
