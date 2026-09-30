@@ -541,7 +541,9 @@ export class IdentificationDriver {
     await this.d.store.updateIdentificationWindow(w.id, { armingTicks: ticks });
     w.armingTicks = ticks;
     if (w.dryRun) {
-      // In shadow there is no setpoint lead to wait for — record what would have been written.
+      // In shadow there is no setpoint lead to wait for — record what would have been written. The calendar is
+      // still asked again here, so the shadow ledger shows exactly what armed would have done (codex on #153).
+      if (!(await this.interlockClearForWrite(w))) return;
       await this.d.store.updateIdentificationWindow(w.id, { state: "active", startedAt: this.now() });
       w.state = "active"; w.startedAt = this.now();
       this.lastResult = `SHADOW would write ${w.targetF} °F (cap ${w.capF}) for #${w.id}`;
@@ -807,14 +809,14 @@ export class IdentificationDriver {
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const body = (await res.json()) as { source?: unknown; blockAll?: unknown; switchbackActiveHydronicZoneIds?: unknown; steppedThermostatZoneIds?: unknown };
       const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
-      if (!INTERLOCK_SOURCES.has(String(body?.source)) || !isStrings(body?.switchbackActiveHydronicZoneIds) || !isStrings(body?.steppedThermostatZoneIds ?? []) || (body?.blockAll !== undefined && typeof body.blockAll !== "boolean")) {
+      const b = (body ?? {}) as typeof body & { asOf?: unknown; horizonMin?: unknown };
+      const blockedArr = b.switchbackActiveHydronicZoneIds;
+      const steppedArr = b.steppedThermostatZoneIds;
+      if (!INTERLOCK_SOURCES.has(String(b.source)) || !isStrings(blockedArr) || !isStrings(steppedArr)
+        || (b.blockAll !== undefined && typeof b.blockAll !== "boolean") || typeof b.asOf !== "string" || !Number.isFinite(Number(b.horizonMin))) {
         return { ok: false, error: "malformed body" };
       }
-      return {
-        ok: true, source: String(body.source), blockAll: body.blockAll === true,
-        blocked: new Set(body.switchbackActiveHydronicZoneIds),
-        stepped: new Set((body.steppedThermostatZoneIds as string[] | undefined) ?? []),
-      };
+      return { ok: true, source: String(b.source), blockAll: b.blockAll === true, blocked: new Set(blockedArr), stepped: new Set(steppedArr) };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return { ok: false, error: /abort|timeout/i.test(msg) ? `timed out after ${INTERLOCK_TIMEOUT_MS} ms` : msg };
@@ -828,9 +830,12 @@ export class IdentificationDriver {
    */
   private async interlockClearForWrite(w: IdentWindow): Promise<boolean> {
     const zoneId = (w.cell as { zoneId?: unknown } | null)?.zoneId;
+    // A window that cannot name the zone it was drawn for cannot be checked against a per-zone answer — fail
+    // closed rather than treat a listed room as clear (codex on #153).
+    if (typeof zoneId !== "string" || !zoneId) { await this.end(w, "interlock:unknown_zone"); return false; }
     const il = await this.probeInterlock(w.durationMin + this.planQuery.abortLatencyMin);
     if (!il.ok) { await this.end(w, `interlock:unreadable:${il.error}`); return false; }
-    if (il.blockAll || (typeof zoneId === "string" && il.blocked.has(zoneId))) { await this.end(w, `interlock:switchback_active:${il.source}`); return false; }
+    if (il.blockAll || il.blocked.has(zoneId)) { await this.end(w, `interlock:switchback_active:${il.source}`); return false; }
     return true;
   }
 

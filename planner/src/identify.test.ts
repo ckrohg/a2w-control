@@ -134,7 +134,7 @@ async function main(): Promise<void> {
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
       async lastIdentificationWindowEnd(includeDryRun = false) {
         if (over.lastEnd !== undefined) return over.lastEnd;
-        const ended = rows.filter((r) => r.state === "ended" && r.endedAt && (includeDryRun || !r.dryRun)).map((r) => r.endedAt!.getTime());
+        const ended = rows.filter((r) => r.state === "ended" && r.endedAt && (includeDryRun || !r.dryRun) && !(r.endReason ?? "").startsWith("interlock:") && (r.dryRun || r.arm === "hold" || r.writeAccepted)).map((r) => r.endedAt!.getTime());
         return ended.length ? new Date(Math.max(...ended)) : null;
       },
       async insertIdentificationWindow(w) { const id = rows.length + 1; rows.push({ id, ...w }); return id; },
@@ -188,7 +188,7 @@ async function main(): Promise<void> {
         if (u.includes("/probe-interlock")) {
           interlockCalls.push(u);
           const seq = over.interlockSequence;
-          const il = (seq && seq.length ? seq[Math.min(interlockCalls.length - 1, seq.length - 1)] : over.interlock) ?? { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } };
+          const il = (seq && seq.length ? seq[Math.min(interlockCalls.length - 1, seq.length - 1)] : over.interlock) ?? { status: 200, body: { asOf: now().toISOString(), horizonMin: 155, source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } };
           if (il.status === 0) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
           if (il.status !== 200) return { ok: false, status: il.status, json: async () => ({ source: "unavailable" }) } as any;
           return { ok: true, status: 200, json: async () => il.body } as any;
@@ -202,6 +202,8 @@ async function main(): Promise<void> {
     const driver = new IdentificationDriver(deps, over.mode ?? "armed");
     return { driver, rows, posts, writes, restores, holds, probeTargets, notes, interlockCalls, advance: (min: number) => { clock += min * 60_000; } };
   }
+  /** A well-formed probe-interlock body (asOf + horizonMin are required by the driver's validator). */
+  const il = (source: string, blocked: string[] = [], stepped: string[] = [], extra: Record<string, unknown> = {}) => ({ asOf: T0.toISOString(), horizonMin: 155, source, switchbackActiveHydronicZoneIds: blocked, steppedThermostatZoneIds: stepped, ...extra });
   const upPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] })] };
 
   // gtm#1618 / #151: the just-in-time experiment calendar is asked right before EVERY draw, in every mode.
@@ -210,12 +212,12 @@ async function main(): Promise<void> {
     await free.driver.tick();
     assert.equal(free.rows.length, 1, "not_armed → draws");
     assert.equal(free.interlockCalls.length, 1); assert.match(free.interlockCalls[0], /\/api\/insights\/probe-interlock\?horizonMin=155$/); // 120 + 35
-    const stepped = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: ["T-xmas"] } } });
+    const stepped = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: il("arm_log", ["z-lr"], ["T-xmas"]) } });
     await stepped.driver.tick();
     assert.equal(stepped.rows.length, 0, "the cell's room is being stepped → no draw");
     assert.match(stepped.driver.status().lastResult ?? "", /switchback active on Living Room Baseboard's room \(T-xmas\) — no draw/);
     assert.equal(stepped.holds.filter((h) => h.until != null).length, 0, "and no hold");
-    const other = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-other"], steppedThermostatZoneIds: ["T-up"] } } });
+    const other = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: il("arm_log", ["z-other"], ["T-up"]) } });
     await other.driver.tick();
     assert.equal(other.rows.length, 1, "another loop's room is stepped → this cell still draws");
     for (const status of [503, 500, 429]) {
@@ -224,14 +226,14 @@ async function main(): Promise<void> {
       assert.equal(down.rows.length, 0, `HTTP ${status} → fail closed, no draw`);
       assert.match(down.driver.status().lastResult ?? "", new RegExp(`interlock unreadable \\(HTTP ${status}\\)`));
     }
-    const all = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "legacy_history", blockAll: true, switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
+    const all = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: il("legacy_history", [], [], { blockAll: true }) } });
     await all.driver.tick();
     assert.equal(all.rows.length, 0, "blockAll → no draw even with an empty zone list");
     assert.match(all.driver.status().lastResult ?? "", /draw nothing today \(legacy_history\)/);
     const bad = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { nope: true } } });
     await bad.driver.tick();
     assert.equal(bad.rows.length, 0, "malformed → no draw");
-    const badSource = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "whatever", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
+    const badSource = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: il("whatever", [], []) } });
     await badSource.driver.tick();
     assert.equal(badSource.rows.length, 0, "unknown source → malformed → no draw");
     const notDeployed = harness({ plan: upPlan, commanded: 135, interlock: { status: 404 } });
@@ -247,12 +249,11 @@ async function main(): Promise<void> {
     // The calendar is asked AGAIN right before an open window actuates (codex on #153): the draw-time answer may be
     // minutes old and the window is invisible to TempIQ until its write is accepted.
     {
-      const clearThenBlocked = [{ status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } }, { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: ["T-xmas"] } }];
+      const clearThenBlocked = [{ status: 200, body: il("not_armed", [], []) }, { status: 200, body: il("arm_log", ["z-lr"], ["T-xmas"]) }];
       const arming = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 100, interlockSequence: clearThenBlocked }); // setpoints do not cover yet → arming
       await arming.driver.tick();
       assert.equal(arming.rows[0].state, "arming");
-      (arming as any).cover = true;
-      // let the pumps cover on the next tick: re-harness is not possible mid-flight, so use a covered harness with the seeded row
+      // Let the pumps cover on the next tick: re-harnessing mid-flight is not possible, so seed the row into a covered harness.
       const armed = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, seedRows: arming.rows, interlockSequence: [clearThenBlocked[1]] });
       await armed.driver.tick();
       assert.equal(armed.rows[0].state, "ended"); assert.match(armed.rows[0].endReason ?? "", /^interlock:switchback_active:arm_log$/);
@@ -263,8 +264,26 @@ async function main(): Promise<void> {
       await pending.driver.tick(); // the retry asks first: 503 → unreadable → ended, no write
       assert.equal(pending.rows[0].state, "ended"); assert.match(pending.rows[0].endReason ?? "", /^interlock:unreadable:HTTP 503$/);
       assert.equal(pending.writes.length, 0);
+      assert.equal(pending.posts.length, 0, "a window that never happened is not posted to TempIQ");
+      // …and a refused-before-write row does NOT start the 60-min cooldown (nothing happened) — the next tick draws again.
+      const again = harness({ plan: upPlan, commanded: 135, seedRows: pending.rows, interlock: { status: 200, body: il("not_armed") } });
+      await again.driver.tick();
+      assert.equal(again.rows.length, 2, "a fresh draw right after an interlock refusal");
+      // An unreconciled row that cannot name its zone fails CLOSED (interlock:unknown_zone) instead of treating a listed room as clear.
+      const noCell = harness({ plan: upPlan, commanded: 135, seedRows: [{ ...pending.rows[0], id: 7, state: "arming", endedAt: null, endReason: null, cell: null, cleanupState: "none" } as IdentWindow], pumpsCoverF: 150, interlock: { status: 200, body: il("arm_log", ["z-lr"], ["T-xmas"]) } });
+      await noCell.driver.tick();
+      assert.equal(noCell.rows[0].state, "ended"); assert.equal(noCell.rows[0].endReason, "interlock:unknown_zone"); assert.equal(noCell.writes.length, 0);
+      // SHADOW: clear at the draw, blocked before promotion → the shadow ledger records the refusal, exactly as armed would have.
+      const sh = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlockSequence: clearThenBlocked });
+      await sh.driver.tick(); assert.equal(sh.rows[0].state, "arming");
+      await sh.driver.tick();
+      assert.equal(sh.rows[0].state, "ended"); assert.match(sh.rows[0].endReason ?? "", /^interlock:switchback_active:arm_log$/);
+      // A body missing asOf / horizonMin is malformed.
+      const thin = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
+      await thin.driver.tick();
+      assert.equal(thin.rows.length, 0); assert.match(thin.driver.status().lastResult ?? "", /malformed body/);
     }
-    const shadow = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: [] } } });
+    const shadow = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlock: { status: 200, body: il("arm_log", ["z-lr"], []) } });
     await shadow.driver.tick();
     assert.equal(shadow.rows.length, 0, "shadow obeys the calendar too — the shadow ledger shows what armed would do");
   }
@@ -548,7 +567,7 @@ async function main(): Promise<void> {
     const seed: IdentWindow = {
       id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
       magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 5 * 60_000), endedAt: null, endReason: null,
-      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
       armingTicks: 0, writeAttempts: 3, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed], acceptedFor: { "identification#1": { id: 77, ts: new Date(T0.getTime() - 4 * 60_000), targetF: 124 } } });
@@ -569,7 +588,7 @@ async function main(): Promise<void> {
     const seed: IdentWindow = {
       id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
       magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
-      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
       armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const h = harness({ plan: downPlan, commanded: 124, seedRows: [seed] });
@@ -585,7 +604,7 @@ async function main(): Promise<void> {
     const seed: IdentWindow = {
       id: 2, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
       magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
-      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
       armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed], acceptedFor: {
@@ -605,7 +624,7 @@ async function main(): Promise<void> {
     const seed: IdentWindow = {
       id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
       magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
-      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: null, safeToProbe: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
       armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
     };
     const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed] });

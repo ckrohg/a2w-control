@@ -959,7 +959,17 @@ export class Store {
     return r.rowCount ? this.rowToIdentWindow(r.rows[0]) : null;
   }
   async lastIdentificationWindowEnd(includeDryRun = false): Promise<Date | null> {
-    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND (NOT dry_run OR $1)`, [includeDryRun]);
+    // Only windows that HAPPENED start the cooldown: a hold arm, a probe whose write was accepted, or (in shadow)
+    // a shadow window — never a row the interlock refused before anything was commanded (codex on #153: one
+    // transient 503 after an arming delay would otherwise silence draws for an hour while the same failure at
+    // draw time costs nothing).
+    const r = await this.pool.query(
+      `SELECT max(ended_at) AS t FROM identification_windows
+       WHERE state = 'ended' AND ended_at IS NOT NULL AND (NOT dry_run OR $1)
+         AND coalesce(end_reason, '') NOT LIKE 'interlock:%'
+         AND (dry_run OR arm = 'hold' OR write_accepted)`,
+      [includeDryRun],
+    );
     return r.rows[0]?.t ? new Date(r.rows[0].t) : null;
   }
   async insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number> {
