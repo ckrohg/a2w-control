@@ -7,6 +7,7 @@
  */
 import http from "node:http";
 import fs from "node:fs";
+import { houseIso, placeWarmestAhead } from "./forecast-shape";
 import path from "node:path";
 
 const PORT = Number(process.env.REHEARSAL_PORT ?? "9101");
@@ -67,18 +68,29 @@ function log(entry: Record<string, unknown>) {
   fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
 }
 
+let loggedNudge: string | null = null;
+/**
+ * The HOUSE's time zone — the same one run.sh pins the planner to. The fake formats each served hour in that zone
+ * WITH its UTC offset (forecast-shape.ts houseIso), never in the host's zone and never offset-less: eval 2026-09-30,
+ * this Mac was on Pacific time, the fake wrote 14:00 (PDT) and the planner read 14:00 EDT — the whole forecast, the
+ * soak hour and the DHW windows sat 3 h off the real clock; and an offset-less string names the fall-back hour twice.
+ */
+const HOUSE_TZ = process.env.TZ && process.env.TZ !== "UTC" ? process.env.TZ : "America/New_York";
 function hourly(): { time: string[]; temperature_2m: number[] } {
-  const start = new Date(); start.setMinutes(0, 0, 0); start.setHours(start.getHours() - 1);
-  const time: string[] = []; const temperature_2m: number[] = [];
+  const start = new Date(); start.setMinutes(0, 0, 0); start.setTime(start.getTime() - 3600_000); // one hour of history, UTC arithmetic
+  const time: string[] = []; const raw: number[] = []; const localDay: string[] = [];
   for (let i = 0; i < 50; i++) {
-    const t = new Date(start.getTime() + i * 3600_000);
-    // open-meteo with timezone=auto returns LOCAL wall-clock ISO strings without an offset.
-    const pad = (n: number) => String(n).padStart(2, "0");
-    time.push(`${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}T${pad(t.getHours())}:00`);
+    const w = houseIso(new Date(start.getTime() + i * 3600_000), HOUSE_TZ);
+    time.push(w.iso);
+    localDay.push(w.day);
     const f = scenario.forecastF[Math.max(0, Math.min(scenario.forecastF.length - 1, i - 1))];
-    temperature_2m.push(f);
+    raw.push(f);
   }
-  return { time, temperature_2m };
+  // index 0 is the hour BEFORE now (kept by the planner only at exactly xx:00:00); the block containing now is index 1.
+  const shaped = placeWarmestAhead(raw, localDay, 1);
+  const key = shaped.nudge ? JSON.stringify(shaped.nudge) : "none";
+  if (loggedNudge !== key) { loggedNudge = key; log({ forecastShape: shaped.nudge ?? "the scenario already places the shaped day's warmest hour ≥ 4 h ahead of now" }); }
+  return { time, temperature_2m: shaped.temperature_2m };
 }
 
 const BANDS: Array<[number, number]> = [[-10, 5], [5, 15], [15, 25], [25, 35], [35, 45], [45, 60]];

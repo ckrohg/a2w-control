@@ -30,7 +30,9 @@ echo "db         fresh $DB_URL"
 echo "build      planner/dist ok"
 
 # fake upstreams
-REHEARSAL_PORT=$PORT REHEARSAL_SCENARIO="$SCEN_PATH" REHEARSAL_LOG="$OUT/requests.jsonl" SLX_SYNC_CODE=FAKE-0001 \
+# TZ pinned for the fake as for the planner: the fake formats open-meteo's local wall-clock hours in this zone
+# (fake-upstreams.ts HOUSE_TZ), so the served forecast lines up with the planner's clock on any host.
+TZ=America/New_York REHEARSAL_PORT=$PORT REHEARSAL_SCENARIO="$SCEN_PATH" REHEARSAL_LOG="$OUT/requests.jsonl" SLX_SYNC_CODE=FAKE-0001 \
   npx -y tsx "$HERE/fake-upstreams.ts" > "$OUT/fake.log" 2>&1 &
 FAKE_PID=$!
 trap 'kill $FAKE_PID 2>/dev/null || true' EXIT
