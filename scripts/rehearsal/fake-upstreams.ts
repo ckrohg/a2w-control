@@ -24,6 +24,8 @@ type Scenario = {
   calling: string[];
   hub: { pi_connected: boolean; pumps: Array<Record<string, unknown> & { id: string }> ; leaseMinutes: number | null };
   plan: { magnitudeF: number; durationMin: number; baseboardBaseF: number; radiantBaseF: number; safe: boolean };
+  /** gtm#1618: what TempIQ's probe-interlock answers (default: not armed). */
+  interlock?: { source: string; blocked?: string[]; stepped?: string[] };
 };
 
 const scenario: Scenario = JSON.parse(fs.readFileSync(SCENARIO, "utf8"));
@@ -139,6 +141,7 @@ const server = http.createServer(async (req, res) => {
   if (m === "GET" && p === "/api/insights/zones") return send(res, 200, { zones: scenario.zones });
   if (m === "GET" && p === "/api/insights/calls") return send(res, 200, { zones: scenario.zones.map((z) => ({ zoneId: z.zoneId, hvacStatus: scenario.calling.includes(z.zoneId) ? "HEATING" : "OFF" })) });
   if (m === "GET" && p === "/api/insights/identification-plan") return send(res, 200, identificationPlan());
+  if (m === "GET" && p === "/api/insights/probe-interlock") return send(res, 200, { asOf: new Date().toISOString(), horizonMin: Number(url.searchParams.get("horizonMin") ?? 155), source: scenario.interlock?.source ?? "not_armed", switchbackActiveHydronicZoneIds: scenario.interlock?.blocked ?? [], steppedThermostatZoneIds: scenario.interlock?.stepped ?? [] });
   if (m === "POST" && p === "/api/insights/experiment-windows") { posts.push({ ts: new Date().toISOString(), path: p, body }); return send(res, 200, { upserted: Array.isArray(body?.windows) ? body.windows.length : 1, rejected: [] }); }
   if (m === "POST" && p === "/api/insights/readings") { posts.push({ ts: new Date().toISOString(), path: p, body }); return send(res, 200, { inserted: Array.isArray(body?.metrics) ? body.metrics.length : 0, deduped: 0 }); }
   if (m === "POST" && (p === "/api/insights/tank-standby-ua" || p === "/api/insights/tank-reheat-rate")) { posts.push({ ts: new Date().toISOString(), path: p, body }); return send(res, 200, { ok: true }); }
