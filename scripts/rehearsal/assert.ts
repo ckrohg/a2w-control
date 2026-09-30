@@ -104,7 +104,13 @@ async function main() {
   if (expect_.windowPosted) {
     const windowPostBodies = fake.posts.filter((p: any) => p.path === "/api/insights/experiment-windows").map((p: any) => JSON.stringify(p.body));
     check(windowPosts.length >= 1 && windowPostBodies.some((b) => b.includes("a2w-hbx-write-")), `the auto-pilot's write was posted as a quarantine window (ledger ${windowPosts.length}; posts ${windowPostBodies.length})`);
-    if (ident.length) check(windowPostBodies.some((b) => /identification/i.test(b)), `the identification window itself was posted (among ${windowPostBodies.length} posts)`);
+    // A hold arm is active (and posted) at the draw; a probe arm posts only once its write is accepted, so an
+    // 'arming' / 'pending_write' window is legitimately unposted after the last poll. The draw is random.
+    if (ident.length) {
+      const w = ident[0];
+      if (w.state === "active") check(windowPostBodies.some((b) => /identification/i.test(b)), `the ACTIVE identification window (${w.arm} ${w.direction}) was posted open (among ${windowPostBodies.length} posts)`);
+      else check(["arming", "pending_write"].includes(String(w.state)), `an unposted window is still arming / pending its write (state ${w.state}, arm ${w.arm}) — not silently dropped`);
+    }
   }
   if (expect_.noUnhandledUpstreamCalls) check(unhandled.length === 0, `no unhandled upstream call (${unhandled.length})`);
   check(!requests.some((r) => /ntfy|resend/i.test(String(r.path))), `no alert egress attempted through the fake`);

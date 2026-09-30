@@ -7,9 +7,7 @@
  * restore, and that a shadow window never writes or posts).
  */
 import assert from "node:assert/strict";
-import {
-  pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource,
-  IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF } from "./identify";
+import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
 import { WriteError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
@@ -96,7 +94,7 @@ async function main(): Promise<void> {
     const open = windowPayload(w, null);
     assert.equal(open.externalId, "a2w-ident-7");
     assert.equal(open.kind, "awt_identification");
-    assert.deepEqual(open.assignment, { arm: "up", magnitudeF: 8, drawnWithProbability: 0.5, seed: "0.2" });
+    assert.deepEqual(open.assignment, { arm: "up", magnitudeF: 8, drawnWithProbability: 0.5, seed: "0.2", completion: "open", endReason: null });
     assert.equal(open.endedAt, null);
     assert.equal(open.commandedTargetF, 143);
     assert.deepEqual(open.zoneIds, ["z-lr", "z-mud"]);
@@ -133,7 +131,11 @@ async function main(): Promise<void> {
       },
       async getRecentSeries() { return []; },
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
-      async lastIdentificationWindowEnd() { return over.lastEnd ?? null; },
+      async lastIdentificationWindowEnd(includeDryRun = false) {
+        if (over.lastEnd !== undefined) return over.lastEnd;
+        const ended = rows.filter((r) => r.state === "ended" && r.endedAt && (includeDryRun || !r.dryRun)).map((r) => r.endedAt!.getTime());
+        return ended.length ? new Date(Math.max(...ended)) : null;
+      },
       async insertIdentificationWindow(w) { const id = rows.length + 1; rows.push({ id, ...w }); return id; },
       async updateIdentificationWindow(id, patch) { Object.assign(rows.find((r) => r.id === id)!, patch); },
       async unpostedIdentificationWindows() { return rows.filter((r) => !r.dryRun && ((r.state === "ended" && !r.postedClosed) || (r.state === "active" && !r.postedOpen))); },
@@ -263,8 +265,36 @@ async function main(): Promise<void> {
       assert.equal(probe.rows[0].state, "active"); assert.equal(probe.writes.length, 1);
       blocks[0].tank_target_f = 136;
       await probe.driver.tick();
-      assert.equal(probe.rows[0].state, "ended"); assert.match(probe.rows[0].endReason ?? "", /^plan_moved:/);
-      assert.equal(probe.rows[0].cleanupState, "done", "a live probe is returned to base by the driver (guarded re-command / restore), then the auto-pilot re-targets");
+      assert.equal(probe.rows[0].state, "ended"); assert.match(probe.rows[0].endReason ?? "", /^plan_moved:132->136$/);
+      assert.equal(probe.rows[0].cleanupState, "done");
+      // The handoff: the plant goes to the plan's NEW target (136), not back to the obsolete base (132) — one
+      // write, which the auto-pilot then finds already commanded (codex pass 2 on #152).
+      const last = probe.writes.at(-1)!;
+      assert.equal(last.targetF, 136, "cleanup re-commands the plan's new target");
+      assert.match(last.source, /identification-end#/); // the cleanup source token
+      assert.match(probe.rows[0].cleanupDetail ?? "", /plan's new target 136 °F \(plan moved from base 132 °F\)/);
+      // The posted close says the window was TRUNCATED, and why.
+      const payload = windowPayload(probe.rows[0], null) as { assignment: { completion: string; endReason: string } };
+      assert.equal(payload.assignment.completion, "truncated");
+      assert.equal(payload.assignment.endReason, "plan_moved:132->136");
+      assert.equal(windowCompletion({ endedAt: new Date(), endReason: "completed" }), "completed");
+      assert.equal(windowCompletion({ endedAt: new Date(), endReason: "aborted:room_deficit:z1" }), "aborted");
+      assert.equal(windowCompletion({ endedAt: null, endReason: null }), "open");
+    }
+    // A SHADOW window the plan ended is not redrawn on the very next poll (shadow cooldown, codex pass 2).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const sh = harness({ plan: upPlan, commanded: 132, operative: 132, mode: "shadow", rng: () => 0.9, planBlocks: blocks });
+      await sh.driver.tick();
+      assert.equal(sh.rows[0].dryRun, true); assert.equal(sh.rows[0].state, "active");
+      blocks[0].tank_target_f = 137;
+      await sh.driver.tick();
+      assert.equal(sh.rows[0].state, "ended");
+      blocks[0].tank_target_f = 137;
+      const sh2 = harness({ plan: upPlan, commanded: 137, operative: 137, mode: "shadow", rng: () => 0.9, planBlocks: blocks, seedRows: sh.rows });
+      await sh2.driver.tick();
+      assert.equal(sh2.rows.length, 1, "no immediate redraw in shadow");
+      assert.match(sh2.driver.status().lastResult ?? "", /min until the next window may open/);
     }
   }
   const downPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] }, { direction: "down", baseAwtF: 130, aboveEverydayCap: false, magnitudeF: 6 })] };

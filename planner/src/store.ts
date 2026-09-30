@@ -954,8 +954,8 @@ export class Store {
     const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state IN ('arming','pending_write','active') ORDER BY id DESC LIMIT 1`);
     return r.rowCount ? this.rowToIdentWindow(r.rows[0]) : null;
   }
-  async lastIdentificationWindowEnd(): Promise<Date | null> {
-    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND NOT dry_run`);
+  async lastIdentificationWindowEnd(includeDryRun = false): Promise<Date | null> {
+    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND (NOT dry_run OR $1)`, [includeDryRun]);
     return r.rows[0]?.t ? new Date(r.rows[0].t) : null;
   }
   async insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number> {
