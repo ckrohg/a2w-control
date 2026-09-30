@@ -5,8 +5,8 @@
  * within 3 h and the demand floor rides the soak's 145 °F ceiling — the harness passed at 01:00 and failed at 17:30
  * for the same planner. The fake therefore shapes the scenario's forecast so that, in the local day containing the
  * hour AHEAD_H hours from now, the warmest hour the PLANNER CAN SEE is at or after now + AHEAD_H: a +0.5 °F nudge on
- * that hour, only when needed, logged. A day that ends before now + AHEAD_H has fewer than 6 blocks left and gets
- * no soak at all.
+ * that hour, only when needed, logged. A day with fewer than 6 blocks inside the planner's horizon gets no soak at
+ * all (the 6-block test below counts exactly those blocks, history hour included).
  *
  * The candidate set is a SUPERSET of what the planner slices (codex on a2w#154): indices [0, nowIdx + HORIZON_H) —
  * index 0 (the served history hour) is kept because at exactly xx:00:00.000 the planner's ≥ now − 1 h filter retains

@@ -389,7 +389,8 @@ formats each served hour in the HOUSE's zone (`HOUSE_TZ`, pinned to `America/New
 offset**, never the host's zone and never offset-less: on a Mac set to Pacific time the fake wrote 14:00 (PDT) and
 the planner read 14:00 EDT, shifting the forecast, the soak hour and the DHW windows 3 h off the real clock, and an
 offset-less string names the fall-back hour twice. The three-poll sequence (plan → act → draw) is therefore the same
-at any time of day, on any host, through both DST changes.
+at any time of day and on any host; the DST hours are covered by the shaping test's instant round-trips, not by a
+rehearsal run on those days.
 
 Requires a local Postgres on :5432 (the DB `a2w_rehearsal` is dropped and recreated). Nothing reaches
 production: the DB must be localhost, `SLX_BASE_URL` / `OPEN_METEO_URL` / `NWS_URL` / `HUB_URL` /
