@@ -34,6 +34,14 @@ import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F, CALL_SAMPLE_GA
   assert.equal(decideFloorRaise({ ...base, floorF: 120 + FLOOR_RAISE_MIN_F }).raise, true, "exactly the gap raises");
   // only where the hourly plan would apply the floor
   assert.equal(decideFloorRaise({ ...base, outdoorF: 55 }).raise, false, "above the winter guard the plan applies no floor");
+  // Honest `why` strings (the first live read after #149 said "feed degraded" for a HEALTHY feed with no zone calling).
+  const why = (a: Partial<Parameters<typeof decideFloorRaise>[0]>) => { const d = decideFloorRaise({ ...base, ...a }); return d.raise ? "RAISE" : d.why; };
+  assert.match(why({ outdoorF: 62, floorF: null, feedHealthy: true, callingCount: 0 }), /outdoor 62°F ≥ winter guard/, "above the guard the guard is the reason, whatever the floor");
+  assert.equal(why({ outdoorF: 30, floorF: null, feedHealthy: true, callingCount: 0 }), "no demand floor (no zone calling)");
+  assert.equal(why({ outdoorF: 30, floorF: null, feedHealthy: false, callingCount: null }), "no demand floor (feed degraded)");
+  assert.equal(why({ outdoorF: 30, floorF: null, feedHealthy: true, callingCount: null }), "no demand floor", "healthy zones, call feed down: no claim either way");
+  assert.equal(why({ outdoorF: 30, floorF: null }), "no demand floor", "callers that pass no feed state get the neutral string");
+  assert.equal(why({ outdoorF: 30, floorF: 140, feedHealthy: true, callingCount: 1 }), "RAISE", "a real floor still raises");
   // never over a soak; a bank / pre-boost below the floor IS raised (identity is dropped by the store)
   assert.equal(decideFloorRaise({ ...base, block: { ...block, tank_target_f: 140, sani: true }, floorF: 145 }).raise, false);
   assert.equal(decideFloorRaise({ ...base, block: { ...block, tank_target_f: 124, boost: true }, floorF: 130 }).raise, true);
