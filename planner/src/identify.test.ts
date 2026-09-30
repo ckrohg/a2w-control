@@ -89,7 +89,7 @@ async function main(): Promise<void> {
       id: 7, createdAt: T0, state: "active", arm: "probe", direction: "up", zoneIds: ["z-lr", "z-mud"], bandLo: 30, bandHi: 45, magnitudeF: 8, baseF: 135, targetF: 143, capF: 145,
       drawProbability: 0.5, drawSeed: "0.2", startedAt: T0, endedAt: null, endReason: null, durationMin: 120, writeId: 11, writeAccepted: true, dryRun: false,
       postedOpen: false, postedClosed: false, cell: { x: 1 }, safeToProbe: { ok: true }, armingTicks: 0, writeAttempts: 1,
-      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0, handoffTargetF: null,
     };
     const open = windowPayload(w, null);
     assert.equal(open.externalId, "a2w-ident-7");
@@ -280,6 +280,33 @@ async function main(): Promise<void> {
       assert.equal(windowCompletion({ endedAt: new Date(), endReason: "completed" }), "completed");
       assert.equal(windowCompletion({ endedAt: new Date(), endReason: "aborted:room_deficit:z1" }), "aborted");
       assert.equal(windowCompletion({ endedAt: null, endReason: null }), "open");
+    }
+    // A handoff to a target ABOVE the everyday cap (a sanitize block, 140) uses the sanitize ceiling, like the
+    // auto-pilot would — not the 135 cap that would have the writer refuse it (codex pass 3).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const hot = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks });
+      await hot.driver.tick(); await hot.driver.tick();
+      assert.equal(hot.rows[0].state, "active");
+      blocks[0].tank_target_f = 140;
+      await hot.driver.tick();
+      const last = hot.writes.at(-1)!;
+      assert.equal(last.targetF, 140); assert.equal(last.capF, 145, "the handoff carries the sanitize ceiling for a target above the everyday cap");
+      assert.equal(hot.rows[0].handoffTargetF, 140, "the handoff target is persisted on the row");
+    }
+    // A handoff whose first write fails transiently is RETRIED to the same new target on a later tick — never
+    // back to the obsolete base (codex pass 3: the retry used to lose the handoff).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const retry = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks, writeFails: [null, 503] }); // probe write ok, first cleanup write 503
+      await retry.driver.tick(); await retry.driver.tick();
+      assert.equal(retry.rows[0].state, "active");
+      blocks[0].tank_target_f = 136;
+      await retry.driver.tick();
+      assert.equal(retry.rows[0].state, "ended"); assert.equal(retry.rows[0].cleanupState, "pending", "transient failure → cleanup pending");
+      await retry.driver.tick(); // cleanupPending retries from the persisted row
+      assert.equal(retry.rows[0].cleanupState, "done");
+      assert.equal(retry.writes.at(-1)!.targetF, 136, "the retry re-commands the plan's new target, not the base 132");
     }
     // A SHADOW window the plan ended is not redrawn on the very next poll (shadow cooldown, codex pass 2).
     {

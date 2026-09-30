@@ -132,6 +132,9 @@ export interface IdentWindow {
   safeToProbe: unknown;
   armingTicks: number;
   writeAttempts: number;
+  /** #152: after plan_moved, the plan's NEW target cleanup hands the plant to (null = return to baseF). Persisted so a
+   *  retried cleanup never falls back to the obsolete base (codex pass 3). */
+  handoffTargetF: number | null;
   /**
    * Returning the plant to its base after a LIVE probe is the driver's job, not the auto-pilot's
    * (codex 2026-09-29 critical: with the auto-pilot in shadow a completed 145 °F probe stayed
@@ -404,7 +407,7 @@ export class IdentificationDriver {
         const openPlans = await this.d.store.recentPlans(6);
         const openPlanTargetF = currentPlanTargetF(openPlans.at(-1)?.plan ?? null, this.now().getTime());
         if (openPlanTargetF != null && Math.abs(openPlanTargetF - open.baseF) >= MIN_STEP_F) {
-          await this.end(open, `plan_moved:${open.baseF}->${openPlanTargetF}`);
+          await this.end(open, `plan_moved:${open.baseF}->${openPlanTargetF}`, { handoffTargetF: openPlanTargetF });
           return;
         }
         if (open.state === "arming") await this.continueArming(open);
@@ -489,7 +492,7 @@ export class IdentificationDriver {
       startedAt: this.now(), endedAt: null, endReason: null, durationMin: cell.suggest.durationMin,
       writeId: null, writeAccepted: false, dryRun, postedOpen: false, postedClosed: false,
       cell, safeToProbe: cell.suggest.safeToProbe, armingTicks: 0, writeAttempts: 0,
-      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0, handoffTargetF: null,
     };
     const id = await this.d.store.insertIdentificationWindow(row);
     const w: IdentWindow = { id, ...row };
@@ -647,8 +650,13 @@ export class IdentificationDriver {
     this.lastResult = `${w.dryRun ? "SHADOW " : ""}active #${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F — ${left} min left`;
   }
 
-  private async end(w: IdentWindow, reason: string): Promise<void> {
+  private async end(w: IdentWindow, reason: string, opts: { handoffTargetF?: number | null } = {}): Promise<void> {
     const endedAt = this.now();
+    // plan_moved: the base is the target the plan has just declared obsolete. Returning there would burn the
+    // writer's 15-min slot and leave the auto-pilot rate-limited on the NEW target for a quarter hour (codex
+    // pass 2 on #152). The handoff target is PERSISTED on the row so a retried cleanup uses it too (pass 3).
+    const handoffTargetF = Number.isFinite(opts.handoffTargetF as number) ? (opts.handoffTargetF as number) : null;
+    w.handoffTargetF = handoffTargetF;
     this.d.phaseB.setProbeTarget(null);
     this.d.autopilot.setHold(null, "");
     // A LIVE probe (a write was accepted) must be returned to its base by THIS driver — the auto-pilot
@@ -656,17 +664,12 @@ export class IdentificationDriver {
     // is retried every tick until confirmed (codex 2026-09-29 critical).
     const wasLive = w.arm === "probe" && !w.dryRun && w.writeAccepted;
     const cleanupState: CleanupState = wasLive ? "pending" : "none";
-    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState });
+    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState, handoffTargetF });
     w.state = "ended"; w.endedAt = endedAt; w.endReason = reason; w.cleanupState = cleanupState;
     this.currentWindow = null;
     this.lastResult = `ended #${w.id} (${reason})`;
     console.log(`[identify] ${this.lastResult}`);
-    // plan_moved: the base is the target the plan has just declared obsolete. Returning there would burn
-    // the writer's 15-min slot and leave the auto-pilot rate-limited on the NEW target for a quarter hour
-    // (codex pass 2 on #152). Hand the plant straight to the plan's current target instead — the same
-    // primitive the auto-pilot uses — so the auto-pilot then finds it already commanded.
-    const handoffF = reason.startsWith("plan_moved:") ? Number(reason.split("->").at(-1)) : null;
-    const cleaned = wasLive ? await this.cleanup(w, reason.startsWith("aborted:"), Number.isFinite(handoffF) ? (handoffF as number) : null) : null;
+    const cleaned = wasLive ? await this.cleanup(w, reason.startsWith("aborted:")) : null;
     if (reason.startsWith("aborted:") && !w.dryRun) {
       await this.d.notify("Identification probe aborted", `#${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F: ${reason}${wasLive ? (cleaned ? ` — ${cleaned}` : " — plant NOT yet returned to base; retrying every poll") : ""}`, "high");
     }
@@ -688,10 +691,14 @@ export class IdentificationDriver {
    * for a down-probe abort that is the safe direction and for an up-probe it is only cost. Any other
    * failure stays 'pending' and is retried next tick.
    */
-  private async cleanup(w: IdentWindow, urgent: boolean, handoffTargetF: number | null = null): Promise<string | null> {
-    // Where the plant goes: the window's base, or — after plan_moved — the plan's new current target.
-    const returnF = handoffTargetF ?? w.baseF;
-    const returnLabel = handoffTargetF != null ? `the plan's new target ${returnF} °F (plan moved from base ${w.baseF} °F)` : `base ${returnF} °F`;
+  private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
+    // Where the plant goes: the window's base, or — after plan_moved — the plan's new current target (persisted
+    // on the row, so a retry after a transient failure returns to the same place). The cap follows the target
+    // like the auto-pilot's does: a sanitize block above the everyday cap needs the sanitize ceiling, or the
+    // guarded write is refused 422 and the plant falls to the as-found curve instead (codex pass 3).
+    const returnF = w.handoffTargetF ?? w.baseF;
+    const returnCapF = returnF > DEFAULT_OPTS.strictCapF ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
+    const returnLabel = w.handoffTargetF != null ? `the plan's new target ${returnF} °F (plan moved from base ${w.baseF} °F)` : `base ${returnF} °F`;
     const attempts = w.cleanupAttempts + 1;
     await this.d.store.updateIdentificationWindow(w.id, { cleanupAttempts: attempts });
     w.cleanupAttempts = attempts;
@@ -731,7 +738,7 @@ export class IdentificationDriver {
     let permanent = urgent;
     if (commanded != null) {
       try {
-        await this.d.writer.setTarget(returnF, cleanupSource(w.id, false), DEFAULT_OPTS.strictCapF);
+        await this.d.writer.setTarget(returnF, cleanupSource(w.id, false), returnCapF);
         return await done(`re-commanded ${returnLabel}`);
       } catch (e) {
         const status = e instanceof WriteError ? e.status : 0;
