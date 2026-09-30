@@ -349,6 +349,21 @@ only-raises, I4 clamp last, hp1 setpoint recomputed.
 Manual (authed with `PLANNER_API_TOKEN`): `POST /api/storm/arm {hours}` /
 `POST /api/storm/disarm`. Audit: `storm_events`. `/health.storm` = state + trigger.
 
+## Identification driver ↔ TempIQ experiment calendar (gtm#1618 / #153)
+
+Right before **every** draw, and again right before an open window's first write or a retried write, the driver asks
+`GET /api/insights/probe-interlock?horizonMin=<probe duration + abort latency>` on TempIQ. A listed hydronic zone,
+`blockAll: true`, a non-200 (a 404 reads "endpoint not deployed on TempIQ yet"), a malformed body or a 3 s timeout
+all mean **no draw** — fail closed, with the reason in `/health.identification.lastResult`. Shadow asks too, so the
+shadow ledger shows what armed would have done. A window the interlock refused before anything was commanded is
+ended as `interlock:…`, is never posted to TempIQ, and never starts the 60-min cooldown (only windows that
+happened do — a hold arm, a probe whose write was accepted, or in shadow a shadow window). That cooldown rule
+lives in SQL; `scripts/identify-cooldown-local-check.ts` proves it against a local Postgres:
+
+```sh
+LOCAL_DATABASE_URL=postgres://$(whoami)@localhost:5432/a2w_local npx tsx ../scripts/identify-cooldown-local-check.ts
+```
+
 ## Cold-day rehearsal (`scripts/rehearsal/`)
 
 Runs the **real planner** (`POLL_ONCE=1`, three polls) against a **local** Postgres with every upstream faked

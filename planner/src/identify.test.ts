@@ -282,6 +282,11 @@ async function main(): Promise<void> {
       const thin = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
       await thin.driver.tick();
       assert.equal(thin.rows.length, 0); assert.match(thin.driver.status().lastResult ?? "", /malformed body/);
+      for (const horizonMin of ["155", "", null, NaN]) { // a coercible string is NOT a number
+        const wrong = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { ...il("not_armed"), horizonMin } } });
+        await wrong.driver.tick();
+        assert.equal(wrong.rows.length, 0, `horizonMin ${JSON.stringify(horizonMin)} → malformed`); assert.match(wrong.driver.status().lastResult ?? "", /malformed body/);
+      }
     }
     const shadow = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlock: { status: 200, body: il("arm_log", ["z-lr"], []) } });
     await shadow.driver.tick();

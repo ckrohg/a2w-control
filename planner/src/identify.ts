@@ -813,7 +813,7 @@ export class IdentificationDriver {
       const blockedArr = b.switchbackActiveHydronicZoneIds;
       const steppedArr = b.steppedThermostatZoneIds;
       if (!INTERLOCK_SOURCES.has(String(b.source)) || !isStrings(blockedArr) || !isStrings(steppedArr)
-        || (b.blockAll !== undefined && typeof b.blockAll !== "boolean") || typeof b.asOf !== "string" || !Number.isFinite(Number(b.horizonMin))) {
+        || (b.blockAll !== undefined && typeof b.blockAll !== "boolean") || typeof b.asOf !== "string" || typeof b.horizonMin !== "number" || !Number.isFinite(b.horizonMin)) {
         return { ok: false, error: "malformed body" };
       }
       return { ok: true, source: String(b.source), blockAll: b.blockAll === true, blocked: new Set(blockedArr), stepped: new Set(steppedArr) };
