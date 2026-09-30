@@ -489,6 +489,7 @@ export class IdentificationDriver {
     // ask before acting. Shadow asks too — the shadow ledger must show what armed would have done.
     const interlock = await this.probeInterlock(cell.suggest.durationMin + this.planQuery.abortLatencyMin);
     if (!interlock.ok) { this.lastResult = `idle: TempIQ probe interlock unreadable (${interlock.error}) — no draw`; return; }
+    if (interlock.blockAll) { this.lastResult = `idle: TempIQ probe interlock says draw nothing today (${interlock.source}) — no draw`; return; }
     if (interlock.blocked.has(cell.zoneId)) {
       this.lastResult = `idle: TempIQ heating switchback active on ${cell.zoneName}'s room (${[...interlock.stepped].join(", ") || "stepped thermostat"}) — no draw`;
       return;
@@ -790,16 +791,16 @@ export class IdentificationDriver {
    * GET /api/insights/probe-interlock — which hydronic zones share a room with a thermostat TempIQ's heating
    * switchback has stepped today (gtm#1618). `ok: false` on any non-200, malformed body or network error.
    */
-  private async probeInterlock(horizonMin: number): Promise<{ ok: true; source: string; blocked: Set<string>; stepped: Set<string> } | { ok: false; error: string }> {
+  private async probeInterlock(horizonMin: number): Promise<{ ok: true; source: string; blockAll: boolean; blocked: Set<string>; stepped: Set<string> } | { ok: false; error: string }> {
     try {
       const res = await this.fetchImpl(`${this.d.baseUrl}/api/insights/probe-interlock?horizonMin=${Math.max(0, Math.round(horizonMin))}`, {
         headers: { Authorization: `Bearer ${this.d.token}` }, signal: AbortSignal.timeout(INTERLOCK_TIMEOUT_MS),
       });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-      const body = (await res.json()) as { source?: unknown; switchbackActiveHydronicZoneIds?: unknown; steppedThermostatZoneIds?: unknown };
+      const body = (await res.json()) as { source?: unknown; blockAll?: unknown; switchbackActiveHydronicZoneIds?: unknown; steppedThermostatZoneIds?: unknown };
       if (!Array.isArray(body?.switchbackActiveHydronicZoneIds) || typeof body?.source !== "string") return { ok: false, error: "malformed body" };
       return {
-        ok: true, source: body.source,
+        ok: true, source: body.source, blockAll: body.blockAll === true,
         blocked: new Set((body.switchbackActiveHydronicZoneIds as unknown[]).map(String)),
         stepped: new Set(((Array.isArray(body.steppedThermostatZoneIds) ? body.steppedThermostatZoneIds : []) as unknown[]).map(String)),
       };

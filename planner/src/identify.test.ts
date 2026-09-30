@@ -222,6 +222,10 @@ async function main(): Promise<void> {
       assert.equal(down.rows.length, 0, `HTTP ${status} → fail closed, no draw`);
       assert.match(down.driver.status().lastResult ?? "", new RegExp(`interlock unreadable \\(HTTP ${status}\\)`));
     }
+    const all = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "legacy_history", blockAll: true, switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
+    await all.driver.tick();
+    assert.equal(all.rows.length, 0, "blockAll → no draw even with an empty zone list");
+    assert.match(all.driver.status().lastResult ?? "", /draw nothing today \(legacy_history\)/);
     const bad = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { nope: true } } });
     await bad.driver.tick();
     assert.equal(bad.rows.length, 0, "malformed → no draw");
