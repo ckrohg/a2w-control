@@ -1,11 +1,12 @@
 /**
- * The rehearsal's hour-independence rule (eval 2026-09-30 F1): whatever the wall clock, the local day that holds
- * the hour 4 h from now has its warmest block at or after now + 4 h, so the plan's daily soak never lands inside the
- * driver's 3 h look-ahead or on the current block. Plain node:assert script under tsx like the planner's other
- * tests (ci.yml); the function lives under scripts/rehearsal because it is harness code, not planner code.
+ * The rehearsal's hour-independence rule (eval 2026-09-30 F1; codex on a2w#154): whatever the wall clock, the local
+ * day that holds the hour 4 h from now has its warmest block — among the blocks the PLANNER can see — at or after
+ * now + 4 h, so the plan's daily soak never lands inside the driver's 3 h look-ahead or on the current block; and
+ * every served hour names one instant through both DST changes. Plain node:assert script under tsx like the
+ * planner's other tests (ci.yml); the functions live under scripts/rehearsal because they are harness code.
  */
 import assert from "node:assert/strict";
-import { placeWarmestAhead, AHEAD_H, NUDGE_F } from "../../scripts/rehearsal/forecast-shape";
+import { placeWarmestAhead, houseIso, AHEAD_H, NUDGE_F, HORIZON_H } from "../../scripts/rehearsal/forecast-shape";
 
 const days = (n: number, hoursLeftToday: number) => Array.from({ length: n }, (_, i) => (i < hoursLeftToday ? "D0" : i < hoursLeftToday + 24 ? "D1" : "D2"));
 
@@ -19,7 +20,7 @@ const days = (n: number, hoursLeftToday: number) => Array.from({ length: n }, (_
   assert.equal(today.indexOf(Math.max(...today)), AHEAD_H, "today's warmest is now the hour 4 h ahead");
   assert.equal(f[AHEAD_H], 16, "input untouched");
 }
-// 2. nothing to do when today's warmest remaining hour is already ≥ 4 h ahead
+// 2. nothing to do when the shaped day's warmest hour is already ≥ 4 h ahead
 {
   const f = [55, 56, 57, 58, 60, 62, 64, 63, 61, 58, 55, 52];
   assert.equal(placeWarmestAhead(f, days(f.length, 12), 0).nudge, null);
@@ -30,19 +31,63 @@ const days = (n: number, hoursLeftToday: number) => Array.from({ length: n }, (_
   const r = placeWarmestAhead(f, days(f.length, 3), 0);
   assert.deepEqual(r.nudge, { index: 4, from: 30, to: 45.5, day: "D1", warmestWas: 3 });
 }
-// 4. honours the current-hour index (the fake keeps one hour of history at index 0, never a candidate)
+// 4. honours the current-hour index (the fake keeps one hour of history at index 0) — and index 0 IS a candidate,
+//    because at exactly xx:00:00 the planner keeps it: a warmer history hour still forces the nudge
 {
   const f = [50, 23, 22, 20, 18, 16, 15, 14, 13, 12, 12, 13];
   const r = placeWarmestAhead(f, ["D0", ...days(11, 11)], 1);
   assert.equal(r.nudge?.index, 1 + AHEAD_H);
-  assert.equal(r.nudge?.warmestWas, 1);
+  assert.equal(r.nudge?.warmestWas, 0, "the served history hour is inside the planner's possible slice");
+  assert.equal(r.nudge?.to, 50.5);
 }
 // 5. now+4 past the end of the series → nothing to do
 assert.equal(placeWarmestAhead([30, 29, 28], ["D0", "D0", "D0"], 0).nudge, null);
-// 6. the nudge is the smallest that wins: exactly warmest + NUDGE_F, never more
+// 6. the nudge is the smallest that wins: exactly warmest + NUDGE_F
 {
   const f = [10, 9, 8, 7, 6, 5, 4, 3];
-  const r = placeWarmestAhead(f, days(f.length, 8), 0);
-  assert.equal(r.nudge?.to, 10.5);
+  assert.equal(placeWarmestAhead(f, days(f.length, 8), 0).nudge?.to, 10.5);
 }
-console.log("rehearsal-forecast-shape: ok (6 groups)");
+// 7. HORIZON (codex must-fix 1): a warmer hour BEYOND the planner's 24-block slice must not suppress the nudge
+{
+  const f = Array.from({ length: 50 }, (_, i) => (i === 26 ? 99 : 30 - (i % 24) * 0.1)); // warmest at index 26 = beyond nowIdx 1 + 24
+  const r = placeWarmestAhead(f, f.map(() => "D0"), 1);
+  assert.ok(r.nudge, "the out-of-horizon maximum is invisible to the planner, so the in-horizon maximum (index 0/1) still forces a nudge");
+  assert.equal(r.nudge!.index, 1 + AHEAD_H);
+  assert.equal(r.nudge!.warmestWas, 0);
+  assert.equal(f[26], 99, "untouched");
+  // and the horizon is exactly computeShadowPlan's slice
+  assert.equal(HORIZON_H, 24);
+}
+// 8. the shaped day has < 6 blocks inside the horizon → the plan skips that day's soak → no nudge
+{
+  // 22 blocks of D0 fill the horizon (nowIdx 0 → indices 0..23 visible); D1 has only 2 visible blocks even though the series continues
+  const f = Array.from({ length: 40 }, (_, i) => 20 + i);
+  const day = f.map((_, i) => (i < 22 ? "D0" : "D1"));
+  // now+4 (index 4) is D0 with 22 visible blocks and a later warmest → no nudge needed; move nowIdx so that now+4 lands in D1
+  const r = placeWarmestAhead(f, day, 20); // target 24 → D1; visible D1 blocks: indices 22..43 capped at 20+24=44 → 22 blocks ≥ 6, warmest is the last → no nudge
+  assert.equal(r.nudge, null);
+  const r2 = placeWarmestAhead(f, f.map((_, i) => (i < 22 ? "D0" : i < 26 ? "D1" : "D2")), 20); // D1 = 4 blocks → too few for a soak
+  assert.equal(r2.nudge, null, "a day with fewer than 6 blocks in the horizon gets no soak and needs no nudge");
+}
+// 9. ties: an EARLIER hour tying the target still wins the planner's first-strict-maximum reduce → the target is nudged
+{
+  const f = [30, 30, 29, 28, 30, 27, 26, 25];
+  const r = placeWarmestAhead(f, days(f.length, 8), 0);
+  assert.deepEqual(r.nudge, { index: 4, from: 30, to: 30.5, day: "D0", warmestWas: 0 });
+}
+// 10. DST (codex must-fix 2): the served strings carry the offset, so the two 01:00s of 2026-11-01 are distinct instants,
+//     spring-forward has no 02:00, and the planner's new Date(t) of each string returns exactly the instant
+{
+  const tz = "America/New_York";
+  assert.equal(houseIso(new Date("2026-11-01T05:00:00Z"), tz).iso, "2026-11-01T01:00:00-04:00");
+  assert.equal(houseIso(new Date("2026-11-01T06:00:00Z"), tz).iso, "2026-11-01T01:00:00-05:00");
+  assert.equal(houseIso(new Date("2026-03-08T06:00:00Z"), tz).iso, "2026-03-08T01:00:00-05:00");
+  assert.equal(houseIso(new Date("2026-03-08T07:00:00Z"), tz).iso, "2026-03-08T03:00:00-04:00");
+  assert.equal(houseIso(new Date("2026-09-30T04:00:00Z"), tz).iso, "2026-09-30T00:00:00-04:00", "midnight is 00, never 24");
+  assert.equal(houseIso(new Date("2026-09-30T04:00:00Z"), tz).day, "2026-09-30");
+  for (const z of ["2026-11-01T05:00:00Z", "2026-11-01T06:00:00Z", "2026-03-08T07:00:00Z"]) {
+    assert.equal(new Date(houseIso(new Date(z), tz).iso).toISOString(), new Date(z).toISOString(), `round-trips ${z}`);
+  }
+  assert.equal(houseIso(new Date("2026-06-01T12:00:00Z"), "UTC").iso, "2026-06-01T12:00:00+00:00");
+}
+console.log("rehearsal-forecast-shape: ok (10 groups)");

@@ -383,10 +383,13 @@ block — the driver then refuses to draw beside it and the demand floor rides t
 passed at 01:00 and failed at 17:30 on the same planner. The fake now shapes the served forecast
 (`scripts/rehearsal/forecast-shape.ts`): the local day holding the hour 4 h from now has its warmest hour at or after
 that hour (a +0.5 °F nudge, logged in `fake.log` as `forecastShape`), and a day with < 6 blocks left gets no soak.
-The fake also formats open-meteo's local wall-clock hours in the HOUSE's zone (`HOUSE_TZ`, pinned to
-`America/New_York` by `run.sh`), never the host's: on a Mac set to Pacific time the fake wrote 14:00 (PDT) and the
-planner read 14:00 EDT, shifting the forecast, the soak hour and the DHW windows 3 h off the real clock. The
-three-poll sequence (plan → act → draw) is therefore the same at any time of day on any host.
+The rule looks only at the blocks the planner can hold (its 24-block slice, plus the served history hour the
+planner keeps at exactly xx:00), so a warmer hour beyond the horizon never suppresses the nudge. The fake also
+formats each served hour in the HOUSE's zone (`HOUSE_TZ`, pinned to `America/New_York` by `run.sh`) **with its UTC
+offset**, never the host's zone and never offset-less: on a Mac set to Pacific time the fake wrote 14:00 (PDT) and
+the planner read 14:00 EDT, shifting the forecast, the soak hour and the DHW windows 3 h off the real clock, and an
+offset-less string names the fall-back hour twice. The three-poll sequence (plan → act → draw) is therefore the same
+at any time of day, on any host, through both DST changes.
 
 Requires a local Postgres on :5432 (the DB `a2w_rehearsal` is dropped and recreated). Nothing reaches
 production: the DB must be localhost, `SLX_BASE_URL` / `OPEN_METEO_URL` / `NWS_URL` / `HUB_URL` /
