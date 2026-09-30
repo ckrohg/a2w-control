@@ -18,6 +18,13 @@ const requests = fs.readFileSync(path.join(OUT, "requests.jsonl"), "utf8").trim(
 const store = new Store(url);
 const pool = (store as unknown as { pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: any[] }> } }).pool;
 const fToC = (f: number) => (f - 32) * 5 / 9;
+/** The ECO-0600's tank target for a PATCHed curve at `outdoorF` (dot/wwsd from the scenario device unless patched). */
+function curveOutputF(patch: Record<string, any>, outdoorF: number): number | null {
+  const dot = Number(patch.dot ?? scenario.device.dot), wwsd = Number(patch.wwsd ?? scenario.device.wwsd), dbt = Number(patch.dbt), mbt = Number(patch.mbt);
+  if (![dot, wwsd, dbt, mbt].every(Number.isFinite)) return null;
+  if (outdoorF <= dot) return dbt; if (outdoorF >= wwsd) return mbt;
+  return mbt + ((wwsd - outdoorF) / (wwsd - dot)) * (dbt - mbt);
+}
 
 const failures: string[] = [];
 const check = (cond: boolean, msg: string) => { if (!cond) failures.push(msg); console.log(`${cond ? "  ok  " : "  FAIL"} ${msg}`); };
@@ -57,9 +64,15 @@ async function main() {
   if (expect_.maxCurrentBlockTargetF != null) check(Number(current?.tank_target_f) <= expect_.maxCurrentBlockTargetF, `current block target ${current?.tank_target_f}°F ≤ ${expect_.maxCurrentBlockTargetF} (no floor above the guard)`);
   if (expect_.currentBlockReason) check(new RegExp(expect_.currentBlockReason, "i").test(String(current?.reason ?? "")), `current block reason names the floor (${current?.reason})`);
   const applied = autopilot.filter((r) => /^(set|applied|written|wrote)/i.test(String(r.result)) && r.dry_run === false);
-  const held = autopilot.filter((r) => /held/i.test(String(r.result)));
-  if (expect_.autopilotWrites === true) check(applied.length >= 1 || (held.length >= 1 && ident.length >= 1), `the auto-pilot wrote the plan target (applied ${applied.length}) or was held for a live probe (held ${held.length}, probes ${ident.length})`);
-  if (expect_.autopilotApplied === true) check(applied.length >= 1, `the auto-pilot APPLIED the plan target to the HBX (applied ${applied.length}; results ${JSON.stringify(autopilot.map((r) => r.result))})`);
+  const targetF = Number(current?.tank_target_f);
+  if (expect_.autopilotApplied === true) {
+    check(applied.length >= 1, `the auto-pilot APPLIED a target to the HBX (applied ${applied.length}; results ${JSON.stringify(autopilot.map((r) => r.result))})`);
+    check(applied.some((r) => Number(r.target_f) === targetF), `the applied target IS the plan's current block (${targetF}°F; applied ${JSON.stringify(applied.map((r) => r.target_f))})`);
+    const patchOut = fake.patches.map((p: any) => curveOutputF(p.body, scenario.outdoorF));
+    check(patchOut.some((o) => o != null && Math.abs(o - targetF) <= 1), `a PATCHed curve outputs the plan target at ${scenario.outdoorF}°F (outputs ${JSON.stringify(patchOut.map((o) => o == null ? null : Math.round(o * 10) / 10))} vs ${targetF})`);
+  }
+  if (expect_.everydayCapF != null) check(targetF <= expect_.everydayCapF, `current block ${targetF}°F never exceeds the everyday I4 cap ${expect_.everydayCapF} even though the binding zone asks for more`);
+  if (expect_.bindingRequirementF != null) check(new RegExp(`needs ${expect_.bindingRequirementF}°F`).test(String(current?.reason)), `the block reason carries the UNCLAMPED requirement (${expect_.bindingRequirementF}°F) so the clamp is legible: "${current?.reason}"`);
   if (expect_.patchesMin != null) check(fake.patches.length >= expect_.patchesMin, `SensorLinx received ≥ ${expect_.patchesMin} PATCH (got ${fake.patches.length})`);
   if (expect_.driverIdledUnsettledFirst) {
     // Sequence proof: after run 2 the auto-pilot has written the floor (a PATCH exists) but NO window was
@@ -68,8 +81,8 @@ async function main() {
     const fake2 = JSON.parse(fs.readFileSync(path.join(OUT, "fake-state-after-run2.json"), "utf8"));
     check(identAfter2 === 0, `run 2: no identification window drawn while the plant (${scenario.tank.targetF}°F) was below the plan (${current?.tank_target_f}°F) — got ${identAfter2}`);
     check(fake2.patches.length >= 1, `run 2: the auto-pilot wrote the floor first (PATCHes after run 2: ${fake2.patches.length})`);
-    check(ident.length >= identAfter2 + 1 || next3h.some((b) => b.sani), `run 3: a window was drawn once the base was settled (windows now ${ident.length})`);
     if (ident.length) check(Math.abs(Number(ident[0].base_f) - Number(current?.tank_target_f)) < 3, `the window's base ${ident[0].base_f}°F is the plan target ${current?.tank_target_f}°F, not the stale device value`);
+    check(ident.length >= identAfter2 + 1, `run 3 drew the window run 2 withheld (${identAfter2} → ${ident.length}) — no escape hatch`);
   }
   if (expect_.autopilotWrites === false) check(applied.length === 0 && fake.patches.length === 0, `no HBX write at all (applied ${applied.length}, PATCHes ${fake.patches.length})`);
   if (expect_.phaseBCommands != null) check(fake.commands.length >= expect_.phaseBCommands, `Phase B leased setpoints on ${fake.commands.length} pump(s) (≥ ${expect_.phaseBCommands})`);
@@ -79,15 +92,20 @@ async function main() {
   for (const c of fake.commands) check(c.body.lease_minutes === 90, `pump ${c.body.pump_id} write carries the 90-min lease (got ${c.body.lease_minutes})`);
   for (const c of latestCmd.values()) {
     if (expect_.phaseBMinC != null) check(Number(c.body.value_c) >= expect_.phaseBMinC, `pump ${c.body.pump_id} latest setpoint ${c.body.value_c}°C ≥ ${expect_.phaseBMinC}°C (tank target + I1 margin)`);
-    if (current) check(Number(c.body.value_c) >= Math.floor(fToC(Number(current.tank_target_f) + 5)), `pump ${c.body.pump_id} latest ${c.body.value_c}°C sits above the current target ${current.tank_target_f}°F + 5°F margin (I1)`);
+    if (current) check(Number(c.body.value_c) >= Math.ceil(fToC(targetF + 5)), `pump ${c.body.pump_id} latest ${c.body.value_c}°C ≥ ceil(${targetF}°F + 5°F → ${Math.ceil(fToC(targetF + 5))}°C) (I1)`);
   }
+  if (expect_.phaseBCommands != null) check(latestCmd.size >= expect_.phaseBCommands, `every configured pump got a leased setpoint (${latestCmd.size} distinct pumps)`);
   const soakSoon = next3h.some((b) => b.sani || /sanitize/i.test(b.reason));
-  if (expect_.probeDrawnUnlessSoakWithin3h) check(ident.length >= 1 || soakSoon, `identification drew a probe (${ident.length}) — or a soak sits within 3 h (${soakSoon}) and the driver idled honestly`);
+  if (expect_.probeDrawn === true) { check(!soakSoon, `no soak inside the 3 h look-ahead (the scenario must exercise a draw, not hide behind one)`); check(ident.length >= 1, `identification drew a window (${ident.length})`); }
   if (expect_.probeDrawn === false) check(ident.length === 0, `no identification probe drawn (${ident.length})`);
   for (const p of fake.patches) { const f = Math.max(...["dbt", "mbt"].map((k) => Number(p.body[k] ?? 0))); if (f > 0) check(f <= (expect_.maxAnyWriteF ?? 145), `PATCH curve top ${f}°F ≤ ${expect_.maxAnyWriteF ?? 145} (identification ceiling)`); }
   if (expect_.maxEverydayWriteF != null) for (const w of writes.filter((w) => !/identif|probe/i.test(`${w.source} ${w.action} ${w.detail}`))) { const req = w.requested ?? {}; const f = Math.max(...Object.values(req).map((v: any) => Number(v) || 0)); if (f > 0) check(f <= expect_.maxEverydayWriteF, `everyday write ${w.action} ${f}°F ≤ ${expect_.maxEverydayWriteF} (I4 strictCap)`); }
-  for (const w of writes) check(!/mismatch|error|refused/i.test(String(w.result)), `hbx_write ${w.action} result "${w.result}" is not a failure`);
-  if (expect_.windowPosted) check(fake.posts.some((p: any) => p.path === "/api/insights/experiment-windows") || windowPosts.length >= 1, `a write window was posted to TempIQ (posts ${fake.posts.filter((p: any) => p.path === "/api/insights/experiment-windows").length}, ledger ${windowPosts.length})`);
+  for (const w of writes) check(/^(accepted|ok|applied)/i.test(String(w.result)), `hbx_write ${w.action} result "${w.result}" is a success (anything else — rejected, mismatch, refused — fails)`);
+  if (expect_.windowPosted) {
+    const windowPostBodies = fake.posts.filter((p: any) => p.path === "/api/insights/experiment-windows").map((p: any) => JSON.stringify(p.body));
+    check(windowPosts.length >= 1 && windowPostBodies.some((b) => b.includes("a2w-hbx-write-")), `the auto-pilot's write was posted as a quarantine window (ledger ${windowPosts.length}; posts ${windowPostBodies.length})`);
+    if (ident.length) check(windowPostBodies.some((b) => /identification/i.test(b)), `the identification window itself was posted (among ${windowPostBodies.length} posts)`);
+  }
   if (expect_.noUnhandledUpstreamCalls) check(unhandled.length === 0, `no unhandled upstream call (${unhandled.length})`);
   check(!requests.some((r) => /ntfy|resend/i.test(String(r.path))), `no alert egress attempted through the fake`);
   check(configVersions.length >= 1, `the planner recorded the device config (${configVersions.length} version(s))`);

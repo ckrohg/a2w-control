@@ -232,10 +232,12 @@
     "driverIdledUnsettledFirst": true,
     "phaseBCommands": 2,
     "phaseBMinC": 58,
-    "probeDrawnUnlessSoakWithin3h": true,
     "maxAnyWriteF": 145,
     "maxEverydayWriteF": 135,
     "windowPosted": true,
-    "noUnhandledUpstreamCalls": true
+    "noUnhandledUpstreamCalls": true,
+    "probeDrawn": true,
+    "everydayCapF": 135,
+    "bindingRequirementF": 137
   }
 }

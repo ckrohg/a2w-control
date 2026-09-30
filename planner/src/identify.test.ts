@@ -123,7 +123,14 @@ async function main(): Promise<void> {
     const store: IdentStore = {
       async getLatestSlx() { return { ts: new Date(clock - (over.slxAgeMs ?? 60_000)), tankF: 130, targetF: over.commanded ?? 135, outdoorF: over.outdoorF ?? 40 }; },
       async activeBoost() { return null; },
-      async recentPlans() { return [{ computedAt: now(), plan: over.planBlocks ?? [] }]; },
+      // Default: one block in force whose target IS the settled base, so the plan-settled guard is neutral
+      // unless a test moves the plan on purpose (tests pass `planBlocks` and may mutate the array in place).
+      async recentPlans() {
+        // A seeded (restart) window's base is where the plan was when it opened — keep the plan there.
+        const seededBase = over.seedRows?.find((r) => r.state !== "ended")?.baseF;
+        const settledF = typeof seededBase === "number" ? seededBase : typeof over.operative === "number" ? over.operative : typeof over.commanded === "number" ? over.commanded : 135;
+        return [{ computedAt: now(), plan: over.planBlocks ?? [{ ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 40, tank_target_f: settledF, hp1_setpoint_f: settledF + 5, reason: "test block" }] }];
+      },
       async getRecentSeries() { return []; },
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
       async lastIdentificationWindowEnd() { return over.lastEnd ?? null; },
@@ -206,6 +213,59 @@ async function main(): Promise<void> {
     const within = harness({ plan: upPlan, commanded: 130, operative: 130, planBlocks: [blockNow, blockLater] });
     await within.driver.tick();
     assert.equal(within.rows.length, 1, "a difference below MIN_STEP_F is settled enough (the auto-pilot would not write it either)");
+    // A LOWER plan target is just as unsettled (a replan the auto-pilot has not applied yet).
+    const lower = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: [{ ...blockNow, tank_target_f: 120 }] });
+    await lower.driver.tick();
+    assert.equal(lower.rows.length, 0); assert.match(lower.driver.status().lastResult ?? "", /plan wants 120 °F but the plant is at 128 °F/);
+    // No block in force (future-only plan, or no plan at all) fails CLOSED: the base cannot be judged settled.
+    for (const blocks of [[blockLater], []]) {
+      const none = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: blocks });
+      await none.driver.tick();
+      assert.equal(none.rows.length, 0, "no window without a block in force");
+      assert.match(none.driver.status().lastResult ?? "", /no plan block in force/);
+      assert.ok(none.holds.every((x) => x.until == null), "and no hold");
+    }
+    // An OPEN window ends the moment the plan moves ≥ MIN_STEP_F from its base — every state.
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const hold = harness({ plan: upPlan, commanded: 132, operative: 132, rng: () => 0.9, planBlocks: blocks });
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].arm, "hold"); assert.equal(hold.rows[0].state, "active");
+      blocks[0].tank_target_f = 137; // the 5-min re-check raised the floor
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "ended"); assert.match(hold.rows[0].endReason ?? "", /^plan_moved:132->137$/);
+      assert.equal(hold.holds.at(-1)?.until, null, "the auto-pilot is released on the same tick");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const arming = harness({ plan: upPlan, commanded: 132, operative: 132, pumpsCoverF: 100, planBlocks: blocks }); // setpoints never cover → stays arming
+      await arming.driver.tick();
+      assert.equal(arming.rows[0].state, "arming");
+      blocks[0].tank_target_f = 128; // a lower replan
+      await arming.driver.tick();
+      assert.equal(arming.rows[0].state, "ended"); assert.match(arming.rows[0].endReason ?? "", /^plan_moved:132->128$/);
+      assert.equal(arming.writes.length, 0, "an arming probe that never wrote is simply dropped");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const pending = harness({ plan: upPlan, commanded: 132, operative: 132, writeFails: [429, 429, 429], planBlocks: blocks });
+      await pending.driver.tick(); await pending.driver.tick(); // arming → covered → write 429 → pending_write
+      assert.equal(pending.rows[0].state, "pending_write");
+      blocks[0].tank_target_f = 136;
+      await pending.driver.tick();
+      assert.equal(pending.rows[0].state, "ended"); assert.match(pending.rows[0].endReason ?? "", /^plan_moved:/);
+      assert.equal(pending.rows[0].cleanupState, "none", "nothing was accepted, nothing to return");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const probe = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks });
+      await probe.driver.tick(); await probe.driver.tick(); // arming → active (write accepted)
+      assert.equal(probe.rows[0].state, "active"); assert.equal(probe.writes.length, 1);
+      blocks[0].tank_target_f = 136;
+      await probe.driver.tick();
+      assert.equal(probe.rows[0].state, "ended"); assert.match(probe.rows[0].endReason ?? "", /^plan_moved:/);
+      assert.equal(probe.rows[0].cleanupState, "done", "a live probe is returned to base by the driver (guarded re-command / restore), then the auto-pilot re-targets");
+    }
   }
   const downPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] }, { direction: "down", baseAwtF: 130, aboveEverydayCap: false, magnitudeF: 6 })] };
 
@@ -520,6 +580,7 @@ async function main(): Promise<void> {
     assert.equal(h.writes.length, 0);
     assert.equal(h.posts.length, 0);
     assert.deepEqual(h.probeTargets.filter((t) => t != null), []);
+    assert.ok(h.holds.every((x) => x.until == null), "a SHADOW window never holds the (possibly live) auto-pilot (codex on #152)");
   }
   // 8. OFF mode: an open window is ended (mode_off) and nothing new starts; idle ticks release hold + Phase B.
   {

@@ -381,6 +381,17 @@ export class IdentificationDriver {
       this.currentWindow = open;
       if (open) {
         if (this.mode === "off") { await this.end(open, "mode_off"); return; }
+        // The window's recorded base must still be where the PLAN is. A floor the 5-min re-check or the
+        // hourly replan moved by ≥ MIN_STEP_F invalidates the assignment (its baseline is stale) and, for a
+        // hold or a down-probe, would keep the house under its own demand floor while the auto-pilot is
+        // held — the deficit abort only covers down-probes (codex on #152). End it; the auto-pilot is
+        // released on the same poll and re-targets the plan.
+        const openPlans = await this.d.store.recentPlans(6);
+        const openPlanTargetF = currentPlanTargetF(openPlans.at(-1)?.plan ?? null, this.now().getTime());
+        if (openPlanTargetF != null && Math.abs(openPlanTargetF - open.baseF) >= MIN_STEP_F) {
+          await this.end(open, `plan_moved:${open.baseF}->${openPlanTargetF}`);
+          return;
+        }
         if (open.state === "arming") await this.continueArming(open);
         else if (open.state === "pending_write") await this.continuePendingWrite(open);
         else await this.continueActive(open);
@@ -437,7 +448,8 @@ export class IdentificationDriver {
     // auto-pilot's hold would keep the house under its own demand floor for the whole window. Found by the
     // cold-day rehearsal (scripts/rehearsal): plan 132 °F, device 128 °F, hold arm at 128, auto-pilot held.
     const planTargetF = currentPlanTargetF(plans.at(-1)?.plan ?? null, nowMs);
-    if (planTargetF != null && Math.abs(planTargetF - operative) >= MIN_STEP_F) {
+    if (planTargetF == null) { this.lastResult = "idle: no plan block in force — the base cannot be judged settled"; return; }
+    if (Math.abs(planTargetF - operative) >= MIN_STEP_F) {
       this.lastResult = `idle: plan wants ${planTargetF} °F but the plant is at ${Math.round(operative)} °F — letting the auto-pilot settle the base first`;
       return;
     }
@@ -466,8 +478,10 @@ export class IdentificationDriver {
     const w: IdentWindow = { id, ...row };
     this.currentWindow = w;
     const label = `${cell.zoneName} [${cell.band[0]},${cell.band[1]}) ${arm === "probe" ? `${cell.suggest.direction} ${tgt.stepF} °F → ${tgt.targetF}` : `HOLD at ${baseF}`} (p=${cell.suggest.assignmentProbability}, u=${seed})`;
-    // Hold the auto-pilot for the window in every arm (a hold arm is a hold of the base, too).
-    this.d.autopilot.setHold(new Date(this.now().getTime() + (cell.suggest.durationMin + 30) * 60_000), `identification #${id}: ${label}`);
+    // Hold the auto-pilot for the window in every LIVE arm (a hold arm is a hold of the base, too). A
+    // shadow window changes nothing on the plant, so it must not stop a live auto-pilot from following
+    // its plan (codex on #152).
+    if (!dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (cell.suggest.durationMin + 30) * 60_000), `identification #${id}: ${label}`);
     if (arm === "hold") {
       this.lastResult = `${dryRun ? "SHADOW " : ""}hold arm #${id}: ${label}`;
       console.log(`[identify] ${this.lastResult}`);
@@ -516,8 +530,8 @@ export class IdentificationDriver {
 
   /** A drawn probe whose write has not been accepted yet: retry (429) or give up (limit reached). */
   private async continuePendingWrite(w: IdentWindow): Promise<void> {
-    // Keep the hold and the Phase B lead alive while the write is pending.
-    this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
+    // Keep the hold and the Phase B lead alive while the write is pending (live windows only).
+    if (!w.dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
     if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
     // RECONCILE before retrying (codex 2026-09-29 pass 2, critical): the device may have ACCEPTED the
     // last attempt while this process died before the row was updated. The writer audits every
@@ -589,8 +603,8 @@ export class IdentificationDriver {
   private async continueActive(w: IdentWindow): Promise<void> {
     const nowMs = this.now().getTime();
     const startedMs = w.startedAt?.getTime() ?? nowMs;
-    // Keep the auto-pilot held and Phase B leading for as long as the window runs.
-    this.d.autopilot.setHold(new Date(startedMs + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction}`);
+    // Keep the auto-pilot held and Phase B leading for as long as a LIVE window runs; shadow holds nothing.
+    if (!w.dryRun) this.d.autopilot.setHold(new Date(startedMs + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction}`);
     if (w.arm === "probe" && w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
     if (nowMs - startedMs >= w.durationMin * 60_000) { await this.end(w, "completed"); return; }
     if (this.mode === "off") { await this.end(w, "mode_off"); return; }

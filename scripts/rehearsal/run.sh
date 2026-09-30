@@ -14,6 +14,8 @@ esac
 [ -f "$SCEN_PATH" ] || { echo "no scenario at $SCEN_PATH"; exit 2; }
 NAME="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["name"])' "$SCEN_PATH")"
 DB="${REHEARSAL_DB:-a2w_rehearsal}"
+case "$DB" in a2w_rehearsal|a2w_rehearsal_*) ;; *) echo "refusing: REHEARSAL_DB must be a2w_rehearsal or a2w_rehearsal_* (it is dropped and recreated)"; exit 2 ;; esac
+[[ "$DB" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "refusing: REHEARSAL_DB is not a plain identifier"; exit 2; }
 DB_URL="postgres://$(whoami)@localhost:5432/$DB"
 PORT="${REHEARSAL_PORT:-9101}"
 OUT="$HERE/out/$NAME"; mkdir -p "$OUT"
