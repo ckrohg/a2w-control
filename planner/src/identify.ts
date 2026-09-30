@@ -132,6 +132,9 @@ export interface IdentWindow {
   safeToProbe: unknown;
   armingTicks: number;
   writeAttempts: number;
+  /** #152: after plan_moved, the plan's NEW target cleanup hands the plant to (null = return to baseF). Persisted so a
+   *  retried cleanup never falls back to the obsolete base (codex pass 3). */
+  handoffTargetF: number | null;
   /**
    * Returning the plant to its base after a LIVE probe is the driver's job, not the auto-pilot's
    * (codex 2026-09-29 critical: with the auto-pilot in shadow a completed 145 °F probe stayed
@@ -150,7 +153,7 @@ export interface IdentStore {
   recentPlans(hours: number): Promise<{ computedAt: Date; plan: any[] }[]>;
   getRecentSeries(hours: number): Promise<{ ts: Date; tankF: number | null; anyCall: boolean }[]>;
   openIdentificationWindow(): Promise<IdentWindow | null>;
-  lastIdentificationWindowEnd(): Promise<Date | null>;
+  lastIdentificationWindowEnd(includeDryRun?: boolean): Promise<Date | null>;
   insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number>;
   updateIdentificationWindow(id: number, patch: Partial<Omit<IdentWindow, "id">>): Promise<void>;
   unpostedIdentificationWindows(): Promise<IdentWindow[]>;
@@ -267,6 +270,17 @@ export function deficitZones(zones: InsightZone[], zoneIds: string[]): string[] 
 }
 
 /** True when a plan block flagged sanitize/bank/storm sits inside the next `hours`. */
+/** The plan block in force at `nowMs` (newest block with ts ≤ now) and its tank target, or null. */
+export function currentPlanTargetF(plan: any[] | null, nowMs: number): number | null {
+  if (!Array.isArray(plan)) return null;
+  const block = plan
+    .filter((b) => b && typeof b.ts === "string" && new Date(b.ts).getTime() <= nowMs)
+    .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+    .at(-1);
+  const t = block ? Number(block.tank_target_f) : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+
 export function planConflictAhead(plan: any[] | null, nowMs: number, hours: number): boolean {
   if (!plan) return false;
   const end = nowMs + hours * 3600_000;
@@ -279,6 +293,14 @@ export function planConflictAhead(plan: any[] | null, nowMs: number, hours: numb
   });
 }
 
+/** open | completed | aborted (physics/plant) | truncated (the plan moved, mode off, arming timeout…). */
+export function windowCompletion(w: Pick<IdentWindow, "endedAt" | "endReason">): "open" | "completed" | "aborted" | "truncated" {
+  if (!w.endedAt) return "open";
+  if (w.endReason === "completed") return "completed";
+  if ((w.endReason ?? "").startsWith("aborted:")) return "aborted";
+  return "truncated";
+}
+
 /** The TempIQ window payload for a window (open when endedAt is null). */
 export function windowPayload(w: IdentWindow, stats: { achievedAwtF: number | null; compliance: number | null; outdoorLowF: number | null; outdoorHighF: number | null } | null): Record<string, unknown> {
   const inRange = (v: number | null | undefined, lo: number, hi: number) => v != null && Number.isFinite(v) && v >= lo && v <= hi;
@@ -288,7 +310,14 @@ export function windowPayload(w: IdentWindow, stats: { achievedAwtF: number | nu
     startedAt: (w.startedAt ?? new Date()).toISOString(),
     endedAt: w.endedAt ? w.endedAt.toISOString() : null,
     zoneIds: w.zoneIds,
-    assignment: { arm: w.arm === "probe" ? w.direction : "hold", magnitudeF: w.magnitudeF, drawnWithProbability: w.drawProbability, seed: w.drawSeed },
+    assignment: {
+      arm: w.arm === "probe" ? w.direction : "hold", magnitudeF: w.magnitudeF, drawnWithProbability: w.drawProbability, seed: w.drawSeed,
+      // Disposition (codex pass 2 on #152): a window the plan cut short is informatively censored — floors
+      // rise when demand rises, so hold arms end early on cold mornings. TempIQ must be able to tell it
+      // from a window that ran its course. `completion` is the machine field; `endReason` the detail.
+      completion: windowCompletion(w),
+      endReason: w.endReason ?? null,
+    },
     commandedTargetF: w.targetF,
     washoutMin: 30,
     source: "a2w-planner",
@@ -370,6 +399,17 @@ export class IdentificationDriver {
       this.currentWindow = open;
       if (open) {
         if (this.mode === "off") { await this.end(open, "mode_off"); return; }
+        // The window's recorded base must still be where the PLAN is. A floor the 5-min re-check or the
+        // hourly replan moved by ≥ MIN_STEP_F invalidates the assignment (its baseline is stale) and, for a
+        // hold or a down-probe, would keep the house under its own demand floor while the auto-pilot is
+        // held — the deficit abort only covers down-probes (codex on #152). End it; the auto-pilot is
+        // released on the same poll and re-targets the plan.
+        const openPlans = await this.d.store.recentPlans(6);
+        const openPlanTargetF = currentPlanTargetF(openPlans.at(-1)?.plan ?? null, this.now().getTime());
+        if (openPlanTargetF != null && Math.abs(openPlanTargetF - open.baseF) >= MIN_STEP_F) {
+          await this.end(open, `plan_moved:${open.baseF}->${openPlanTargetF}`, { handoffTargetF: openPlanTargetF });
+          return;
+        }
         if (open.state === "arming") await this.continueArming(open);
         else if (open.state === "pending_write") await this.continuePendingWrite(open);
         else await this.continueActive(open);
@@ -399,7 +439,9 @@ export class IdentificationDriver {
     if (this.mode === "armed" && this.d.autopilot.isDryRun) { this.lastResult = "idle: auto-pilot is in shadow — armed identification requires it live (Off/Armed switch)"; return; }
     const unreturned = await this.d.store.cleanupPendingIdentificationWindows();
     if (unreturned.length) { this.lastResult = `idle: ${unreturned.length} ended probe(s) not yet returned to base (#${unreturned.map((w) => w.id).join(", #")}) — no new window until they are`; return; }
-    const lastEnd = await this.d.store.lastIdentificationWindowEnd();
+    // Shadow windows never touch the plant, so they are not counted against LIVE draws — but a shadow
+    // window the plan just ended must not be redrawn on the very next poll either (codex pass 2 on #152).
+    const lastEnd = await this.d.store.lastIdentificationWindowEnd(this.mode === "shadow");
     if (lastEnd && nowMs - lastEnd.getTime() < MIN_GAP_MIN * 60_000) { this.lastResult = `idle: ${Math.round((MIN_GAP_MIN * 60_000 - (nowMs - lastEnd.getTime())) / 60_000)} min until the next window may open`; return; }
     const plans = await this.d.store.recentPlans(6);
     if (planConflictAhead(plans.at(-1)?.plan ?? null, nowMs, 3)) { this.lastResult = "idle: sanitize/bank/storm block within 3 h"; return; }
@@ -420,6 +462,17 @@ export class IdentificationDriver {
     if (st.adoption_pending === true) { this.lastResult = `idle: last command (${commanded ?? "?"} °F) not yet adopted (operative ${operative ?? "?"} °F) — base not settled`; return; }
     if (operative == null || !Number.isFinite(operative)) { this.lastResult = "idle: no operative tank target from SensorLinx — base unknown"; return; }
     if (commanded != null && Math.abs(commanded - operative) > 3) { this.lastResult = `idle: commanded ${commanded} °F vs operative ${operative} °F disagree — base not settled`; return; }
+    // The base must also be where the PLAN wants the plant right now. The driver ticks before the
+    // auto-pilot in the same poll, so a floor the hourly plan or the 5-min re-check just raised has not
+    // been written yet: drawing here would freeze the OLD target as a "hold" (or probe from it) and the
+    // auto-pilot's hold would keep the house under its own demand floor for the whole window. Found by the
+    // cold-day rehearsal (scripts/rehearsal): plan 132 °F, device 128 °F, hold arm at 128, auto-pilot held.
+    const planTargetF = currentPlanTargetF(plans.at(-1)?.plan ?? null, nowMs);
+    if (planTargetF == null) { this.lastResult = "idle: no plan block in force — the base cannot be judged settled"; return; }
+    if (Math.abs(planTargetF - operative) >= MIN_STEP_F) {
+      this.lastResult = `idle: plan wants ${planTargetF} °F but the plant is at ${Math.round(operative)} °F — letting the auto-pilot settle the base first`;
+      return;
+    }
     const baseF = Math.round(operative);
     const tgt = probeTarget({
       direction: cell.suggest.direction, baseF, magnitudeF: cell.suggest.magnitudeF,
@@ -439,14 +492,16 @@ export class IdentificationDriver {
       startedAt: this.now(), endedAt: null, endReason: null, durationMin: cell.suggest.durationMin,
       writeId: null, writeAccepted: false, dryRun, postedOpen: false, postedClosed: false,
       cell, safeToProbe: cell.suggest.safeToProbe, armingTicks: 0, writeAttempts: 0,
-      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0, handoffTargetF: null,
     };
     const id = await this.d.store.insertIdentificationWindow(row);
     const w: IdentWindow = { id, ...row };
     this.currentWindow = w;
     const label = `${cell.zoneName} [${cell.band[0]},${cell.band[1]}) ${arm === "probe" ? `${cell.suggest.direction} ${tgt.stepF} °F → ${tgt.targetF}` : `HOLD at ${baseF}`} (p=${cell.suggest.assignmentProbability}, u=${seed})`;
-    // Hold the auto-pilot for the window in every arm (a hold arm is a hold of the base, too).
-    this.d.autopilot.setHold(new Date(this.now().getTime() + (cell.suggest.durationMin + 30) * 60_000), `identification #${id}: ${label}`);
+    // Hold the auto-pilot for the window in every LIVE arm (a hold arm is a hold of the base, too). A
+    // shadow window changes nothing on the plant, so it must not stop a live auto-pilot from following
+    // its plan (codex on #152).
+    if (!dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (cell.suggest.durationMin + 30) * 60_000), `identification #${id}: ${label}`);
     if (arm === "hold") {
       this.lastResult = `${dryRun ? "SHADOW " : ""}hold arm #${id}: ${label}`;
       console.log(`[identify] ${this.lastResult}`);
@@ -495,8 +550,8 @@ export class IdentificationDriver {
 
   /** A drawn probe whose write has not been accepted yet: retry (429) or give up (limit reached). */
   private async continuePendingWrite(w: IdentWindow): Promise<void> {
-    // Keep the hold and the Phase B lead alive while the write is pending.
-    this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
+    // Keep the hold and the Phase B lead alive while the write is pending (live windows only).
+    if (!w.dryRun) this.d.autopilot.setHold(new Date(this.now().getTime() + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction} (write pending)`);
     if (w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
     // RECONCILE before retrying (codex 2026-09-29 pass 2, critical): the device may have ACCEPTED the
     // last attempt while this process died before the row was updated. The writer audits every
@@ -568,8 +623,8 @@ export class IdentificationDriver {
   private async continueActive(w: IdentWindow): Promise<void> {
     const nowMs = this.now().getTime();
     const startedMs = w.startedAt?.getTime() ?? nowMs;
-    // Keep the auto-pilot held and Phase B leading for as long as the window runs.
-    this.d.autopilot.setHold(new Date(startedMs + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction}`);
+    // Keep the auto-pilot held and Phase B leading for as long as a LIVE window runs; shadow holds nothing.
+    if (!w.dryRun) this.d.autopilot.setHold(new Date(startedMs + (w.durationMin + 30) * 60_000), `identification #${w.id} ${w.arm} ${w.direction}`);
     if (w.arm === "probe" && w.direction === "up" && !w.dryRun) this.d.phaseB.setProbeTarget(w.targetF);
     if (nowMs - startedMs >= w.durationMin * 60_000) { await this.end(w, "completed"); return; }
     if (this.mode === "off") { await this.end(w, "mode_off"); return; }
@@ -595,8 +650,13 @@ export class IdentificationDriver {
     this.lastResult = `${w.dryRun ? "SHADOW " : ""}active #${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F — ${left} min left`;
   }
 
-  private async end(w: IdentWindow, reason: string): Promise<void> {
+  private async end(w: IdentWindow, reason: string, opts: { handoffTargetF?: number | null } = {}): Promise<void> {
     const endedAt = this.now();
+    // plan_moved: the base is the target the plan has just declared obsolete. Returning there would burn the
+    // writer's 15-min slot and leave the auto-pilot rate-limited on the NEW target for a quarter hour (codex
+    // pass 2 on #152). The handoff target is PERSISTED on the row so a retried cleanup uses it too (pass 3).
+    const handoffTargetF = Number.isFinite(opts.handoffTargetF as number) ? (opts.handoffTargetF as number) : null;
+    w.handoffTargetF = handoffTargetF;
     this.d.phaseB.setProbeTarget(null);
     this.d.autopilot.setHold(null, "");
     // A LIVE probe (a write was accepted) must be returned to its base by THIS driver — the auto-pilot
@@ -604,7 +664,7 @@ export class IdentificationDriver {
     // is retried every tick until confirmed (codex 2026-09-29 critical).
     const wasLive = w.arm === "probe" && !w.dryRun && w.writeAccepted;
     const cleanupState: CleanupState = wasLive ? "pending" : "none";
-    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState });
+    await this.d.store.updateIdentificationWindow(w.id, { state: "ended", endedAt, endReason: reason, cleanupState, handoffTargetF });
     w.state = "ended"; w.endedAt = endedAt; w.endReason = reason; w.cleanupState = cleanupState;
     this.currentWindow = null;
     this.lastResult = `ended #${w.id} (${reason})`;
@@ -632,6 +692,13 @@ export class IdentificationDriver {
    * failure stays 'pending' and is retried next tick.
    */
   private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
+    // Where the plant goes: the window's base, or — after plan_moved — the plan's new current target (persisted
+    // on the row, so a retry after a transient failure returns to the same place). The cap follows the target
+    // like the auto-pilot's does: a sanitize block above the everyday cap needs the sanitize ceiling, or the
+    // guarded write is refused 422 and the plant falls to the as-found curve instead (codex pass 3).
+    const returnF = w.handoffTargetF ?? w.baseF;
+    const returnCapF = returnF > DEFAULT_OPTS.strictCapF ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
+    const returnLabel = w.handoffTargetF != null ? `the plan's new target ${returnF} °F (plan moved from base ${w.baseF} °F)` : `base ${returnF} °F`;
     const attempts = w.cleanupAttempts + 1;
     await this.d.store.updateIdentificationWindow(w.id, { cleanupAttempts: attempts });
     w.cleanupAttempts = attempts;
@@ -671,8 +738,8 @@ export class IdentificationDriver {
     let permanent = urgent;
     if (commanded != null) {
       try {
-        await this.d.writer.setTarget(w.baseF, cleanupSource(w.id, false), DEFAULT_OPTS.strictCapF);
-        return await done(`re-commanded base ${w.baseF} °F`);
+        await this.d.writer.setTarget(returnF, cleanupSource(w.id, false), returnCapF);
+        return await done(`re-commanded ${returnLabel}`);
       } catch (e) {
         const status = e instanceof WriteError ? e.status : 0;
         permanent = permanent || (status >= 400 && status < 500) || attempts >= CLEANUP_TRANSIENT_MAX;
@@ -690,7 +757,20 @@ export class IdentificationDriver {
 
   private async cleanupPending(): Promise<void> {
     const rows = await this.d.store.cleanupPendingIdentificationWindows();
-    for (const w of rows) await this.cleanup(w, false);
+    if (!rows.length) return;
+    // A plan_moved handoff retried later must go where the plan is NOW, not where it was when the window
+    // ended: base 132 → plan 136 (503, pending) → plan 140 → a retry to 136 would spend the writer's slot on a
+    // stale value and leave the auto-pilot's 140 rate-limited (codex pass 4 on #152). Refresh + persist first.
+    const plans = await this.d.store.recentPlans(6);
+    const planNowF = currentPlanTargetF(plans.at(-1)?.plan ?? null, this.now().getTime());
+    for (const w of rows) {
+      if (w.handoffTargetF != null && planNowF != null && Math.round(planNowF) !== Math.round(w.handoffTargetF)) {
+        console.log(`[identify] cleanup #${w.id}: handoff target refreshed ${w.handoffTargetF} → ${planNowF} °F (the plan moved again)`);
+        w.handoffTargetF = planNowF;
+        await this.d.store.updateIdentificationWindow(w.id, { handoffTargetF: planNowF });
+      }
+      await this.cleanup(w, false);
+    }
   }
 
   // ── TempIQ posting (fail-soft; unposted rows are retried each tick) ──

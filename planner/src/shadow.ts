@@ -394,7 +394,7 @@ export async function forecastWithFallback(
 
 export async function fetchForecast(lat: string, lon: string): Promise<ForecastHour[]> {
   const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `${process.env.OPEN_METEO_URL || "https://api.open-meteo.com"}/v1/forecast?latitude=${lat}&longitude=${lon}` +
     `&hourly=temperature_2m&temperature_unit=fahrenheit&forecast_days=2&timezone=auto`;
   const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`open-meteo: HTTP ${res.status}`);

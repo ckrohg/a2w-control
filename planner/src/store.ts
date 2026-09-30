@@ -310,6 +310,9 @@ export class Store {
       ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_detail   text;
       ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS cleanup_attempts integer NOT NULL DEFAULT 0;
       ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS write_accepted   boolean NOT NULL DEFAULT false;
+      -- #152: where cleanup returns the plant after plan_moved — the plan's NEW target, persisted so a retried
+      -- cleanup never falls back to the obsolete base (codex pass 3).
+      ALTER TABLE identification_windows ADD COLUMN IF NOT EXISTS handoff_target_f real;
       UPDATE identification_windows SET write_accepted = true WHERE write_id IS NOT NULL AND NOT write_accepted;
       -- …and the NEWEST already-ended live probe that predates cleanup tracking enters the cleanup queue
       -- (codex pass 4: a backfilled write_accepted row with cleanup_state 'none' was never cleaned). Only
@@ -948,14 +951,15 @@ export class Store {
       cell: r.cell ?? null, safeToProbe: r.safe_to_probe ?? null, armingTicks: Number(r.arming_ticks ?? 0), writeAttempts: Number(r.write_attempts ?? 0),
       cleanupState: (r.cleanup_state ?? "none") as IdentWindow["cleanupState"], cleanupDetail: r.cleanup_detail == null ? null : String(r.cleanup_detail),
       cleanupAttempts: Number(r.cleanup_attempts ?? 0),
+      handoffTargetF: r.handoff_target_f == null ? null : Number(r.handoff_target_f),
     };
   }
   async openIdentificationWindow(): Promise<IdentWindow | null> {
     const r = await this.pool.query(`SELECT * FROM identification_windows WHERE state IN ('arming','pending_write','active') ORDER BY id DESC LIMIT 1`);
     return r.rowCount ? this.rowToIdentWindow(r.rows[0]) : null;
   }
-  async lastIdentificationWindowEnd(): Promise<Date | null> {
-    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND NOT dry_run`);
+  async lastIdentificationWindowEnd(includeDryRun = false): Promise<Date | null> {
+    const r = await this.pool.query(`SELECT max(ended_at) AS t FROM identification_windows WHERE state = 'ended' AND (NOT dry_run OR $1)`, [includeDryRun]);
     return r.rows[0]?.t ? new Date(r.rows[0].t) : null;
   }
   async insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number> {
@@ -977,6 +981,7 @@ export class Store {
       state: "state", endedAt: "ended_at", endReason: "end_reason", startedAt: "started_at", writeId: "write_id",
       postedOpen: "posted_open", postedClosed: "posted_closed", armingTicks: "arming_ticks", writeAttempts: "write_attempts",
       cleanupState: "cleanup_state", cleanupDetail: "cleanup_detail", cleanupAttempts: "cleanup_attempts", writeAccepted: "write_accepted",
+      handoffTargetF: "handoff_target_f",
     };
     const sets: string[] = []; const vals: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) {

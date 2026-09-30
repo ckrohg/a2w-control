@@ -348,3 +348,24 @@ only-raises, I4 clamp last, hp1 setpoint recomputed.
 
 Manual (authed with `PLANNER_API_TOKEN`): `POST /api/storm/arm {hours}` /
 `POST /api/storm/disarm`. Audit: `storm_events`. `/health.storm` = state + trigger.
+
+## Cold-day rehearsal (`scripts/rehearsal/`)
+
+Runs the **real planner** (`POLL_ONCE=1`, three polls) against a **local** Postgres with every upstream faked
+— SensorLinx (device read + PATCH echo), the hub (state + leased commands), TempIQ (zones, calls,
+identification plan, posts), open-meteo, NWS, OutageWatch — from a scenario JSON, then asserts what the
+planner *did* (DB ledgers + the fake's request log), not what it logged.
+
+```sh
+scripts/rehearsal/run.sh cold-morning     # 22 °F falling to 12 °F, two zones calling, leases armed
+scripts/rehearsal/run.sh warm-evening     # 62 °F, nothing calling, device already at 120 → must write NOTHING
+```
+
+Requires a local Postgres on :5432 (the DB `a2w_rehearsal` is dropped and recreated). Nothing reaches
+production: the DB must be localhost, `SLX_BASE_URL` / `OPEN_METEO_URL` / `NWS_URL` / `HUB_URL` /
+`TEMPIQ_BASE_URL` all point at the fake, and ntfy / Resend / SPAN stay unset. Poll 1 plans (a virgin DB has
+no plan), poll 2 writes the floor (the driver idles: base not at plan), poll 3 draws an identification window
+on the settled base. Add a scenario by copying `scenarios/cold-morning.json`; the `expect` block drives
+`assert.ts`. The first run of this harness found the driver drawing a hold arm at the device's stale target
+before the auto-pilot had written a freshly raised floor (fixed in `identify.ts`: the base must sit within
+`MIN_STEP_F` of the plan's current block).

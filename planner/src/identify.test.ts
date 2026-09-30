@@ -7,10 +7,7 @@
  * restore, and that a shadow window never writes or posts).
  */
 import assert from "node:assert/strict";
-import {
-  pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource,
-  IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps,
-} from "./identify";
+import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
 import { WriteError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
@@ -92,12 +89,12 @@ async function main(): Promise<void> {
       id: 7, createdAt: T0, state: "active", arm: "probe", direction: "up", zoneIds: ["z-lr", "z-mud"], bandLo: 30, bandHi: 45, magnitudeF: 8, baseF: 135, targetF: 143, capF: 145,
       drawProbability: 0.5, drawSeed: "0.2", startedAt: T0, endedAt: null, endReason: null, durationMin: 120, writeId: 11, writeAccepted: true, dryRun: false,
       postedOpen: false, postedClosed: false, cell: { x: 1 }, safeToProbe: { ok: true }, armingTicks: 0, writeAttempts: 1,
-      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+      cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0, handoffTargetF: null,
     };
     const open = windowPayload(w, null);
     assert.equal(open.externalId, "a2w-ident-7");
     assert.equal(open.kind, "awt_identification");
-    assert.deepEqual(open.assignment, { arm: "up", magnitudeF: 8, drawnWithProbability: 0.5, seed: "0.2" });
+    assert.deepEqual(open.assignment, { arm: "up", magnitudeF: 8, drawnWithProbability: 0.5, seed: "0.2", completion: "open", endReason: null });
     assert.equal(open.endedAt, null);
     assert.equal(open.commandedTargetF, 143);
     assert.deepEqual(open.zoneIds, ["z-lr", "z-mud"]);
@@ -110,7 +107,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const writes: Array<{ targetF: number; source: string; capF: number }> = [];
@@ -124,10 +121,21 @@ async function main(): Promise<void> {
     const store: IdentStore = {
       async getLatestSlx() { return { ts: new Date(clock - (over.slxAgeMs ?? 60_000)), tankF: 130, targetF: over.commanded ?? 135, outdoorF: over.outdoorF ?? 40 }; },
       async activeBoost() { return null; },
-      async recentPlans() { return [{ computedAt: now(), plan: [] }]; },
+      // Default: one block in force whose target IS the settled base, so the plan-settled guard is neutral
+      // unless a test moves the plan on purpose (tests pass `planBlocks` and may mutate the array in place).
+      async recentPlans() {
+        // A seeded (restart) window's base is where the plan was when it opened — keep the plan there.
+        const seededBase = over.seedRows?.find((r) => r.state !== "ended")?.baseF;
+        const settledF = typeof seededBase === "number" ? seededBase : typeof over.operative === "number" ? over.operative : typeof over.commanded === "number" ? over.commanded : 135;
+        return [{ computedAt: now(), plan: over.planBlocks ?? [{ ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 40, tank_target_f: settledF, hp1_setpoint_f: settledF + 5, reason: "test block" }] }];
+      },
       async getRecentSeries() { return []; },
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
-      async lastIdentificationWindowEnd() { return over.lastEnd ?? null; },
+      async lastIdentificationWindowEnd(includeDryRun = false) {
+        if (over.lastEnd !== undefined) return over.lastEnd;
+        const ended = rows.filter((r) => r.state === "ended" && r.endedAt && (includeDryRun || !r.dryRun)).map((r) => r.endedAt!.getTime());
+        return ended.length ? new Date(Math.max(...ended)) : null;
+      },
       async insertIdentificationWindow(w) { const id = rows.length + 1; rows.push({ id, ...w }); return id; },
       async updateIdentificationWindow(id, patch) { Object.assign(rows.find((r) => r.id === id)!, patch); },
       async unpostedIdentificationWindows() { return rows.filter((r) => !r.dryRun && ((r.state === "ended" && !r.postedClosed) || (r.state === "active" && !r.postedOpen))); },
@@ -186,6 +194,151 @@ async function main(): Promise<void> {
     return { driver, rows, posts, writes, restores, holds, probeTargets, notes, advance: (min: number) => { clock += min * 60_000; } };
   }
   const upPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] })] };
+
+  // 0. The base must be where the PLAN wants the plant (cold-day rehearsal finding): the driver ticks before
+  //    the auto-pilot, so a freshly raised floor is not written yet — drawing would freeze the old target.
+  {
+    const blockNow = { ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 38, tank_target_f: 132, hp1_setpoint_f: 137, reason: "binding zone: Living Room Baseboard needs 137°F" };
+    const blockLater = { ts: new Date(T0.getTime() + 40 * 60_000).toISOString(), outdoor_f: 37, tank_target_f: 140, hp1_setpoint_f: 145, reason: "later" };
+    assert.equal(currentPlanTargetF([blockLater, blockNow], T0.getTime()), 132, "the block in force is the newest one at or before now");
+    assert.equal(currentPlanTargetF([], T0.getTime()), null);
+    assert.equal(currentPlanTargetF(null, T0.getTime()), null);
+    const unsettled = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: [blockNow, blockLater] });
+    await unsettled.driver.tick();
+    assert.equal(unsettled.rows.length, 0, "no window while the plan (132) is above the plant (128)");
+    assert.match(unsettled.driver.status().lastResult ?? "", /plan wants 132 °F but the plant is at 128 °F/);
+    assert.equal(unsettled.holds.filter((h) => h.until != null).length, 0, "the auto-pilot is NOT held (only the routine hold-clear ran) — it must be free to write the floor");
+    const settled = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: [blockNow, blockLater] });
+    await settled.driver.tick();
+    assert.equal(settled.rows.length, 1, "once the plant sits at the plan target, the window opens");
+    assert.equal(settled.rows[0].baseF, 132);
+    const within = harness({ plan: upPlan, commanded: 130, operative: 130, planBlocks: [blockNow, blockLater] });
+    await within.driver.tick();
+    assert.equal(within.rows.length, 1, "a difference below MIN_STEP_F is settled enough (the auto-pilot would not write it either)");
+    // A LOWER plan target is just as unsettled (a replan the auto-pilot has not applied yet).
+    const lower = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: [{ ...blockNow, tank_target_f: 120 }] });
+    await lower.driver.tick();
+    assert.equal(lower.rows.length, 0); assert.match(lower.driver.status().lastResult ?? "", /plan wants 120 °F but the plant is at 128 °F/);
+    // No block in force (future-only plan, or no plan at all) fails CLOSED: the base cannot be judged settled.
+    for (const blocks of [[blockLater], []]) {
+      const none = harness({ plan: upPlan, commanded: 128, operative: 128, planBlocks: blocks });
+      await none.driver.tick();
+      assert.equal(none.rows.length, 0, "no window without a block in force");
+      assert.match(none.driver.status().lastResult ?? "", /no plan block in force/);
+      assert.ok(none.holds.every((x) => x.until == null), "and no hold");
+    }
+    // An OPEN window ends the moment the plan moves ≥ MIN_STEP_F from its base — every state.
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const hold = harness({ plan: upPlan, commanded: 132, operative: 132, rng: () => 0.9, planBlocks: blocks });
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].arm, "hold"); assert.equal(hold.rows[0].state, "active");
+      blocks[0].tank_target_f = 137; // the 5-min re-check raised the floor
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "ended"); assert.match(hold.rows[0].endReason ?? "", /^plan_moved:132->137$/);
+      assert.equal(hold.holds.at(-1)?.until, null, "the auto-pilot is released on the same tick");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const arming = harness({ plan: upPlan, commanded: 132, operative: 132, pumpsCoverF: 100, planBlocks: blocks }); // setpoints never cover → stays arming
+      await arming.driver.tick();
+      assert.equal(arming.rows[0].state, "arming");
+      blocks[0].tank_target_f = 128; // a lower replan
+      await arming.driver.tick();
+      assert.equal(arming.rows[0].state, "ended"); assert.match(arming.rows[0].endReason ?? "", /^plan_moved:132->128$/);
+      assert.equal(arming.writes.length, 0, "an arming probe that never wrote is simply dropped");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const pending = harness({ plan: upPlan, commanded: 132, operative: 132, writeFails: [429, 429, 429], planBlocks: blocks });
+      await pending.driver.tick(); await pending.driver.tick(); // arming → covered → write 429 → pending_write
+      assert.equal(pending.rows[0].state, "pending_write");
+      blocks[0].tank_target_f = 136;
+      await pending.driver.tick();
+      assert.equal(pending.rows[0].state, "ended"); assert.match(pending.rows[0].endReason ?? "", /^plan_moved:/);
+      assert.equal(pending.rows[0].cleanupState, "none", "nothing was accepted, nothing to return");
+    }
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const probe = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks });
+      await probe.driver.tick(); await probe.driver.tick(); // arming → active (write accepted)
+      assert.equal(probe.rows[0].state, "active"); assert.equal(probe.writes.length, 1);
+      blocks[0].tank_target_f = 136;
+      await probe.driver.tick();
+      assert.equal(probe.rows[0].state, "ended"); assert.match(probe.rows[0].endReason ?? "", /^plan_moved:132->136$/);
+      assert.equal(probe.rows[0].cleanupState, "done");
+      // The handoff: the plant goes to the plan's NEW target (136), not back to the obsolete base (132) — one
+      // write, which the auto-pilot then finds already commanded (codex pass 2 on #152).
+      const last = probe.writes.at(-1)!;
+      assert.equal(last.targetF, 136, "cleanup re-commands the plan's new target");
+      assert.match(last.source, /identification-end#/); // the cleanup source token
+      assert.match(probe.rows[0].cleanupDetail ?? "", /plan's new target 136 °F \(plan moved from base 132 °F\)/);
+      // The posted close says the window was TRUNCATED, and why.
+      const payload = windowPayload(probe.rows[0], null) as { assignment: { completion: string; endReason: string } };
+      assert.equal(payload.assignment.completion, "truncated");
+      assert.equal(payload.assignment.endReason, "plan_moved:132->136");
+      assert.equal(windowCompletion({ endedAt: new Date(), endReason: "completed" }), "completed");
+      assert.equal(windowCompletion({ endedAt: new Date(), endReason: "aborted:room_deficit:z1" }), "aborted");
+      assert.equal(windowCompletion({ endedAt: null, endReason: null }), "open");
+    }
+    // A handoff to a target ABOVE the everyday cap (a sanitize block, 140) uses the sanitize ceiling, like the
+    // auto-pilot would — not the 135 cap that would have the writer refuse it (codex pass 3).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const hot = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks });
+      await hot.driver.tick(); await hot.driver.tick();
+      assert.equal(hot.rows[0].state, "active");
+      blocks[0].tank_target_f = 140;
+      await hot.driver.tick();
+      const last = hot.writes.at(-1)!;
+      assert.equal(last.targetF, 140); assert.equal(last.capF, 145, "the handoff carries the sanitize ceiling for a target above the everyday cap");
+      assert.equal(hot.rows[0].handoffTargetF, 140, "the handoff target is persisted on the row");
+    }
+    // A handoff whose first write fails transiently is RETRIED to the same new target on a later tick — never
+    // back to the obsolete base (codex pass 3: the retry used to lose the handoff).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const retry = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks, writeFails: [null, 503] }); // probe write ok, first cleanup write 503
+      await retry.driver.tick(); await retry.driver.tick();
+      assert.equal(retry.rows[0].state, "active");
+      blocks[0].tank_target_f = 136;
+      await retry.driver.tick();
+      assert.equal(retry.rows[0].state, "ended"); assert.equal(retry.rows[0].cleanupState, "pending", "transient failure → cleanup pending");
+      await retry.driver.tick(); // cleanupPending retries from the persisted row
+      assert.equal(retry.rows[0].cleanupState, "done");
+      assert.equal(retry.writes.at(-1)!.targetF, 136, "the retry re-commands the plan's new target, not the base 132");
+    }
+    // …and if the plan moves AGAIN while cleanup is pending, the retry goes where the plan is NOW (codex pass 4).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const again = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks, writeFails: [null, 503] });
+      await again.driver.tick(); await again.driver.tick();
+      blocks[0].tank_target_f = 136;
+      await again.driver.tick();
+      assert.equal(again.rows[0].cleanupState, "pending"); assert.equal(again.rows[0].handoffTargetF, 136);
+      blocks[0].tank_target_f = 140; // the 5-min re-check raised the floor once more
+      await again.driver.tick();
+      assert.equal(again.rows[0].cleanupState, "done");
+      assert.equal(again.rows[0].handoffTargetF, 140, "the persisted handoff follows the plan");
+      const last = again.writes.at(-1)!;
+      assert.equal(last.targetF, 140, "the retry commands the CURRENT plan target"); assert.equal(last.capF, 145);
+    }
+    // A SHADOW window the plan ended is not redrawn on the very next poll (shadow cooldown, codex pass 2).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const sh = harness({ plan: upPlan, commanded: 132, operative: 132, mode: "shadow", rng: () => 0.9, planBlocks: blocks });
+      await sh.driver.tick();
+      assert.equal(sh.rows[0].dryRun, true); assert.equal(sh.rows[0].state, "active");
+      blocks[0].tank_target_f = 137;
+      await sh.driver.tick();
+      assert.equal(sh.rows[0].state, "ended");
+      blocks[0].tank_target_f = 137;
+      const sh2 = harness({ plan: upPlan, commanded: 137, operative: 137, mode: "shadow", rng: () => 0.9, planBlocks: blocks, seedRows: sh.rows });
+      await sh2.driver.tick();
+      assert.equal(sh2.rows.length, 1, "no immediate redraw in shadow");
+      assert.match(sh2.driver.status().lastResult ?? "", /min until the next window may open/);
+    }
+  }
   const downPlan: IdentPlan = { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] }, { direction: "down", baseAwtF: 130, aboveEverydayCap: false, magnitudeF: 6 })] };
 
   // 1. UP probe: arming (Phase B lead, autopilot held, no write) → active once setpoints cover → write with the identification cap → posted open.
@@ -499,6 +652,7 @@ async function main(): Promise<void> {
     assert.equal(h.writes.length, 0);
     assert.equal(h.posts.length, 0);
     assert.deepEqual(h.probeTargets.filter((t) => t != null), []);
+    assert.ok(h.holds.every((x) => x.until == null), "a SHADOW window never holds the (possibly live) auto-pilot (codex on #152)");
   }
   // 8. OFF mode: an open window is ended (mode_off) and nothing new starts; idle ticks release hold + Phase B.
   {
