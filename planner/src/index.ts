@@ -957,9 +957,11 @@ async function floorReCheckOnce(): Promise<void> {
   const baseline = await store.baselineConfig().catch(() => null);
   const cfg = curveOverridden(cfgLive, baseline) ? baseline : cfgLive;
   const bandHiF = outdoorF != null ? bandFor(outdoorF, cfg, DEFAULT_OPTS.strictCapF).hi : DEFAULT_OPTS.strictCapF;
+  const feed = demandFeed.status();
   const d = decideFloorRaise({
     block, floorF: floor?.tankTargetF ?? null, bindingZone: floor?.bindingZone ?? null, awtF: floor?.bindingAwtF ?? null,
     outdoorF, winterGuardF: DEFAULT_OPTS.winterGuardF, bandHiF,
+    feedHealthy: feed.healthy, callingCount: feed.callingCount,
   });
   if (!d.raise) { floorCadence.lastDecision = d.why; return; }
   const hp1 = Math.round(Math.min(Math.max(d.toF + DEFAULT_OPTS.i1MarginF, DEFAULT_OPTS.hpMinF), DEFAULT_OPTS.strictCapF + DEFAULT_OPTS.i1MarginF));

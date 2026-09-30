@@ -63,15 +63,26 @@ export function decideFloorRaise(args: {
   winterGuardF: number;
   /** I4 upper bound at this outdoor (bandFor(...).hi) — the raise never exceeds it. */
   bandHiF: number;
+  /** The zone feed's health (DemandFeed.isHealthy()). A null floor from a HEALTHY feed means no zone is calling — not a degraded feed. */
+  feedHealthy?: boolean | null;
+  /** Zones calling right now (DemandFeed.status().callingCount); null = the call feed is down (all-zones posture). */
+  callingCount?: number | null;
   minRaiseF?: number;
   now?: Date;
 }): FloorRaiseDecision {
   const minRaiseF = args.minRaiseF ?? FLOOR_RAISE_MIN_F;
   const b = args.block;
   if (!b || !Number.isFinite(Number(b.tank_target_f))) return { raise: false, why: "no current plan block" };
-  if (args.floorF == null || !Number.isFinite(args.floorF)) return { raise: false, why: "no demand floor (feed degraded)" };
   if (args.outdoorF == null || !Number.isFinite(args.outdoorF)) return { raise: false, why: "no outdoor reading" };
+  // The guard comes BEFORE the floor check: above it the hourly plan applies no floor either, and that
+  // is the honest reason in shoulder season — not "feed degraded" for a feed that is healthy with no
+  // zone calling (the first live /health read after #149 said exactly that).
   if (args.outdoorF >= args.winterGuardF) return { raise: false, why: `outdoor ${args.outdoorF.toFixed(0)}°F ≥ winter guard ${args.winterGuardF}°F — the hourly plan applies no floor here either` };
+  if (args.floorF == null || !Number.isFinite(args.floorF)) {
+    if (args.feedHealthy === false) return { raise: false, why: "no demand floor (feed degraded)" };
+    if (args.callingCount === 0) return { raise: false, why: "no demand floor (no zone calling)" };
+    return { raise: false, why: "no demand floor" };
+  }
   if (b.sani) return { raise: false, why: "current block is the sanitize soak (never subsumed)" };
   const fromF = Number(b.tank_target_f);
   const toF = Math.round(Math.min(args.floorF, args.bandHiF));
