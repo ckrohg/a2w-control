@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }}) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>}) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -187,7 +187,9 @@ async function main(): Promise<void> {
         if (u.includes("/identification-plan")) return { ok: true, status: 200, json: async () => over.plan ?? { generatedAt: now().toISOString(), cells: [] } } as any;
         if (u.includes("/probe-interlock")) {
           interlockCalls.push(u);
-          const il = over.interlock ?? { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } };
+          const seq = over.interlockSequence;
+          const il = (seq && seq.length ? seq[Math.min(interlockCalls.length - 1, seq.length - 1)] : over.interlock) ?? { status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } };
+          if (il.status === 0) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
           if (il.status !== 200) return { ok: false, status: il.status, json: async () => ({ source: "unavailable" }) } as any;
           return { ok: true, status: 200, json: async () => il.body } as any;
         }
@@ -229,6 +231,39 @@ async function main(): Promise<void> {
     const bad = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { nope: true } } });
     await bad.driver.tick();
     assert.equal(bad.rows.length, 0, "malformed → no draw");
+    const badSource = harness({ plan: upPlan, commanded: 135, interlock: { status: 200, body: { source: "whatever", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } } });
+    await badSource.driver.tick();
+    assert.equal(badSource.rows.length, 0, "unknown source → malformed → no draw");
+    const notDeployed = harness({ plan: upPlan, commanded: 135, interlock: { status: 404 } });
+    await notDeployed.driver.tick();
+    assert.equal(notDeployed.rows.length, 0); assert.match(notDeployed.driver.status().lastResult ?? "", /endpoint not deployed on TempIQ yet \(HTTP 404\)/);
+    const slow = harness({ plan: upPlan, commanded: 135, interlock: { status: 0 } });
+    await slow.driver.tick();
+    assert.equal(slow.rows.length, 0); assert.match(slow.driver.status().lastResult ?? "", /timed out after 3000 ms/);
+    const tooLong = harness({ plan: { generatedAt: T0.toISOString(), cells: [cell({ band: [30, 45] }, { durationMin: 1500 })] }, commanded: 135 });
+    await tooLong.driver.tick();
+    assert.equal(tooLong.rows.length, 0); assert.match(tooLong.driver.status().lastResult ?? "", /horizon 1535 min outside 0\.\.1440/);
+    assert.equal(tooLong.interlockCalls.length, 0, "refused locally, never clamped");
+    // The calendar is asked AGAIN right before an open window actuates (codex on #153): the draw-time answer may be
+    // minutes old and the window is invisible to TempIQ until its write is accepted.
+    {
+      const clearThenBlocked = [{ status: 200, body: { source: "not_armed", switchbackActiveHydronicZoneIds: [], steppedThermostatZoneIds: [] } }, { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: ["T-xmas"] } }];
+      const arming = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 100, interlockSequence: clearThenBlocked }); // setpoints do not cover yet → arming
+      await arming.driver.tick();
+      assert.equal(arming.rows[0].state, "arming");
+      (arming as any).cover = true;
+      // let the pumps cover on the next tick: re-harness is not possible mid-flight, so use a covered harness with the seeded row
+      const armed = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, seedRows: arming.rows, interlockSequence: [clearThenBlocked[1]] });
+      await armed.driver.tick();
+      assert.equal(armed.rows[0].state, "ended"); assert.match(armed.rows[0].endReason ?? "", /^interlock:switchback_active:arm_log$/);
+      assert.equal(armed.writes.length, 0, "nothing was written"); assert.equal(armed.rows[0].cleanupState, "none");
+      const pending = harness({ plan: upPlan, commanded: 135, writeFails: [429], interlockSequence: [clearThenBlocked[0], clearThenBlocked[0], { status: 503 }] });
+      await pending.driver.tick(); await pending.driver.tick(); // draw → covered → write 429 → pending_write
+      assert.equal(pending.rows[0].state, "pending_write");
+      await pending.driver.tick(); // the retry asks first: 503 → unreadable → ended, no write
+      assert.equal(pending.rows[0].state, "ended"); assert.match(pending.rows[0].endReason ?? "", /^interlock:unreadable:HTTP 503$/);
+      assert.equal(pending.writes.length, 0);
+    }
     const shadow = harness({ plan: upPlan, commanded: 135, mode: "shadow", interlock: { status: 200, body: { source: "arm_log", switchbackActiveHydronicZoneIds: ["z-lr"], steppedThermostatZoneIds: [] } } });
     await shadow.driver.tick();
     assert.equal(shadow.rows.length, 0, "shadow obeys the calendar too — the shadow ledger shows what armed would do");

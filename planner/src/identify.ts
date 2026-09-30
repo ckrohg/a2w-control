@@ -64,8 +64,12 @@ export const IDENT_MODES: readonly IdentMode[] = ["off", "shadow", "armed"];
 const PLAN_REFRESH_MIN = 60;          // the plan is hourly-grained; a stale plan is not re-drawn against
 const PLAN_MAX_AGE_MIN = 180;         // beyond this the plan is not trusted for a NEW window
 const MIN_GAP_MIN = 60;
-/** gtm#1618: the just-in-time interlock is two indexed statements on TempIQ; anything slower means "do not draw". */
-const INTERLOCK_TIMEOUT_MS = 10_000;               // washout + normal operation between windows
+/** gtm#1618: the just-in-time interlock is two indexed statements on TempIQ; anything slower means "do not draw" —
+ *  and the driver ticks ahead of the auto-pilot on the same poll, so the wait is bounded tightly. */
+const INTERLOCK_TIMEOUT_MS = 3_000;
+/** TempIQ's probe-interlock accepts horizonMin in 0..1440; a plan cell outside that is refused, never clamped. */
+const INTERLOCK_HORIZON_MAX_MIN = 24 * 60;
+const INTERLOCK_SOURCES = new Set(["not_armed", "none_dispatched", "arm_log", "legacy_history"]);               // washout + normal operation between windows
 const ARMING_MAX_TICKS = 4;           // ~20 min for Phase B to lead the setpoints, else give up
 const WRITE_RETRY_MAX = 3;            // 429 (rate limit) retries, one per poll
 const CLEANUP_TRANSIENT_MAX = 6;      // transient cleanup failures tolerated before falling back to the as-found restore
@@ -557,6 +561,7 @@ export class IdentificationDriver {
       this.lastResult = `arming #${w.id}: setpoints not yet ≥ ${w.targetF + DEFAULT_OPTS.i1MarginF} °F (tick ${ticks}/${ARMING_MAX_TICKS})`;
       return;
     }
+    if (!(await this.interlockClearForWrite(w))) return;
     await this.d.store.updateIdentificationWindow(w.id, { state: "pending_write" });
     w.state = "pending_write";
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
@@ -590,6 +595,7 @@ export class IdentificationDriver {
       }
     }
     if (this.d.isI1Violated() || this.d.isStormActive()) { await this.end(w, "aborted:before_write"); return; }
+    if (!(await this.interlockClearForWrite(w))) return;
     await this.writeProbe(w, `#${w.id} ${w.direction} → ${w.targetF}`);
   }
 
@@ -792,21 +798,40 @@ export class IdentificationDriver {
    * switchback has stepped today (gtm#1618). `ok: false` on any non-200, malformed body or network error.
    */
   private async probeInterlock(horizonMin: number): Promise<{ ok: true; source: string; blockAll: boolean; blocked: Set<string>; stepped: Set<string> } | { ok: false; error: string }> {
+    if (!Number.isFinite(horizonMin) || horizonMin < 0 || horizonMin > INTERLOCK_HORIZON_MAX_MIN) return { ok: false, error: `horizon ${horizonMin} min outside 0..${INTERLOCK_HORIZON_MAX_MIN}` };
     try {
-      const res = await this.fetchImpl(`${this.d.baseUrl}/api/insights/probe-interlock?horizonMin=${Math.max(0, Math.round(horizonMin))}`, {
+      const res = await this.fetchImpl(`${this.d.baseUrl}/api/insights/probe-interlock?horizonMin=${Math.round(horizonMin)}`, {
         headers: { Authorization: `Bearer ${this.d.token}` }, signal: AbortSignal.timeout(INTERLOCK_TIMEOUT_MS),
       });
+      if (res.status === 404) return { ok: false, error: "endpoint not deployed on TempIQ yet (HTTP 404)" };
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const body = (await res.json()) as { source?: unknown; blockAll?: unknown; switchbackActiveHydronicZoneIds?: unknown; steppedThermostatZoneIds?: unknown };
-      if (!Array.isArray(body?.switchbackActiveHydronicZoneIds) || typeof body?.source !== "string") return { ok: false, error: "malformed body" };
+      const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+      if (!INTERLOCK_SOURCES.has(String(body?.source)) || !isStrings(body?.switchbackActiveHydronicZoneIds) || !isStrings(body?.steppedThermostatZoneIds ?? []) || (body?.blockAll !== undefined && typeof body.blockAll !== "boolean")) {
+        return { ok: false, error: "malformed body" };
+      }
       return {
-        ok: true, source: body.source, blockAll: body.blockAll === true,
-        blocked: new Set((body.switchbackActiveHydronicZoneIds as unknown[]).map(String)),
-        stepped: new Set(((Array.isArray(body.steppedThermostatZoneIds) ? body.steppedThermostatZoneIds : []) as unknown[]).map(String)),
+        ok: true, source: String(body.source), blockAll: body.blockAll === true,
+        blocked: new Set(body.switchbackActiveHydronicZoneIds),
+        stepped: new Set((body.steppedThermostatZoneIds as string[] | undefined) ?? []),
       };
     } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: /abort|timeout/i.test(msg) ? `timed out after ${INTERLOCK_TIMEOUT_MS} ms` : msg };
     }
+  }
+
+  /**
+   * The same calendar check, for an OPEN window about to actuate (arming → write, pending_write → retry): the
+   * draw-time answer may be minutes old and the window is not visible to TempIQ until its write is accepted
+   * (codex on #153). Blocked or unreadable → the unwritten window is ended; nothing was commanded, nothing to return.
+   */
+  private async interlockClearForWrite(w: IdentWindow): Promise<boolean> {
+    const zoneId = (w.cell as { zoneId?: unknown } | null)?.zoneId;
+    const il = await this.probeInterlock(w.durationMin + this.planQuery.abortLatencyMin);
+    if (!il.ok) { await this.end(w, `interlock:unreadable:${il.error}`); return false; }
+    if (il.blockAll || (typeof zoneId === "string" && il.blocked.has(zoneId))) { await this.end(w, `interlock:switchback_active:${il.source}`); return false; }
+    return true;
   }
 
   // ── TempIQ posting (fail-soft; unposted rows are retried each tick) ──
