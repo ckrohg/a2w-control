@@ -377,6 +377,17 @@ scripts/rehearsal/run.sh cold-morning     # 22 °F falling to 12 °F, two zones 
 scripts/rehearsal/run.sh warm-evening     # 62 °F, nothing calling, device already at 120 → must write NOTHING
 ```
 
+**Hour-independent by construction** (eval 2026-09-30, F1): the plan's daily 140 °F soak goes to the warmest
+*remaining* hour of the local day, so a falling forecast run in the late afternoon would put the soak on the current
+block — the driver then refuses to draw beside it and the demand floor rides the soak's 145 °F ceiling; the harness
+passed at 01:00 and failed at 17:30 on the same planner. The fake now shapes the served forecast
+(`scripts/rehearsal/forecast-shape.ts`): the local day holding the hour 4 h from now has its warmest hour at or after
+that hour (a +0.5 °F nudge, logged in `fake.log` as `forecastShape`), and a day with < 6 blocks left gets no soak.
+The fake also formats open-meteo's local wall-clock hours in the HOUSE's zone (`HOUSE_TZ`, pinned to
+`America/New_York` by `run.sh`), never the host's: on a Mac set to Pacific time the fake wrote 14:00 (PDT) and the
+planner read 14:00 EDT, shifting the forecast, the soak hour and the DHW windows 3 h off the real clock. The
+three-poll sequence (plan → act → draw) is therefore the same at any time of day on any host.
+
 Requires a local Postgres on :5432 (the DB `a2w_rehearsal` is dropped and recreated). Nothing reaches
 production: the DB must be localhost, `SLX_BASE_URL` / `OPEN_METEO_URL` / `NWS_URL` / `HUB_URL` /
 `TEMPIQ_BASE_URL` all point at the fake, and ntfy / Resend / SPAN stay unset. Poll 1 plans (a virgin DB has
