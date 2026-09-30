@@ -308,6 +308,21 @@ async function main(): Promise<void> {
       assert.equal(retry.rows[0].cleanupState, "done");
       assert.equal(retry.writes.at(-1)!.targetF, 136, "the retry re-commands the plan's new target, not the base 132");
     }
+    // …and if the plan moves AGAIN while cleanup is pending, the retry goes where the plan is NOW (codex pass 4).
+    {
+      const blocks = [{ ...blockNow, tank_target_f: 132 }];
+      const again = harness({ plan: upPlan, commanded: 132, operative: 132, planBlocks: blocks, writeFails: [null, 503] });
+      await again.driver.tick(); await again.driver.tick();
+      blocks[0].tank_target_f = 136;
+      await again.driver.tick();
+      assert.equal(again.rows[0].cleanupState, "pending"); assert.equal(again.rows[0].handoffTargetF, 136);
+      blocks[0].tank_target_f = 140; // the 5-min re-check raised the floor once more
+      await again.driver.tick();
+      assert.equal(again.rows[0].cleanupState, "done");
+      assert.equal(again.rows[0].handoffTargetF, 140, "the persisted handoff follows the plan");
+      const last = again.writes.at(-1)!;
+      assert.equal(last.targetF, 140, "the retry commands the CURRENT plan target"); assert.equal(last.capF, 145);
+    }
     // A SHADOW window the plan ended is not redrawn on the very next poll (shadow cooldown, codex pass 2).
     {
       const blocks = [{ ...blockNow, tank_target_f: 132 }];

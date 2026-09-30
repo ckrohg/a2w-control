@@ -757,7 +757,20 @@ export class IdentificationDriver {
 
   private async cleanupPending(): Promise<void> {
     const rows = await this.d.store.cleanupPendingIdentificationWindows();
-    for (const w of rows) await this.cleanup(w, false);
+    if (!rows.length) return;
+    // A plan_moved handoff retried later must go where the plan is NOW, not where it was when the window
+    // ended: base 132 → plan 136 (503, pending) → plan 140 → a retry to 136 would spend the writer's slot on a
+    // stale value and leave the auto-pilot's 140 rate-limited (codex pass 4 on #152). Refresh + persist first.
+    const plans = await this.d.store.recentPlans(6);
+    const planNowF = currentPlanTargetF(plans.at(-1)?.plan ?? null, this.now().getTime());
+    for (const w of rows) {
+      if (w.handoffTargetF != null && planNowF != null && Math.round(planNowF) !== Math.round(w.handoffTargetF)) {
+        console.log(`[identify] cleanup #${w.id}: handoff target refreshed ${w.handoffTargetF} → ${planNowF} °F (the plan moved again)`);
+        w.handoffTargetF = planNowF;
+        await this.d.store.updateIdentificationWindow(w.id, { handoffTargetF: planNowF });
+      }
+      await this.cleanup(w, false);
+    }
   }
 
   // ── TempIQ posting (fail-soft; unposted rows are retried each tick) ──
