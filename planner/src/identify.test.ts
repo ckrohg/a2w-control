@@ -255,15 +255,24 @@ async function main(): Promise<void> {
       assert.equal(arming.rows[0].state, "arming");
       // Let the pumps cover on the next tick: re-harnessing mid-flight is not possible, so seed the row into a covered harness.
       const armed = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, seedRows: arming.rows, interlockSequence: [clearThenBlocked[1]] });
+      const ticksBefore = armed.rows[0].armingTicks;
       await armed.driver.tick();
       assert.equal(armed.rows[0].state, "ended"); assert.match(armed.rows[0].endReason ?? "", /^interlock:switchback_active:arm_log$/);
       assert.equal(armed.writes.length, 0, "nothing was written"); assert.equal(armed.rows[0].cleanupState, "none");
+      // ORDER (codex pass 4/5): the calendar was asked before any preparatory side effect of the tick.
+      assert.equal(armed.rows[0].armingTicks, ticksBefore, "a refused arming tick does not count as an arming tick");
+      assert.deepEqual(armed.probeTargets.filter((t) => t != null), [], "no Phase B lead was set before the refusal");
+      assert.deepEqual(armed.holds.filter((h) => h.until != null), [], "no hold was renewed before the refusal");
       const pending = harness({ plan: upPlan, commanded: 135, writeFails: [429], interlockSequence: [clearThenBlocked[0], clearThenBlocked[0], { status: 503 }] });
       await pending.driver.tick(); await pending.driver.tick(); // draw → covered → write 429 → pending_write
       assert.equal(pending.rows[0].state, "pending_write");
+      const holdsBefore = pending.holds.filter((h) => h.until != null).length, leadsBefore = pending.probeTargets.filter((t) => t != null).length;
       await pending.driver.tick(); // the retry asks first: 503 → unreadable → ended, no write
       assert.equal(pending.rows[0].state, "ended"); assert.match(pending.rows[0].endReason ?? "", /^interlock:unreadable:HTTP 503$/);
       assert.equal(pending.writes.length, 0);
+      assert.equal(pending.holds.filter((h) => h.until != null).length, holdsBefore, "the hold was not renewed before the refusal");
+      assert.equal(pending.probeTargets.filter((t) => t != null).length, leadsBefore, "the Phase B lead was not renewed before the refusal");
+      assert.equal(pending.holds.at(-1)?.until, null, "end() released the hold");
       assert.equal(pending.posts.length, 0, "a window that never happened is not posted to TempIQ");
       // …and a refused-before-write row does NOT start the 60-min cooldown (nothing happened) — the next tick draws again.
       const again = harness({ plan: upPlan, commanded: 135, seedRows: pending.rows, interlock: { status: 200, body: il("not_armed") } });
