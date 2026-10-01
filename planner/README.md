@@ -365,6 +365,18 @@ lives in SQL; `scripts/identify-cooldown-local-check.ts` proves it against a loc
 LOCAL_DATABASE_URL=postgres://$(whoami)@localhost:5432/a2w_local npx tsx ../scripts/identify-cooldown-local-check.ts
 ```
 
+## Observability added by the 2026-09-30 eval (F4 / F6 / §10.10)
+
+- `/health.dhw.last_pre_boost` — `{at, toF, reason, result}` of the last #135 pre-boost block the auto-pilot reached
+  (`set` | `would-set` | `rate-limited` | `rejected: …` | `held` — already commanded within tolerance, or an
+  identification hold); null until the first boost hour. Answers "did this morning's boost fire, and if not why?"
+  without a prod query.
+- `/health.curve.in_force.shaped` now means "the plan's shaped curve is the one the device holds" (the auto-pilot's own
+  four-field predicate), not `dbt − mbt > 4`; `spread_f` keeps the spread visible.
+- `/health.phase_b.fail_streak` — consecutive write failures per pump (the ntfy page fires at 3; this says how long).
+- `scripts/identification-mode.sh [off|shadow|armed]` — read or set the identification driver's mode on the live planner
+  with the bearer read from Railway (never printed). Arming pages ntfy at "high".
+
 ## Cold-day rehearsal (`scripts/rehearsal/`)
 
 Runs the **real planner** (`POLL_ONCE=1`, three polls) against a **local** Postgres with every upstream faked

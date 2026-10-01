@@ -1718,7 +1718,15 @@ async function main(): Promise<void> {
             // shaped curve the latest plan implies — not just the last commanded scalar.
             curve: {
               mode: SHAPED_CURVE_MODE === "live" ? "shaped" : SHAPED_CURVE_MODE === "shadow" ? "shadow" : "flat-target",
-              in_force: lastDeviceCurve ? { ...lastDeviceCurve, output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastDeviceCurve, lastThermal.outdoor_f) * 10) / 10 : null, shaped: lastDeviceCurve.dbt - lastDeviceCurve.mbt > 4 } : null,
+              in_force: lastDeviceCurve ? {
+                ...lastDeviceCurve,
+                output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastDeviceCurve, lastThermal.outdoor_f) * 10) / 10 : null,
+                // "shaped" = the PLAN's curve is the one in force (the auto-pilot's own four-field predicate), not a
+                // spread heuristic: the floor-clamped plan curve has a 2 °F spread and read false the day it went live
+                // (eval 2026-09-30 §10.10). spread_f keeps the old signal visible.
+                shaped: lastShapedCurve ? curveAlreadyInForce(lastShapedCurve, lastDeviceCurve) : false,
+                spread_f: Number.isFinite(Number(lastDeviceCurve.dbt) - Number(lastDeviceCurve.mbt)) ? Math.round((Number(lastDeviceCurve.dbt) - Number(lastDeviceCurve.mbt)) * 10) / 10 : null,
+              } : null,
               plan_implies: lastShapedCurve ? {
                 dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis,
                 output_at_live_outdoor_f: lastThermal.outdoor_f != null ? Math.round(curveOutputF(lastShapedCurve, lastThermal.outdoor_f) * 10) / 10 : null,
@@ -1729,7 +1737,7 @@ async function main(): Promise<void> {
               } : null,
             },
             phase_b: phaseB
-              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults }
+              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults, fail_streak: phaseB.streaks() }
               : "disabled",
             // #136: the per-poll floor re-check — last decision and the raises it made in the past 24 h.
             demand_floor_cadence: (() => {
@@ -1790,6 +1798,9 @@ async function main(): Promise<void> {
               min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F, standby_f_per_h: STANDBY_F_PER_H,
               // peaks = hours where ≥ 50 % of observed days had a draw (unpadded); the floor windows are the padded 25 % ones
               peak_threshold: 0.5, floor_windows: learnedWindowsForHealth,
+              // eval 2026-09-30 F6: did the boost actually fire? The last pre-boost block the auto-pilot acted on and how
+              // (set | would-set | rate-limited | rejected: …); null until the first boost hour is reached.
+              last_pre_boost: autopilot ? autopilot.lastPreBoost : null,
             },
             hygiene: {
               auto_sanitize: autoSanitizeLive,

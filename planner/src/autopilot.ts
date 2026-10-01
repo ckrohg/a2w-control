@@ -60,6 +60,12 @@ export class AutoPilot {
   public lastRunAt: string | null = null;
   public lastResult = "not run yet";
   public lastTargetF: number | null = null; // most recent decided target — surfaced in the heartbeat
+  /**
+   * eval 2026-09-30 F6: the #135 pre-boost was unobservable from outside prod (only hbx_writes knew). The most recent
+   * pre-boost block the auto-pilot ACTED on — set, dry-run, rate-limited or rejected — with the result, so /health.dhw
+   * can say whether this morning's boost fired. null until the first boost block is reached.
+   */
+  public lastPreBoost: { at: string; toF: number; reason: string; result: string } | null = null;
   private lastLogged: string | null = null;
 
   constructor(
@@ -91,9 +97,10 @@ export class AutoPilot {
   get holdActive(): boolean { return this.holdUntil != null && Date.now() < this.holdUntil; }
 
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
-  private async record(target: number | null, reason: string, result: string, verbose: string, _block?: Record<string, unknown> | null): Promise<void> {
+  private async record(target: number | null, reason: string, result: string, verbose: string, block?: Record<string, unknown> | null): Promise<void> {
     this.lastResult = verbose;
     this.lastTargetF = target;
+    if (block?.boost === true && target != null) this.lastPreBoost = { at: new Date().toISOString(), toF: target, reason, result };
     const key = `${result}|${target}`;
     if (key !== this.lastLogged) {
       this.lastLogged = key;
@@ -121,7 +128,8 @@ export class AutoPilot {
     this.lastRunAt = new Date().toISOString();
 
     if (this.holdActive) {
-      await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`);
+      // the block is passed so a boost reached during an identification hold is recorded as held, not lost (codex on #158)
+      await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`, block);
       return;
     }
     const status = await this.writer.status();
@@ -132,7 +140,7 @@ export class AutoPilot {
     const curveHour = this.shapedCurve ? curveDecision(block) : null;
     // Skip if already commanded there — avoids curve churn and needless rate-limit rejections.
     if (curveHour?.kind !== "curve" && commanded != null && Math.abs(commanded - target) <= APPLY_TOLERANCE_F) {
-      await this.record(target, reason, "held", `holding ${target}°F (${reason}) — already commanded`);
+      await this.record(target, reason, "held", `holding ${target}°F (${reason}) — already commanded`, block);
       return;
     }
 
@@ -194,25 +202,25 @@ export class AutoPilot {
       return;
     }
     if (this.dryRun) {
-      await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
+      await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`, block);
       console.log(`[autopilot] ${this.lastResult}`);
       return;
     }
 
     try {
       await this.writer.setTarget(target, "autopilot", capF);
-      await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
+      await this.record(target, reason, "set", `set ${target}°F — ${reason}`, block);
       console.log(`[autopilot] ${this.lastResult}`);
     } catch (e) {
       if (e instanceof WriteError && e.status === 429) {
         // The 15-min rate limit — expected when the plan changes faster than we may write. Not an error.
-        await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${target}°F (${reason})`);
+        await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${target}°F (${reason})`, block);
         return;
       }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
       // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
       // caught by the standing I1 monitor + the adoption monitor.
-      await this.record(target, reason, `rejected: ${msg}`, `rejected ${target}°F: ${msg}`);
+      await this.record(target, reason, `rejected: ${msg}`, `rejected ${target}°F: ${msg}`, block);
       console.warn(`[autopilot] ${this.lastResult}`);
     }
   }
