@@ -278,7 +278,14 @@ export function computeShadowPlan(
       if (demandFloor) {
         if (demandFloor.tankTargetF > target) {
           target = demandFloor.tankTargetF;
-          reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+          const floorReason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+          // a2w#155: the soak is never subsumed — when the floor outruns the 140 °F soak the block is STILL the
+          // soak (its `sani` flag and its sanitizeCapF ceiling stay), so its reason must keep saying so: the
+          // poster files it as the soak and the identification driver keeps its distance (planConflictAhead
+          // matches /sanitize/). Before this the reason was rewritten to the floor's and the identity was lost.
+          reason = d.sani
+            ? `${d.reason} — raised to the demand floor ${Math.round(target)}°F (${floorReason})`
+            : floorReason;
           d.bank = false; d.boost = false;
         }
       } else if (hbxConfig) {

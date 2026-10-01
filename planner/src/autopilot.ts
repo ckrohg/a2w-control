@@ -172,10 +172,19 @@ export class AutoPilot {
       return;
     }
 
+    // a2w#156: the everyday I4 cap is lifted to sanitizeCapF ONLY for the block the plan marked as the soak
+    // (`sani`), never inferred from the target's size. The plan clamps every non-soak block to strictCap, so a
+    // non-soak target above it means the plan and the auto-pilot disagree about what this hour is — refuse it
+    // here (fail closed, logged) instead of writing it under the soak's ceiling. Identification probes do not
+    // pass through here (identify.ts writes with its own cap).
+    const isSoak = block?.sani === true;
+    if (!isSoak && target > DEFAULT_OPTS.strictCapF) {
+      await this.record(target, reason, "rejected: non-soak block above everyday cap", `rejected ${target}°F: non-soak block above the everyday cap ${DEFAULT_OPTS.strictCapF}°F (${reason})`);
+      console.warn(`[autopilot] ${this.lastResult}`);
+      return;
+    }
     try {
-      // A plan target above the everyday strictCap is the daily sanitize excursion — allow it up to
-      // sanitizeCapF (only sanitize produces >strictCap in the plan). I1 in setTarget still guards it.
-      const capF = target > DEFAULT_OPTS.strictCapF ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
+      const capF = isSoak ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
       await this.writer.setTarget(target, "autopilot", capF);
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
       console.log(`[autopilot] ${this.lastResult}`);

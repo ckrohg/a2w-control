@@ -296,3 +296,28 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.equal(new Date(tp.ts).getHours(), 14, "…placed at 14:00 — 15:00 and 16:00 are inside the other peak");
   console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
 }
+
+// a2w#155 — a demand floor that outruns the 140 °F soak keeps the soak's identity: the block stays `sani`, the
+// reason still names the sanitize (so planConflictAhead and the poster see a soak) and says the floor raised it.
+{
+  const cold: ForecastHour[] = Array.from({ length: 24 }, (_, i) => ({ ts: new Date(Date.UTC(2026, 0, 15, 5 + i)), outdoorF: 20 + (i === 13 ? 6 : 0) })); // warmest at 18:00Z = 13:00 local
+  const floor = { tankTargetF: 142, bindingZone: "Living Room Baseboard", awtF: 137 };
+  const plan = computeShadowPlan(cold, null, DEFAULT_OPTS, floor, true, false);
+  const soak = plan.filter((b) => b.sani);
+  assert.equal(soak.length, 1, "exactly one soak block");
+  assert.equal(soak[0].tank_target_f, 142, "the floor raised the soak block to 142 °F (within sanitizeCapF 145)");
+  assert.match(soak[0].reason, /daily sanitize/i, "the soak keeps its identity in the reason");
+  assert.match(soak[0].reason, /raised to the demand floor 142°F/, "…and says the floor raised it");
+  assert.match(soak[0].reason, /binding zone: Living Room Baseboard needs 137°F/, "…naming the floor's cause");
+  // every NON-soak block is the floor clamped to the everyday cap, with the plain floor reason
+  for (const b of plan.filter((x) => !x.sani)) {
+    assert.equal(b.tank_target_f, DEFAULT_OPTS.strictCapF, `non-soak block ${b.ts} clamped to strictCap`);
+    assert.match(b.reason, /^binding zone: Living Room Baseboard needs 137°F/);
+    assert.doesNotMatch(b.reason, /sanitize/i);
+  }
+  // a floor BELOW the soak target leaves the soak untouched
+  const mild = computeShadowPlan(cold, null, DEFAULT_OPTS, { tankTargetF: 128, bindingZone: "Dining", awtF: 123 }, true, false).filter((b) => b.sani)[0];
+  assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
+  assert.doesNotMatch(mild.reason, /raised to the demand floor/);
+  console.log("shadow.test.ts (#155 soak identity under the demand floor): all assertions passed");
+}
