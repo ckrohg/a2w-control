@@ -150,7 +150,10 @@ export class PhaseB {
 
     for (const d of decisions) {
       if (this.dryRun) {
-        this.failStreak[d.pump_id] = 0; // nothing was attempted, so nothing is failing (codex on #158)
+        // nothing was attempted, so nothing is failing — and the alert latch moves with the streak, or a later sustained
+        // failure after the lane goes active again could never page (codex pass 2 on #158)
+        this.failStreak[d.pump_id] = 0;
+        this.alerted[d.pump_id] = false;
         this.lastResults[d.pump_id] = `DRY-RUN would send ${d.value_c}°C — ${d.reason}`;
         console.log(`[phase-b] ${this.lastResults[d.pump_id]}`);
         await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "dry-run", valueC: d.value_c, result: "would-send" }).catch(() => {});
