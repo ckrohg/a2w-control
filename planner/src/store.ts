@@ -182,6 +182,14 @@ export class Store {
         fetched_at timestamptz NOT NULL,
         payload    jsonb NOT NULL
       );
+      -- wave plan 2026-10-01 B2b: latest winter scoreboard from TempIQ (/api/insights/winter-scoreboard) — this
+      -- winter's kWh per HDD65 vs last winter, same weeks, with the comfort share. Enrichment ONLY (digest +
+      -- observability); never gates control. Single row: the payload carries every week of both seasons.
+      CREATE TABLE IF NOT EXISTS tempiq_winter_scoreboard (
+        id         integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        fetched_at timestamptz NOT NULL,
+        payload    jsonb NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS storm_events (
         id         serial PRIMARY KEY,
         started_at timestamptz NOT NULL DEFAULT now(),
@@ -659,6 +667,16 @@ export class Store {
   async upsertTempiqDhwUsage(payload: unknown): Promise<void> {
     await this.pool.query(
       `INSERT INTO tempiq_dhw_usage (id, fetched_at, payload) VALUES (1, now(), $1)
+       ON CONFLICT (id) DO UPDATE SET
+         fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
+      [JSON.stringify(payload)],
+    );
+  }
+
+  /** Latest winter scoreboard (wave plan B2b) → tempiq_winter_scoreboard row 1. */
+  async upsertTempiqWinterScoreboard(payload: unknown): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO tempiq_winter_scoreboard (id, fetched_at, payload) VALUES (1, now(), $1)
        ON CONFLICT (id) DO UPDATE SET
          fetched_at = EXCLUDED.fetched_at, payload = EXCLUDED.payload`,
       [JSON.stringify(payload)],

@@ -300,6 +300,47 @@ async function buildDigest() {
     const rising = c.drops > c.prev && c.drops >= 3;
     notes.push(`${c.pump_id.toUpperCase()} comm: ${c.drops} dropout${c.drops === 1 ? "" : "s"} (prev wk ${c.prev})${c.err != null ? ` · ${fmt(Number(c.err), 1)}% err` : ""}${rising ? ` — <b style="color:${BAD}">degrading, keep an eye on it</b>` : ""}.`);
   }
+  // Winter scoreboard (TempIQ, mirrored hourly into tempiq_winter_scoreboard by the planner — wave plan B2b):
+  // this winter's kWh per HDD65 against last winter over the SAME weeks. Omitted until the first rated week; the
+  // mirror's own fetchedAt is quoted so a stale mirror reads as stale, not as this week's number.
+  try {
+    const row = (await sql`SELECT payload FROM tempiq_winter_scoreboard WHERE id = 1`).rows[0];
+    const sb = row?.payload as {
+      available?: boolean; season?: string; fetchedAt?: string;
+      comparison?: { weeksCompared?: number; intensityChangePct?: number | null;
+        current?: { kwhPerHdd?: number | null; coldShare?: number | null } | null;
+        baseline?: { season?: string; kwhPerHdd?: number | null; coldShare?: number | null } | null } | null;
+    } | undefined;
+    const c = sb?.comparison ?? null;
+    if (sb?.available === true && c?.current?.kwhPerHdd != null) {
+      // A VERDICT (the coloured change) needs all three legs: a fresh mirror (fetchedAt present, valid, ≤ 26 h — the
+      // planner refreshes hourly), a baseline number, and ≥ 1 compared week. Missing any of them, the number is
+      // shown plainly and the gap is named — a stale or baseline-less figure must never read as this week's result.
+      const fetchedMs = sb.fetchedAt ? new Date(sb.fetchedAt).getTime() : NaN;
+      const ageH = Number.isFinite(fetchedMs) ? (Date.now() - fetchedMs) / 3_600_000 : null;
+      const fresh = ageH != null && ageH >= 0 && ageH <= 26;
+      const weeksCompared = typeof c.weeksCompared === "number" && Number.isFinite(c.weeksCompared) ? c.weeksCompared : 0;
+      const hasBaseline = c.baseline?.kwhPerHdd != null && weeksCompared >= 1;
+      const chg = hasBaseline && typeof c.intensityChangePct === "number" && Number.isFinite(c.intensityChangePct) ? c.intensityChangePct : null;
+      const rounded = chg != null ? Math.sign(chg) * Math.round(Math.abs(chg)) : null; // half away from zero: -0.5 → -1, +0.5 → +1, -0.4 → 0
+      let verdict = "";
+      if (rounded != null && fresh) {
+        verdict = rounded === 0
+          ? ` — <b>flat per degree of cold</b>`
+          : ` — <b style="color:${rounded < 0 ? GOOD : BAD}">${rounded > 0 ? "+" : ""}${rounded}% per degree of cold</b>`;
+      }
+      const caveat = !fresh
+        ? ` <span style="color:${MUTED}">· ${ageH == null ? "mirror age unknown" : ageH < 0 ? "mirror timestamp is in the future" : `mirror ${fmt(ageH / 24, 1)} d old`} — no verdict</span>`
+        : !hasBaseline ? ` <span style="color:${MUTED}">· no same-week baseline yet — no verdict</span>` : "";
+      notes.push(
+        `Winter scoreboard (${sb.season ?? "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
+        (hasBaseline ? ` vs ${fmt(c.baseline!.kwhPerHdd, 2)} last winter over the same ${weeksCompared} week${weeksCompared === 1 ? "" : "s"}` : "") +
+        verdict +
+        (c.current.coldShare != null ? `; hydronic rooms below 66°F ${fmt(c.current.coldShare * 100, 1)}% of sampled hours${hasBaseline && c.baseline?.coldShare != null ? ` (last winter ${fmt(c.baseline.coldShare * 100, 1)}%)` : ""}` : "") +
+        caveat + `.`,
+      );
+    }
+  } catch { /* mirror table missing — omit the note */ }
 
   // ---- demand-floor section (heating weather only) ---------------------------------
   // Provenance wording is the point of the block: a ceiling that measured nothing about

@@ -89,6 +89,53 @@ interface DhwUsageResponse {
   rolling?: { window24hKwh?: number | null; window72hKwh?: number | null; basis?: string | null } | null;
 }
 
+// Winter scoreboard (TempIQ #2063, GET /api/insights/winter-scoreboard): this winter's kWh per HDD65 against last
+// winter over the SAME week indices, plus the pooled comfort share. Narrow projection — every field optional; the
+// whole body is persisted as jsonb for the digest. `available:false` carries a reason (not_migrated | no_rows |
+// season_not_found) and is a normal answer before the first rated week of a season.
+export interface WinterScoreboardResponse {
+  available?: boolean;
+  reason?: string | null;
+  season?: string | null;
+  baselineSeason?: string | null;
+  weeks?: unknown[] | null;
+  comparison?: {
+    weeksCompared?: number | null;
+    current?: { kwhPerHdd?: number | null; hdd65?: number | null; hvacKwh?: number | null; coldShare?: number | null } | null;
+    baseline?: { season?: string | null; kwhPerHdd?: number | null; hdd65?: number | null; hvacKwh?: number | null; coldShare?: number | null } | null;
+    intensityChangePct?: number | null;
+    note?: string | null;
+  } | null;
+  generatedAt?: string | null;
+}
+
+/** Round half AWAY from zero (Math.round(-0.5) is -0, Math.round(0.5) is 1 — asymmetric). PURE. */
+export function roundPct(n: number): number {
+  return Math.sign(n) * Math.round(Math.abs(n));
+}
+
+/** "+7%", "-12%", or "flat" when |change| < 0.5 — never "-0%" (a sign on a zero reads as a verdict). PURE. */
+export function formatChangePct(pct: number | null | undefined): string | null {
+  const n = numOrNull(pct);
+  if (n == null) return null;
+  const r = roundPct(n);
+  if (r === 0) return "flat";
+  return `${r > 0 ? "+" : ""}${r}%`;
+}
+
+/** One-line human summary for lastResult / the log. PURE. The change is quoted only next to the baseline it is against. */
+export function summarizeWinterScoreboard(body: WinterScoreboardResponse | null | undefined): string {
+  if (!body || body.available === false) return `scoreboard: unavailable${body?.reason ? ` (${body.reason})` : ""}`;
+  const c = body.comparison ?? null;
+  const weeks = Array.isArray(body.weeks) ? body.weeks.length : 0;
+  const cur = numOrNull(c?.current?.kwhPerHdd);
+  const base = numOrNull(c?.baseline?.kwhPerHdd);
+  const chg = base != null ? formatChangePct(c?.intensityChangePct) : null;
+  const season = body.season ?? "?";
+  if (cur == null) return `scoreboard: ${season}, ${weeks} wk, no rated week yet`;
+  return `scoreboard: ${season} ${cur.toFixed(2)} kWh/HDD${base != null ? ` vs ${base.toFixed(2)} last winter` : ""}${chg != null ? ` (${chg})` : ""}, ${numOrNull(c?.weeksCompared) ?? 0} wk compared`;
+}
+
 export class TempiqReader {
   private lastFetchAt: string | null = null;
   private lastResult: string | null = null;
@@ -145,6 +192,13 @@ export class TempiqReader {
       results.push(await this.fetchDhwUsage());
     } catch (e) {
       results.push(`dhw error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // ADVISORY (wave plan B2b): the winter scoreboard. Same contract as dhw — a 404 before TempIQ #2063 deploys or
+    // available:false before the first rated week must not inflate the failure streak.
+    try {
+      results.push(await this.fetchWinterScoreboard());
+    } catch (e) {
+      results.push(`scoreboard error: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     if (failed < 3) this.lastFetchAt = new Date().toISOString();
@@ -242,6 +296,13 @@ export class TempiqReader {
     const daily = numOrNull(e?.dailyElectricalKwh);
     const cyc = numOrNull(e?.cycleCount);
     return `dhw: ${daily != null ? `${daily.toFixed(1)}kWh/d` : "?"}${cyc != null ? `, ${cyc} cyc` : ""}${e?.stale ? " (stale)" : ""}`;
+  }
+
+  /** Winter scoreboard (wave plan B2b) → tempiq_winter_scoreboard row 1. Whole body persisted; summary for the log. */
+  private async fetchWinterScoreboard(): Promise<string> {
+    const body = await this.get<WinterScoreboardResponse>("/api/insights/winter-scoreboard");
+    await this.store.upsertTempiqWinterScoreboard({ ...body, fetchedAt: new Date().toISOString() });
+    return summarizeWinterScoreboard(body);
   }
 }
 
