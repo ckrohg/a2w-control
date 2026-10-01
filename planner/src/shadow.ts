@@ -23,10 +23,12 @@ export interface ShadowBlock {
   tank_target_f: number;
   hp1_setpoint_f: number;
   reason: string;
-  /** Excursion flags (the reason text also names them): the I8 soak, the #58 bank, the #135 pre-boost. */
+  /** Excursion flags (the reason text also names them): the I8 soak, the #58 bank, the #135 pre-boost, the §6.11 storm raise. */
   sani?: boolean;
   bank?: boolean;
   boost?: boolean;
+  /** a2w#156: set by index.ts storm shaping — authorises the block to run up to STORM_CAP_F in the auto-pilot. */
+  storm?: boolean;
 }
 
 /** #135: a learned draw window's boost, sized from the measured sag (see dhw.ts measureWindowSags). */

@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
 import { classifyKind } from "./tempiq-windows";
+import { planConflictAhead } from "./identify";
 
 // A flat summer day: 24 hours, all warm (no winter guard, no natural ≥sanitizeF hour). Timestamps use
 // LOCAL components so day-grouping + warmest-hour selection are deterministic regardless of machine TZ.
@@ -319,5 +320,15 @@ console.log("shadow.test.ts: all assertions passed ✓");
   const mild = computeShadowPlan(cold, null, DEFAULT_OPTS, { tankTargetF: 128, bindingZone: "Dining", awtF: 123 }, true, false).filter((b) => b.sani)[0];
   assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
   assert.doesNotMatch(mild.reason, /raised to the demand floor/);
+  // a 150 °F floor on the soak hour is clamped to sanitizeCapF (145), still the soak
+  const hot = computeShadowPlan(cold, null, DEFAULT_OPTS, { tankTargetF: 150, bindingZone: "Living Room Baseboard", awtF: 145 }, true, false).filter((b) => b.sani)[0];
+  assert.equal(hot.tank_target_f, DEFAULT_OPTS.sanitizeCapF, "the soak's ceiling binds the floor");
+  assert.match(hot.reason, /daily sanitize/i);
+  // the combined reason still classifies as the SOAK everywhere it is read: the poster's kind and the driver's conflict
+  assert.equal(classifyKind({ source: "autopilot", reason: soak[0].reason, commandedTargetF: soak[0].tank_target_f } as any), "sanitize", "tempiq-windows classifyKind files the raised soak as the soak");
+  assert.equal(classifyKind({ source: "autopilot", reason: plan.filter((b) => !b.sani)[0].reason, commandedTargetF: 135 } as any), "autopilot", "…and a plain floor block as autopilot");
+  const nowMs = new Date(soak[0].ts).getTime() - 3600_000;
+  assert.equal(planConflictAhead(plan, nowMs, 3), true, "the identification driver keeps its distance from the raised soak");
+  assert.equal(planConflictAhead(plan.filter((b) => !b.sani).map((b) => ({ ...b, reason: b.reason })), nowMs, 3), false, "…and the plain floor blocks are not conflicts");
   console.log("shadow.test.ts (#155 soak identity under the demand floor): all assertions passed");
 }

@@ -67,6 +67,8 @@ export class AutoPilot {
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
     /** #133 (b): command the plan's shaped curve for non-excursion hours (env SHAPED_CURVE=1). */
     private readonly shapedCurve = false,
+    /** §6.11 storm shaping may raise a block up to this (env STORM_CAP_F, default = the everyday cap). */
+    private readonly stormCapF: number = DEFAULT_OPTS.strictCapF,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A). The env value only seeds the constructor; the
@@ -87,7 +89,7 @@ export class AutoPilot {
   get holdActive(): boolean { return this.holdUntil != null && Date.now() < this.holdUntil; }
 
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
-  private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {
+  private async record(target: number | null, reason: string, result: string, verbose: string, _block?: Record<string, unknown> | null): Promise<void> {
     this.lastResult = verbose;
     this.lastTargetF = target;
     const key = `${result}|${target}`;
@@ -172,19 +174,20 @@ export class AutoPilot {
       return;
     }
 
-    // a2w#156: the everyday I4 cap is lifted to sanitizeCapF ONLY for the block the plan marked as the soak
-    // (`sani`), never inferred from the target's size. The plan clamps every non-soak block to strictCap, so a
-    // non-soak target above it means the plan and the auto-pilot disagree about what this hour is — refuse it
-    // here (fail closed, logged) instead of writing it under the soak's ceiling. Identification probes do not
-    // pass through here (identify.ts writes with its own cap).
-    const isSoak = block?.sani === true;
-    if (!isSoak && target > DEFAULT_OPTS.strictCapF) {
-      await this.record(target, reason, "rejected: non-soak block above everyday cap", `rejected ${target}°F: non-soak block above the everyday cap ${DEFAULT_OPTS.strictCapF}°F (${reason})`);
+    // a2w#156: the block's IDENTITY authorises its ceiling, never the target's size. The soak (`sani`) may run to
+    // sanitizeCapF; a storm block (`storm`, §6.11) to STORM_CAP_F (owner-configured, 135 by default); everything else
+    // is clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot
+    // disagree about what this hour is — refuse it (fail closed, logged) instead of writing it under an excursion's
+    // ceiling. Identification probes do not pass through here (identify.ts writes with its own cap).
+    const capF = block?.sani === true ? DEFAULT_OPTS.sanitizeCapF
+      : block?.storm === true ? Math.max(DEFAULT_OPTS.strictCapF, this.stormCapF)
+      : DEFAULT_OPTS.strictCapF;
+    if (target > capF) {
+      await this.record(target, reason, `rejected: ${block?.storm === true ? "storm" : "non-soak"} block above its cap`, `rejected ${target}°F: ${block?.storm === true ? "storm block above STORM_CAP_F" : "non-soak block above the everyday cap"} ${capF}°F (${reason})`, block);
       console.warn(`[autopilot] ${this.lastResult}`);
       return;
     }
     try {
-      const capF = isSoak ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
       await this.writer.setTarget(target, "autopilot", capF);
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
       console.log(`[autopilot] ${this.lastResult}`);
