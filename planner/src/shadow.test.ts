@@ -325,8 +325,9 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.equal(hot.tank_target_f, DEFAULT_OPTS.sanitizeCapF, "the soak's ceiling binds the floor");
   assert.match(hot.reason, /daily sanitize/i);
   // the combined reason still classifies as the SOAK everywhere it is read: the poster's kind and the driver's conflict
-  assert.equal(classifyKind({ source: "autopilot", reason: soak[0].reason, commandedTargetF: soak[0].tank_target_f } as any), "sanitize", "tempiq-windows classifyKind files the raised soak as the soak");
-  assert.equal(classifyKind({ source: "autopilot", reason: plan.filter((b) => !b.sani)[0].reason, commandedTargetF: 135 } as any), "autopilot", "…and a plain floor block as autopilot");
+  const kind = (reason: string, commandedTargetF: number) => classifyKind({ source: "autopilot", reason, commandedTargetF, stormActive: false, boostMatched: false });
+  assert.equal(kind(soak[0].reason, soak[0].tank_target_f), "sanitize", "tempiq-windows classifyKind files the raised soak as the soak");
+  assert.equal(kind(plan.filter((b) => !b.sani)[0].reason, 135), "autopilot", "…and a plain floor block as autopilot");
   const nowMs = new Date(soak[0].ts).getTime() - 3600_000;
   assert.equal(planConflictAhead(plan, nowMs, 3), true, "the identification driver keeps its distance from the raised soak");
   assert.equal(planConflictAhead(plan.filter((b) => !b.sani).map((b) => ({ ...b, reason: b.reason })), nowMs, 3), false, "…and the plain floor blocks are not conflicts");

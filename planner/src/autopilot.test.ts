@@ -8,8 +8,8 @@ import { AutoPilot } from "./autopilot";
 import { DEFAULT_OPTS } from "./shadow";
 
 type Call = { target: number; capF: number | undefined };
-function harness(block: Record<string, unknown>, commanded: number | null = 120, stormCapF?: number) {
-  const calls: Call[] = []; const logs: Array<{ result: string }> = [];
+function harness(block: Record<string, unknown>, commanded: number | null = 120, stormCapF?: number, shaped = false) {
+  const calls: Call[] = []; const logs: Array<{ result: string }> = []; const curves: unknown[] = [];
   const store = {
     recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), ...block }] }],
     insertAutopilotLog: async (row: { result: string }) => { logs.push(row); },
@@ -17,10 +17,10 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
   const writer = {
     status: async () => ({ commanded_target_f: commanded, curve_in_force: null }),
     setTarget: async (target: number, _source: string, capF?: number) => { calls.push({ target, capF }); return {}; },
-    setCurve: async () => { throw new Error("setCurve must not be called in flat-target mode"); },
+    setCurve: async (c: unknown) => { if (!shaped) throw new Error("setCurve must not be called in flat-target mode"); curves.push(c); return {}; },
   } as any;
-  const ap = new AutoPilot(store, writer, false, async () => {}, false, stormCapF);
-  return { ap, calls, logs };
+  const ap = new AutoPilot(store, writer, false, async () => {}, shaped, stormCapF);
+  return { ap, calls, logs, curves };
 }
 
 (async () => {
@@ -80,6 +80,30 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
     await h.ap.applyLatestPlan(); await h.ap.applyLatestPlan();
     assert.equal(h.logs.filter((l) => l.result.startsWith("rejected:")).length, 1);
     assert.equal(h.ap.lastTargetF, 142); assert.match(h.ap.lastResult, /^rejected 142°F/);
+  }
+  // 7. SHAPED-CURVE mode (codex pass 2): a storm block whose reason was rewritten by forecast preheat is STILL an
+  //    excursion by its flag — the flat storm target is written, the curve is not
+  {
+    const h = harness({ tank_target_f: 134, storm: true, reason: "forecast demand: preheat for the 06:00 cold front", shaped_curve: { dot: 46, dbt: 120, mbt: 118, wwsd: 125 } }, 120, 145, true);
+    await h.ap.applyLatestPlan();
+    assert.equal(h.curves.length, 0, "no curve write on a storm block");
+    assert.deepEqual(h.calls[0], { target: 134, capF: 145 });
+    // and a plain curve hour still commands the curve
+    const c = harness({ tank_target_f: 120, reason: "DHW window floor", shaped_curve: { dot: 46, dbt: 120, mbt: 118, wwsd: 125 } }, 120, 145, true);
+    await c.ap.applyLatestPlan();
+    assert.equal(c.curves.length, 1); assert.equal(c.calls.length, 0);
+  }
+  // 8. COMBINED identity (codex pass 2): a storm window over the soak hour (sani + storm) may run to the HIGHER cap
+  {
+    const both = harness({ tank_target_f: 150, sani: true, storm: true, reason: "storm mode: banking heat (x)" }, 120, 150);
+    await both.ap.applyLatestPlan();
+    assert.deepEqual(both.calls[0], { target: 150, capF: 150 }, "sani 145 and storm 150 → 150");
+    const over = harness({ tank_target_f: 151, sani: true, storm: true, reason: "storm mode: banking heat (x)" }, 120, 150);
+    await over.ap.applyLatestPlan();
+    assert.equal(over.calls.length, 0); assert.match(over.ap.lastResult, /soak\+storm block above both caps 150°F/);
+    const soakOnlyCap = harness({ tank_target_f: 145, sani: true, storm: true, reason: "storm mode: banking heat (x)" }); // default storm cap 135 → the soak's 145 wins
+    await soakOnlyCap.ap.applyLatestPlan();
+    assert.deepEqual(soakOnlyCap.calls[0], { target: 145, capF: DEFAULT_OPTS.sanitizeCapF });
   }
   console.log("autopilot.test.ts (#156 cap by the block's identity): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

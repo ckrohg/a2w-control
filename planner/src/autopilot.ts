@@ -41,12 +41,14 @@ export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown
     && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
 }
 
-export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
+export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; storm?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
   const reason = String(block?.reason ?? "");
   // The flags are authoritative; the reason regex is the fallback for blocks written before the flags
   // were emitted. (#135: a winter pre-boost's reason can be rewritten by the demand floor — the flag
   // must still make it an excursion, or shaped-curve mode would run the curve through the boost hour.)
-  if (block?.sani === true || block?.bank === true || block?.boost === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
+  // a2w#156 (codex pass 2 on #157): the storm FLAG makes the hour an excursion too — forecast preheat and the floor
+  // cadence can rewrite a storm block's reason, and the regex alone would then run the curve through the storm raise.
+  if (block?.sani === true || block?.bank === true || block?.boost === true || block?.storm === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
     return { kind: "excursion", reason };
   }
   const c = block?.shaped_curve as Partial<ShapedCurve> | undefined;
@@ -179,11 +181,13 @@ export class AutoPilot {
     // is clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot
     // disagree about what this hour is — refuse it (fail closed, logged) instead of writing it under an excursion's
     // ceiling. Identification probes do not pass through here (identify.ts writes with its own cap).
-    const capF = block?.sani === true ? DEFAULT_OPTS.sanitizeCapF
-      : block?.storm === true ? Math.max(DEFAULT_OPTS.strictCapF, this.stormCapF)
-      : DEFAULT_OPTS.strictCapF;
+    // A block can carry more than one identity (a storm window over the soak hour sets both sani and storm); each
+    // identity authorises its own ceiling and the block may run to the highest one its producers were allowed.
+    const isSoak = block?.sani === true, isStorm = block?.storm === true;
+    const capF = Math.max(DEFAULT_OPTS.strictCapF, isSoak ? DEFAULT_OPTS.sanitizeCapF : 0, isStorm ? this.stormCapF : 0);
     if (target > capF) {
-      await this.record(target, reason, `rejected: ${block?.storm === true ? "storm" : "non-soak"} block above its cap`, `rejected ${target}°F: ${block?.storm === true ? "storm block above STORM_CAP_F" : "non-soak block above the everyday cap"} ${capF}°F (${reason})`, block);
+      const what = isStorm ? (isSoak ? "soak+storm block above both caps" : "storm block above STORM_CAP_F") : isSoak ? "soak block above sanitizeCapF" : "non-soak block above the everyday cap";
+      await this.record(target, reason, `rejected: ${isStorm ? "storm" : isSoak ? "soak" : "non-soak"} block above its cap`, `rejected ${target}°F: ${what} ${capF}°F (${reason})`, block);
       console.warn(`[autopilot] ${this.lastResult}`);
       return;
     }
