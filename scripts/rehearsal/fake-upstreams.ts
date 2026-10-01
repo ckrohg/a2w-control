@@ -161,6 +161,7 @@ const server = http.createServer(async (req, res) => {
   if (m === "GET" && p === "/api/insights/zone-energy") return send(res, 200, { zones: [] });
   if (m === "GET" && p === "/api/insights/spatial-graph") return send(res, 200, { nodes: [], edges: [] });
   if (m === "GET" && p === "/api/insights/dhw-usage") return send(res, 200, {});
+  if (m === "GET" && p === "/api/insights/winter-scoreboard") return send(res, 200, { available: false, reason: "no_rows", propertyId: "rehearsal", seasons: [] });
   if (m === "GET" && p === "/api/insights/zones/required-supply-forecast") return send(res, 200, { generatedAt: new Date().toISOString(), forecast: { newestVintage: null, oldestVintage: null, hoursAvailable: 0, degradeReason: "rehearsal" }, zones: [] });
   // ---- weather / outage --------------------------------------------------------------------------
   if (m === "GET" && p === "/v1/forecast") {

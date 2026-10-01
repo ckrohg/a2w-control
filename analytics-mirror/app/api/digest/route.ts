@@ -300,6 +300,31 @@ async function buildDigest() {
     const rising = c.drops > c.prev && c.drops >= 3;
     notes.push(`${c.pump_id.toUpperCase()} comm: ${c.drops} dropout${c.drops === 1 ? "" : "s"} (prev wk ${c.prev})${c.err != null ? ` · ${fmt(Number(c.err), 1)}% err` : ""}${rising ? ` — <b style="color:${BAD}">degrading, keep an eye on it</b>` : ""}.`);
   }
+  // Winter scoreboard (TempIQ, mirrored hourly into tempiq_winter_scoreboard by the planner — wave plan B2b):
+  // this winter's kWh per HDD65 against last winter over the SAME weeks. Omitted until the first rated week; the
+  // mirror's own fetchedAt is quoted so a stale mirror reads as stale, not as this week's number.
+  try {
+    const row = (await sql`SELECT payload FROM tempiq_winter_scoreboard WHERE id = 1`).rows[0];
+    const sb = row?.payload as {
+      available?: boolean; season?: string; fetchedAt?: string;
+      comparison?: { weeksCompared?: number; intensityChangePct?: number | null;
+        current?: { kwhPerHdd?: number | null; coldShare?: number | null } | null;
+        baseline?: { season?: string; kwhPerHdd?: number | null; coldShare?: number | null } | null } | null;
+    } | undefined;
+    const c = sb?.comparison ?? null;
+    if (sb?.available === true && c?.current?.kwhPerHdd != null) {
+      const chg = c.intensityChangePct;
+      const cheaper = chg != null && chg < 0;
+      const ageH = sb.fetchedAt ? (Date.now() - new Date(sb.fetchedAt).getTime()) / 3_600_000 : null;
+      notes.push(
+        `Winter scoreboard (${sb.season ?? "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
+        (c.baseline?.kwhPerHdd != null ? ` vs ${fmt(c.baseline.kwhPerHdd, 2)} last winter over the same ${c.weeksCompared ?? 0} week${c.weeksCompared === 1 ? "" : "s"}` : "") +
+        (chg != null ? ` — <b style="color:${cheaper ? GOOD : BAD}">${chg > 0 ? "+" : ""}${fmt(chg, 0)}% per degree of cold</b>` : "") +
+        (c.current.coldShare != null ? `; hydronic rooms below 66°F ${fmt(c.current.coldShare * 100, 1)}% of sampled hours${c.baseline?.coldShare != null ? ` (last winter ${fmt(c.baseline.coldShare * 100, 1)}%)` : ""}` : "") +
+        (ageH != null && ageH > 26 ? ` <span style="color:${MUTED}">· mirror ${fmt(ageH / 24, 1)} d old</span>` : "") + `.`,
+      );
+    }
+  } catch { /* mirror table missing — omit the note */ }
 
   // ---- demand-floor section (heating weather only) ---------------------------------
   // Provenance wording is the point of the block: a ceiling that measured nothing about
