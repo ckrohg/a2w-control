@@ -4,7 +4,7 @@
  * and a narrow Store.
  */
 import assert from "node:assert/strict";
-import { TempiqReader, summarizeWinterScoreboard, formatChangePct } from "./tempiq-read";
+import { TempiqReader, summarizeWinterScoreboard, formatChangePct, roundPct } from "./tempiq-read";
 import type { Store } from "./store";
 
 type Route = { status: number; body: unknown };
@@ -108,7 +108,12 @@ async function withFetch(routes: Record<string, Route>, fn: (calls: string[]) =>
   assert.equal(formatChangePct(-0.4), "flat");
   assert.equal(formatChangePct(-0), "flat");
   assert.equal(formatChangePct(0.49), "flat");
-  assert.equal(formatChangePct(-0.5), "flat");
+  assert.equal(formatChangePct(-0.49), "flat");
+  // half rounds AWAY from zero on both sides (Math.round alone gives -0.5 → -0 but 0.5 → 1)
+  assert.equal(formatChangePct(-0.5), "-1%");
+  assert.equal(formatChangePct(0.5), "+1%");
+  assert.equal(roundPct(-0.5), -1); assert.equal(roundPct(0.5), 1); assert.equal(roundPct(-2.5), -3); assert.equal(roundPct(2.5), 3);
+  assert.ok(Object.is(roundPct(-0.4), -0) || roundPct(-0.4) === 0); // still equal to 0 for the flat test
   assert.equal(formatChangePct(-1.6), "-2%");
   assert.equal(formatChangePct(NaN), null);
   assert.equal(formatChangePct(null), null);

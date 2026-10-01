@@ -109,11 +109,16 @@ export interface WinterScoreboardResponse {
   generatedAt?: string | null;
 }
 
-/** "+7%", "-12%", or "flat" when the change rounds to zero — never "-0%" (a sign on a zero reads as a verdict). PURE. */
+/** Round half AWAY from zero (Math.round(-0.5) is -0, Math.round(0.5) is 1 — asymmetric). PURE. */
+export function roundPct(n: number): number {
+  return Math.sign(n) * Math.round(Math.abs(n));
+}
+
+/** "+7%", "-12%", or "flat" when |change| < 0.5 — never "-0%" (a sign on a zero reads as a verdict). PURE. */
 export function formatChangePct(pct: number | null | undefined): string | null {
   const n = numOrNull(pct);
   if (n == null) return null;
-  const r = Math.round(n);
+  const r = roundPct(n);
   if (r === 0) return "flat";
   return `${r > 0 ? "+" : ""}${r}%`;
 }

@@ -322,7 +322,7 @@ async function buildDigest() {
       const weeksCompared = typeof c.weeksCompared === "number" && Number.isFinite(c.weeksCompared) ? c.weeksCompared : 0;
       const hasBaseline = c.baseline?.kwhPerHdd != null && weeksCompared >= 1;
       const chg = hasBaseline && typeof c.intensityChangePct === "number" && Number.isFinite(c.intensityChangePct) ? c.intensityChangePct : null;
-      const rounded = chg != null ? Math.round(chg) : null;
+      const rounded = chg != null ? Math.sign(chg) * Math.round(Math.abs(chg)) : null; // half away from zero: -0.5 → -1, +0.5 → +1, -0.4 → 0
       let verdict = "";
       if (rounded != null && fresh) {
         verdict = rounded === 0
@@ -330,7 +330,7 @@ async function buildDigest() {
           : ` — <b style="color:${rounded < 0 ? GOOD : BAD}">${rounded > 0 ? "+" : ""}${rounded}% per degree of cold</b>`;
       }
       const caveat = !fresh
-        ? ` <span style="color:${MUTED}">· ${ageH == null ? "mirror age unknown" : `mirror ${fmt(ageH / 24, 1)} d old`} — no verdict</span>`
+        ? ` <span style="color:${MUTED}">· ${ageH == null ? "mirror age unknown" : ageH < 0 ? "mirror timestamp is in the future" : `mirror ${fmt(ageH / 24, 1)} d old`} — no verdict</span>`
         : !hasBaseline ? ` <span style="color:${MUTED}">· no same-week baseline yet — no verdict</span>` : "";
       notes.push(
         `Winter scoreboard (${sb.season ?? "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
