@@ -75,6 +75,8 @@ export function computeTracking(
 export class PhaseB {
   private failStreak: Record<string, number> = {};
   private alerted: Record<string, boolean> = {};
+  /** eval 2026-09-30 F4: consecutive write failures per pump, for /health — the alert fires at 3; the count says how long. */
+  streaks(): Record<string, number> { return { ...this.failStreak }; }
   /** Per-pump: did the Pi actually ARM the lease we asked for? null = not yet observed.
    *  See verifyLeases() — this is the FINDING-1b fix. */
   private leaseArmed: Record<string, boolean | null> = {};
