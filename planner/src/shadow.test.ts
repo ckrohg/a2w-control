@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
 import { classifyKind } from "./tempiq-windows";
+import { planConflictAhead } from "./identify";
 
 // A flat summer day: 24 hours, all warm (no winter guard, no natural ≥sanitizeF hour). Timestamps use
 // LOCAL components so day-grouping + warmest-hour selection are deterministic regardless of machine TZ.
@@ -295,4 +296,40 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.ok(tp, "the 17:00 peak still gets its boost");
   assert.equal(new Date(tp.ts).getHours(), 14, "…placed at 14:00 — 15:00 and 16:00 are inside the other peak");
   console.log("shadow.test.ts (#135 pre-boost): all assertions passed");
+}
+
+// a2w#155 — a demand floor that outruns the 140 °F soak keeps the soak's identity: the block stays `sani`, the
+// reason still names the sanitize (so planConflictAhead and the poster see a soak) and says the floor raised it.
+{
+  const cold: ForecastHour[] = Array.from({ length: 24 }, (_, i) => ({ ts: new Date(Date.UTC(2026, 0, 15, 5 + i)), outdoorF: 20 + (i === 13 ? 6 : 0) })); // warmest at 18:00Z = 13:00 local
+  const floor = { tankTargetF: 142, bindingZone: "Living Room Baseboard", awtF: 137 };
+  const plan = computeShadowPlan(cold, null, DEFAULT_OPTS, floor, true, false);
+  const soak = plan.filter((b) => b.sani);
+  assert.equal(soak.length, 1, "exactly one soak block");
+  assert.equal(soak[0].tank_target_f, 142, "the floor raised the soak block to 142 °F (within sanitizeCapF 145)");
+  assert.match(soak[0].reason, /daily sanitize/i, "the soak keeps its identity in the reason");
+  assert.match(soak[0].reason, /raised to the demand floor 142°F/, "…and says the floor raised it");
+  assert.match(soak[0].reason, /binding zone: Living Room Baseboard needs 137°F/, "…naming the floor's cause");
+  // every NON-soak block is the floor clamped to the everyday cap, with the plain floor reason
+  for (const b of plan.filter((x) => !x.sani)) {
+    assert.equal(b.tank_target_f, DEFAULT_OPTS.strictCapF, `non-soak block ${b.ts} clamped to strictCap`);
+    assert.match(b.reason, /^binding zone: Living Room Baseboard needs 137°F/);
+    assert.doesNotMatch(b.reason, /sanitize/i);
+  }
+  // a floor BELOW the soak target leaves the soak untouched
+  const mild = computeShadowPlan(cold, null, DEFAULT_OPTS, { tankTargetF: 128, bindingZone: "Dining", awtF: 123 }, true, false).filter((b) => b.sani)[0];
+  assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
+  assert.doesNotMatch(mild.reason, /raised to the demand floor/);
+  // a 150 °F floor on the soak hour is clamped to sanitizeCapF (145), still the soak
+  const hot = computeShadowPlan(cold, null, DEFAULT_OPTS, { tankTargetF: 150, bindingZone: "Living Room Baseboard", awtF: 145 }, true, false).filter((b) => b.sani)[0];
+  assert.equal(hot.tank_target_f, DEFAULT_OPTS.sanitizeCapF, "the soak's ceiling binds the floor");
+  assert.match(hot.reason, /daily sanitize/i);
+  // the combined reason still classifies as the SOAK everywhere it is read: the poster's kind and the driver's conflict
+  const kind = (reason: string, commandedTargetF: number) => classifyKind({ source: "autopilot", reason, commandedTargetF, stormActive: false, boostMatched: false });
+  assert.equal(kind(soak[0].reason, soak[0].tank_target_f), "sanitize", "tempiq-windows classifyKind files the raised soak as the soak");
+  assert.equal(kind(plan.filter((b) => !b.sani)[0].reason, 135), "autopilot", "…and a plain floor block as autopilot");
+  const nowMs = new Date(soak[0].ts).getTime() - 3600_000;
+  assert.equal(planConflictAhead(plan, nowMs, 3), true, "the identification driver keeps its distance from the raised soak");
+  assert.equal(planConflictAhead(plan.filter((b) => !b.sani).map((b) => ({ ...b, reason: b.reason })), nowMs, 3), false, "…and the plain floor blocks are not conflicts");
+  console.log("shadow.test.ts (#155 soak identity under the demand floor): all assertions passed");
 }

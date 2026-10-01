@@ -41,12 +41,14 @@ export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown
     && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
 }
 
-export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
+export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; storm?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
   const reason = String(block?.reason ?? "");
   // The flags are authoritative; the reason regex is the fallback for blocks written before the flags
   // were emitted. (#135: a winter pre-boost's reason can be rewritten by the demand floor — the flag
   // must still make it an excursion, or shaped-curve mode would run the curve through the boost hour.)
-  if (block?.sani === true || block?.bank === true || block?.boost === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
+  // a2w#156 (codex pass 2 on #157): the storm FLAG makes the hour an excursion too — forecast preheat and the floor
+  // cadence can rewrite a storm block's reason, and the regex alone would then run the curve through the storm raise.
+  if (block?.sani === true || block?.bank === true || block?.boost === true || block?.storm === true || /sanitize|storm|bank|boost|pre-?charge/i.test(reason)) {
     return { kind: "excursion", reason };
   }
   const c = block?.shaped_curve as Partial<ShapedCurve> | undefined;
@@ -67,6 +69,8 @@ export class AutoPilot {
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
     /** #133 (b): command the plan's shaped curve for non-excursion hours (env SHAPED_CURVE=1). */
     private readonly shapedCurve = false,
+    /** §6.11 storm shaping may raise a block up to this (env STORM_CAP_F, default = the everyday cap). */
+    private readonly stormCapF: number = DEFAULT_OPTS.strictCapF,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A). The env value only seeds the constructor; the
@@ -87,7 +91,7 @@ export class AutoPilot {
   get holdActive(): boolean { return this.holdUntil != null && Date.now() < this.holdUntil; }
 
   /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
-  private async record(target: number | null, reason: string, result: string, verbose: string): Promise<void> {
+  private async record(target: number | null, reason: string, result: string, verbose: string, _block?: Record<string, unknown> | null): Promise<void> {
     this.lastResult = verbose;
     this.lastTargetF = target;
     const key = `${result}|${target}`;
@@ -166,6 +170,29 @@ export class AutoPilot {
       }
       // excursion or no curve → the flat target write below, exactly as before
     }
+    // a2w#156: the block's IDENTITY authorises its ceiling, never the target's size. The soak (`sani`) may run to
+    // sanitizeCapF; a storm block (`storm`, §6.11) to STORM_CAP_F (owner-configured, 135 by default); everything else
+    // is clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot
+    // disagree about what this hour is — refuse it (fail closed, logged) instead of writing it under an excursion's
+    // ceiling. Identification probes do not pass through here (identify.ts writes with its own cap).
+    // A block can carry more than one identity (a storm window over the soak hour sets both sani and storm); each
+    // identity authorises its own ceiling and the block may run to the highest one its producers were allowed.
+    const isSoak = block?.sani === true, isStorm = block?.storm === true;
+    const capF = Math.max(DEFAULT_OPTS.strictCapF, isSoak ? DEFAULT_OPTS.sanitizeCapF : 0, isStorm ? this.stormCapF : 0);
+    if (target > capF) {
+      // Checked BEFORE the dry-run branch so a dry run previews the same verdict (codex pass 3 on #157): a malformed
+      // plan must read "would reject" during commissioning, not "would set".
+      const what = isStorm ? (isSoak ? "soak+storm block above both caps" : "storm block above STORM_CAP_F") : isSoak ? "soak block above sanitizeCapF" : "non-soak block above the everyday cap";
+      const identity = isStorm ? "storm" : isSoak ? "soak" : "non-soak";
+      if (this.dryRun) {
+        await this.record(target, reason, `would-reject: ${identity} block above its cap`, `DRY-RUN would reject ${target}°F: ${what} ${capF}°F (${reason})`, block);
+        console.log(`[autopilot] ${this.lastResult}`);
+        return;
+      }
+      await this.record(target, reason, `rejected: ${identity} block above its cap`, `rejected ${target}°F: ${what} ${capF}°F (${reason})`, block);
+      console.warn(`[autopilot] ${this.lastResult}`);
+      return;
+    }
     if (this.dryRun) {
       await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
       console.log(`[autopilot] ${this.lastResult}`);
@@ -173,9 +200,6 @@ export class AutoPilot {
     }
 
     try {
-      // A plan target above the everyday strictCap is the daily sanitize excursion — allow it up to
-      // sanitizeCapF (only sanitize produces >strictCap in the plan). I1 in setTarget still guards it.
-      const capF = target > DEFAULT_OPTS.strictCapF ? DEFAULT_OPTS.sanitizeCapF : DEFAULT_OPTS.strictCapF;
       await this.writer.setTarget(target, "autopilot", capF);
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
       console.log(`[autopilot] ${this.lastResult}`);

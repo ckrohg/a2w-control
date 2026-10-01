@@ -23,10 +23,12 @@ export interface ShadowBlock {
   tank_target_f: number;
   hp1_setpoint_f: number;
   reason: string;
-  /** Excursion flags (the reason text also names them): the I8 soak, the #58 bank, the #135 pre-boost. */
+  /** Excursion flags (the reason text also names them): the I8 soak, the #58 bank, the #135 pre-boost, the §6.11 storm raise. */
   sani?: boolean;
   bank?: boolean;
   boost?: boolean;
+  /** a2w#156: set by index.ts storm shaping — authorises the block to run up to STORM_CAP_F in the auto-pilot. */
+  storm?: boolean;
 }
 
 /** #135: a learned draw window's boost, sized from the measured sag (see dhw.ts measureWindowSags). */
@@ -278,7 +280,14 @@ export function computeShadowPlan(
       if (demandFloor) {
         if (demandFloor.tankTargetF > target) {
           target = demandFloor.tankTargetF;
-          reason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+          const floorReason = `binding zone: ${demandFloor.bindingZone} needs ${Math.round(demandFloor.awtF)}°F (winter solver shadow)`;
+          // a2w#155: the soak is never subsumed — when the floor outruns the 140 °F soak the block is STILL the
+          // soak (its `sani` flag and its sanitizeCapF ceiling stay), so its reason must keep saying so: the
+          // poster files it as the soak and the identification driver keeps its distance (planConflictAhead
+          // matches /sanitize/). Before this the reason was rewritten to the floor's and the identity was lost.
+          reason = d.sani
+            ? `${d.reason} — raised to the demand floor ${Math.round(target)}°F (${floorReason})`
+            : floorReason;
           d.bank = false; d.boost = false;
         }
       } else if (hbxConfig) {

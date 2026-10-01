@@ -1168,6 +1168,10 @@ async function shadowOnce(): Promise<void> {
       block.tank_target_f = raised;
       block.hp1_setpoint_f = Math.round(Math.min(Math.max(raised + opts.i1MarginF, opts.hpMinF), opts.hpMaxF));
       block.reason = `storm mode: banking heat (${storm.trigger})`;
+      // a2w#156: the block's IDENTITY authorises its ceiling. A storm block may run up to STORM_CAP_F (owner-configured;
+      // 135 by default, so it never exceeds the everyday cap unless deliberately raised); the auto-pilot reads this
+      // flag, never the target's size.
+      block.storm = true;
     }
   }
 
@@ -1384,7 +1388,7 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
 // non-excursion hours (a few writes a season) so the HBX weather-compensates on its own between
 // writes and after a planner death. Off = today's flat per-hour target. The curve itself is computed
 // in shadowOnce (it needs the demand feed + the 24 h forecast) and stamped on every plan block.
-const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy, SHAPED_CURVE) : null;
+const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy, SHAPED_CURVE, STORM_CAP_F) : null;
 
 // Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs
 // RANDOMISED supply-water probes drawn from TempIQ's identification plan so U4 can MEASURE each
