@@ -313,15 +313,31 @@ async function buildDigest() {
     } | undefined;
     const c = sb?.comparison ?? null;
     if (sb?.available === true && c?.current?.kwhPerHdd != null) {
-      const chg = c.intensityChangePct;
-      const cheaper = chg != null && chg < 0;
-      const ageH = sb.fetchedAt ? (Date.now() - new Date(sb.fetchedAt).getTime()) / 3_600_000 : null;
+      // A VERDICT (the coloured change) needs all three legs: a fresh mirror (fetchedAt present, valid, ≤ 26 h — the
+      // planner refreshes hourly), a baseline number, and ≥ 1 compared week. Missing any of them, the number is
+      // shown plainly and the gap is named — a stale or baseline-less figure must never read as this week's result.
+      const fetchedMs = sb.fetchedAt ? new Date(sb.fetchedAt).getTime() : NaN;
+      const ageH = Number.isFinite(fetchedMs) ? (Date.now() - fetchedMs) / 3_600_000 : null;
+      const fresh = ageH != null && ageH >= 0 && ageH <= 26;
+      const weeksCompared = typeof c.weeksCompared === "number" && Number.isFinite(c.weeksCompared) ? c.weeksCompared : 0;
+      const hasBaseline = c.baseline?.kwhPerHdd != null && weeksCompared >= 1;
+      const chg = hasBaseline && typeof c.intensityChangePct === "number" && Number.isFinite(c.intensityChangePct) ? c.intensityChangePct : null;
+      const rounded = chg != null ? Math.round(chg) : null;
+      let verdict = "";
+      if (rounded != null && fresh) {
+        verdict = rounded === 0
+          ? ` — <b>flat per degree of cold</b>`
+          : ` — <b style="color:${rounded < 0 ? GOOD : BAD}">${rounded > 0 ? "+" : ""}${rounded}% per degree of cold</b>`;
+      }
+      const caveat = !fresh
+        ? ` <span style="color:${MUTED}">· ${ageH == null ? "mirror age unknown" : `mirror ${fmt(ageH / 24, 1)} d old`} — no verdict</span>`
+        : !hasBaseline ? ` <span style="color:${MUTED}">· no same-week baseline yet — no verdict</span>` : "";
       notes.push(
         `Winter scoreboard (${sb.season ?? "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
-        (c.baseline?.kwhPerHdd != null ? ` vs ${fmt(c.baseline.kwhPerHdd, 2)} last winter over the same ${c.weeksCompared ?? 0} week${c.weeksCompared === 1 ? "" : "s"}` : "") +
-        (chg != null ? ` — <b style="color:${cheaper ? GOOD : BAD}">${chg > 0 ? "+" : ""}${fmt(chg, 0)}% per degree of cold</b>` : "") +
-        (c.current.coldShare != null ? `; hydronic rooms below 66°F ${fmt(c.current.coldShare * 100, 1)}% of sampled hours${c.baseline?.coldShare != null ? ` (last winter ${fmt(c.baseline.coldShare * 100, 1)}%)` : ""}` : "") +
-        (ageH != null && ageH > 26 ? ` <span style="color:${MUTED}">· mirror ${fmt(ageH / 24, 1)} d old</span>` : "") + `.`,
+        (hasBaseline ? ` vs ${fmt(c.baseline!.kwhPerHdd, 2)} last winter over the same ${weeksCompared} week${weeksCompared === 1 ? "" : "s"}` : "") +
+        verdict +
+        (c.current.coldShare != null ? `; hydronic rooms below 66°F ${fmt(c.current.coldShare * 100, 1)}% of sampled hours${hasBaseline && c.baseline?.coldShare != null ? ` (last winter ${fmt(c.baseline.coldShare * 100, 1)}%)` : ""}` : "") +
+        caveat + `.`,
       );
     }
   } catch { /* mirror table missing — omit the note */ }

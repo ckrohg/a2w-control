@@ -109,17 +109,26 @@ export interface WinterScoreboardResponse {
   generatedAt?: string | null;
 }
 
-/** One-line human summary for lastResult / the log. PURE. */
+/** "+7%", "-12%", or "flat" when the change rounds to zero — never "-0%" (a sign on a zero reads as a verdict). PURE. */
+export function formatChangePct(pct: number | null | undefined): string | null {
+  const n = numOrNull(pct);
+  if (n == null) return null;
+  const r = Math.round(n);
+  if (r === 0) return "flat";
+  return `${r > 0 ? "+" : ""}${r}%`;
+}
+
+/** One-line human summary for lastResult / the log. PURE. The change is quoted only next to the baseline it is against. */
 export function summarizeWinterScoreboard(body: WinterScoreboardResponse | null | undefined): string {
   if (!body || body.available === false) return `scoreboard: unavailable${body?.reason ? ` (${body.reason})` : ""}`;
   const c = body.comparison ?? null;
   const weeks = Array.isArray(body.weeks) ? body.weeks.length : 0;
   const cur = numOrNull(c?.current?.kwhPerHdd);
   const base = numOrNull(c?.baseline?.kwhPerHdd);
-  const chg = numOrNull(c?.intensityChangePct);
+  const chg = base != null ? formatChangePct(c?.intensityChangePct) : null;
   const season = body.season ?? "?";
   if (cur == null) return `scoreboard: ${season}, ${weeks} wk, no rated week yet`;
-  return `scoreboard: ${season} ${cur.toFixed(2)} kWh/HDD${base != null ? ` vs ${base.toFixed(2)} last winter` : ""}${chg != null ? ` (${chg > 0 ? "+" : ""}${chg.toFixed(0)}%)` : ""}, ${numOrNull(c?.weeksCompared) ?? 0} wk compared`;
+  return `scoreboard: ${season} ${cur.toFixed(2)} kWh/HDD${base != null ? ` vs ${base.toFixed(2)} last winter` : ""}${chg != null ? ` (${chg})` : ""}, ${numOrNull(c?.weeksCompared) ?? 0} wk compared`;
 }
 
 export class TempiqReader {

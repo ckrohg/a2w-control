@@ -4,7 +4,7 @@
  * and a narrow Store.
  */
 import assert from "node:assert/strict";
-import { TempiqReader, summarizeWinterScoreboard } from "./tempiq-read";
+import { TempiqReader, summarizeWinterScoreboard, formatChangePct } from "./tempiq-read";
 import type { Store } from "./store";
 
 type Route = { status: number; body: unknown };
@@ -104,5 +104,34 @@ async function withFetch(routes: Record<string, Route>, fn: (calls: string[]) =>
   assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: [], comparison: { weeksCompared: 1, current: { kwhPerHdd: 3.1 }, baseline: null, intensityChangePct: null } }), "scoreboard: 2026-27 3.10 kWh/HDD, 1 wk compared");
   assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: [], comparison: { weeksCompared: 3, current: { kwhPerHdd: 3.1 }, baseline: { kwhPerHdd: 2.9 }, intensityChangePct: 6.9 } }), "scoreboard: 2026-27 3.10 kWh/HDD vs 2.90 last winter (+7%), 3 wk compared");
   assert.equal(summarizeWinterScoreboard(null), "scoreboard: unavailable");
+  // 6. rounding: a change that rounds to zero is "flat" (never "-0%"); the change is never quoted without its baseline
+  assert.equal(formatChangePct(-0.4), "flat");
+  assert.equal(formatChangePct(-0), "flat");
+  assert.equal(formatChangePct(0.49), "flat");
+  assert.equal(formatChangePct(-0.5), "flat");
+  assert.equal(formatChangePct(-1.6), "-2%");
+  assert.equal(formatChangePct(NaN), null);
+  assert.equal(formatChangePct(null), null);
+  assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: [], comparison: { weeksCompared: 2, current: { kwhPerHdd: 3 }, baseline: { kwhPerHdd: 3.01 }, intensityChangePct: -0.4 } }), "scoreboard: 2026-27 3.00 kWh/HDD vs 3.01 last winter (flat), 2 wk compared");
+  assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: [], comparison: { weeksCompared: 2, current: { kwhPerHdd: 3 }, baseline: null, intensityChangePct: -12 } }), "scoreboard: 2026-27 3.00 kWh/HDD, 2 wk compared");
+  // 7. odd shapes: weeks not an array, comparison null, NaN numbers
+  assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: "x" as unknown as unknown[], comparison: null }), "scoreboard: 2026-27, 0 wk, no rated week yet");
+  assert.equal(summarizeWinterScoreboard({ available: true, season: "2026-27", weeks: [], comparison: { current: { kwhPerHdd: NaN } } }), "scoreboard: 2026-27, 0 wk, no rated week yet");
+  // 8. a non-JSON 200 on the scoreboard route stays inside the advisory try (tick resolves, streak 0, nothing persisted)
+  {
+    const { store, upserts } = fakeStore();
+    const r = new TempiqReader(store, "https://tempiq.test", "tok");
+    const calls: string[] = [];
+    const inner = fakeFetch({ ...critical }, calls);
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const path = new URL(String(input instanceof Request ? input.url : input)).pathname;
+      if (path === "/api/insights/winter-scoreboard") return new Response("<html>maintenance</html>", { status: 200, headers: { "content-type": "text/html" } });
+      return inner(input);
+    }) as typeof fetch;
+    try { await r.tick(); } finally { globalThis.fetch = realFetch; }
+    assert.equal(r.status().consecutiveFailures, 0);
+    assert.match(r.status().lastResult ?? "", /scoreboard error: /);
+    assert.equal(upserts.scoreboard.length, 0);
+  }
   console.log("ok tempiq-read (advisory tier + winter scoreboard mirror)");
 })().catch((e) => { console.error(e); process.exit(1); });
