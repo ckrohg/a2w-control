@@ -75,8 +75,10 @@ export function computeTracking(
 export class PhaseB {
   private failStreak: Record<string, number> = {};
   private alerted: Record<string, boolean> = {};
-  /** eval 2026-09-30 F4: consecutive write failures per pump, for /health — the alert fires at 3; the count says how long. */
-  streaks(): Record<string, number> { return { ...this.failStreak }; }
+  /** eval 2026-09-30 F4: consecutive write failures per pump, for /health — the alert fires at 3; the count says how long.
+   *  Every configured pump is present (0 when never failed, or reset by a success or a dry-run cycle), so the map is a
+   *  CURRENT count, never a sparse history. */
+  streaks(): Record<string, number> { return Object.fromEntries(this.pumpIds.map((id) => [id, this.failStreak[id] ?? 0])); }
   /** Per-pump: did the Pi actually ARM the lease we asked for? null = not yet observed.
    *  See verifyLeases() — this is the FINDING-1b fix. */
   private leaseArmed: Record<string, boolean | null> = {};
@@ -148,6 +150,7 @@ export class PhaseB {
 
     for (const d of decisions) {
       if (this.dryRun) {
+        this.failStreak[d.pump_id] = 0; // nothing was attempted, so nothing is failing (codex on #158)
         this.lastResults[d.pump_id] = `DRY-RUN would send ${d.value_c}°C — ${d.reason}`;
         console.log(`[phase-b] ${this.lastResults[d.pump_id]}`);
         await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "dry-run", valueC: d.value_c, result: "would-send" }).catch(() => {});

@@ -24,6 +24,11 @@ function harness(block: Record<string, unknown>, opts: { dryRun?: boolean; fail?
   { const ap = harness(boost, { dryRun: true }); await ap.applyLatestPlan(); assert.equal(ap.lastPreBoost?.result, "would-set"); }
   { const ap = harness(boost, { fail: new WriteError(429, "rate limited") }); await ap.applyLatestPlan(); assert.equal(ap.lastPreBoost?.result, "rate-limited"); }
   { const ap = harness(boost, { fail: new WriteError(422, "I1 would be violated") }); await ap.applyLatestPlan(); assert.match(ap.lastPreBoost?.result ?? "", /^rejected: /); }
+  // 2b. HELD outcomes are remembered too — already commanded within tolerance, and an identification hold (codex on #158)
+  { const ap = harness({ ...boost, tank_target_f: 121 }); await ap.applyLatestPlan(); assert.equal(ap.lastPreBoost?.result, "held", "within 2 °F of the commanded 120 → held, still recorded"); }
+  { const ap = harness(boost); ap.setHold(new Date(Date.now() + 3600_000), "identification window w1"); await ap.applyLatestPlan(); assert.equal(ap.lastPreBoost?.result, "held"); assert.equal(ap.lastPreBoost?.toF, 129); }
+  // 2c. a later non-boost block leaves the last boost in place
+  { const ap = harness(boost); await ap.applyLatestPlan(); const keep = ap.lastPreBoost; (ap as any).store.recentPlans = async () => [{ plan: [{ ts: new Date().toISOString(), tank_target_f: 120, reason: "DHW window floor" }] }]; await ap.applyLatestPlan(); assert.deepEqual(ap.lastPreBoost, keep); }
   // 3. a non-boost block never touches it
   { const ap = harness({ tank_target_f: 120, reason: "DHW window floor" }); await ap.applyLatestPlan(); assert.equal(ap.lastPreBoost, null); }
   console.log("autopilot-observability.test.ts (F6 last pre-boost): all assertions passed");

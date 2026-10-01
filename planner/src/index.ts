@@ -1721,7 +1721,7 @@ async function main(): Promise<void> {
                 // spread heuristic: the floor-clamped plan curve has a 2 °F spread and read false the day it went live
                 // (eval 2026-09-30 §10.10). spread_f keeps the old signal visible.
                 shaped: lastShapedCurve ? curveAlreadyInForce(lastShapedCurve, lastDeviceCurve) : false,
-                spread_f: Math.round((Number(lastDeviceCurve.dbt) - Number(lastDeviceCurve.mbt)) * 10) / 10,
+                spread_f: Number.isFinite(Number(lastDeviceCurve.dbt) - Number(lastDeviceCurve.mbt)) ? Math.round((Number(lastDeviceCurve.dbt) - Number(lastDeviceCurve.mbt)) * 10) / 10 : null,
               } : null,
               plan_implies: lastShapedCurve ? {
                 dot: lastShapedCurve.dot, dbt: lastShapedCurve.dbt, mbt: lastShapedCurve.mbt, wwsd: lastShapedCurve.wwsd, basis: lastShapedCurve.basis,

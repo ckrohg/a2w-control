@@ -124,7 +124,8 @@ export class AutoPilot {
     this.lastRunAt = new Date().toISOString();
 
     if (this.holdActive) {
-      await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`);
+      // the block is passed so a boost reached during an identification hold is recorded as held, not lost (codex on #158)
+      await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`, block);
       return;
     }
     const status = await this.writer.status();
