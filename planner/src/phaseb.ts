@@ -74,7 +74,12 @@ export function computeTracking(
 
 export class PhaseB {
   private failStreak: Record<string, number> = {};
+  /** paging latch: a "tracking failing" page went out for the current failure run; cleared by success or a dry-run cycle */
   private alerted: Record<string, boolean> = {};
+  /** recovery gate (codex pass 3 on #158): a failure page went out and its "recovered" page has not — survives a
+   *  dry-run interlude (dry-run proves nothing was attempted, not that the failure recovered); cleared only by a
+   *  successful ACTIVE write, which emits "Phase B recovered". */
+  private recoveryPending: Record<string, boolean> = {};
   /** eval 2026-09-30 F4: consecutive write failures per pump, for /health — the alert fires at 3; the count says how long.
    *  Every configured pump is present (0 when never failed, or reset by a success or a dry-run cycle), so the map is a
    *  CURRENT count, never a sparse history. */
@@ -150,8 +155,9 @@ export class PhaseB {
 
     for (const d of decisions) {
       if (this.dryRun) {
-        // nothing was attempted, so nothing is failing — and the alert latch moves with the streak, or a later sustained
-        // failure after the lane goes active again could never page (codex pass 2 on #158)
+        // nothing was attempted, so nothing is failing — the streak and the PAGING latch reset so a later sustained
+        // failure after the lane goes active again pages (codex pass 2 on #158); the RECOVERY gate stays, so the
+        // operator still gets "recovered" once an active write succeeds (codex pass 3)
         this.failStreak[d.pump_id] = 0;
         this.alerted[d.pump_id] = false;
         this.lastResults[d.pump_id] = `DRY-RUN would send ${d.value_c}°C — ${d.reason}`;
@@ -169,8 +175,9 @@ export class PhaseB {
       await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "active", valueC: d.value_c, result: res.ok ? "sent" : `failed: ${res.detail}` }).catch(() => {});
       if (res.ok) {
         this.failStreak[d.pump_id] = 0;
-        if (this.alerted[d.pump_id]) {
-          this.alerted[d.pump_id] = false;
+        this.alerted[d.pump_id] = false;
+        if (this.recoveryPending[d.pump_id]) {
+          this.recoveryPending[d.pump_id] = false;
           await this.notify("Phase B recovered", `${d.pump_id} tracking again (${d.value_c}°C).`);
         }
       } else {
@@ -180,6 +187,7 @@ export class PhaseB {
         // baseline on its own (safe); page once so a human knows tracking stopped.
         if (this.failStreak[d.pump_id] === 3 && !this.alerted[d.pump_id]) {
           this.alerted[d.pump_id] = true;
+          this.recoveryPending[d.pump_id] = true;
           await this.notify(
             "Phase B tracking failing",
             `${d.pump_id}: 3 consecutive write failures (${res.detail}). ` +
