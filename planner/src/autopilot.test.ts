@@ -8,7 +8,7 @@ import { AutoPilot } from "./autopilot";
 import { DEFAULT_OPTS } from "./shadow";
 
 type Call = { target: number; capF: number | undefined };
-function harness(block: Record<string, unknown>, commanded: number | null = 120, stormCapF?: number, shaped = false) {
+function harness(block: Record<string, unknown>, commanded: number | null = 120, stormCapF?: number, shaped = false, dryRun = false) {
   const calls: Call[] = []; const logs: Array<{ result: string }> = []; const curves: unknown[] = [];
   const store = {
     recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), ...block }] }],
@@ -19,7 +19,7 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
     setTarget: async (target: number, _source: string, capF?: number) => { calls.push({ target, capF }); return {}; },
     setCurve: async (c: unknown) => { if (!shaped) throw new Error("setCurve must not be called in flat-target mode"); curves.push(c); return {}; },
   } as any;
-  const ap = new AutoPilot(store, writer, false, async () => {}, shaped, stormCapF);
+  const ap = new AutoPilot(store, writer, dryRun, async () => {}, shaped, stormCapF);
   return { ap, calls, logs, curves };
 }
 
@@ -104,6 +104,22 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
     const soakOnlyCap = harness({ tank_target_f: 145, sani: true, storm: true, reason: "storm mode: banking heat (x)" }); // default storm cap 135 → the soak's 145 wins
     await soakOnlyCap.ap.applyLatestPlan();
     assert.deepEqual(soakOnlyCap.calls[0], { target: 145, capF: DEFAULT_OPTS.sanitizeCapF });
+  }
+  // 9. DRY-RUN previews the same verdict (codex pass 3): an unflagged 142 reads "would reject", a soak 142 reads "would set"; nothing is written either way
+  {
+    const bad = harness({ tank_target_f: 142, reason: "binding zone: X needs 137°F" }, 120, undefined, false, true);
+    await bad.ap.applyLatestPlan();
+    assert.equal(bad.calls.length, 0); assert.match(bad.ap.lastResult, /^DRY-RUN would reject 142°F: non-soak block above the everyday cap 135°F/);
+    assert.ok(bad.logs.some((l) => l.result === "would-reject: non-soak block above its cap"));
+    const ok = harness({ tank_target_f: 142, sani: true, reason: "daily sanitize to 140°F (I8)" }, 120, undefined, false, true);
+    await ok.ap.applyLatestPlan();
+    assert.equal(ok.calls.length, 0); assert.match(ok.ap.lastResult, /^DRY-RUN would set 142°F/);
+  }
+  // 10. a STORM_CAP_F configured BELOW the everyday cap cannot lower it (nit, pass 3)
+  {
+    const h = harness({ tank_target_f: 135, storm: true, reason: "storm mode: banking heat (x)" }, 120, 120);
+    await h.ap.applyLatestPlan();
+    assert.deepEqual(h.calls[0], { target: 135, capF: DEFAULT_OPTS.strictCapF });
   }
   console.log("autopilot.test.ts (#156 cap by the block's identity): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

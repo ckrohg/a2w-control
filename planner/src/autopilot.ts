@@ -170,12 +170,6 @@ export class AutoPilot {
       }
       // excursion or no curve → the flat target write below, exactly as before
     }
-    if (this.dryRun) {
-      await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
-      console.log(`[autopilot] ${this.lastResult}`);
-      return;
-    }
-
     // a2w#156: the block's IDENTITY authorises its ceiling, never the target's size. The soak (`sani`) may run to
     // sanitizeCapF; a storm block (`storm`, §6.11) to STORM_CAP_F (owner-configured, 135 by default); everything else
     // is clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot
@@ -186,11 +180,25 @@ export class AutoPilot {
     const isSoak = block?.sani === true, isStorm = block?.storm === true;
     const capF = Math.max(DEFAULT_OPTS.strictCapF, isSoak ? DEFAULT_OPTS.sanitizeCapF : 0, isStorm ? this.stormCapF : 0);
     if (target > capF) {
+      // Checked BEFORE the dry-run branch so a dry run previews the same verdict (codex pass 3 on #157): a malformed
+      // plan must read "would reject" during commissioning, not "would set".
       const what = isStorm ? (isSoak ? "soak+storm block above both caps" : "storm block above STORM_CAP_F") : isSoak ? "soak block above sanitizeCapF" : "non-soak block above the everyday cap";
-      await this.record(target, reason, `rejected: ${isStorm ? "storm" : isSoak ? "soak" : "non-soak"} block above its cap`, `rejected ${target}°F: ${what} ${capF}°F (${reason})`, block);
+      const identity = isStorm ? "storm" : isSoak ? "soak" : "non-soak";
+      if (this.dryRun) {
+        await this.record(target, reason, `would-reject: ${identity} block above its cap`, `DRY-RUN would reject ${target}°F: ${what} ${capF}°F (${reason})`, block);
+        console.log(`[autopilot] ${this.lastResult}`);
+        return;
+      }
+      await this.record(target, reason, `rejected: ${identity} block above its cap`, `rejected ${target}°F: ${what} ${capF}°F (${reason})`, block);
       console.warn(`[autopilot] ${this.lastResult}`);
       return;
     }
+    if (this.dryRun) {
+      await this.record(target, reason, "would-set", `DRY-RUN would set ${target}°F — ${reason} (commanded now ${commanded ?? "—"}°F)`);
+      console.log(`[autopilot] ${this.lastResult}`);
+      return;
+    }
+
     try {
       await this.writer.setTarget(target, "autopilot", capF);
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`);
