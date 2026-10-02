@@ -7,7 +7,7 @@
 # Usage: bash scripts/eval-run.sh [capture.jsonl]
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-CAP="${1:-/tmp/a2w-eval-capture.jsonl}"
+CAP="${1:-$HOME/.a2w/a2w-eval-capture.jsonl}"
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
 ok(){ printf '  ok      %s\n' "$1"; } ; bad(){ printf '  FAIL    %s\n' "$1"; } ; warn(){ printf '  WARN    %s\n' "$1"; } ; info(){ printf '  --      %s\n' "$1"; }
 

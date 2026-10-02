@@ -14,7 +14,7 @@ set -uo pipefail
 PLANNER="${PLANNER_URL:-https://a2w-planner-production.up.railway.app}"
 HUB="${HUB_URL:-https://a2w-hub-production.up.railway.app}"
 OUTAGE="${OUTAGEWATCH_URL:-https://victorious-light-production.up.railway.app}"
-OUT="${OUT:-/tmp/a2w-eval-capture.jsonl}"
+OUT="${OUT:-$HOME/.a2w/a2w-eval-capture.jsonl}"
 g() { curl -sf -m 20 "$@" 2>/dev/null || echo null; }
 # A failed fetch must record as null, NEVER as "no alerts" / "no outage": the capture exists to
 # answer "did storm mode stand down when the warning ended?", and a transient NWS 5xx that reads
