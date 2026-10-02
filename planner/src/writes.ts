@@ -27,6 +27,17 @@ const SLX_FRESH_MS = 20 * 60 * 1000;
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
+// ── Graceful-handover coordination (2026-10-01) ──────────────────────────────────────────────────
+// index.ts raises the barrier on SIGTERM; the device PATCH below counts itself in/out so shutdown can tell whether
+// a command is still on the wire before it releases the single-writer lease (it never releases over one).
+let writeBarrier = false;
+let writesInFlight = 0;
+/** Refuse every NEW device write from now on (idempotent). */
+export function raiseWriteBarrier(): void { writeBarrier = true; }
+export function isWriteBarrierUp(): boolean { return writeBarrier; }
+/** Device PATCHes currently on the wire. */
+export function deviceWritesInFlight(): number { return writesInFlight; }
+
 export class WriteError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -302,6 +313,13 @@ export class HbxWriter {
     action: string,
     summary: string,
   ): Promise<Record<string, unknown>> {
+    // Graceful handover (2026-10-01): once SIGTERM has landed no NEW device write may start — the lease is about to
+    // be handed to the successor and a PATCH that began after the barrier could land after the successor's own
+    // decision. Refused and recorded, never silently dropped; the successor re-plans on its next poll.
+    if (writeBarrier) {
+      await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier up (lease handover in progress)" });
+      throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
+    }
     // Single-writer lease gate (flag-gated; null = disabled). If this instance does not hold a
     // fresh lease, another planner is the active writer — refuse BEFORE touching the device.
     // Gates EVERY write path (set_target / boost / restore all funnel through here). #36.
@@ -313,11 +331,14 @@ export class HbxWriter {
       }
     }
     let dev: Record<string, any>;
+    writesInFlight++;
     try {
       dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
     } catch (e) {
       await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
       throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
+    } finally {
+      writesInFlight--;
     }
 
     const mismatches = Object.entries(fields).filter(([k, v]) => dev[k] !== v);

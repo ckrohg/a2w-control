@@ -851,6 +851,15 @@ main().catch((e) => { console.error(e); process.exit(1); });
   assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45], status: "identified" })], now).count, 0);
   assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45], deliveryTypeSource: "seeded" })], now).count, 0);
   assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45] }, { safeToProbe: { ok: false, binding: null } })], now).count, 0);
+  // the SAME predicate as pickCell: a DOWN cell with an incomplete forecast is not eligible (an UP cell is)
+  assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45] }, { direction: "down", forecastComplete: false })], now).count, 0, "down + incomplete forecast");
+  assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45] }, { direction: "up", forecastComplete: false })], now).count, 24, "up tolerates an incomplete forecast");
+  // a null outdoor must NOT read as 0 °F and land inside a band that contains zero
+  assert.equal(eligibleHoursAhead(plan.map((b) => ({ ...b, outdoor_f: null })), [cell({ band: [-10, 5] })], now).count, 0, "null outdoor is not 0 °F");
+  assert.equal(eligibleHoursAhead(plan.map((b) => ({ ...b, outdoor_f: "" })), [cell({ band: [-10, 5] })], now).count, 0, "empty string outdoor is not 0 °F");
+  assert.equal(eligibleHoursAhead(plan.map((b) => ({ ...b, outdoor_f: "2.5" })), [cell({ band: [-10, 5] })], now).count, 24, "numeric strings (pg numeric) are read");
+  // unordered input is sorted before the next-24 slice
+  assert.equal(eligibleHoursAhead([...plan].reverse(), cells, now).firstHourIso, plan[0].ts);
   // past blocks are ignored; only the next 24 count; no plan → 0
   const longPlan = Array.from({ length: 30 }, (_, h) => hour(h - 3));
   assert.equal(eligibleHoursAhead(longPlan, cells, now).count, 24);

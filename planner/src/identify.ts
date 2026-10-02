@@ -206,16 +206,21 @@ export interface IdentDeps {
 export const probeSource = (windowId: number) => `identification#${windowId}`;
 export const cleanupSource = (windowId: number, urgent: boolean) => `${urgent ? "identification-abort" : "identification-end"}#${windowId}`;
 
-/** Top safe, owner-verified, unidentified cell whose band contains the current outdoor. */
-export function pickCell(plan: IdentPlan, outdoorF: number): PlanCell | null {
-  const eligible = plan.cells.filter((c) =>
-    c.status === "unidentified"
+/** The ONE eligibility predicate (pickCell and the forward look share it, so they cannot drift — codex on #162):
+ *  unidentified, safe to probe, owner-verified delivery type, the outdoor inside the cell's band, and a DOWN probe
+ *  only when its forecast is complete (an UP probe tolerates an incomplete forecast). */
+export function cellEligibleAt(c: PlanCell, outdoorF: number): boolean {
+  return c.status === "unidentified"
     && c.suggest != null
     && c.suggest.safeToProbe.ok === true
     && c.deliveryTypeSource === "owner_verified"
     && outdoorF >= c.band[0] && outdoorF < c.band[1]
-    && (c.suggest.direction === "up" || c.suggest.forecastComplete !== false),
-  );
+    && (c.suggest.direction === "up" || c.suggest.forecastComplete !== false);
+}
+
+/** Top safe, owner-verified, unidentified cell whose band contains the current outdoor. */
+export function pickCell(plan: IdentPlan, outdoorF: number): PlanCell | null {
+  const eligible = plan.cells.filter((c) => cellEligibleAt(c, outdoorF));
   eligible.sort((a, b) => (b.suggest!.informationGain - a.suggest!.informationGain) || a.band[0] - b.band[0]);
   return eligible[0] ?? null;
 }
@@ -302,22 +307,27 @@ export function planConflictAhead(plan: any[] | null, nowMs: number, hours: numb
 /**
  * Forward look (wave plan 2026-10-01 C1): of the next 24 plan blocks, how many could host a draw — not inside the
  * exclusion of an excursion block (a block at hour h is excluded when planConflictAhead would refuse at h, i.e. an
- * excursion lies in [h − 1 h, h + 3 h]) AND cold enough for at least one probeable cell (the same band test pickCell
- * uses, over the same cell filter). The daily soak + the bank block each wipe out 4 h; with a 24-block horizon this
- * is the number that says whether identification can draw at all on a given day. PURE; reuses planConflictAhead so
- * the rule cannot drift. Blocks without an outdoor forecast are not counted.
+ * excursion lies in [h − 1 h, h + 3 h], so each excursion wipes out the 5 hourly blocks in [e − 3 h, e + 1 h]) AND
+ * with at least one cell eligible at that block's forecast outdoor (cellEligibleAt — the exact predicate pickCell
+ * draws with, direction/forecast rule included). The daily soak + the bank block together cost 10 of 24 blocks; this
+ * is the number that says whether identification can draw at all on a given day. PURE; reuses planConflictAhead and
+ * cellEligibleAt so the rules cannot drift. Blocks are taken in plan order; a block whose outdoor_f is missing (null)
+ * or not a finite number is not counted (Number(null) would be 0 and could land inside a real band).
  */
 export function eligibleHoursAhead(plan: any[] | null, cells: PlanCell[], nowMs: number): { count: number; firstHourIso: string | null } {
   if (!plan) return { count: 0, firstHourIso: null };
-  const probeable = cells.filter((c) => c.status === "unidentified" && c.suggest != null && c.suggest.safeToProbe.ok === true && c.deliveryTypeSource === "owner_verified");
-  const blocks = plan.filter((b) => Number.isFinite(Date.parse(String(b?.ts))) && Date.parse(String(b.ts)) >= nowMs).slice(0, 24);
+  const blocks = plan
+    .filter((b) => Number.isFinite(Date.parse(String(b?.ts))) && Date.parse(String(b.ts)) >= nowMs)
+    .sort((a, b) => Date.parse(String(a.ts)) - Date.parse(String(b.ts)))
+    .slice(0, 24);
   let count = 0; let first: string | null = null;
   for (const b of blocks) {
     const t = Date.parse(String(b.ts));
-    const o = Number(b.outdoor_f);
+    const raw = b.outdoor_f;
+    const o = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
     if (!Number.isFinite(o)) continue;
     if (planConflictAhead(plan, t, 3)) continue;
-    if (!probeable.some((c) => o >= c.band[0] && o < c.band[1])) continue;
+    if (!cells.some((c) => cellEligibleAt(c, o))) continue;
     count++;
     first ??= String(b.ts);
   }
@@ -429,6 +439,13 @@ export class IdentificationDriver {
   /** One poll: advance the window state machine; never throws. */
   async tick(): Promise<void> {
     this.lastTickAt = this.now().toISOString();
+    // Forward look FIRST, every tick, in every mode (off, shadow, armed, window open) — one recentPlans query per
+    // 5-min tick, deliberately — so the status describes the next 24 h regardless of which gate idles the driver
+    // (planEligibleNow is refreshed only past every gate; codex pass 1 on #162). Uses the cells last fetched.
+    try {
+      const plans = await this.d.store.recentPlans(1);
+      this.eligibleAhead = eligibleHoursAhead(plans.at(-1)?.plan ?? null, this.plan?.cells ?? [], this.now().getTime());
+    } catch { /* observability only */ }
     try {
       await this.cleanupPending();
       await this.postPending();
@@ -461,12 +478,6 @@ export class IdentificationDriver {
       this.lastResult = `error: ${e instanceof Error ? e.message : String(e)}`;
       console.error(`[identify] ${this.lastResult}`);
     }
-    // Forward look, refreshed every tick regardless of which gate idled the driver (planEligibleNow is only refreshed
-    // past every gate, so on an idling driver it goes stale — this one does not). Uses the cells last fetched.
-    try {
-      const plans = await this.d.store.recentPlans(1);
-      this.eligibleAhead = eligibleHoursAhead(plans.at(-1)?.plan ?? null, this.plan?.cells ?? [], this.now().getTime());
-    } catch { /* observability only */ }
   }
 
   // ── idle → arming/active ──
@@ -491,7 +502,7 @@ export class IdentificationDriver {
     await this.refreshPlan(nowMs);
     if (!this.plan || this.planFetchedAt == null || nowMs - this.planFetchedAt > PLAN_MAX_AGE_MIN * 60_000) { this.lastResult = "idle: no fresh identification plan"; return; }
     const cell = pickCell(this.plan, slx.outdoorF);
-    this.eligibleNow = this.plan.cells.filter((c) => c.status === "unidentified" && c.suggest?.safeToProbe.ok && c.deliveryTypeSource === "owner_verified" && slx.outdoorF! >= c.band[0] && slx.outdoorF! < c.band[1]).length;
+    this.eligibleNow = this.plan.cells.filter((c) => cellEligibleAt(c, slx.outdoorF!)).length;
     if (!cell || !cell.suggest) { this.lastResult = `idle: no safe cell for ${slx.outdoorF} °F outdoor`; return; }
 
     // The base is the target the device is ACTUALLY driving to (temp1.target), and only when the last
