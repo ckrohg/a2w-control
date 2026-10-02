@@ -7,7 +7,7 @@
  * restore, and that a shadow window never writes or posts).
  */
 import assert from "node:assert/strict";
-import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
+import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
 import { WriteError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
@@ -823,4 +823,37 @@ main().catch((e) => { console.error(e); process.exit(1); });
   assert.equal(planConflictAhead([{ ts: "2026-11-20T13:00:00Z", reason: "DHW window floor", boost: true }], now, 3), true, "the boost flag conflicts");
   assert.equal(planConflictAhead([{ ts: "2026-11-20T13:00:00Z", reason: "DHW window floor" }], now, 3), false);
   console.log("identify.test.ts (#135 pre-boost conflict): all assertions passed");
+})();
+
+// Wave plan 2026-10-01 C1: the forward look — how many of the next 24 plan blocks could host a draw.
+(() => {
+  const now = Date.parse("2026-11-20T12:00:00Z");
+  const hour = (h: number, over: Record<string, unknown> = {}) => ({ ts: new Date(now + h * 3600_000).toISOString(), tank_target_f: 120, outdoor_f: 40, reason: "demand floor", ...over });
+  const plan = Array.from({ length: 24 }, (_, h) => hour(h));
+  const cells: PlanCell[] = [cell({ band: [30, 45] })];
+  // all 24 blocks cold enough, no excursion → 24 eligible, first = now
+  let e = eligibleHoursAhead(plan, cells, now);
+  assert.equal(e.count, 24); assert.equal(e.firstHourIso, plan[0].ts);
+  // a soak at h=10 excludes [h−3, h+1] = hours 7..11 (5 blocks) → 19
+  const withSoak = plan.map((b, h) => (h === 10 ? hour(h, { sani: true, tank_target_f: 140, reason: "daily sanitize to 140°F = 60°C (I8 pasteurization, warmest hour)" }) : b));
+  e = eligibleHoursAhead(withSoak, cells, now);
+  assert.equal(e.count, 19, "soak wipes 5 blocks"); assert.equal(e.firstHourIso, plan[0].ts);
+  // soak at h=10 AND bank at h=20 → 19 − 5 (hours 17..21) = 14; a storm block by REASON only also counts
+  const withBoth = withSoak.map((b, h) => (h === 20 ? hour(h, { bank: true, reason: "bank" }) : b));
+  assert.equal(eligibleHoursAhead(withBoth, cells, now).count, 14, "soak + bank wipe 10 blocks");
+  const withStorm = plan.map((b, h) => (h === 0 ? hour(h, { reason: "storm mode: banking heat (pre-storm)" }) : b));
+  assert.equal(eligibleHoursAhead(withStorm, cells, now).count, 22, "storm at h=0 excludes hours 0 and 1");
+  assert.equal(eligibleHoursAhead(withStorm, cells, now).firstHourIso, plan[2].ts);
+  // too warm for every band → 0; a block with no outdoor forecast is not counted
+  assert.equal(eligibleHoursAhead(plan.map((b) => ({ ...b, outdoor_f: 61 })), cells, now).count, 0, "too warm");
+  assert.equal(eligibleHoursAhead(plan.map((b, h) => (h < 4 ? { ...b, outdoor_f: null } : b)), cells, now).count, 20, "no forecast → not counted");
+  // cells that are identified / unsafe / not owner-verified do not make an hour eligible
+  assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45], status: "identified" })], now).count, 0);
+  assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45], deliveryTypeSource: "seeded" })], now).count, 0);
+  assert.equal(eligibleHoursAhead(plan, [cell({ band: [30, 45] }, { safeToProbe: { ok: false, binding: null } })], now).count, 0);
+  // past blocks are ignored; only the next 24 count; no plan → 0
+  const longPlan = Array.from({ length: 30 }, (_, h) => hour(h - 3));
+  assert.equal(eligibleHoursAhead(longPlan, cells, now).count, 24);
+  assert.deepEqual(eligibleHoursAhead(null, cells, now), { count: 0, firstHourIso: null });
+  console.log("identify.test.ts (C1 eligibleHoursAhead): all assertions passed");
 })();

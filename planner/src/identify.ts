@@ -299,6 +299,31 @@ export function planConflictAhead(plan: any[] | null, nowMs: number, hours: numb
   });
 }
 
+/**
+ * Forward look (wave plan 2026-10-01 C1): of the next 24 plan blocks, how many could host a draw — not inside the
+ * exclusion of an excursion block (a block at hour h is excluded when planConflictAhead would refuse at h, i.e. an
+ * excursion lies in [h − 1 h, h + 3 h]) AND cold enough for at least one probeable cell (the same band test pickCell
+ * uses, over the same cell filter). The daily soak + the bank block each wipe out 4 h; with a 24-block horizon this
+ * is the number that says whether identification can draw at all on a given day. PURE; reuses planConflictAhead so
+ * the rule cannot drift. Blocks without an outdoor forecast are not counted.
+ */
+export function eligibleHoursAhead(plan: any[] | null, cells: PlanCell[], nowMs: number): { count: number; firstHourIso: string | null } {
+  if (!plan) return { count: 0, firstHourIso: null };
+  const probeable = cells.filter((c) => c.status === "unidentified" && c.suggest != null && c.suggest.safeToProbe.ok === true && c.deliveryTypeSource === "owner_verified");
+  const blocks = plan.filter((b) => Number.isFinite(Date.parse(String(b?.ts))) && Date.parse(String(b.ts)) >= nowMs).slice(0, 24);
+  let count = 0; let first: string | null = null;
+  for (const b of blocks) {
+    const t = Date.parse(String(b.ts));
+    const o = Number(b.outdoor_f);
+    if (!Number.isFinite(o)) continue;
+    if (planConflictAhead(plan, t, 3)) continue;
+    if (!probeable.some((c) => o >= c.band[0] && o < c.band[1])) continue;
+    count++;
+    first ??= String(b.ts);
+  }
+  return { count, firstHourIso: first };
+}
+
 /** open | completed | aborted (physics/plant) | truncated (the plan moved, mode off, arming timeout…). */
 export function windowCompletion(w: Pick<IdentWindow, "endedAt" | "endReason">): "open" | "completed" | "aborted" | "truncated" {
   if (!w.endedAt) return "open";
@@ -348,6 +373,10 @@ export interface IdentStatus {
   planFetchedAt: string | null;
   planCells: number;
   planEligibleNow: number;
+  /** of the next 24 plan blocks, how many could host a draw (outside the soak/bank/storm exclusion and inside a probeable band) */
+  eligibleHoursNext24h: number;
+  /** the first such block's hour (ISO), or null */
+  firstEligibleHour: string | null;
   window: null | { id: number; state: IdentState; arm: IdentArm; direction: IdentDirection; targetF: number; baseF: number; startedAt: string | null; endsAt: string | null; zoneIds: string[] };
   consecutivePostFailures: number;
 }
@@ -359,6 +388,7 @@ export class IdentificationDriver {
   private lastTickAt: string | null = null;
   private lastResult: string | null = "not run yet";
   private eligibleNow = 0;
+  private eligibleAhead: { count: number; firstHourIso: string | null } = { count: 0, firstHourIso: null };
   private consecutivePostFailures = 0;
   private readonly fetchImpl: typeof fetch;
   private readonly rng: () => number;
@@ -383,6 +413,7 @@ export class IdentificationDriver {
       mode: this.mode, enabled: true, lastTickAt: this.lastTickAt, lastResult: this.lastResult,
       planFetchedAt: this.planFetchedAt ? new Date(this.planFetchedAt).toISOString() : null,
       planCells: this.plan?.cells.length ?? 0, planEligibleNow: this.eligibleNow,
+      eligibleHoursNext24h: this.eligibleAhead.count, firstEligibleHour: this.eligibleAhead.firstHourIso,
       window: this.currentWindow ? {
         id: this.currentWindow.id, state: this.currentWindow.state, arm: this.currentWindow.arm, direction: this.currentWindow.direction,
         targetF: this.currentWindow.targetF, baseF: this.currentWindow.baseF,
@@ -430,6 +461,12 @@ export class IdentificationDriver {
       this.lastResult = `error: ${e instanceof Error ? e.message : String(e)}`;
       console.error(`[identify] ${this.lastResult}`);
     }
+    // Forward look, refreshed every tick regardless of which gate idled the driver (planEligibleNow is only refreshed
+    // past every gate, so on an idling driver it goes stale — this one does not). Uses the cells last fetched.
+    try {
+      const plans = await this.d.store.recentPlans(1);
+      this.eligibleAhead = eligibleHoursAhead(plans.at(-1)?.plan ?? null, this.plan?.cells ?? [], this.now().getTime());
+    } catch { /* observability only */ }
   }
 
   // ── idle → arming/active ──
