@@ -1771,7 +1771,9 @@ async function main(): Promise<void> {
     // compensating release needs the pool. So: give pending ops one more bounded chance, then release if quiet.
     const leaseOpsSettled = leaseOpsDone || await settleAll(pendingLeaseOps, 1_500);
     if (WRITER_LEASE_ENABLED && loopsDone && leaseOpsSettled && deviceWritesInFlight() === 0) {
-      await store.releaseWriterLease(INSTANCE_ID).catch(() => {});
+      const releasedLate = await store.releaseWriterLease(INSTANCE_ID).catch(() => false);
+      // the first gate may have refused over an in-flight write that has since finished — say what finally happened
+      if (releasedLate) console.log(`[shutdown] ${reason}: writer lease released on the final check (work finished during cleanup)`);
     } else if (WRITER_LEASE_ENABLED && !leaseOpsSettled) {
       console.warn(`[shutdown] ${reason}: a lease renew/claim is still pending — leaving the row to the staleness window rather than racing it`);
     }
