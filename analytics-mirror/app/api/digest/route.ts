@@ -125,38 +125,41 @@ async function buildDigest() {
 
   // Hot water: TempIQ's DHW-vs-space-isolated aggregate, mirrored hourly by the planner into tempiq_dhw_usage
   // (#160: the mirror's payload is DhwUsageResponse — estimate{dailyElectricalKwh, hydronicCop, cycleCount, lastUpdatedAt,
-  // stale} + rolling{window24hKwh, window72hKwh} — not the events[] shape this block was first written against, so the
-  // tile read "no TempIQ data" while the mirror was populated). The week figure is the daily estimate × 7 and is
-  // labelled as such; a stale estimate or an old mirror is named, never shown as this week's number.
-  let dhw: { weekKwh: number; dailyKwh: number; cycles: number | null; cop: number | null; caveat: string | null } | null = null;
+  // hoursSinceUpdate, stale} + rolling{…} — not the events[] shape this block was first written against, so the tile
+  // read "no TempIQ data" while the mirror was populated). Staleness is TempIQ's call (estimate.stale, hoursSinceUpdate):
+  // the digest adds no threshold of its own. The weekly figure (daily × 7, labelled as such) is shown only when the
+  // mirror is fresh (fetchedAt within 26 h, same policy as the scoreboard note) AND TempIQ does not call the estimate
+  // stale; otherwise the value is withheld and the daily estimate is shown with the caveat named.
+  let dhw: { weekKwh: number | null; dailyKwh: number; cycles: number | null; cop: number | null; caveat: string | null } | null = null;
   try {
     const row = (await sql`SELECT payload FROM tempiq_dhw_usage WHERE id = 1`).rows[0];
     const payload = row?.payload as {
       available?: boolean; fetchedAt?: string;
-      estimate?: { dailyElectricalKwh?: number | null; hydronicCop?: number | null; cycleCount?: number | null; lastUpdatedAt?: string | null; stale?: boolean | null } | null;
+      estimate?: { dailyElectricalKwh?: number | null; hydronicCop?: number | null; cycleCount?: number | null; lastUpdatedAt?: string | null; hoursSinceUpdate?: number | null; stale?: boolean | null } | null;
     } | undefined;
     const e = payload?.estimate ?? null;
-    const daily = typeof e?.dailyElectricalKwh === "number" && Number.isFinite(e.dailyElectricalKwh) ? e.dailyElectricalKwh : null;
+    const daily = typeof e?.dailyElectricalKwh === "number" && Number.isFinite(e.dailyElectricalKwh) && e.dailyElectricalKwh >= 0 ? e.dailyElectricalKwh : null;
     if (payload?.available !== false && daily != null) {
-      // Caveats are ADDITIVE, not a precedence chain: an unknown or old or future mirror age AND a stale estimate are
-      // both named when both hold (the same freshness policy as the winter scoreboard note below: 26 h, future = invalid).
       const fetchedMs = payload?.fetchedAt ? new Date(payload.fetchedAt).getTime() : NaN;
       const mirrorAgeH = Number.isFinite(fetchedMs) ? (Date.now() - fetchedMs) / 3_600_000 : null;
+      const mirrorFresh = mirrorAgeH != null && mirrorAgeH >= 0 && mirrorAgeH <= 26;
+      // the estimate's own recency, as TempIQ reports it (hoursSinceUpdate; lastUpdatedAt as the fallback)
       const updatedMs = e?.lastUpdatedAt ? new Date(e.lastUpdatedAt).getTime() : NaN;
-      const estimateAgeH = Number.isFinite(updatedMs) ? (Date.now() - updatedMs) / 3_600_000 : null;
+      const estimateAgeH = typeof e?.hoursSinceUpdate === "number" && Number.isFinite(e.hoursSinceUpdate) ? e.hoursSinceUpdate
+        : Number.isFinite(updatedMs) ? (Date.now() - updatedMs) / 3_600_000 : null;
+      const stale = e?.stale === true;
       const caveats: string[] = [];
       if (mirrorAgeH == null) caveats.push("mirror age unknown");
       else if (mirrorAgeH < 0) caveats.push("mirror timestamp is in the future");
       else if (mirrorAgeH > 26) caveats.push(`mirror ${fmt(mirrorAgeH / 24, 1)} d old`);
-      if (e?.stale === true || (estimateAgeH != null && (estimateAgeH > 72 || estimateAgeH < 0))) {
-        caveats.push(estimateAgeH != null && estimateAgeH >= 0 ? `estimate ${fmt(estimateAgeH / 24, 1)} d stale` : "estimate stale");
-      }
-      const caveat = caveats.length ? caveats.join(" · ") : null;
+      if (stale) caveats.push(`TempIQ calls the estimate stale${estimateAgeH != null && estimateAgeH >= 0 ? ` (${fmt(estimateAgeH / 24, 1)} d)` : ""}`);
+      else if (e?.stale == null && estimateAgeH == null) caveats.push("estimate recency unknown");
       dhw = {
-        weekKwh: daily * 7, dailyKwh: daily,
-        cycles: typeof e?.cycleCount === "number" && Number.isFinite(e.cycleCount) ? e.cycleCount : null,
+        weekKwh: mirrorFresh && !stale ? daily * 7 : null,
+        dailyKwh: daily,
+        cycles: typeof e?.cycleCount === "number" && Number.isFinite(e.cycleCount) && e.cycleCount >= 0 ? e.cycleCount : null,
         cop: typeof e?.hydronicCop === "number" && Number.isFinite(e.hydronicCop) ? e.hydronicCop : null,
-        caveat,
+        caveat: caveats.length ? caveats.join(" · ") : null,
       };
     }
   } catch { /* aggregate missing — omit the block */ }
@@ -264,8 +267,8 @@ async function buildDigest() {
   </tr><tr>
     ${tile("saved this week", `$${fmt(cur.saved, 2)}`,
            `${delta(cur.saved, prev?.saved, "up")} <span style="color:${MUTED}">· $${fmt(totalSaved, 0)} since Jul 16</span>`)}
-    ${tile("hot water", dhw ? `≈${fmt(dhw.weekKwh, 1)} kWh/wk` : "—",
-           dhw ? `<span style="color:${INK2}">${fmt(dhw.dailyKwh, 2)} kWh/d${dhw.cycles != null ? `, ${dhw.cycles} recharge${dhw.cycles === 1 ? "" : "s"} in the estimate` : ""}</span> <span style="color:${MUTED}">· DHW COP ${dhw.cop != null ? fmt(dhw.cop, 1) : "—"}${dhw.caveat ? ` · ${dhw.caveat}` : ""}</span>` : `<span style="color:${MUTED}">no TempIQ data</span>`)}
+    ${tile("hot water", dhw?.weekKwh != null ? `≈${fmt(dhw.weekKwh, 1)} kWh/wk` : "—",
+           dhw ? `<span style="color:${INK2}">${fmt(dhw.dailyKwh, 2)} kWh/d estimate${dhw.cycles != null ? `, ${dhw.cycles} recharge${dhw.cycles === 1 ? "" : "s"} in the estimate` : ""}</span> <span style="color:${MUTED}">· DHW COP ${dhw.cop != null ? fmt(dhw.cop, 1) : "—"}${dhw.caveat ? ` · ${dhw.caveat}${dhw.weekKwh == null ? " — weekly figure withheld" : ""}` : ""}</span>` : `<span style="color:${MUTED}">no TempIQ data</span>`)}
   </tr></table>`;
 
   // ---- 7-day savings bar strip (single series -> no legend; title names it; ---------
