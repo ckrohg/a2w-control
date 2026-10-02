@@ -320,23 +320,34 @@ export class HbxWriter {
       await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier up (lease handover in progress)" });
       throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
     }
-    // Single-writer lease gate (flag-gated; null = disabled). If this instance does not hold a
-    // fresh lease, another planner is the active writer — refuse BEFORE touching the device.
-    // Gates EVERY write path (set_target / boost / restore all funnel through here). #36.
-    if (this.writerLease) {
-      const held = await this.store.holdsWriterLease(this.writerLease.instanceId, this.writerLease.staleMs);
-      if (!held) {
-        await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "does not hold the single-writer lease — another planner instance is the active writer" });
-        throw new WriteError(423, "refused: this instance does not hold the single-writer lease (another planner is the active writer). See README §Single-writer invariant, #36.");
-      }
-    }
-    let dev: Record<string, any>;
+    // ADMISSION is counted synchronously, right after the barrier check and before any await: a write that has
+    // passed the barrier is in flight from this point (including the dashboard API routes, which are not inside the
+    // poll loop), so shutdown's "no device write on the wire" check cannot miss one blocked in the lease query
+    // (codex pass 3 on #162). Released in the finally below on every path.
     writesInFlight++;
+    let dev: Record<string, any>;
     try {
-      dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
-    } catch (e) {
-      await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
-      throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
+      // Single-writer lease gate (flag-gated; null = disabled). If this instance does not hold a
+      // fresh lease, another planner is the active writer — refuse BEFORE touching the device.
+      // Gates EVERY write path (set_target / boost / restore all funnel through here). #36.
+      if (this.writerLease) {
+        const held = await this.store.holdsWriterLease(this.writerLease.instanceId, this.writerLease.staleMs);
+        if (!held) {
+          await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "does not hold the single-writer lease — another planner instance is the active writer" });
+          throw new WriteError(423, "refused: this instance does not hold the single-writer lease (another planner is the active writer). See README §Single-writer invariant, #36.");
+        }
+      }
+      // the barrier may have gone up while the lease query was in flight — the lease answer is then stale by design
+      if (writeBarrier) {
+        await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier went up during the lease check" });
+        throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
+      }
+      try {
+        dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
+      } catch (e) {
+        await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
+        throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
+      }
     } finally {
       writesInFlight--;
     }
