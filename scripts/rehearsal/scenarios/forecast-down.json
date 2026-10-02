@@ -1,0 +1,242 @@
+{
+  "name": "forecast-down",
+  "_comment": "Wave 3 degraded-upstream rehearsal: the cold morning with open-meteo down from the first call (503) on a virgin DB \u2014 no cached forecast to fall back on. The hourly plan step fails loudly (shadow failed) and no plan exists; the auto-pilot has nothing to apply and writes NOTHING; Phase B keeps tracking the device's own operative target (I1 holds without a plan); nothing pages a false alarm within three polls.",
+  "outdoorF": 22,
+  "forecastF": [
+    23,
+    22,
+    20,
+    18,
+    16,
+    15,
+    14,
+    13,
+    12,
+    12,
+    13,
+    15,
+    18,
+    21,
+    24,
+    26,
+    28,
+    29,
+    30,
+    30,
+    29,
+    27,
+    25,
+    23,
+    21,
+    20,
+    19,
+    18,
+    18,
+    19,
+    22,
+    25,
+    28,
+    30,
+    31,
+    31,
+    30,
+    28,
+    26,
+    24,
+    22,
+    21,
+    20,
+    19,
+    19,
+    20,
+    22,
+    24
+  ],
+  "tank": {
+    "actualF": 118,
+    "targetF": 128
+  },
+  "device": {
+    "dot": 10,
+    "wwsd": 65,
+    "dbt": 130,
+    "mbt": 126,
+    "htDif": 6,
+    "numStg": 2,
+    "hpStg": 2,
+    "lagT": 180,
+    "lagOff": 5,
+    "bkLag": 60,
+    "bkDif": 10,
+    "bkTemp": 100,
+    "bkOd": 0,
+    "bkTk": 1,
+    "permHD": 1,
+    "permCD": 0,
+    "dhwOn": 1,
+    "dhwT": 120,
+    "units": 1
+  },
+  "zones": [
+    {
+      "zoneId": "z-lrb",
+      "zoneName": "Living Room Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 340,
+        "thermalMass": 5200,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 152,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 66.2,
+        "setpointF": 69
+      }
+    },
+    {
+      "zoneId": "z-upb",
+      "zoneName": "Upstairs Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 290,
+        "thermalMass": 4600,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 146,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 68.4,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-bsb",
+      "zoneName": "Basement Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 210,
+        "thermalMass": 6000,
+        "confidence": 0.7,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 138,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 62.5,
+        "setpointF": 62
+      }
+    },
+    {
+      "zoneId": "z-kr",
+      "zoneName": "Kitchen Radiant",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 180,
+        "thermalMass": 9000,
+        "confidence": 0.75,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 112,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 67.1,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-mbr",
+      "zoneName": "Master Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 90,
+        "thermalMass": 3000,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 110,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 69.0,
+        "setpointF": 70
+      }
+    },
+    {
+      "zoneId": "z-ubr",
+      "zoneName": "Upstairs Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 70,
+        "thermalMass": 2500,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 108,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 68.0,
+        "setpointF": 68
+      }
+    }
+  ],
+  "calling": [
+    "z-lrb",
+    "z-kr"
+  ],
+  "hub": {
+    "pi_connected": true,
+    "leaseMinutes": 90,
+    "pumps": [
+      {
+        "id": "pump1",
+        "name": "Pump 1"
+      },
+      {
+        "id": "pump2",
+        "name": "Pump 2"
+      }
+    ]
+  },
+  "plan": {
+    "magnitudeF": 8,
+    "durationMin": 120,
+    "baseboardBaseF": 135,
+    "radiantBaseF": 120,
+    "safe": true
+  },
+  "expect": {
+    "planMissingOk": true,
+    "autopilotWrites": false,
+    "phaseBCommands": 2,
+    "noUnhandledUpstreamCalls": true,
+    "probeDrawn": false,
+    "plannerLogged": [
+      "shadow failed"
+    ]
+  },
+  "fail": {
+    "/v1/forecast": {
+      "status": 503
+    }
+  }
+}

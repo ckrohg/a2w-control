@@ -27,7 +27,23 @@ type Scenario = {
   plan: { magnitudeF: number; durationMin: number; baseboardBaseF: number; radiantBaseF: number; safe: boolean };
   /** gtm#1618: what TempIQ's probe-interlock answers (default: not armed). */
   interlock?: { source: string; blocked?: string[]; stepped?: string[] };
+  /**
+   * Wave 3 (degraded-upstream rehearsal): make an upstream FAIL. Keys are path PREFIXES (matched with startsWith);
+   * every matching request answers `status` (default 503) with { error: "simulated outage" } — after the first
+   * `afterCalls` successes when set (so a cache can be seeded first). Logged with failed:true.
+   */
+  fail?: Record<string, { status?: number; afterCalls?: number }>;
 };
+const failCounts = new Map<string, number>();
+function simulatedFailure(p: string): number | null {
+  for (const [prefix, rule] of Object.entries(scenario.fail ?? {})) {
+    if (!p.startsWith(prefix)) continue;
+    const n = (failCounts.get(prefix) ?? 0) + 1; failCounts.set(prefix, n);
+    if (rule.afterCalls != null && n <= rule.afterCalls) return null;
+    return rule.status ?? 503;
+  }
+  return null;
+}
 
 const scenario: Scenario = JSON.parse(fs.readFileSync(SCENARIO, "utf8"));
 fs.mkdirSync(path.dirname(LOG), { recursive: true });
@@ -130,7 +146,9 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname; const m = req.method ?? "GET";
   const raw = await readBody(req);
   let body: any = null; try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
-  log({ method: m, path: p, query: Object.fromEntries(url.searchParams), body });
+  const failWith = simulatedFailure(p);
+  log({ method: m, path: p, query: Object.fromEntries(url.searchParams), body, ...(failWith != null ? { failed: true, status: failWith } : {}) });
+  if (failWith != null) return send(res, failWith, { error: "simulated outage" });
 
   // ---- SensorLinx --------------------------------------------------------------------------------
   if (m === "POST" && p === "/account/login") return send(res, 200, { token: "fake-jwt" });

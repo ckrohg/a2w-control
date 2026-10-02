@@ -1782,16 +1782,20 @@ async function main(): Promise<void> {
   for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => void cleanup(sig).then(() => process.exit(0)));
 
   if (process.env.POLL_ONCE === "1") {
+    // Each step runs on its own, exactly like the long-running loop's hourly chain: a forecast outage (open-meteo 503
+    // on a virgin DB — the forecast-down rehearsal) used to FATAL the one-shot here while prod merely logged
+    // "shadow failed" and carried on, so the rehearsal could not even observe the degraded behaviour it exists to test.
+    const once = (label: string, fn: () => Promise<unknown>) => fn().then(() => {}, (e) => console.error(`${label} failed:`, (e as Error).message));
     await pollOnce();
-    await shadowOnce();
-    await scoreOnce();
-    await decayScanOnce(store);
-    await realized.computeAndStore().catch((e) => console.error("realized-savings failed:", (e as Error).message));
-    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
-    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN);
-    if (tempiq) await tempiq.tick();
-    if (tempiqRead) await tempiqRead.tick();
-    if (tempiqWindows) await tempiqWindows.tick();
+    await once("shadow", shadowOnce);
+    await once("score", scoreOnce);
+    await once("decay scan", () => decayScanOnce(store));
+    await once("realized-savings", () => realized.computeAndStore());
+    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-ua-push", () => pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
+    if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
+    if (tempiq) await once("tempiq-push", () => tempiq.tick());
+    if (tempiqRead) await once("tempiq-read", () => tempiqRead.tick());
+    if (tempiqWindows) await once("tempiq-windows", () => tempiqWindows.tick());
     console.log("POLL_ONCE ok");
     await cleanup("POLL_ONCE"); // releases the shared lease this run may have claimed, drops the heartbeat, closes
     return;
