@@ -501,6 +501,8 @@ export class IdentificationDriver {
     if (planConflictAhead(plans.at(-1)?.plan ?? null, nowMs, 3)) { this.lastResult = "idle: sanitize/bank/storm block within 3 h"; return; }
     await this.refreshPlan(nowMs);
     if (!this.plan || this.planFetchedAt == null || nowMs - this.planFetchedAt > PLAN_MAX_AGE_MIN * 60_000) { this.lastResult = "idle: no fresh identification plan"; return; }
+    // the plan cells may have just arrived (first armed tick) — recompute the forward look from the plans already fetched
+    this.eligibleAhead = eligibleHoursAhead(plans.at(-1)?.plan ?? null, this.plan.cells, nowMs);
     const cell = pickCell(this.plan, slx.outdoorF);
     this.eligibleNow = this.plan.cells.filter((c) => cellEligibleAt(c, slx.outdoorF!)).length;
     if (!cell || !cell.suggest) { this.lastResult = `idle: no safe cell for ${slx.outdoorF} °F outdoor`; return; }

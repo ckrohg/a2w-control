@@ -100,8 +100,10 @@ export class PhaseB {
     /** #133 (b): lead the shaped curve's output (SHAPED_CURVE=1). Off = the pre-#133 tracking, byte-identical. */
     private readonly shapedCurve = false,
     /** Graceful handover (2026-10-01): the pump setpoint goes through the hub, not writes.ts, so Phase B asks this
-     *  before every send — false while the planner does not hold the writer lease or is shutting down. */
-    private readonly canWrite: () => boolean = () => true,
+     *  before every send — a FRESH answer (the DB lease row, not a cached flag: a planner whose renews have been
+     *  failing for 12 min may still believe it holds the lease while a successor has claimed it — codex pass 2 on
+     *  #162), false while the planner does not hold the writer lease or is shutting down. */
+    private readonly canWrite: () => Promise<boolean> = async () => true,
   ) {}
 
   /** Runtime override of the dry-run flag (W2-A) — flipped from the dashboard Off/Armed switch via
@@ -168,7 +170,7 @@ export class PhaseB {
         await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "dry-run", valueC: d.value_c, result: "would-send" }).catch(() => {});
         continue;
       }
-      if (!this.canWrite()) {
+      if (!(await this.canWrite().catch(() => false))) {
         // not this planner's turn (lease not held) or the process is handing over — do not touch the pumps; the
         // streak is untouched because nothing was attempted (a lease gap is not a Modbus failure)
         this.lastResults[d.pump_id] = `skipped ${d.value_c}°C — writer lease not held / handing over`;

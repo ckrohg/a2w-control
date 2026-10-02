@@ -201,9 +201,11 @@ const SHAPED_CURVE = SHAPED_CURVE_MODE === "live";
 const SHAPED_CURVE_STAMP = SHAPED_CURVE_MODE !== "off";
 const phaseB = PHASE_B_ENABLED && hub
   ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE,
-      // Phase B writes through the hub (not writes.ts): gate it on the SAME lease the HBX writes honour, and on the
-      // shutdown barrier (codex pass 1 on #162 — the dying container must not renew a 90-min pump lease).
-      () => !shuttingDown && (!WRITER_LEASE_ENABLED || writerLeaseState?.held === true))
+      // Phase B writes through the hub (not writes.ts): gate it on the SAME lease the HBX writes honour — checked
+      // FRESH against the DB row before every send, exactly like writes.ts does — and on the shutdown barrier
+      // (codex passes 1–2 on #162: the dying container must not renew a 90-min pump lease, and a cached held=true
+      // can be stale after 12 min of failed renews while a successor has claimed the row).
+      async () => !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS)))
   : null;
 
 // SPAN backup-element power alarm — an INDEPENDENT net (vs the HBX's own backup_called decision
@@ -1764,10 +1766,18 @@ async function main(): Promise<void> {
       console.log(`[shutdown] ${reason}: exiting (writer lease disabled)`);
     }
     await store.dropInstance(INSTANCE_ID).catch(() => {});
-    // a renew/claim that landed between the wait and here could have re-claimed the row — undo it (conditional, safe)
-    if (WRITER_LEASE_ENABLED && loopsDone && deviceWritesInFlight() === 0) await store.releaseWriterLease(INSTANCE_ID).catch(() => {});
-    clearTimeout(hardExit);
+    // A renew/claim that landed between the wait and here could have re-claimed the row — undo it (conditional, safe),
+    // but ONLY when every lease op has settled: an op still pending could land after this release too, and its own
+    // compensating release needs the pool. So: give pending ops one more bounded chance, then release if quiet.
+    const leaseOpsSettled = leaseOpsDone || await settleAll(pendingLeaseOps, 1_500);
+    if (WRITER_LEASE_ENABLED && loopsDone && leaseOpsSettled && deviceWritesInFlight() === 0) {
+      await store.releaseWriterLease(INSTANCE_ID).catch(() => {});
+    } else if (WRITER_LEASE_ENABLED && !leaseOpsSettled) {
+      console.warn(`[shutdown] ${reason}: a lease renew/claim is still pending — leaving the row to the staleness window rather than racing it`);
+    }
+    // the hard-exit timer stays armed THROUGH store.close(): a hung pool.end() must not outlive the drain window
     await store.close().catch(() => {});
+    clearTimeout(hardExit);
   };
   for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => void cleanup(sig).then(() => process.exit(0)));
 
