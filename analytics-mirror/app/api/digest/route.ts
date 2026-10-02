@@ -138,14 +138,20 @@ async function buildDigest() {
     const e = payload?.estimate ?? null;
     const daily = typeof e?.dailyElectricalKwh === "number" && Number.isFinite(e.dailyElectricalKwh) ? e.dailyElectricalKwh : null;
     if (payload?.available !== false && daily != null) {
+      // Caveats are ADDITIVE, not a precedence chain: an unknown or old or future mirror age AND a stale estimate are
+      // both named when both hold (the same freshness policy as the winter scoreboard note below: 26 h, future = invalid).
       const fetchedMs = payload?.fetchedAt ? new Date(payload.fetchedAt).getTime() : NaN;
       const mirrorAgeH = Number.isFinite(fetchedMs) ? (Date.now() - fetchedMs) / 3_600_000 : null;
       const updatedMs = e?.lastUpdatedAt ? new Date(e.lastUpdatedAt).getTime() : NaN;
       const estimateAgeH = Number.isFinite(updatedMs) ? (Date.now() - updatedMs) / 3_600_000 : null;
-      const caveat = mirrorAgeH == null ? "mirror age unknown"
-        : mirrorAgeH > 26 ? `mirror ${fmt(mirrorAgeH / 24, 1)} d old`
-        : e?.stale === true || (estimateAgeH != null && estimateAgeH > 72) ? `estimate ${estimateAgeH != null ? `${fmt(estimateAgeH / 24, 1)} d` : ""} stale`.replace("  ", " ")
-        : null;
+      const caveats: string[] = [];
+      if (mirrorAgeH == null) caveats.push("mirror age unknown");
+      else if (mirrorAgeH < 0) caveats.push("mirror timestamp is in the future");
+      else if (mirrorAgeH > 26) caveats.push(`mirror ${fmt(mirrorAgeH / 24, 1)} d old`);
+      if (e?.stale === true || (estimateAgeH != null && (estimateAgeH > 72 || estimateAgeH < 0))) {
+        caveats.push(estimateAgeH != null && estimateAgeH >= 0 ? `estimate ${fmt(estimateAgeH / 24, 1)} d stale` : "estimate stale");
+      }
+      const caveat = caveats.length ? caveats.join(" · ") : null;
       dhw = {
         weekKwh: daily * 7, dailyKwh: daily,
         cycles: typeof e?.cycleCount === "number" && Number.isFinite(e.cycleCount) ? e.cycleCount : null,
