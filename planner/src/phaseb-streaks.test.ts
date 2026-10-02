@@ -5,18 +5,20 @@
 import assert from "node:assert/strict";
 import { PhaseB } from "./phaseb";
 
-function harness(opts: { dryRun?: boolean; fail?: Set<string> }) {
+function harness(opts: { dryRun?: boolean; fail?: Set<string>; canWrite?: () => Promise<boolean> }) {
   // `fail` is read on every call, so a test can flip a pump from failing to healthy mid-sequence
+  const logs: Array<{ pumpId: string; result: string }> = [];
+  const sends: string[] = [];
   const store = {
     getLatestSlx: async () => ({ ts: new Date(), targetF: 120, outdoorF: 60, tankF: 121 }),
     recentPlans: async () => [{ plan: [{ ts: new Date().toISOString(), tank_target_f: 120, outdoor_f: 60 }] }],
-    insertPhaseBLog: async () => {},
+    insertPhaseBLog: async (row: { pumpId: string; result: string }) => { logs.push({ pumpId: row.pumpId, result: row.result }); },
     latestConfig: async () => null,
   } as any;
-  const hub = { sendSetpoint: async (pumpId: string) => (opts.fail?.has(pumpId) ? { ok: false, detail: "cannot connect" } : { ok: true }), getState: async () => ({ pumps: [] }) } as any;
+  const hub = { sendSetpoint: async (pumpId: string) => { sends.push(pumpId); return opts.fail?.has(pumpId) ? { ok: false, detail: "cannot connect" } : { ok: true }; }, getState: async () => ({ pumps: [] }) } as any;
   const notes: string[] = [];
-  const pb = new PhaseB(store, hub, ["pump1", "pump2"], opts.dryRun ?? false, async (t: string) => { notes.push(t); }, false);
-  return { pb, notes };
+  const pb = new PhaseB(store, hub, ["pump1", "pump2"], opts.dryRun ?? false, async (t: string) => { notes.push(t); }, false, opts.canWrite);
+  return { pb, notes, logs, sends };
 }
 
 (async () => {
@@ -47,6 +49,24 @@ function harness(opts: { dryRun?: boolean; fail?: Set<string> }) {
     assert.equal(h.notes.filter((n) => n === "Phase B recovered").length, 1, "…and only once");
     // a pump that never paged never gets a 'recovered' page
     assert.equal(h.notes.filter((n) => /pump2/.test(n)).length, 0);
+  }
+  // Graceful handover (#162): canWrite is asked FRESH before every send; false (lease not held / shutting down) skips the
+  // pump without touching the Modbus streak and records a 'skipped: no writer lease' row; a rejected lease query skips too
+  {
+    let calls = 0;
+    const h = harness({ canWrite: async () => { calls++; return false; } });
+    await h.pb.runOnce();
+    assert.equal(calls, 2, "one fresh lease check per pump");
+    assert.deepEqual(h.sends, [], "no pump setpoint sent without the lease");
+    assert.deepEqual(h.pb.streaks(), { pump1: 0, pump2: 0 }, "a lease gap is not a Modbus failure");
+    assert.deepEqual(h.logs.map((l) => l.result), ["skipped: no writer lease", "skipped: no writer lease"]);
+    assert.match(h.pb.lastResults.pump1, /writer lease not held/);
+    const r = harness({ canWrite: async () => { throw new Error("db blip"); } });
+    await r.pb.runOnce();
+    assert.deepEqual(r.sends, [], "a failed lease query fails CLOSED (skip)");
+    const ok = harness({ canWrite: async () => true });
+    await ok.pb.runOnce();
+    assert.deepEqual(ok.sends, ["pump1", "pump2"], "with the lease, both pumps are sent");
   }
   console.log("phaseb-streaks.test.ts (F4 current per-pump failure count): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
