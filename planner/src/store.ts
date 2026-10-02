@@ -1334,6 +1334,25 @@ export class Store {
     return { held: holder === instanceId, holder };
   }
 
+  /**
+   * Release the single-writer lease ONLY if this instance still holds it — a departing or stale holder must never
+   * clear a successor's lease (the WHERE makes a late release harmless). The successor's claim path already honours
+   * an unheld row immediately (`holder IS NULL`), so a clean exit hands over in seconds instead of the 12-min
+   * staleness wait (handovers measured 649–981 s on 2026-10-01). Returns whether a row was released.
+   */
+  async releaseWriterLease(instanceId: string): Promise<boolean> {
+    const r = await this.pool.query(
+      `UPDATE hbx_writer_lease SET holder = NULL, heartbeat_at = now() WHERE id = 1 AND holder = $1`,
+      [instanceId],
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  /** Forget this instance's heartbeat row on a clean exit so the successor's peer check is not fooled for an hour. */
+  async dropInstance(instanceId: string): Promise<void> {
+    await this.pool.query(`DELETE FROM planner_instances WHERE instance_id = $1`, [instanceId]);
+  }
+
   /** True iff this instance currently holds a FRESH single-writer lease (the write-path gate). */
   async holdsWriterLease(instanceId: string, staleMs: number): Promise<boolean> {
     const res = await this.pool.query(

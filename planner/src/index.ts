@@ -41,7 +41,7 @@ import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
-import { HbxWriter, WriteError, curveOverridden } from "./writes";
+import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -200,7 +200,12 @@ const SHAPED_CURVE_MODE = parseShapedCurveMode(process.env.SHAPED_CURVE);
 const SHAPED_CURVE = SHAPED_CURVE_MODE === "live";
 const SHAPED_CURVE_STAMP = SHAPED_CURVE_MODE !== "off";
 const phaseB = PHASE_B_ENABLED && hub
-  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE)
+  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE,
+      // Phase B writes through the hub (not writes.ts): gate it on the SAME lease the HBX writes honour — checked
+      // FRESH against the DB row before every send, exactly like writes.ts does — and on the shutdown barrier
+      // (codex passes 1–2 on #162: the dying container must not renew a 90-min pump lease, and a cached held=true
+      // can be stale after 12 min of failed renews while a successor has claimed the row).
+      async () => !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS)))
   : null;
 
 // SPAN backup-element power alarm — an INDEPENDENT net (vs the HBX's own backup_called decision
@@ -360,6 +365,10 @@ export function alertSubject(title: string, priority: string, resolved = false):
 
 async function ntfy(title: string, body: string, priority = "default",
                     opts: { resolved?: boolean; email?: boolean } = {}): Promise<void> {
+  if (!NTFY_TOPIC) {
+    // No topic (rehearsal, local runs): the page is still a fact — log it so a harness can assert what WOULD have paged.
+    console.log(`[ntfy] (no topic) ${priority}${opts.resolved ? " resolved" : ""}: ${title}`);
+  }
   if (NTFY_TOPIC) {
     // HTTP headers are ByteStrings — a leading emoji (⚠ = U+26A0) THROWS and silently
     // kills the push. Caught live by the first /api/drill run (2026-08-06): the real
@@ -749,6 +758,56 @@ const INSTANCE_FRESH_MS = 12 * 60 * 1000; // > 2× the 5-min poll, so a slow pol
 // freshness. Enable deliberately at go-live and confirm takeover on the first redeploy.
 const WRITER_LEASE_ENABLED = process.env.WRITER_LEASE_ENABLED === "1";
 let writerLeaseState: { held: boolean; holder: string | null } | null = null;
+// Graceful handover (2026-10-01): set on SIGTERM/SIGINT so no renew races the release and no timer fires again.
+let shuttingDown = false;
+// EVERY loop() still running (not just the latest — a slow poll can outlive the 5-min interval), so shutdown can wait
+// for all actuation to settle before it releases the lease; and every lease renew/claim still awaiting the DB, so a
+// renew that started before SIGTERM cannot re-claim the row after the release (codex pass 1 on #162).
+const activeLoops = new Set<Promise<unknown>>();
+const pendingLeaseOps = new Set<Promise<unknown>>();
+let loopRunning = false;
+let leaseRetryTimer: NodeJS.Timeout | null = null;
+let leaseRetryBusy = false;
+let leaseWaitingSince: number | null = null;
+function track<T>(set: Set<Promise<unknown>>, p: Promise<T>): Promise<T> {
+  set.add(p);
+  p.then(() => set.delete(p), () => set.delete(p));
+  return p;
+}
+async function settleAll(set: Set<Promise<unknown>>, boundMs: number): Promise<boolean> {
+  const all = Promise.allSettled([...set]);
+  const done = await Promise.race([all.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), boundMs))]);
+  return done;
+}
+/**
+ * A waiting instance used to re-try the claim only on its next 5-min poll, so even a cleanly released lease sat
+ * unheld for up to 5 min. While not held, retry every 20 s (DB clock decides; the claim is atomic) and stop the
+ * moment it is held — the write path still re-checks the lease on every PATCH, so this only shortens the wait.
+ */
+function scheduleLeaseClaimRetry(): void {
+  if (!WRITER_LEASE_ENABLED || shuttingDown || leaseRetryTimer) return;
+  leaseWaitingSince ??= Date.now();
+  leaseRetryTimer = setInterval(async () => {
+    if (shuttingDown) { clearInterval(leaseRetryTimer!); leaseRetryTimer = null; return; }
+    if (leaseRetryBusy) return; // a slow DB must not stack callbacks
+    leaseRetryBusy = true;
+    try {
+      const state = await track(pendingLeaseOps, store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS));
+      if (shuttingDown) {
+        // SIGTERM landed while this claim was in flight: never keep a lease we are about to abandon
+        if (state.held) await store.releaseWriterLease(INSTANCE_ID).catch(() => {});
+        return;
+      }
+      writerLeaseState = state;
+      if (state.held) {
+        console.log(`writer lease acquired by ${INSTANCE_ID} after ${Math.round((Date.now() - (leaseWaitingSince ?? Date.now())) / 1000)} s waiting`);
+        clearInterval(leaseRetryTimer!); leaseRetryTimer = null; leaseWaitingSince = null;
+      }
+    } catch (e) { console.error("writer-lease claim retry failed:", (e as Error).message); }
+    finally { leaseRetryBusy = false; }
+  }, 20_000);
+  leaseRetryTimer.unref?.();
+}
 let instancePrevPeers = new Set<string>();
 let multiInstanceAlerted = false;
 async function checkSingleWriter(): Promise<void> {
@@ -1553,10 +1612,16 @@ async function pollOnce(): Promise<void> {
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
-  if (WRITER_LEASE_ENABLED) {
-    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease.
-    try { writerLeaseState = await store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS); }
+  if (WRITER_LEASE_ENABLED && !shuttingDown) {
+    // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease. (Not while shutting
+    // down: a renew landing after the release would re-claim the row and bring the 12-min wait back.)
+    try {
+      const state = await track(pendingLeaseOps, store.renewOrClaimLease(INSTANCE_ID, INSTANCE_FRESH_MS));
+      if (shuttingDown && state.held) await store.releaseWriterLease(INSTANCE_ID).catch(() => {}); // landed after SIGTERM
+      else writerLeaseState = state;
+    }
     catch (e) { console.error("writer-lease renew failed:", (e as Error).message); }
+    if (!shuttingDown && writerLeaseState && !writerLeaseState.held) scheduleLeaseClaimRetry();
   }
   // #122 Wave 2 — runs AFTER the renew so it judges this cycle's lease, not last cycle's.
   await checkLeaseAndPi().catch((e) => console.error("lease/pi check failed:", (e as Error).message));
@@ -1608,6 +1673,17 @@ async function pollOnce(): Promise<void> {
 }
 
 async function loop(): Promise<void> {
+  if (shuttingDown) return;
+  if (loopRunning) { console.warn("poll overlap: the previous poll is still running — skipping this tick"); return; }
+  loopRunning = true;
+  try {
+    await loopBody();
+  } finally {
+    loopRunning = false;
+  }
+}
+
+async function loopBody(): Promise<void> {
   try {
     await pollOnce();
     lastPollAt = new Date().toISOString();
@@ -1657,6 +1733,56 @@ async function main(): Promise<void> {
     identificationMode: IDENTIFICATION_MODE_SEED,
   }).catch((e) => console.error("controller_flags seed failed:", (e as Error).message));
 
+  // Graceful handover on redeploy (2026-10-01; codex pass 1 on #162 for the ordering). Railway SIGTERMs the old
+  // container while the new one is already up. Without this the lease row kept the dead holder until the 12-min
+  // staleness expiry + the successor's next poll (649–981 s measured). Order matters:
+  //   1. shuttingDown + write barrier: no new device write starts, no renew/claim is scheduled, no timer fires again;
+  //   2. wait (bounded) for every running poll and every pending lease op — actuation already on the wire finishes;
+  //   3. release ONLY if nothing is still writing (a release over an in-flight PATCH would let two planners command
+  //      the device) — otherwise exit WITHOUT releasing, which is the old, safe 12-min path;
+  //   4. drop the heartbeat row, release once more (a renew that landed late is undone), close, exit 0.
+  // The whole thing fits inside RAILWAY_DEPLOYMENT_DRAINING_SECONDS (set to 20 on the service) via a 12 s hard exit.
+  // Registered BEFORE the one-shot branch so a local POLL_ONCE run can never strand the shared lease either.
+  let cleanupDone = false;
+  const cleanup = async (reason: string): Promise<void> => {
+    if (cleanupDone) return;
+    cleanupDone = true;
+    shuttingDown = true;
+    raiseWriteBarrier();
+    const hardExit = setTimeout(() => { console.error(`[shutdown] ${reason}: forced exit (in-flight work did not finish in time)`); process.exit(0); }, 12_000);
+    hardExit.unref?.();
+    if (leaseRetryTimer) { clearInterval(leaseRetryTimer); leaseRetryTimer = null; }
+    const loopsDone = await settleAll(activeLoops, 9_000);
+    const leaseOpsDone = await settleAll(pendingLeaseOps, 1_500);
+    if (WRITER_LEASE_ENABLED) {
+      const quiet = loopsDone && leaseOpsDone && deviceWritesInFlight() === 0;
+      if (quiet) {
+        const released = await store.releaseWriterLease(INSTANCE_ID).catch((e) => { console.error("[shutdown] lease release failed:", (e as Error).message); return false; });
+        console.log(`[shutdown] ${reason}: writer lease ${released ? "released" : "not held"} by ${INSTANCE_ID}`);
+      } else {
+        console.warn(`[shutdown] ${reason}: NOT releasing the writer lease — work still in flight (loops settled: ${loopsDone}, lease ops settled: ${leaseOpsDone}, device writes on the wire: ${deviceWritesInFlight()}); the successor takes over after the staleness window`);
+      }
+    } else {
+      console.log(`[shutdown] ${reason}: exiting (writer lease disabled)`);
+    }
+    await store.dropInstance(INSTANCE_ID).catch(() => {});
+    // A renew/claim that landed between the wait and here could have re-claimed the row — undo it (conditional, safe),
+    // but ONLY when every lease op has settled: an op still pending could land after this release too, and its own
+    // compensating release needs the pool. So: give pending ops one more bounded chance, then release if quiet.
+    const leaseOpsSettled = leaseOpsDone || await settleAll(pendingLeaseOps, 1_500);
+    if (WRITER_LEASE_ENABLED && loopsDone && leaseOpsSettled && deviceWritesInFlight() === 0) {
+      const releasedLate = await store.releaseWriterLease(INSTANCE_ID).catch(() => false);
+      // the first gate may have refused over an in-flight write that has since finished — say what finally happened
+      if (releasedLate) console.log(`[shutdown] ${reason}: writer lease released on the final check (work finished during cleanup)`);
+    } else if (WRITER_LEASE_ENABLED && !leaseOpsSettled) {
+      console.warn(`[shutdown] ${reason}: a lease renew/claim is still pending — leaving the row to the staleness window rather than racing it`);
+    }
+    // the hard-exit timer stays armed THROUGH store.close(): a hung pool.end() must not outlive the drain window
+    await store.close().catch(() => {});
+    clearTimeout(hardExit);
+  };
+  for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => void cleanup(sig).then(() => process.exit(0)));
+
   if (process.env.POLL_ONCE === "1") {
     await pollOnce();
     await shadowOnce();
@@ -1669,7 +1795,7 @@ async function main(): Promise<void> {
     if (tempiqRead) await tempiqRead.tick();
     if (tempiqWindows) await tempiqWindows.tick();
     console.log("POLL_ONCE ok");
-    await store.close();
+    await cleanup("POLL_ONCE"); // releases the shared lease this run may have claimed, drops the heartbeat, closes
     return;
   }
 
@@ -2047,8 +2173,8 @@ async function main(): Promise<void> {
     setInterval(() => void spanWatch.tick().catch((e) => console.error("spanwatch failed:", (e as Error).message)), SPAN_POLL_SECONDS * 1000);
   }
 
-  await loop();
-  setInterval(loop, POLL_SECONDS * 1000);
+  await track(activeLoops, loop());
+  setInterval(() => { if (!shuttingDown) void track(activeLoops, loop()); }, POLL_SECONDS * 1000);
   if (tempiq) {
     void tempiq.tick();
     setInterval(() => void tempiq.tick(), TEMPIQ_PUSH_EVERY_MIN * 60 * 1000);
@@ -2067,6 +2193,7 @@ async function main(): Promise<void> {
   const step = (label: string, fn: () => Promise<unknown>) =>
     fn().then(() => {}, (e) => console.error(`${label} failed:`, (e as Error).message));
   const shadowLoop = async () => {
+    if (shuttingDown) return;
     await step("shadow", shadowOnce);
     await step("score", scoreOnce);
     await step("decay scan", () => decayScanOnce(store));
