@@ -15,7 +15,7 @@
   "registered_services": [
     {
       "name": "a2w-control",
-      "path": "/Users/ckrohg/Documents/Claude/a2w-control",
+      "path": "/Users/administrator/Claude/a2w-control",
       "description": "this repo \u2014 planner (Railway), analytics-mirror (Vercel), heatpump-bridge (Pi)"
     }
   ]

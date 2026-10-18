@@ -36,4 +36,4 @@ target_repo: ckrohg/a2w-control
 issue = 23
 
 [context]
-spec = "/Users/ckrohg/Documents/Claude/a2w-control/specs/w1-a-design-foundation-globals-css-token.md"
+spec = "/Users/administrator/Claude/a2w-control/specs/w1-a-design-foundation-globals-css-token.md"
