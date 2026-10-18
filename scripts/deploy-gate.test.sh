@@ -56,5 +56,15 @@ ck "the exact #129 list is DEPLOYING"        "deploying" "$(printf 'planner/src/
 ck "hub/ is DEPLOYING"                       "deploying" "$(printf 'hub/src/index.ts\n' | classify_files)"
 ck "docs + scripts are INERT"                "inert"     "$(printf 'knowledge/reference/x.md\nscripts/y.sh\n.github/workflows/z.yml\n' | classify_files)"
 
+# ---- 6. #166 dropout counts on the detail line. Absent (pre-#166 hub) must render EMPTY so the
+#         probe output is unchanged until the hub actually deploys; present must show the counts;
+#         an open dropout adds its running length. Never a gate input -- that is drift-check [6].
+ck "pre-#166 hub: no dropout text"  ""  "$(dropout_summary '{"ok":true,"pi_connected":true,"last_state_ts":1}')"
+ck "counts shown when present"      "dropouts24h=2 longest=130min" \
+  "$(dropout_summary '{"ok":true,"pi_connected":true,"pi_dropouts_24h":2,"longest_dropout_min":130,"current_dropout_min":null}')"
+ck "open dropout shows its length"  "dropouts24h=0 longest=0min current=45min" \
+  "$(dropout_summary '{"ok":true,"pi_connected":false,"pi_dropouts_24h":0,"longest_dropout_min":0,"current_dropout_min":45}')"
+ck "garbage json -> empty, not a crash" "" "$(dropout_summary 'not json')"
+
 echo
 [ "$fails" -eq 0 ] && echo "deploy-gate.test.sh: all assertions passed" || { echo "deploy-gate.test.sh: FAILURES"; exit 1; }

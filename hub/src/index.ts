@@ -22,6 +22,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import express, { type Request, type Response } from "express";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
+import { createDropoutTracker } from "./dropouts";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -226,6 +227,12 @@ let lastPiSeenAt = 0;
 let everSeenPi = false;
 let piSilenceAlerted = false;
 
+/** Pi-link dropout episodes (#166): in-memory, rolling 24 h / 7 d, reset on every hub boot.
+ * Fed from the SAME two transitions that log "Pi connected" / "Pi disconnected" — a
+ * replacement socket never reaches `disconnected()` because `cleanup` only fires it for the
+ * socket that is still `piSocket`, and the tracker ignores repeats in either direction. */
+const piDropouts = createDropoutTracker();
+
 interface PendingCommand {
   resolve: (ack: AckMessage) => void;
   timer: NodeJS.Timeout;
@@ -253,12 +260,17 @@ function settleCommand(commandId: string, ack: AckMessage): void {
 const app = express();
 app.use(express.json());
 
-/** GET /health — OPEN (no auth). */
+/** GET /health — OPEN (no auth).
+ * The first three fields are a contract: scripts/deploy-gate.sh probe() and
+ * scripts/drift-check.sh parse `ok`, `pi_connected`, `last_state_ts` — keep them first and
+ * unchanged. The dropout fields (#166) are additive; drift-check [6] skips while
+ * `pi_dropouts_24h` is absent and asserts ≤ 1 once it appears. */
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
     ok: true,
     pi_connected: piSocket !== null && piSocket.readyState === WebSocket.OPEN,
     last_state_ts: lastState ? lastState.ts : null,
+    ...piDropouts.snapshot(),
   });
 });
 
@@ -613,6 +625,12 @@ wss.on("connection", (ws: WebSocket) => {
   lastPiSeenAt = Date.now();
   everSeenPi = true;
   console.log("[hub] Pi connected");
+  // #166: if this connect ends a dropout, say how long it was — on one line, so a 3 h outage
+  // no longer has to be reconstructed by diffing two timestamps two hours apart.
+  const ended = piDropouts.connected();
+  if (ended) {
+    console.log(`[hub] Pi reconnected after ${ended.minutes} min (disconnected at ${ended.start})`);
+  }
 
   // Liveness: mark alive on pong; drop on a missed ping->pong round.
   let isAlive = true;
@@ -684,6 +702,7 @@ wss.on("connection", (ws: WebSocket) => {
     clearInterval(pingTimer);
     if (piSocket === ws) {
       piSocket = null;
+      piDropouts.disconnected(); // opens the episode; "missed pong — terminating" lands here exactly once
       console.log("[hub] Pi disconnected");
     }
   };
