@@ -40,8 +40,17 @@ if (!HUB_CLIENT_TOKEN) {
 }
 
 // Env-overridable (like WATCHDOG_INTERVAL_MS) so the link e2e test can exercise the missed-pong
-// path in seconds instead of a minute. Production never sets it.
-const PI_PING_INTERVAL_MS = Number(process.env.PI_PING_INTERVAL_MS ?? 30_000); // ping the Pi every ~30s
+// path in seconds instead of a minute. Production never sets it. Validated: a malformed value
+// ("", "abc", 0, 1e12) would otherwise become Node's 1 ms minimum and reap a healthy Pi every
+// tick (Codex, PR #178) — anything not a finite number in [100 ms, 2^31-1] is the default.
+const PI_PING_INTERVAL_MS = (() => {
+  const raw = process.env.PI_PING_INTERVAL_MS;
+  if (raw === undefined) return 30_000; // ping the Pi every ~30s
+  const n = Number(raw);
+  if (Number.isFinite(n) && n >= 100 && n <= 2_147_483_647) return n;
+  console.warn(`[hub] PI_PING_INTERVAL_MS=${JSON.stringify(raw)} is not a sane interval — using 30000`);
+  return 30_000;
+})();
 const COMMAND_ACK_TIMEOUT_MS = 10_000; // await matching ack up to 10s
 
 // Dead-man watchdog: the Pi checks in every ~15s, so if it goes silent past this threshold the
