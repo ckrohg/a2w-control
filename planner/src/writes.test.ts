@@ -7,14 +7,16 @@
  * under tsx like the other planner suites: npx tsx planner/src/writes.test.ts
  */
 import assert from "node:assert/strict";
-import { HbxWriter, WriteError, PI_STATE_FRESH_MS, piStateUnverifiable } from "./writes";
+import { HbxWriter, WriteError, PI_STATE_FRESH_MS, PI_CLOCK_SKEW_MAX_S, piStateUnverifiable } from "./writes";
 import type { HubState } from "./hub";
 
 const nowS = () => Math.floor(Date.now() / 1000);
 
 // ── 1. the pure verdict: the three refusal shapes and the one pass ───────────────────────────────────────────────
 {
-  const now = Date.now();
+  // a fixed, whole-second `now` so the ages in the messages are exact (the harness sections below use the live clock)
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const nowS = () => now / 1000;
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() - 20 }, now), null, "connected + 20 s old frame is live");
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() - PI_STATE_FRESH_MS / 1000 + 5 }, now), null, "just inside the bound is live");
   const disc = piStateUnverifiable({ pi_connected: false, ts: nowS() - 134 }, now);
@@ -28,6 +30,12 @@ const nowS = () => Math.floor(Date.now() / 1000);
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: now - 20_000 }, now), null, "a ms frame 20 s old is live");
   assert.match(piStateUnverifiable({ pi_connected: true, ts: now - 11 * 60_000 }, now) ?? "", /stale/, "a ms frame 11 min old is stale");
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() + 30 }, now), null, "a Pi clock slightly ahead is not stale (age clamps at 0)");
+  // codex pass 1 on #179: a frame stamped in the FUTURE beyond honest skew is not evidence either (the Pi has no RTC —
+  // a mis-set clock would otherwise make a frozen frame read fresh for a day: fail-open)
+  assert.match(piStateUnverifiable({ pi_connected: true, ts: nowS() + 86_400 }, now) ?? "", /^Pi state is stamped 86400 s in the future — cannot verify I1 \(clock skew beyond 300 s\)$/, "a frame stamped tomorrow (seconds) is refused");
+  assert.match(piStateUnverifiable({ pi_connected: true, ts: now + 86_400_000 }, now) ?? "", /in the future/, "…and in milliseconds");
+  assert.match(piStateUnverifiable({ pi_connected: true, ts: nowS() + PI_CLOCK_SKEW_MAX_S + 1 }, now) ?? "", /in the future/, "just past the skew allowance is refused");
+  assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() + PI_CLOCK_SKEW_MAX_S - 1 }, now), null, "inside the skew allowance is live");
   assert.match(piStateUnverifiable({ pi_connected: true, ts: Number.NaN }, now) ?? "", /no Pi state/, "NaN is no frame");
   console.log("writes.test.ts (#167 piStateUnverifiable): all assertions passed");
 }
@@ -101,6 +109,13 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
     const n = harness(() => ({ pi_connected: true, ts: null, pumps: [] }));
     await rejects(n.writer.setTarget(128, "autopilot"), 503, /no Pi state at the hub/);
     assert.equal(n.patches.length, 0);
+    // a frame stamped in the FUTURE (seconds and ms) is refused on BOTH paths with zero PATCHes (codex pass 1 on #179)
+    for (const ts of [nowS() + 86_400, Date.now() + 86_400_000]) {
+      const f = harness(() => ({ pi_connected: true, ts, pumps: pumps(60) }));
+      await rejects(f.writer.setTarget(128, "autopilot"), 503, /in the future/);
+      await rejects(f.writer.setCurve(CURVE, "autopilot"), 503, /in the future/);
+      assert.equal(f.patches.length, 0, `no PATCH against a future-stamped frame (ts ${ts})`);
+    }
   }
   // ── 5. restore() stays exempt: reverting to the as-found curve is never blocked by the Pi's absence ───────────
   {

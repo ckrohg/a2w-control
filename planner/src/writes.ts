@@ -34,6 +34,12 @@ const SLX_FRESH_MS = 20 * 60 * 1000;
  * silence alert (index.ts PI_QUIET_ALERT_S) and far inside the 2–3 h dropouts measured (eval 2026-10-18 F1/F2).
  */
 export const PI_STATE_FRESH_MS = 10 * 60 * 1000;
+/**
+ * How far AHEAD of the planner's clock a frame may be stamped before it is refused too (codex pass 1 on #179): the
+ * Pi has no RTC, so a frame stamped tomorrow by a mis-set clock would otherwise read as fresh for a day — a
+ * fail-OPEN path. Honest NTP skew is seconds; anything beyond this is not evidence of live pumps.
+ */
+export const PI_CLOCK_SKEW_MAX_S = 5 * 60;
 
 /**
  * The reason the hub's state cannot stand in for the live pumps — or null when it can. Pure, so the three refusal
@@ -45,11 +51,14 @@ export const PI_STATE_FRESH_MS = 10 * 60 * 1000;
  */
 export function piStateUnverifiable(state: Pick<HubState, "pi_connected" | "ts">, nowMs: number = Date.now()): string | null {
   const ts = typeof state.ts === "number" && Number.isFinite(state.ts) ? state.ts : null;
-  const ageS = ts == null ? null : Math.max(0, Math.round((nowMs - (ts > 1e11 ? ts : ts * 1000)) / 1000));
+  // signed: negative = the frame is stamped in OUR future (Pi clock ahead)
+  const rawAgeS = ts == null ? null : Math.round((nowMs - (ts > 1e11 ? ts : ts * 1000)) / 1000);
+  const ageS = rawAgeS == null ? null : Math.max(0, rawAgeS);
   const last = ageS == null ? "no state frame since the hub started" : `last state ${ageS} s ago`;
   if (!state.pi_connected) return `Pi disconnected from the hub — cannot verify I1 (${last})`;
-  if (ageS == null) return `no Pi state at the hub — cannot verify I1 (${last})`;
-  if (ageS * 1000 > PI_STATE_FRESH_MS) return `Pi state at the hub is stale — cannot verify I1 (${last}, limit ${PI_STATE_FRESH_MS / 1000} s)`;
+  if (rawAgeS == null) return `no Pi state at the hub — cannot verify I1 (${last})`;
+  if (rawAgeS < -PI_CLOCK_SKEW_MAX_S) return `Pi state is stamped ${-rawAgeS} s in the future — cannot verify I1 (clock skew beyond ${PI_CLOCK_SKEW_MAX_S} s)`;
+  if (rawAgeS * 1000 > PI_STATE_FRESH_MS) return `Pi state at the hub is stale — cannot verify I1 (${last}, limit ${PI_STATE_FRESH_MS / 1000} s)`;
   return null;
 }
 
