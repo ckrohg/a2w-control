@@ -32,7 +32,7 @@ const nowS = () => Math.floor(Date.now() / 1000);
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() + 30 }, now), null, "a Pi clock slightly ahead is not stale (age clamps at 0)");
   // codex pass 1 on #179: a frame stamped in the FUTURE beyond honest skew is not evidence either (the Pi has no RTC —
   // a mis-set clock would otherwise make a frozen frame read fresh for a day: fail-open)
-  assert.match(piStateUnverifiable({ pi_connected: true, ts: nowS() + 86_400 }, now) ?? "", /^Pi state is stamped 86400 s in the future — cannot verify I1 \(clock skew beyond 300 s\)$/, "a frame stamped tomorrow (seconds) is refused");
+  assert.match(piStateUnverifiable({ pi_connected: true, ts: nowS() + 86_400 }, now) ?? "", /^Pi state is stamped in the future — cannot verify I1 \(86400 s ahead, clock skew beyond 300 s\)$/, "a frame stamped tomorrow (seconds) is refused");
   assert.match(piStateUnverifiable({ pi_connected: true, ts: now + 86_400_000 }, now) ?? "", /in the future/, "…and in milliseconds");
   assert.match(piStateUnverifiable({ pi_connected: true, ts: nowS() + PI_CLOCK_SKEW_MAX_S + 1 }, now) ?? "", /in the future/, "just past the skew allowance is refused");
   assert.equal(piStateUnverifiable({ pi_connected: true, ts: nowS() + PI_CLOCK_SKEW_MAX_S - 1 }, now), null, "inside the skew allowance is live");
@@ -113,8 +113,14 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
     for (const ts of [nowS() + 86_400, Date.now() + 86_400_000]) {
       const f = harness(() => ({ pi_connected: true, ts, pumps: pumps(60) }));
       await rejects(f.writer.setTarget(128, "autopilot"), 503, /in the future/);
-      await rejects(f.writer.setCurve(CURVE, "autopilot"), 503, /in the future/);
+      const e = await rejects(f.writer.setCurve(CURVE, "autopilot"), 503, /in the future/);
+      assert.equal(e.stable, "Pi state is stamped in the future — cannot verify I1", "the ledger key carries no moving number (codex pass 2)");
       assert.equal(f.patches.length, 0, `no PATCH against a future-stamped frame (ts ${ts})`);
+    }
+    // dedup across advancing time: every refusal shape yields the SAME stable key as the clock moves
+    for (const mk of [(t: number) => ({ pi_connected: false, ts: t - 100 }), (t: number) => ({ pi_connected: true, ts: t - 900 }), (t: number) => ({ pi_connected: true, ts: t + 86_400 })]) {
+      const keys = new Set([0, 1, 60, 3600].map((dt) => (piStateUnverifiable({ ...mk(nowS() + dt), pumps: [] } as any, (nowS() + dt) * 1000 + 999) ?? "").replace(/ \(.*\)$/, "")));
+      assert.equal(keys.size, 1, `one ledger key across time, got ${JSON.stringify([...keys])}`);
     }
   }
   // ── 5. restore() stays exempt: reverting to the as-found curve is never blocked by the Pi's absence ───────────

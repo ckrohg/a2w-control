@@ -57,7 +57,8 @@ export function piStateUnverifiable(state: Pick<HubState, "pi_connected" | "ts">
   const last = ageS == null ? "no state frame since the hub started" : `last state ${ageS} s ago`;
   if (!state.pi_connected) return `Pi disconnected from the hub — cannot verify I1 (${last})`;
   if (rawAgeS == null) return `no Pi state at the hub — cannot verify I1 (${last})`;
-  if (rawAgeS < -PI_CLOCK_SKEW_MAX_S) return `Pi state is stamped ${-rawAgeS} s in the future — cannot verify I1 (clock skew beyond ${PI_CLOCK_SKEW_MAX_S} s)`;
+  // the moving number sits in the parenthesis so the age-free `stable` form is constant (codex pass 2 on #179)
+  if (rawAgeS < -PI_CLOCK_SKEW_MAX_S) return `Pi state is stamped in the future — cannot verify I1 (${-rawAgeS} s ahead, clock skew beyond ${PI_CLOCK_SKEW_MAX_S} s)`;
   if (rawAgeS * 1000 > PI_STATE_FRESH_MS) return `Pi state at the hub is stale — cannot verify I1 (${last}, limit ${PI_STATE_FRESH_MS / 1000} s)`;
   return null;
 }
