@@ -15,6 +15,9 @@ const scenario = JSON.parse(fs.readFileSync(process.env.REHEARSAL_SCENARIO!, "ut
 const expect_ = scenario.expect ?? {};
 const fake = JSON.parse(fs.readFileSync(path.join(OUT, "fake-state.json"), "utf8"));
 const requests = fs.readFileSync(path.join(OUT, "requests.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+// Wave 3: what the planner WOULD have paged (ntfy logs the title when no topic is configured) and what it logged.
+const plannerLogs = fs.readdirSync(OUT).filter((f) => /^planner-run\d+\.log$/.test(f)).sort().map((f) => fs.readFileSync(path.join(OUT, f), "utf8")).join("\n");
+const pages = plannerLogs.split("\n").filter((l) => l.includes("[ntfy] (no topic)")).map((l) => l.replace(/^.*\[ntfy\] \(no topic\) /, ""));
 const store = new Store(url);
 const pool = (store as unknown as { pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: any[] }> } }).pool;
 const fToC = (f: number) => (f - 32) * 5 / 9;
@@ -56,10 +59,26 @@ async function main() {
   console.log(`fake device now: target ${fake.device.temps.temp1.target}°F curve dot ${fake.device.dot} wwsd ${fake.device.wwsd} dbt ${fake.device.dbt} mbt ${fake.device.mbt}`);
   const unhandled = requests.filter((r) => r.unhandled);
   if (unhandled.length) console.log(`UNHANDLED upstream calls: ${JSON.stringify(unhandled.map((u) => `${u.method} ${u.path}`))}`);
+  const failed = requests.filter((r) => r.failed);
+  if (failed.length) console.log(`SIMULATED upstream failures: ${failed.length} (${JSON.stringify([...new Set(failed.map((u) => `${u.method} ${u.path}`))])})`);
+  if (pages.length) console.log(`would-have-paged: ${JSON.stringify(pages)}`);
 
   console.log(`\n── checks ─────────────────────────────────────────────────`);
-  check(plan.length === 24, `the hourly plan has 24 blocks (got ${plan.length})`);
-  check(current != null, `a current block exists for the poll to act on`);
+  if (expect_.planMissingOk === true) {
+    // a cold-start outage of the forecast leaves NO plan — the point of the scenario is what the planner does then
+    check(plan.length === 0 || plan.length === 24, `either no plan (outage) or a complete one (got ${plan.length})`);
+  } else {
+    check(plan.length === 24, `the hourly plan has 24 blocks (got ${plan.length})`);
+    check(current != null, `a current block exists for the poll to act on`);
+  }
+  if (expect_.forecastSource) check(plans[0]?.meta?.forecast_source === expect_.forecastSource, `plan meta.forecast_source is ${expect_.forecastSource} (got ${plans[0]?.meta?.forecast_source})`);
+  if (expect_.plannerLogged) for (const re of expect_.plannerLogged as string[]) check(new RegExp(re, "i").test(plannerLogs), `the planner logged /${re}/`);
+  if (expect_.pagesContain) for (const re of expect_.pagesContain as string[]) check(pages.some((t) => new RegExp(re, "i").test(t)), `would have paged /${re}/ (pages: ${JSON.stringify(pages)})`);
+  if (expect_.pagesNone === true) check(pages.length === 0, `no page raised (${JSON.stringify(pages)})`);
+  if (expect_.phaseBAllFailed === true) check(phaseB.length > 0 && phaseB.every((p) => /^failed|skipped/i.test(String(p.result))), `every Phase B attempt failed or was skipped — the Pi is down (${JSON.stringify(phaseB.map((p) => p.result))})`);
+  if (expect_.hubCommands != null) check(fake.commands.length === expect_.hubCommands, `the hub received exactly ${expect_.hubCommands} command(s) (got ${fake.commands.length})`);
+  if (expect_.autopilotResults) check(autopilot.length > 0 && autopilot.every((r) => new RegExp(expect_.autopilotResults, "i").test(String(r.result))), `every auto-pilot decision matches /${expect_.autopilotResults}/ (${JSON.stringify(autopilot.map((r) => r.result))})`);
+  if (expect_.patchesMax != null) check(fake.patches.length <= expect_.patchesMax, `SensorLinx received ≤ ${expect_.patchesMax} PATCH (got ${fake.patches.length})`);
   if (expect_.minCurrentBlockTargetF != null) check(Number(current?.tank_target_f) >= expect_.minCurrentBlockTargetF, `current block target ${current?.tank_target_f}°F ≥ ${expect_.minCurrentBlockTargetF} (demand floor applied)`);
   if (expect_.maxCurrentBlockTargetF != null) check(Number(current?.tank_target_f) <= expect_.maxCurrentBlockTargetF, `current block target ${current?.tank_target_f}°F ≤ ${expect_.maxCurrentBlockTargetF} (no floor above the guard)`);
   if (expect_.currentBlockReason) check(new RegExp(expect_.currentBlockReason, "i").test(String(current?.reason ?? "")), `current block reason names the floor (${current?.reason})`);
@@ -100,7 +119,13 @@ async function main() {
   if (expect_.probeDrawn === false) check(ident.length === 0, `no identification probe drawn (${ident.length})`);
   for (const p of fake.patches) { const f = Math.max(...["dbt", "mbt"].map((k) => Number(p.body[k] ?? 0))); if (f > 0) check(f <= (expect_.maxAnyWriteF ?? 145), `PATCH curve top ${f}°F ≤ ${expect_.maxAnyWriteF ?? 145} (identification ceiling)`); }
   if (expect_.maxEverydayWriteF != null) for (const w of writes.filter((w) => !/identif|probe/i.test(`${w.source} ${w.action} ${w.detail}`))) { const req = w.requested ?? {}; const f = Math.max(...Object.values(req).map((v: any) => Number(v) || 0)); if (f > 0) check(f <= expect_.maxEverydayWriteF, `everyday write ${w.action} ${f}°F ≤ ${expect_.maxEverydayWriteF} (I4 strictCap)`); }
-  for (const w of writes) check(/^(accepted|ok|applied)/i.test(String(w.result)), `hbx_write ${w.action} result "${w.result}" is a success (anything else — rejected, mismatch, refused — fails)`);
+  // a scenario may DECLARE the one rejection it exists to provoke (fail-closed paths are the point of the degraded set)
+  const rejectionOk = expect_.writeRejectionsOk ? new RegExp(expect_.writeRejectionsOk, "i") : null;
+  for (const w of writes) {
+    if (rejectionOk && w.result === "rejected" && rejectionOk.test(String(w.detail ?? ""))) { check(true, `hbx_write ${w.action} rejected for the declared reason: ${w.detail}`); continue; }
+    check(/^(accepted|ok|applied)/i.test(String(w.result)), `hbx_write ${w.action} result "${w.result}" is a success (anything else — rejected, mismatch, refused — fails)`);
+  }
+  if (expect_.maxWrites != null) check(writes.length <= expect_.maxWrites, `at most ${expect_.maxWrites} HBX write(s) (got ${writes.length})`);
   if (expect_.windowPosted) {
     const windowPostBodies = fake.posts.filter((p: any) => p.path === "/api/insights/experiment-windows").map((p: any) => JSON.stringify(p.body));
     check(windowPosts.length >= 1 && windowPostBodies.some((b) => b.includes("a2w-hbx-write-")), `the auto-pilot's write was posted as a quarantine window (ledger ${windowPosts.length}; posts ${windowPostBodies.length})`);
