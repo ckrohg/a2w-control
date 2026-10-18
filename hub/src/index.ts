@@ -39,7 +39,9 @@ if (!HUB_CLIENT_TOKEN) {
   console.warn("[hub] WARNING: HUB_CLIENT_TOKEN is not set — all HTTP client requests will be rejected.");
 }
 
-const PI_PING_INTERVAL_MS = 30_000; // ping the Pi every ~30s
+// Env-overridable (like WATCHDOG_INTERVAL_MS) so the link e2e test can exercise the missed-pong
+// path in seconds instead of a minute. Production never sets it.
+const PI_PING_INTERVAL_MS = Number(process.env.PI_PING_INTERVAL_MS ?? 30_000); // ping the Pi every ~30s
 const COMMAND_ACK_TIMEOUT_MS = 10_000; // await matching ack up to 10s
 
 // Dead-man watchdog: the Pi checks in every ~15s, so if it goes silent past this threshold the
@@ -232,6 +234,16 @@ let piSilenceAlerted = false;
  * replacement socket never reaches `disconnected()` because `cleanup` only fires it for the
  * socket that is still `piSocket`, and the tracker ignores repeats in either direction. */
 const piDropouts = createDropoutTracker();
+
+/** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
+ * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
+ * the replacement check, and the eventual `close` event count at most once between them. */
+function markDisconnected(sock: WebSocket): void {
+  if (piSocket !== sock) return;
+  piSocket = null;
+  piDropouts.disconnected();
+  console.log("[hub] Pi disconnected");
+}
 
 interface PendingCommand {
   resolve: (ack: AckMessage) => void;
@@ -615,8 +627,15 @@ server.on("upgrade", (req: IncomingMessage, socket, head) => {
 wss.on("connection", (ws: WebSocket) => {
   // Hold AT MOST ONE Pi WS: a new connection replaces the old one.
   if (piSocket && piSocket !== ws) {
+    const old = piSocket;
+    // #166: replacing a LIVE socket is not a dropout. But a socket already CLOSING/CLOSED (the
+    // Pi sent its close frame; ws can hold the TCP teardown up to 30 s before emitting `close`)
+    // is a dropout /health has been reporting (pi_connected:false) that the tracker has not
+    // registered yet — and once this socket takes over, the old one's late `close` would be
+    // ignored. Register it now so this connect closes it as a short episode (Codex, PR #178).
+    if (old.readyState !== WebSocket.OPEN) markDisconnected(old);
     try {
-      piSocket.close(4000, "replaced by new Pi connection");
+      old.close(4000, "replaced by new Pi connection");
     } catch {
       /* ignore */
     }
@@ -632,16 +651,6 @@ wss.on("connection", (ws: WebSocket) => {
     console.log(`[hub] Pi reconnected after ${ended.minutes} min (disconnected at ${ended.start})`);
   }
 
-  // The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
-  // can take the link down, so a replaced socket's late `close` and the terminate path's
-  // explicit call each count at most once between them (#166).
-  const markDisconnected = (sock: WebSocket): void => {
-    if (piSocket !== sock) return;
-    piSocket = null;
-    piDropouts.disconnected();
-    console.log("[hub] Pi disconnected");
-  };
-
   // Liveness: mark alive on pong; drop on a missed ping->pong round.
   let isAlive = true;
   ws.on("pong", () => {
@@ -650,7 +659,12 @@ wss.on("connection", (ws: WebSocket) => {
   });
 
   const pingTimer = setInterval(() => {
-    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.readyState !== WebSocket.OPEN) {
+      // CLOSING/CLOSED with no `close` event yet: /health already says pi_connected:false,
+      // so the tracker must agree (idempotent; the eventual `close` is then a no-op).
+      markDisconnected(ws);
+      return;
+    }
     if (!isAlive) {
       console.warn("[hub] Pi missed pong — terminating");
       // #166: from the hub's point of view the link is dead NOW, so the dropout starts here,
