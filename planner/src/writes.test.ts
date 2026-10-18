@@ -117,10 +117,19 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
       assert.equal(e.stable, "Pi state is stamped in the future — cannot verify I1", "the ledger key carries no moving number (codex pass 2)");
       assert.equal(f.patches.length, 0, `no PATCH against a future-stamped frame (ts ${ts})`);
     }
-    // dedup across advancing time: every refusal shape yields the SAME stable key as the clock moves
-    for (const mk of [(t: number) => ({ pi_connected: false, ts: t - 100 }), (t: number) => ({ pi_connected: true, ts: t - 900 }), (t: number) => ({ pi_connected: true, ts: t + 86_400 })]) {
-      const keys = new Set([0, 1, 60, 3600].map((dt) => (piStateUnverifiable({ ...mk(nowS() + dt), pumps: [] } as any, (nowS() + dt) * 1000 + 999) ?? "").replace(/ \(.*\)$/, "")));
-      assert.equal(keys.size, 1, `one ledger key across time, got ${JSON.stringify([...keys])}`);
+    // dedup across advancing time: each frame's ts is FROZEN (the hub keeps serving it) while the planner's clock
+    // advances through later polls — the age / ahead number changes, the stable key must not (codex pass 3 on #179)
+    const t0 = nowS();
+    const frames: Array<[string, { pi_connected: boolean; ts: number }, string]> = [
+      ["disconnected", { pi_connected: false, ts: t0 - 100 }, "Pi disconnected from the hub — cannot verify I1"],
+      ["stale", { pi_connected: true, ts: t0 - 900 }, "Pi state at the hub is stale — cannot verify I1"],
+      ["future", { pi_connected: true, ts: t0 + 86_400 }, "Pi state is stamped in the future — cannot verify I1"],
+    ];
+    for (const [name, frame, expectKey] of frames) {
+      const msgs = [0, 1, 60, 3600].map((dt) => piStateUnverifiable(frame, (t0 + dt) * 1000 + 999) ?? "");
+      assert.equal(new Set(msgs).size, 4, `${name}: the diagnostic message moves with the clock (${JSON.stringify(msgs)})`);
+      const keys = new Set(msgs.map((m) => m.replace(/ \(.*\)$/, "")));
+      assert.deepEqual([...keys], [expectKey], `${name}: one ledger key across time`);
     }
   }
   // ── 5. restore() stays exempt: reverting to the as-found curve is never blocked by the Pi's absence ───────────
