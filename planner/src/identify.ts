@@ -39,7 +39,7 @@ import { randomBytes } from "node:crypto";
 import type { HubClient } from "./hub";
 import type { Store } from "./store";
 import type { HbxWriter } from "./writes";
-import { WriteError } from "./writes";
+import { WriteError, piStateUnverifiable } from "./writes";
 import type { AutoPilot } from "./autopilot";
 import type { PhaseB } from "./phaseb";
 import type { DemandFeed, InsightZone } from "./demand";
@@ -608,7 +608,9 @@ export class IdentificationDriver {
     let covered = false;
     try {
       const state = await this.d.hub.getState();
-      const online = state.pumps.filter((p) => p.online);
+      // #167: the hub's frozen copy of a dropped Pi's pumps is not coverage — the writer would refuse the probe
+      // (503) anyway; refusing here keeps the arm arming instead of spending a write attempt on it.
+      const online = piStateUnverifiable(state) ? [] : state.pumps.filter((p) => p.online);
       covered = online.length > 0 && online.every((p) => p.setpoint_c != null && cToF(p.setpoint_c) >= w.targetF + DEFAULT_OPTS.i1MarginF);
     } catch { covered = false; }
     if (!covered) {
@@ -706,7 +708,8 @@ export class IdentificationDriver {
     const slx = await this.d.store.getLatestSlx();
     const slxFresh = !!slx && nowMs - slx.ts.getTime() <= SLX_FRESH_MS;
     let hubOnline = true;
-    try { hubOnline = (await this.d.hub.getState()).pumps.some((p) => p.online); } catch { hubOnline = false; }
+    // #167: a disconnected / stale Pi reads as hub_offline — the stale pumps[] the hub still serves is not a live pump.
+    try { const st = await this.d.hub.getState(); hubOnline = !piStateUnverifiable(st) && st.pumps.some((p) => p.online); } catch { hubOnline = false; }
     let deficit: string[] = [];
     let draw = false;
     if (w.arm === "probe" && w.direction === "down") {

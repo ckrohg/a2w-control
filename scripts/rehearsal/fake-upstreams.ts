@@ -23,7 +23,13 @@ type Scenario = {
   device: Record<string, unknown>;
   zones: Array<Record<string, unknown> & { zoneId: string; deliveryType: string }>;
   calling: string[];
-  hub: { pi_connected: boolean; pumps: Array<Record<string, unknown> & { id: string }> ; leaseMinutes: number | null };
+  /**
+   * `pi_connected:false` makes the fake behave like the real hub during a Pi dropout (#167): GET /api/state keeps
+   * serving the LAST pumps[] (the hub's in-memory copy) with pi_connected:false, and POST /api/command answers
+   * 503 { ok:false, detail:"no Pi connected" } (hub/src/index.ts:327). `stateAgeS` is how long ago the Pi pushed
+   * that frame — served as `ts` in UNIX SECONDS like the Pi's time.time() (hub_client.py:227); default 0 = fresh.
+   */
+  hub: { pi_connected: boolean; stateAgeS?: number; pumps: Array<Record<string, unknown> & { id: string }> ; leaseMinutes: number | null };
   plan: { magnitudeF: number; durationMin: number; baseboardBaseF: number; radiantBaseF: number; safe: boolean };
   /** gtm#1618: what TempIQ's probe-interlock answers (default: not armed). */
   interlock?: { source: string; blocked?: string[]; stepped?: string[] };
@@ -160,8 +166,11 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, device);
   }
   // ---- hub ---------------------------------------------------------------------------------------
-  if (m === "GET" && p === "/api/state") return send(res, 200, { pi_connected: scenario.hub.pi_connected, ts: Date.now(), pumps });
+  if (m === "GET" && p === "/api/state") return send(res, 200, { pi_connected: scenario.hub.pi_connected, ts: Math.floor(Date.now() / 1000) - (scenario.hub.stateAgeS ?? 0), pumps });
   if (m === "POST" && p === "/api/command") {
+    // the real hub refuses to relay when no Pi socket is open — the command never reaches a pump, so the fake's
+    // setpoints stay where the (stale) last frame left them
+    if (!scenario.hub.pi_connected) { log({ refused: true, path: p, detail: "no Pi connected" }); return send(res, 503, { ok: false, detail: "no Pi connected" }); }
     commands.push({ ts: new Date().toISOString(), body });
     const pump = pumps.find((x) => x.id === body?.pump_id);
     if (pump && typeof body?.value_c === "number") pump.setpoint_c = body.value_c;
