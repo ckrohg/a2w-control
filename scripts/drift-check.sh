@@ -189,6 +189,62 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
+echo "[5] storm-mode inputs — OutageWatch (eval 2026-10-18 F4)"
+# storm.ts treats an unreachable OutageWatch as "no signal", never as an outage -- correct, and also
+# why nobody noticed it had been CRASHED since 2026-03-15: a fail-soft input that is permanently
+# absent is drift the system cannot see about itself. The grid-outage trigger (#115: zero positive
+# examples) has had no source all year.
+OW="${OUTAGEWATCH_URL:-https://victorious-light-production.up.railway.app}"
+OW_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$OW/api/status" 2>/dev/null || echo 000)"
+if [ "$OW_CODE" = "200" ]; then
+  pass "OutageWatch /api/status answers 200"
+else
+  fail "OutageWatch /api/status answers HTTP ${OW_CODE} — storm mode has no grid-outage input (#175 N5)"
+fi
+
+echo
+echo "[6] Pi link — hub dropout episodes (eval 2026-10-18 F1; the field lands with #166)"
+# Five 2-3 h dropouts in four days, Oct 14-17; 14 % of Phase B writes failed. The hub counts
+# episodes once #166 deploys; until then this section says so instead of passing vacuously.
+if [ -z "$HUBH" ]; then
+  skip "hub unreachable — cannot assert dropouts"
+else
+  DROPS="$(jq -r '.pi_dropouts_24h // empty' <<<"$HUBH")"
+  LONGEST="$(jq -r '.longest_dropout_min // "?"' <<<"$HUBH")"
+  if [ -z "$DROPS" ]; then
+    skip "hub predates pi_dropouts_24h (#166) — redeploy the hub to assert it"
+  elif [ "$DROPS" -le 1 ] 2>/dev/null; then
+    pass "hub saw ${DROPS} Pi dropout(s) in 24 h (longest ${LONGEST} min)"
+  else
+    fail "hub saw ${DROPS} Pi dropouts in 24 h (longest ${LONGEST} min) — the Pi link is not winter-grade (#165, #76)"
+  fi
+fi
+
+echo
+echo "[7] declared posture vs live — identification + shaped curve (wave 2026-10-18)"
+# Owner intent since 2026-10-01: identification ARMED (first draws 2026-10-17/18) and SHAPED_CURVE=1
+# (2026-09-30). A quiet flip of either is drift; a deliberate pause gets a dated ack, not silence.
+# in_force.shaped is reported, not asserted: an excursion hour (soak / bank / pre-boost / storm)
+# legitimately writes a flat target on top of the curve, so a false here at 13:23Z can be normal.
+if [ -n "$HEALTH" ]; then
+  IDM="$(jq -r '.identification.mode // "absent"' <<<"$HEALTH")"
+  if [ "$IDM" = "armed" ]; then
+    pass "identification mode=armed"
+  else
+    fail "identification mode=${IDM} — owner intent is armed; ack with a date in drift-ack.txt if paused deliberately"
+  fi
+  CM="$(jq -r '.curve.mode // "absent"' <<<"$HEALTH")"
+  # NOT `// "absent"`: jq's // treats a boolean false as missing, which would report a real
+  # false as "absent". Test for null explicitly.
+  CS="$(jq -r 'if .curve.in_force.shaped == null then "absent" else (.curve.in_force.shaped|tostring) end' <<<"$HEALTH")"
+  if [ "$CM" = "shaped" ]; then
+    pass "shaped curve mode=shaped (in_force.shaped=${CS}$([ "$CS" = "true" ] || echo ' — excursion hour, or the curve was overwritten'))"
+  else
+    fail "curve mode=${CM} — SHAPED_CURVE=1 since 2026-09-30 (#133); a flat fallback is the #133 risk again"
+  fi
+fi
+
+echo
 if [ "$FAILED" -eq 0 ]; then
   if [ "$ACKED" -gt 0 ]; then echo "no NEW drift ($ACKED acknowledged: $ACKED_BY)"; else echo "no drift detected"; fi
 else
