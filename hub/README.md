@@ -25,7 +25,7 @@ stay human-only on the direct LAN/Funnel path and are never relayed by the hub.
 
 | Method | Path           | Auth                    | Purpose |
 | ------ | -------------- | ----------------------- | ------- |
-| GET    | `/health`      | open                    | `{ok, pi_connected, last_state_ts}` |
+| GET    | `/health`      | open                    | `{ok, pi_connected, last_state_ts}` + Pi dropout episodes (#166): `pi_dropouts_24h`, `pi_dropouts_7d`, `longest_dropout_min`, `last_dropout {start,end,minutes}`, `current_dropout_min` (null while connected), `tracking_since` — in-memory, reset on every hub boot |
 | GET    | `/api/state`   | Bearer `HUB_CLIENT_TOKEN` | latest state the Pi pushed |
 | POST   | `/api/command` | Bearer `HUB_CLIENT_TOKEN` | relay a setpoint to the Pi, await ack |
 | POST   | `/api/write-enable` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | arm/disarm a pump's write path (owner 2026-07-14); Pi applies audit + push ceremony |
@@ -65,6 +65,14 @@ Tokens are compared constant-time. Generate them with e.g. `openssl rand -hex 32
 set the hub pushes an ntfy alert when the Pi drops (power / WiFi / internet / bridge down) and
 a recovery when it returns — an external dead-man on infra you already own (no healthchecks.io).
 Fires only after the Pi has connected once, and only on transitions.
+
+**Pi dropout episodes (#166):** every reconnect logs
+`[hub] Pi reconnected after N min (disconnected at <ISO>)`, and `/health` carries a rolling
+24 h / 7 d count of episodes, the longest in 24 h, the last one, and the running length of an
+open one. A replacement socket (new Pi connection while the old is still open) is not a
+dropout; a 15 s flap is one of 0.3 min, so flaps and the daily 2–3 h windows stay
+distinguishable. `scripts/deploy-gate.sh` prints the counts; `scripts/drift-check.sh` [6]
+asserts `pi_dropouts_24h ≤ 1`. Memory only — a hub redeploy zeroes it (see `tracking_since`).
 
 ## Local development
 

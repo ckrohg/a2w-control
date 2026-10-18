@@ -50,6 +50,17 @@ lease_holder() {  # $1 = planner /health json -> holder id, empty when not held
          then (.writer_lease.holder // "?") else "" end' <<<"$1" 2>/dev/null || echo ""
 }
 
+# #166: the hub counts Pi-link dropout episodes in /health (pi_dropouts_24h, longest_dropout_min,
+# current_dropout_min while disconnected). Shown on the detail line, NOT gated: the gate asks "is
+# the system healthy right now", and yesterday's 2 h dropout is drift-check's question ([6]).
+# Empty until the #166 hub is deployed, so the line is byte-identical to before until then.
+dropout_summary() {  # $1 = hub /health json -> "" | "dropouts24h=N longest=Mmin[ current=Kmin]"
+  jq -r 'if (.pi_dropouts_24h|type) != "number" then "" else
+           "dropouts24h=\(.pi_dropouts_24h) longest=\(.longest_dropout_min // 0)min"
+           + (if (.current_dropout_min|type) == "number" then " current=\(.current_dropout_min)min" else "" end)
+         end' <<<"$1" 2>/dev/null || echo ""
+}
+
 # Classification (2026-09-27, after #129 merged unbracketed). Pure function of the file list so it
 # can be tested; deploying | inert | unknown. Only planner/** and hub/** redeploy under the Railway
 # watchPatterns. An EMPTY list is "unknown" -- never "inert": on #129 `gh pr view --json files`
@@ -67,7 +78,7 @@ classify_pr() {  # $1 = PR number; tries two sources before admitting it cannot 
 }
 
 probe() {
-  local hub planner pi age results lease bad=""
+  local hub planner pi age results lease drops="" bad=""
   hub="$(curl -sf -m 15 "$HUB/health" 2>/dev/null)" || hub=""
   planner="$(curl -sf -m 15 "$PLANNER/health" 2>/dev/null)" || planner=""
 
@@ -81,6 +92,7 @@ probe() {
     # has not been reaped yet -- the earlier signal of the two.
     age="$(jq -r --argjson now "$(date +%s)" '($now - (.last_state_ts // 0)) | floor' <<<"$hub")"
     [ "$age" -gt "$STALE_S" ] 2>/dev/null && bad="${bad}pi-stale(${age}s) "
+    drops="$(dropout_summary "$hub")"
   fi
 
   if [ -n "$planner" ]; then
@@ -99,8 +111,8 @@ probe() {
     esac
   fi
 
-  if [ -n "$bad" ]; then echo "bad|${bad}"; else
-    echo "ok|pi connected, last push ${age}s ago, phase_b clean, lease ${lease}"
+  if [ -n "$bad" ]; then echo "bad|${bad}${drops:+[$drops]}"; else
+    echo "ok|pi connected, last push ${age}s ago, phase_b clean, lease ${lease}${drops:+, $drops}"
   fi
 }
 
