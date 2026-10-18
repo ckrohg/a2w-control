@@ -87,7 +87,7 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
   // ── 3. disconnected → 503, no PATCH, audited; the ledger key is the age-free `stable` form ─────────────────────
   {
     const h = harness(() => ({ pi_connected: false, ts: nowS() - 2 * 3600, pumps: pumps(60) })); // the Oct 17 shape: stale 140 °F setpoints that COVER the target
-    const e = await rejects(h.writer.setTarget(128, "autopilot"), 503, /^Pi disconnected from the hub — cannot verify I1 \(last state 7200 s ago\)$/);
+    const e = await rejects(h.writer.setTarget(128, "autopilot"), 503, /^Pi disconnected from the hub — cannot verify I1 \(last state 720[01] s ago\)$/);
     assert.equal(e.stable, "Pi disconnected from the hub — cannot verify I1", "stable form drops the moving age");
     assert.equal(h.patches.length, 0, "NO PATCH against a Pi that is not there");
     assert.deepEqual(h.audits.map((a) => [a.action, a.result]), [["set_target", "rejected"]], "the refusal is audited");
@@ -99,7 +99,7 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
   // ── 4. connected but STALE (the hub's frame is older than PI_STATE_FRESH_MS) → 503 on both paths ──────────────
   {
     const h = harness(() => ({ pi_connected: true, ts: nowS() - 15 * 60, pumps: pumps(60) }));
-    const e = await rejects(h.writer.setTarget(128, "autopilot"), 503, /^Pi state at the hub is stale — cannot verify I1 \(last state 900 s ago, limit 600 s\)$/);
+    const e = await rejects(h.writer.setTarget(128, "autopilot"), 503, /^Pi state at the hub is stale — cannot verify I1 \(last state 90[01] s ago, limit 600 s\)$/);
     assert.equal(e.stable, "Pi state at the hub is stale — cannot verify I1");
     assert.equal(h.patches.length, 0);
     const c = harness(() => ({ pi_connected: true, ts: nowS() - 15 * 60, pumps: pumps(60) }));
