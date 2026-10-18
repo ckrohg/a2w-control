@@ -13,4 +13,11 @@
 # The regex is matched (extended, case-sensitive) against the full fail() message. Keep patterns
 # narrow. Do NOT ack "unrecognised phase_b result" or "hub unreachable": those mean the instrument
 # broke, not that a known condition persists.
-2026-10-11 #117 NO lease|baseline_setpoint_c is unset|finding1-arm-baseline-runbook
+# 2026-10-18 renewal (eval-2026-10-18 F5): the #117 ack expired 2026-10-11 and the check ran red every day after,
+# with its failure email inert -- exactly the "permanently red hides new drift" failure above. Renewed to the
+# Safe-tier deadline (readiness §9.4). The right end to this line is N11 on the owner's Wave 0 card (#175): arm
+# baseline_setpoint_c on the Pi and the ack becomes moot.
+2026-11-15 #117 NO lease|baseline_setpoint_c is unset|finding1-arm-baseline-runbook
+# OutageWatch has been CRASHED since 2026-03-15 (eval-2026-10-18 F4); storm mode treats it as "no signal". Known,
+# owner item N5 on #175. Acknowledged so the NEW section [5] below does not paint the run red for a known outage.
+2026-11-15 #175 OutageWatch /api/status answers HTTP
