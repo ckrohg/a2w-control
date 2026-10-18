@@ -20,6 +20,14 @@
  * Counters reset on every hub boot; `tracking_since` says how much of the window the
  * numbers actually cover, so "0 dropouts" five minutes after a deploy is not misread as a
  * clean day.
+ *
+ * Clock: durations and pruning must not move when the container's wall clock is stepped
+ * (NTP correction, host migration). The default clock is therefore wall-clock-at-boot plus
+ * MONOTONIC elapsed time (`performance.now()`), so a backward step mid-outage cannot shorten
+ * the episode or stall pruning; the ISO stamps it yields drift from true wall time only by
+ * the size of any step after boot, which is the right trade for a duration counter. Pruning
+ * is a plain filter rather than a sorted scan, so an injected non-monotonic clock still
+ * prunes correctly.
  */
 
 export interface Dropout {
@@ -69,9 +77,22 @@ interface Episode {
 }
 
 /**
- * @param now  clock returning epoch milliseconds (defaults to Date.now).
+ * Epoch-ms clock that is immune to wall-clock steps after construction: it reads the wall
+ * clock ONCE and advances it by monotonic elapsed time. Both sources are injectable for tests.
  */
-export function createDropoutTracker(now: () => number = Date.now): DropoutTracker {
+export function createMonotonicClock(
+  wall: () => number = Date.now,
+  mono: () => number = () => performance.now(),
+): () => number {
+  const wallAtStart = wall();
+  const monoAtStart = mono();
+  return () => wallAtStart + (mono() - monoAtStart);
+}
+
+/**
+ * @param now  clock returning epoch milliseconds; defaults to a step-immune monotonic clock.
+ */
+export function createDropoutTracker(now: () => number = createMonotonicClock()): DropoutTracker {
   const trackingSinceMs = now();
   /** Closed episodes, oldest first, pruned to the 7 d window on every mutation/read. */
   let episodes: Episode[] = [];
@@ -82,10 +103,9 @@ export function createDropoutTracker(now: () => number = Date.now): DropoutTrack
 
   const prune = (t: number): void => {
     const cutoff = t - WINDOW_7D_MS;
-    // Episodes are appended in end order, so the first one still inside the window bounds them all.
-    let i = 0;
-    while (i < episodes.length && episodes[i].endMs <= cutoff) i++;
-    if (i > 0) episodes = episodes.slice(i);
+    // A filter, not a sorted scan: ~150 entries at the measured worst case (21 episodes/day),
+    // and it stays correct if the injected clock ever hands back a smaller value.
+    if (episodes.some((e) => e.endMs <= cutoff)) episodes = episodes.filter((e) => e.endMs > cutoff);
   };
 
   const toDropout = (e: Episode): Dropout => ({

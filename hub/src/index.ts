@@ -632,6 +632,16 @@ wss.on("connection", (ws: WebSocket) => {
     console.log(`[hub] Pi reconnected after ${ended.minutes} min (disconnected at ${ended.start})`);
   }
 
+  // The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
+  // can take the link down, so a replaced socket's late `close` and the terminate path's
+  // explicit call each count at most once between them (#166).
+  const markDisconnected = (sock: WebSocket): void => {
+    if (piSocket !== sock) return;
+    piSocket = null;
+    piDropouts.disconnected();
+    console.log("[hub] Pi disconnected");
+  };
+
   // Liveness: mark alive on pong; drop on a missed ping->pong round.
   let isAlive = true;
   ws.on("pong", () => {
@@ -643,6 +653,12 @@ wss.on("connection", (ws: WebSocket) => {
     if (ws.readyState !== WebSocket.OPEN) return;
     if (!isAlive) {
       console.warn("[hub] Pi missed pong — terminating");
+      // #166: from the hub's point of view the link is dead NOW, so the dropout starts here,
+      // not when the destroyed socket's `close` event lands a tick later. That also closes a
+      // race (Codex, PR #178): a replacement Pi connection arriving before that `close` would
+      // make `cleanup` skip (piSocket !== ws) and the episode would never open. markDisconnected
+      // is idempotent, so the terminate path still counts exactly once.
+      markDisconnected(ws);
       ws.terminate();
       return;
     }
@@ -700,11 +716,7 @@ wss.on("connection", (ws: WebSocket) => {
 
   const cleanup = () => {
     clearInterval(pingTimer);
-    if (piSocket === ws) {
-      piSocket = null;
-      piDropouts.disconnected(); // opens the episode; "missed pong — terminating" lands here exactly once
-      console.log("[hub] Pi disconnected");
-    }
+    markDisconnected(ws);
   };
 
   ws.on("close", cleanup);

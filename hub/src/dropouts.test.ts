@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { createDropoutTracker, toMinutes, WINDOW_24H_MS, WINDOW_7D_MS } from "./dropouts";
+import { createDropoutTracker, createMonotonicClock, toMinutes, WINDOW_24H_MS, WINDOW_7D_MS } from "./dropouts";
 
 const MIN = 60_000;
 const T0 = Date.parse("2026-10-17T00:00:00Z");
@@ -210,6 +210,40 @@ test("a 7 d window of daily 2 h dropouts plus 20 flaps a day stays bounded and c
   assert.equal(s.pi_dropouts_24h, 21);
   assert.equal(s.longest_dropout_min, 120);
   assert.equal(s.pi_dropouts_7d, 7 * 21);
+});
+
+test("default clock: a backward wall-clock step mid-outage does not shorten the episode (Codex #178)", () => {
+  let wall = T0, mono = 1_000_000;
+  const now = createMonotonicClock(() => wall, () => mono);
+  const tr = createDropoutTracker(now);
+  tr.connected();
+  mono += 10 * MIN; wall += 10 * MIN;
+  tr.disconnected();
+  mono += 60 * MIN; wall += 60 * MIN;
+  wall -= 60 * MIN;                       // NTP steps the container clock back an hour
+  mono += 70 * MIN; wall += 70 * MIN;
+  const ended = tr.connected();
+  assert.equal(ended?.minutes, 130, "130 min of monotonic time, whatever the wall clock did");
+  assert.equal(ended?.start, new Date(T0 + 10 * MIN).toISOString());
+  // and a FORWARD step does not lengthen it either
+  tr.disconnected();
+  wall += 24 * 60 * MIN; mono += 5 * MIN;
+  assert.equal(tr.connected()?.minutes, 5);
+});
+
+test("pruning tolerates an injected clock that runs backwards (end stamps out of order)", () => {
+  const c = clock();
+  const tr = createDropoutTracker(c.now);
+  tr.connected();
+  c.at("2026-10-17T11:50:00Z"); tr.disconnected();
+  c.at("2026-10-17T12:00:00Z"); tr.connected();          // A ends 12:00
+  c.at("2026-10-17T11:00:00Z"); tr.disconnected();       // clock stepped back
+  c.at("2026-10-17T11:02:00Z"); tr.connected();          // B ends 11:02, appended AFTER A
+  assert.equal(tr.snapshot().pi_dropouts_7d, 2);
+  c.at(new Date(Date.parse("2026-10-17T11:03:00Z") + WINDOW_7D_MS).toISOString());
+  const s = tr.snapshot();
+  assert.equal(s.pi_dropouts_7d, 1, "B expired even though A, which is older in the list, has not");
+  assert.equal(s.last_dropout?.end, "2026-10-17T12:00:00.000Z");
 });
 
 console.log(`dropouts.test.ts: ${passed} assertions groups passed`);
