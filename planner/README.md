@@ -387,6 +387,10 @@ planner *did* (DB ledgers + the fake's request log), not what it logged.
 ```sh
 scripts/rehearsal/run.sh cold-morning     # 22 °F falling to 12 °F, two zones calling, leases armed
 scripts/rehearsal/run.sh warm-evening     # 62 °F, nothing calling, device already at 120 → must write NOTHING
+scripts/rehearsal/run.sh tempiq-down      # cold morning, every /api/insights route 503 → winter-guard plan, held
+scripts/rehearsal/run.sh forecast-down    # cold morning, open-meteo 503 → cached / no plan, nothing written blind
+scripts/rehearsal/run.sh pi-offline       # hub unreachable (/api/state 503) → every write refused, no probe
+scripts/rehearsal/run.sh pi-dropped-hub-up # hub UP, Pi gone 2 h: stale pumps[] + pi_connected:false → refused 503 (#167)
 ```
 
 **Hour-independent by construction** (eval 2026-09-30, F1): the plan's daily 140 °F soak goes to the warmest

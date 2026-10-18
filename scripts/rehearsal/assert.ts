@@ -76,6 +76,9 @@ async function main() {
   if (expect_.pagesContain) for (const re of expect_.pagesContain as string[]) check(pages.some((t) => new RegExp(re, "i").test(t)), `would have paged /${re}/ (pages: ${JSON.stringify(pages)})`);
   if (expect_.pagesNone === true) check(pages.length === 0, `no page raised (${JSON.stringify(pages)})`);
   if (expect_.phaseBAllFailed === true) check(phaseB.length > 0 && phaseB.every((p) => /^failed|skipped/i.test(String(p.result))), `every Phase B attempt failed or was skipped — the Pi is down (${JSON.stringify(phaseB.map((p) => p.result))})`);
+  // #167: the failure SHAPE matters — a hub that is up but has no Pi answers 503 "no Pi connected", not a connection error
+  if (expect_.phaseBResults) check(phaseB.length > 0 && phaseB.every((p) => new RegExp(expect_.phaseBResults, "i").test(String(p.result))), `every Phase B result matches /${expect_.phaseBResults}/ (${JSON.stringify(phaseB.map((p) => p.result))})`);
+  if (expect_.hubCommandsRefused != null) { const refused = requests.filter((r) => r.refused && r.path === "/api/command").length; check(refused >= expect_.hubCommandsRefused, `the hub refused ≥ ${expect_.hubCommandsRefused} command(s) with "no Pi connected" (got ${refused})`); }
   if (expect_.hubCommands != null) check(fake.commands.length === expect_.hubCommands, `the hub received exactly ${expect_.hubCommands} command(s) (got ${fake.commands.length})`);
   if (expect_.autopilotResults) check(autopilot.length > 0 && autopilot.every((r) => new RegExp(expect_.autopilotResults, "i").test(String(r.result))), `every auto-pilot decision matches /${expect_.autopilotResults}/ (${JSON.stringify(autopilot.map((r) => r.result))})`);
   if (expect_.patchesMax != null) check(fake.patches.length <= expect_.patchesMax, `SensorLinx received ≤ ${expect_.patchesMax} PATCH (got ${fake.patches.length})`);

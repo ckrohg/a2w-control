@@ -13,9 +13,10 @@
 import { Store } from "./store";
 import { HbxWriter, WriteError } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
-import { sameCurve, type ShapedCurve } from "./curve";
-
-const APPLY_TOLERANCE_F = 2; // don't rewrite if the plan target is within this of the commanded
+import { APPLY_TOLERANCE_F, curveAlreadyInForce, type ShapedCurve } from "./curve";
+// #173: curveAlreadyInForce + APPLY_TOLERANCE_F live in curve.ts now (shared with writes.ts status() and /health);
+// re-exported so existing importers keep working.
+export { curveAlreadyInForce };
 
 export type CurveDecision =
   | { kind: "excursion"; reason: string }                       // bank / soak / storm / boost hour → a flat target on top
@@ -28,19 +29,6 @@ export type CurveDecision =
  * of the curve; every other hour the SHAPED curve is the command — written only when its endpoints
  * differ from the commanded ones (sameCurve, dot included), which is a few times a season, not hourly.
  */
-/**
- * Is the plan's curve already the one the device holds? All FOUR endpoints must agree — dot, dbt, mbt
- * within the adoption tolerance and wwsd within 0.5 °F (codex pass 2 on #145: comparing three of them
- * let a wwsd drift read as "held" and never reach setCurve's stale-plan guard).
- */
-export function curveAlreadyInForce(curve: ShapedCurve, inForce: { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null | undefined, toleranceF = APPLY_TOLERANCE_F): boolean {
-  if (!inForce) return false;
-  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
-  return sameCurve(curve, { dbt: n(inForce.dbt), mbt: n(inForce.mbt) }, toleranceF)
-    && Math.abs(n(inForce.dot) - curve.dot) <= toleranceF
-    && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
-}
-
 export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: unknown; boost?: unknown; storm?: unknown; shaped_curve?: unknown } | null | undefined): CurveDecision {
   const reason = String(block?.reason ?? "");
   // The flags are authoritative; the reason regex is the fallback for blocks written before the flags
@@ -170,8 +158,10 @@ export class AutoPilot {
             await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
             return;
           }
+          // #167: a disconnected / stale Pi is refused 503 exactly like an unreachable hub — filed as a rejection
+          // (the ledger key is the age-free `stable` form, so a 3-h dropout is ONE row), warned, never paged.
           const msg = e instanceof WriteError ? e.message : (e as Error).message;
-          await this.record(target, reason, `rejected: ${msg}`, `rejected ${label}: ${msg}`);
+          await this.record(target, reason, `rejected: ${e instanceof WriteError ? e.stable : msg}`, `rejected ${label}: ${msg}`);
           console.warn(`[autopilot] ${this.lastResult}`);
         }
         return;
@@ -219,8 +209,10 @@ export class AutoPilot {
       }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
       // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
-      // caught by the standing I1 monitor + the adoption monitor.
-      await this.record(target, reason, `rejected: ${msg}`, `rejected ${target}°F: ${msg}`, block);
+      // caught by the standing I1 monitor + the adoption monitor. #167: "cannot verify I1" (hub unreachable,
+      // Pi disconnected, Pi state stale) is the same class — the house runs on the device's own curve until the
+      // Pi is back. The ledger key is the age-free `stable` form so a dropout is one row, not one per poll.
+      await this.record(target, reason, `rejected: ${e instanceof WriteError ? e.stable : msg}`, `rejected ${target}°F: ${msg}`, block);
       console.warn(`[autopilot] ${this.lastResult}`);
     }
   }

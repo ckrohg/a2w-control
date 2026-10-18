@@ -294,7 +294,13 @@ export function computeShadowPlan(
         const curve = curveTargetF(hbxConfig, d.f.outdoorF);
         if (curve != null && curve > target) {
           target = curve;
-          reason = "winter guard: mimic HBX curve (winter solver not built yet)";
+          // a2w#168 (the #155 class, one branch over): when the as-found curve outruns the 140 °F soak the block is
+          // STILL the soak — its `sani` flag and sanitizeCapF ceiling stay, so the reason must keep saying so, or the
+          // poster files the hour as autopilot and the identification driver (planConflictAhead matches /sanitize/)
+          // stops keeping its distance. Measured twice on 2026-10-17: "set 145°F — winter guard: mimic HBX curve".
+          reason = d.sani
+            ? `${d.reason} — raised to the as-found curve ${Math.round(target)}°F (winter guard)`
+            : "winter guard: mimic HBX curve";
           d.bank = false; d.boost = false;
         }
       }

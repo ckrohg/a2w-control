@@ -130,7 +130,8 @@ main().catch((e) => { console.error(e); process.exit(1); });
 
 // ── #133 steps 3–4: Phase B's curve lead and the auto-pilot's curve decision (pure) ──
 import { curveLeadF } from "./phaseb";
-import { curveDecision, curveAlreadyInForce } from "./autopilot";
+import { curveDecision } from "./autopilot";
+import { curveAlreadyInForce } from "./curve";
 
 (async () => {
   // Phase B leads the curve's output over now AND the next hour: a colder next hour raises the lead.

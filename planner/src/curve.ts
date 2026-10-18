@@ -169,6 +169,25 @@ export function sameCurve(x: Pick<ShapedCurve, "dbt" | "mbt">, y: Pick<ShapedCur
   return y != null && Math.abs(x.dbt - y.dbt) <= toleranceF && Math.abs(x.mbt - y.mbt) <= toleranceF;
 }
 
+/** The auto-pilot does not rewrite a target / curve that sits within this of the commanded one. */
+export const APPLY_TOLERANCE_F = 2;
+
+/**
+ * Is the plan's curve already the one the device holds? All FOUR endpoints must agree — dot, dbt, mbt
+ * within the adoption tolerance and wwsd within 0.5 °F (codex pass 2 on #145: comparing three of them
+ * let a wwsd drift read as "held" and never reach setCurve's stale-plan guard).
+ * ONE predicate, shared (#173): the auto-pilot's "already commanded" check, /health.curve.in_force.shaped and
+ * the writer's status().curve_in_force.shaped (what the dashboard reads) all answer the same question with it —
+ * before this the writer used a dbt−mbt>4 spread heuristic and disagreed with /health on the live 121/119 curve.
+ */
+export function curveAlreadyInForce(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, inForce: { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown } | null | undefined, toleranceF = APPLY_TOLERANCE_F): boolean {
+  if (!inForce) return false;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
+  return sameCurve(curve, { dbt: n(inForce.dbt), mbt: n(inForce.mbt) }, toleranceF)
+    && Math.abs(n(inForce.dot) - curve.dot) <= toleranceF
+    && Math.abs(n(inForce.wwsd) - curve.wwsd) <= 0.5;
+}
+
 /**
  * #133 (b) rollout switch. `SHAPED_CURVE` is read as:
  *   - off     (unset / "0")   — byte-identical to the pre-#133 planner: nothing computed or stamped;

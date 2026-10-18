@@ -19,11 +19,11 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H } from "./shadow";
-import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode } from "./curve";
+import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
 import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats } from "./hygiene";
-import { AutoPilot, curveAlreadyInForce } from "./autopilot";
+import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
   fetchNwsAlerts,
@@ -1380,6 +1380,10 @@ async function shadowOnce(): Promise<void> {
 
   }
 
+
+  // #173: the writer answers status().curve_in_force.shaped with the same predicate /health uses, against the
+  // same plan curve (null when none was shaped this plan) — so the dashboard and /health cannot disagree.
+  writer.setPlanCurve(lastShapedCurve);
 
   await store.insertShadowPlan(plan, {
     forecast_source: fc.source,

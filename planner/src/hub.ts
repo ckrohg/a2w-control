@@ -25,6 +25,13 @@ export interface HubPump {
 
 export interface HubState {
   pi_connected: boolean;
+  /**
+   * When the Pi pushed the frame `pumps` comes from: the Pi's own `time.time()`, UNIX SECONDS
+   * (heatpump-bridge/bridge/hub_client.py:227), relayed unchanged by the hub. null until the hub has seen a frame
+   * since IT started. The hub keeps serving the last frame after the Pi drops — `pi_connected` says whether the
+   * Pi is there NOW, `ts` says how old `pumps` is; the HBX writer refuses I1 checks on either (#167, writes.ts
+   * piStateUnverifiable).
+   */
   ts: number | null;
   pumps: HubPump[];
 }

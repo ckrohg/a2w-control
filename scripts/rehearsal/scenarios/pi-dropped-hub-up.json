@@ -1,0 +1,249 @@
+{
+  "name": "pi-dropped-hub-up",
+  "_comment": "#167 (eval 2026-10-18 F2): the cold morning, but the Pi has been off the hub for 2 h while the hub itself is UP — the measured Oct 17 15–17Z shape, not the pi-offline scenario's 503 on /api/state. GET /api/state keeps serving the Pi's LAST pumps[] (setpoints 60 °C = 140 °F, the incident's value — they COVER the plan target, so the pre-#167 writer passed I1 against them and wrote at 17:51Z) with pi_connected:false and a ts 2 h old; POST /api/command answers 503 'no Pi connected'. EXPECTED: the writer refuses every I1 check 503 'Pi disconnected from the hub — cannot verify I1', the auto-pilot files it as a rejection (held, Pi away) and never pages, SensorLinx sees NO PATCH, every Phase B attempt fails with the hub's 503, no probe is drawn (the base never reached the plan), no page at all.",
+  "outdoorF": 22,
+  "forecastF": [
+    23,
+    22,
+    20,
+    18,
+    16,
+    15,
+    14,
+    13,
+    12,
+    12,
+    13,
+    15,
+    18,
+    21,
+    24,
+    26,
+    28,
+    29,
+    30,
+    30,
+    29,
+    27,
+    25,
+    23,
+    21,
+    20,
+    19,
+    18,
+    18,
+    19,
+    22,
+    25,
+    28,
+    30,
+    31,
+    31,
+    30,
+    28,
+    26,
+    24,
+    22,
+    21,
+    20,
+    19,
+    19,
+    20,
+    22,
+    24
+  ],
+  "tank": {
+    "actualF": 118,
+    "targetF": 128
+  },
+  "device": {
+    "dot": 10,
+    "wwsd": 65,
+    "dbt": 130,
+    "mbt": 126,
+    "htDif": 6,
+    "numStg": 2,
+    "hpStg": 2,
+    "lagT": 180,
+    "lagOff": 5,
+    "bkLag": 60,
+    "bkDif": 10,
+    "bkTemp": 100,
+    "bkOd": 0,
+    "bkTk": 1,
+    "permHD": 1,
+    "permCD": 0,
+    "dhwOn": 1,
+    "dhwT": 120,
+    "units": 1
+  },
+  "zones": [
+    {
+      "zoneId": "z-lrb",
+      "zoneName": "Living Room Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 340,
+        "thermalMass": 5200,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 152,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 66.2,
+        "setpointF": 69
+      }
+    },
+    {
+      "zoneId": "z-upb",
+      "zoneName": "Upstairs Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 290,
+        "thermalMass": 4600,
+        "confidence": 0.8,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 146,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 68.4,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-bsb",
+      "zoneName": "Basement Baseboard",
+      "deliveryType": "baseboard",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 210,
+        "thermalMass": 6000,
+        "confidence": 0.7,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 138,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 62.5,
+        "setpointF": 62
+      }
+    },
+    {
+      "zoneId": "z-kr",
+      "zoneName": "Kitchen Radiant",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": true,
+      "envelope": {
+        "ua": 180,
+        "thermalMass": 9000,
+        "confidence": 0.75,
+        "source": "measured"
+      },
+      "requiredSupplyWaterTempF": 112,
+      "resetCurve": {
+        "designSupplyFSource": "demonstrated_max"
+      },
+      "demand": {
+        "currentTempF": 67.1,
+        "setpointF": 68
+      }
+    },
+    {
+      "zoneId": "z-mbr",
+      "zoneName": "Master Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 90,
+        "thermalMass": 3000,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 110,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 69.0,
+        "setpointF": 70
+      }
+    },
+    {
+      "zoneId": "z-ubr",
+      "zoneName": "Upstairs Bathroom",
+      "deliveryType": "radiant_floor",
+      "deliveryTypeVerified": false,
+      "envelope": {
+        "ua": 70,
+        "thermalMass": 2500,
+        "confidence": 0.3,
+        "source": "inferred"
+      },
+      "requiredSupplyWaterTempF": 108,
+      "resetCurve": {
+        "designSupplyFSource": "type_default"
+      },
+      "demand": {
+        "currentTempF": 68.0,
+        "setpointF": 68
+      }
+    }
+  ],
+  "calling": [
+    "z-lrb",
+    "z-kr"
+  ],
+  "hub": {
+    "pi_connected": false,
+    "stateAgeS": 7200,
+    "leaseMinutes": 90,
+    "pumps": [
+      {
+        "id": "pump1",
+        "name": "Pump 1",
+        "setpoint_c": 60
+      },
+      {
+        "id": "pump2",
+        "name": "Pump 2",
+        "setpoint_c": 60
+      }
+    ]
+  },
+  "plan": {
+    "magnitudeF": 8,
+    "durationMin": 120,
+    "baseboardBaseF": 135,
+    "radiantBaseF": 120,
+    "safe": true
+  },
+  "expect": {
+    "minCurrentBlockTargetF": 130,
+    "currentBlockReason": "binding zone|floor|requires",
+    "autopilotWrites": false,
+    "autopilotResults": "^(held|rejected: Pi disconnected from the hub — cannot verify I1)$",
+    "writeRejectionsOk": "Pi disconnected from the hub — cannot verify I1 \\(last state \\d+ s ago\\)",
+    "patchesMax": 0,
+    "phaseBAllFailed": true,
+    "phaseBResults": "^failed: no Pi connected$",
+    "hubCommands": 0,
+    "hubCommandsRefused": 2,
+    "probeDrawn": false,
+    "pagesNone": true,
+    "plannerLogged": [
+      "\\[autopilot\\] rejected \\d+°F: Pi disconnected from the hub — cannot verify I1 \\(last state \\d+ s ago\\)"
+    ],
+    "noUnhandledUpstreamCalls": true,
+    "_expectNote": "Before #167 this scenario wrote the floor (≥1 PATCH) against setpoints the Pi was no longer holding. With it the tank stays on the device's own curve until the Pi is back; the only ledger rows are the 503 rejections, deduped to one per condition."
+  }
+}

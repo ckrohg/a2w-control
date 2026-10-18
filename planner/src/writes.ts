@@ -17,13 +17,51 @@
 
 import { SensorLinxClient } from "./sensorlinx";
 import { Store } from "./store";
-import { HubClient } from "./hub";
+import { HubClient, type HubState } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
 import { extractConfig, diffConfig } from "./drift";
-import { curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
+import { curveAlreadyInForce, curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
 const SLX_FRESH_MS = 20 * 60 * 1000;
+
+/**
+ * #167: how old the hub's copy of the Pi's state may be before the I1 cross-check refuses to use it. The hub keeps
+ * serving the Pi's LAST pumps[] after the Pi drops (pi_connected:false, ts frozen), and both I1 checks below used to
+ * read those frozen setpoints as live: during the 2026-10-17 15–17Z dropout the auto-pilot set 145 °F at 17:51Z
+ * against setpoints the Pi was no longer holding, Phase B could not lead, and the monitor logged an I1 VIOLATION at
+ * 17:55Z. The Pi pushes a state frame every 15 s, so 10 min is 40 missed pushes — comfortably past the hub's 3-min
+ * silence alert (index.ts PI_QUIET_ALERT_S) and far inside the 2–3 h dropouts measured (eval 2026-10-18 F1/F2).
+ */
+export const PI_STATE_FRESH_MS = 10 * 60 * 1000;
+/**
+ * How far AHEAD of the planner's clock a frame may be stamped before it is refused too (codex pass 1 on #179): the
+ * Pi has no RTC, so a frame stamped tomorrow by a mis-set clock would otherwise read as fresh for a day — a
+ * fail-OPEN path. Honest NTP skew is seconds; anything beyond this is not evidence of live pumps.
+ */
+export const PI_CLOCK_SKEW_MAX_S = 5 * 60;
+
+/**
+ * The reason the hub's state cannot stand in for the live pumps — or null when it can. Pure, so the three refusal
+ * shapes are unit-testable without a Store (writes.test.ts). Used by BOTH I1 checks (setTarget, setCurve) and by the
+ * identification driver's setpoint-coverage check; restore() stays exempt (reverting to baseline is never blocked).
+ * `ts` is the Pi's own `time.time()` — UNIX SECONDS (heatpump-bridge/bridge/hub_client.py:227), relayed by the hub
+ * unchanged (hub/src/index.ts GET /api/state). A millisecond value (> 1e11, i.e. after the year 5138 in seconds) is
+ * normalised rather than trusted: read as seconds it would sit far in the future and make every frame look fresh.
+ */
+export function piStateUnverifiable(state: Pick<HubState, "pi_connected" | "ts">, nowMs: number = Date.now()): string | null {
+  const ts = typeof state.ts === "number" && Number.isFinite(state.ts) ? state.ts : null;
+  // signed: negative = the frame is stamped in OUR future (Pi clock ahead)
+  const rawAgeS = ts == null ? null : Math.round((nowMs - (ts > 1e11 ? ts : ts * 1000)) / 1000);
+  const ageS = rawAgeS == null ? null : Math.max(0, rawAgeS);
+  const last = ageS == null ? "no state frame since the hub started" : `last state ${ageS} s ago`;
+  if (!state.pi_connected) return `Pi disconnected from the hub — cannot verify I1 (${last})`;
+  if (rawAgeS == null) return `no Pi state at the hub — cannot verify I1 (${last})`;
+  // the moving number sits in the parenthesis so the age-free `stable` form is constant (codex pass 2 on #179)
+  if (rawAgeS < -PI_CLOCK_SKEW_MAX_S) return `Pi state is stamped in the future — cannot verify I1 (${-rawAgeS} s ahead, clock skew beyond ${PI_CLOCK_SKEW_MAX_S} s)`;
+  if (rawAgeS * 1000 > PI_STATE_FRESH_MS) return `Pi state at the hub is stale — cannot verify I1 (${last}, limit ${PI_STATE_FRESH_MS / 1000} s)`;
+  return null;
+}
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 
@@ -39,7 +77,12 @@ export function isWriteBarrierUp(): boolean { return writeBarrier; }
 export function deviceWritesInFlight(): number { return writesInFlight; }
 
 export class WriteError extends Error {
-  constructor(public status: number, message: string) {
+  /**
+   * `stable` is the message with its moving parts (ages, counts) removed — the key the auto-pilot dedups its ledger
+   * on (#167: "Pi disconnected … (last state 134 s ago)" changes every poll; without this a 3-h dropout would write
+   * 36 autopilot_log rows for one condition). Defaults to the message itself.
+   */
+  constructor(public status: number, message: string, public readonly stable: string = message) {
     super(message);
   }
 }
@@ -61,6 +104,7 @@ export function curveOverridden(
 
 export class HbxWriter {
   private lastWriteAt = 0;
+  private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
 
   constructor(
     private readonly slx: SensorLinxClient,
@@ -108,10 +152,15 @@ export class HbxWriter {
       baseline: baseline ? { dbt: baseline.dbt, mbt: baseline.mbt } : null,
       // #133 acceptance 3: the curve IN FORCE and what it evaluates to at the live outdoor — not just the
       // last commanded scalar. A near-flat setTarget curve shows dbt ≈ mbt; a shaped one shows the slope.
+      // #173: `shaped` = the PLAN's curve is the one in force — the same four-field predicate /health and the
+      // auto-pilot use (curveAlreadyInForce), not the old dbt−mbt>4 spread heuristic: the floor-clamped plan curve
+      // has a 2 °F spread (121/119 live on 2026-10-18) and read false here while /health said true. spread_f keeps
+      // the old signal visible beside it.
       curve_in_force: cfg && typeof cfg.dot === "number" && typeof cfg.wwsd === "number" && typeof cfg.dbt === "number" && typeof cfg.mbt === "number"
         ? { dot: cfg.dot, wwsd: cfg.wwsd, dbt: cfg.dbt, mbt: cfg.mbt,
             output_at_live_outdoor_f: outdoor != null ? Math.round(curveOutputF({ dot: cfg.dot, wwsd: cfg.wwsd, dbt: cfg.dbt, mbt: cfg.mbt }, outdoor) * 10) / 10 : null,
-            shaped: (cfg.dbt as number) - (cfg.mbt as number) > 4 }
+            shaped: this.planCurve ? curveAlreadyInForce(this.planCurve, cfg) : false,
+            spread_f: Math.round(((cfg.dbt as number) - (cfg.mbt as number)) * 10) / 10 }
         : null,
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
@@ -125,14 +174,35 @@ export class HbxWriter {
     this.autoSanitizeEnabled = enabled;
   }
 
+  /**
+   * #173: the curve the latest plan implies (index.ts shadowOnce stamps it on every block as `shaped_curve`), so
+   * status() can answer "is the PLAN's curve the one in force?" with the same four-field predicate /health uses.
+   * null until the first plan of this process, or when the feed could not shape one — then `shaped` is false, as
+   * it is on /health.
+   */
+  setPlanCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null): void {
+    this.planCurve = curve;
+  }
+
+  /**
+   * #167: the I1 cross-check may only read hub state that IS the live pumps. A disconnected Pi, a hub that has had no
+   * frame since it started, or a frame older than PI_STATE_FRESH_MS is refused with 503 — the same status and the
+   * same "cannot verify I1" shape as an unreachable hub, which the auto-pilot already files as a rejection (no page)
+   * and the identification driver as a transient. The message carries the age; `stable` drops it for dedup.
+   */
+  private async rejectUnlessPiLive(state: HubState, reject: (status: number, detail: string, stable?: string) => Promise<never>): Promise<void> {
+    const why = piStateUnverifiable(state);
+    if (why) await reject(503, why, why.replace(/ \(.*\)$/, ""));
+  }
+
   // capF is the I4 upper ceiling for THIS write. Defaults to the everyday strictCap; the daily
   // sanitize passes DEFAULT_OPTS.sanitizeCapF so its 140°F soak isn't clamped to 135. This only
   // raises the envelope ceiling — the I1 cross-check below is unchanged, so a higher target still
   // requires the pump setpoints to cover it (setpoint ≥ target + margin) or the write is rejected.
   async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
-    const reject = async (status: number, detail: string) => {
+    const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
-      throw new WriteError(status, detail);
+      throw new WriteError(status, detail, stable);
     };
 
     if (!Number.isFinite(targetF)) await reject(422, "target_f must be a number");
@@ -161,6 +231,7 @@ export class HbxWriter {
     if (this.hub) {
       try {
         const state = await this.hub.getState();
+        await this.rejectUnlessPiLive(state, reject);
         const required = targetF + DEFAULT_OPTS.i1MarginF;
         const offenders = state.pumps
           .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
@@ -226,9 +297,9 @@ export class HbxWriter {
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
     // validated (the guard already refused a wwsd that differs from the live one).
     const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
-    const reject = async (status: number, detail: string) => {
+    const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_curve", requested, result: "rejected", detail });
-      throw new WriteError(status, detail);
+      throw new WriteError(status, detail, stable);
     };
     const latest = await this.store.getLatestSlx();
     if (!latest || Date.now() - latest.ts.getTime() > SLX_FRESH_MS || latest.outdoorF == null) {
@@ -244,6 +315,7 @@ export class HbxWriter {
     if (this.hub) {
       try {
         const state = await this.hub.getState();
+        await this.rejectUnlessPiLive(state, reject);
         const required = outputNow + DEFAULT_OPTS.i1MarginF;
         const offenders = state.pumps
           .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)

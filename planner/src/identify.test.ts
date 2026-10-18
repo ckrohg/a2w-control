@@ -171,7 +171,8 @@ async function main(): Promise<void> {
       autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false } as any,
       phaseB: { setProbeTarget: (t) => { probeTargets.push(t); } } as any,
       demandFeed: { zones: () => over.zones ?? [], refresh: async () => {}, isHealthy: () => true } as any,
-      hub: { getState: async () => ({ pumps: [{ id: "pump1", online: true, setpoint_c: ((over.pumpsCoverF ?? 150) - 32) * 5 / 9 }] }) } as any,
+      // a LIVE hub frame (#167: a missing pi_connected / ts reads as a dropped Pi and is not coverage)
+      hub: { getState: async () => ({ pi_connected: true, ts: Math.floor(Date.now() / 1000), pumps: [{ id: "pump1", online: true, setpoint_c: ((over.pumpsCoverF ?? 150) - 32) * 5 / 9 }] }) } as any,
       baseUrl: "https://tempiq.test", token: "tok",
       notify: async (t, b) => { notes.push(t); },
       isI1Violated: () => over.i1 ?? false,

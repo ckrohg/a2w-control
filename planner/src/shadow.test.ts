@@ -333,3 +333,33 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.equal(planConflictAhead(plan.filter((b) => !b.sani).map((b) => ({ ...b, reason: b.reason })), nowMs, 3), false, "…and the plain floor blocks are not conflicts");
   console.log("shadow.test.ts (#155 soak identity under the demand floor): all assertions passed");
 }
+
+// a2w#168 — the #155 class, one branch over: with NO demand floor (feed degraded) the winter guard raises every block
+// below winterGuardF to the as-found curve. When that curve outruns the 140 °F soak the block is STILL the soak: `sani`
+// stays, the reason still names the sanitize (poster → "sanitize", planConflictAhead → conflict) and says the guard
+// raised it. Every other block gets the plain winter-guard reason — without the stale "(winter solver not built yet)".
+{
+  const cold: ForecastHour[] = Array.from({ length: 24 }, (_, i) => ({ ts: new Date(Date.UTC(2026, 0, 15, 5 + i)), outdoorF: 20 + (i === 13 ? 6 : 0) }));
+  const hot = { dot: 10, wwsd: 65, dbt: 150, mbt: 120 }; // 144.5 °F at 20 °F, 141.2 °F at 26 °F — above the 140 °F soak everywhere
+  const plan = computeShadowPlan(cold, hot, DEFAULT_OPTS, null, true, false);
+  const soak = plan.filter((b) => b.sani);
+  assert.equal(soak.length, 1, "exactly one soak block");
+  assert.ok(soak[0].tank_target_f > DEFAULT_OPTS.sanitizeF && soak[0].tank_target_f <= DEFAULT_OPTS.sanitizeCapF, `the guard raised the soak above 140 °F within sanitizeCapF (got ${soak[0].tank_target_f})`);
+  assert.match(soak[0].reason, /daily sanitize/i, "the soak keeps its identity in the reason");
+  assert.match(soak[0].reason, new RegExp(`raised to the as-found curve ${soak[0].tank_target_f}°F \\(winter guard\\)$`), "…and says the winter guard raised it");
+  assert.doesNotMatch(soak[0].reason, /winter solver not built yet/);
+  for (const b of plan.filter((x) => !x.sani)) {
+    assert.equal(b.tank_target_f, DEFAULT_OPTS.strictCapF, `non-soak block ${b.ts} is the curve clamped to strictCap`);
+    assert.equal(b.reason, "winter guard: mimic HBX curve", "the plain winter-guard reason, stale wording gone");
+  }
+  const kind = (reason: string, commandedTargetF: number) => classifyKind({ source: "autopilot", reason, commandedTargetF, stormActive: false, boostMatched: false });
+  assert.equal(kind(soak[0].reason, soak[0].tank_target_f), "sanitize", "tempiq-windows classifyKind files the raised soak as the soak (Oct 17 it read 'autopilot')");
+  assert.equal(kind(plan.filter((b) => !b.sani)[0].reason, 135), "autopilot", "…and a plain winter-guard block as autopilot");
+  const nowMs = new Date(soak[0].ts).getTime() - 3600_000;
+  assert.equal(planConflictAhead(plan, nowMs, 3), true, "the identification driver keeps its distance from the raised soak");
+  // a curve BELOW the soak leaves the soak's reason untouched (the guard only takes the reason when it raises the target)
+  const mild = computeShadowPlan(cold, { dot: 10, wwsd: 65, dbt: 130, mbt: 120 }, DEFAULT_OPTS, null, true, false).filter((b) => b.sani)[0];
+  assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
+  assert.doesNotMatch(mild.reason, /winter guard/);
+  console.log("shadow.test.ts (#168 soak identity under the winter guard): all assertions passed");
+}
