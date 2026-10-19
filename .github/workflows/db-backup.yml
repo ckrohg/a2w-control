@@ -1,7 +1,9 @@
-# @purpose Weekly disaster-recovery backup of the Neon Postgres DB. Runs scripts/backup-db.sh to
+# @purpose Weekly disaster-recovery backup of the live Railway Postgres DB. Runs scripts/backup-db.sh to
 # produce an encrypted dump, then commits it to the orphan `db-backups` branch (created on first
-# run). The LIVE DB already keeps history indefinitely; this guards against losing Neon itself
-# (free-tier PITR ≈ 7 days). Requires two repo secrets: DATABASE_URL and BACKUP_PASSPHRASE.
+# run). The LIVE DB already keeps history indefinitely; this guards against losing the Railway
+# database itself. backup-db.sh refuses a dump whose newest reading is stale, so a DATABASE_URL
+# left pointing at a dead database fails loudly (it silently dumped the dead Neon DB for 8 weeks
+# after the 2026-08-23 migration). Requires two repo secrets: DATABASE_URL and BACKUP_PASSPHRASE.
 name: db-backup
 
 on:
@@ -22,20 +24,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL 17 client
-        # Neon runs Postgres 17; the runner ships pg_dump 16, which refuses to dump a newer
-        # server ("server version mismatch"). Install the matching client from the PGDG apt repo
-        # so pg_dump >= the Neon server version. pg_wrapper then invokes the newest installed (17).
+      - name: Install PostgreSQL client (must be >= the server's major version)
+        # The live DB is Railway Postgres 18 (migrated off Neon 2026-08-23, #79). pg_dump refuses
+        # to dump a newer server ("server version mismatch"), and the runner ships 16. Install the
+        # matching client from the PGDG apt repo. Bump PG_MAJOR when Railway upgrades the server.
+        env:
+          PG_MAJOR: "18"
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
-          # The runner's /usr/bin/pg_dump stays pinned to ubuntu's 16; the PG17 binaries land in a
-          # versioned dir. Prepend it to PATH for later steps so pg_dump resolves to 17.
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
-          /usr/lib/postgresql/17/bin/pg_dump --version
+          sudo apt-get install -y "postgresql-client-${PG_MAJOR}"
+          # The runner's /usr/bin/pg_dump stays pinned to ubuntu's 16; the PGDG binaries land in a
+          # versioned dir. Prepend it to PATH for later steps.
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_dump" --version
 
       - name: Produce encrypted dump
         env:
