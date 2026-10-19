@@ -171,8 +171,10 @@ an episode.
 
 ## Re-measure
 
-- When the backup passphrase is on this Mac, run `scripts/analyze-local.sh` and the appendix query, then replace
-  §5's proxy.
+- Two things must happen first: the backup passphrase must be on this Mac, **and** the weekly dump must be current
+  again. Since 2026-08-24 every `db-backups` dump is the same 6.54 MB, because the workflow's `DATABASE_URL` secret
+  still points at the pre-migration Neon database, so a restore today would return August data. Once a post-repoint
+  dump exists, run `scripts/analyze-local.sh` and the appendix query, then replace §5's proxy.
 - After ≥ 2 weeks below 0 °C, re-run `rolling.py` and `defrost.py` on a fresh Pi backup. The −5…0 °C bins hold
   < 4 run-h today.
 
