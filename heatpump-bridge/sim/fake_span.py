@@ -44,16 +44,17 @@ class FakeSpan:
     TOKEN = "fake-span-token"
 
     def __init__(self, circuits: dict[str, dict] | None = None):
-        # name -> {id, relayState, isUserControllable, instantPowerW}
+        # name -> {id, relayState, isUserControllable, instantPowerW}. Like the real panel,
+        # consumption is NEGATIVE (Air-Water 2 heating read -5694 W on 2026-10-19).
         self.circuits = circuits or {
             "Air-Water 1": {"id": "c-aw1", "relayState": "CLOSED", "isUserControllable": True,
-                            "instantPowerW": 2400.0},
+                            "instantPowerW": -2400.0},
             "Air-Water 2": {"id": "c-aw2", "relayState": "CLOSED", "isUserControllable": True,
-                            "instantPowerW": 108.0},
+                            "instantPowerW": -108.0},
             "Buffer Tank": {"id": "c-bt", "relayState": "CLOSED", "isUserControllable": True,
                             "instantPowerW": 0.0},
             "Kitchen": {"id": "c-k", "relayState": "CLOSED", "isUserControllable": True,
-                        "instantPowerW": 50.0},
+                        "instantPowerW": -50.0},
         }
         self.writes: list[tuple[str, str]] = []     # (circuit name, relayState) in order
         self.rejected: list[dict] = []                # bodies refused with 422 (schema-invalid)

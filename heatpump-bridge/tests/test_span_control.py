@@ -374,7 +374,7 @@ async def test_precheck_runs_on_the_fresh_read_and_can_refuse(rig):
         return "pump started heating"
     with pytest.raises(BreakerRefused, match="precheck: pump started heating"):
         await ctl.execute("Air-Water 2", "power_cycle", precheck=no)
-    assert seen == [108.0] and panel.writes == []
+    assert seen == [-108.0] and panel.writes == []   # raw panel value: consumption is negative
     assert (await ctl.execute("Air-Water 2", "power_cycle", precheck=lambda c: None))["ok"]
 
 

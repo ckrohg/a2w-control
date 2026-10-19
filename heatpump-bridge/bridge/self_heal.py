@@ -53,6 +53,14 @@ def _is_blocking(f: dict) -> bool:
     return str(getattr(sev, "value", sev)).lower() != "info"
 
 
+
+def _draw_w(power_w) -> float | None:
+    """How much a circuit draws, sign ignored. SPAN's local API reports consumption as a NEGATIVE
+    instantPowerW on this panel (Air-Water 2 heating read -5694 W on 2026-10-19), so a raw
+    `power >= running_power_w` never fires: recovery could never be verified while the pump ran,
+    and the swapped-map backstop was dead. Every power comparison here goes through this."""
+    return None if power_w is None else abs(float(power_w))
+
 class SelfHealer:
     def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None, span_cfg=None,
                  state_dir: str | None = None, clock=time.time, mono=time.monotonic,
@@ -217,7 +225,7 @@ class SelfHealer:
             return None
         for c in snap["circuits"]:
             if c["name"] == self.cfg.circuits[pid]:
-                return c["power_w"]
+                return _draw_w(c["power_w"])
         return None
 
     def _target_fault(self, snap: dict) -> dict | None:
@@ -574,8 +582,9 @@ class SelfHealer:
         other = self._other_down(pid, span=None)   # the controller itself checks the relays
         if other:
             return other
-        if circ.get("power_w") is not None and circ["power_w"] >= self.cfg.running_power_w:
-            return f"'{circ.get('name')}' draws {circ['power_w']:.0f} W while the pump reports idle"
+        draw = _draw_w(circ.get("power_w"))
+        if draw is not None and draw >= self.cfg.running_power_w:
+            return f"'{circ.get('name')}' draws {draw:.0f} W while the pump reports idle"
         return None
 
     def _begin_verify(self, st: dict, code: str, *, shadow: bool) -> None:
