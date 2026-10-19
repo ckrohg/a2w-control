@@ -29,6 +29,19 @@ stay human-only on the direct LAN/Funnel path and are never relayed by the hub.
 | GET    | `/api/state`   | Bearer `HUB_CLIENT_TOKEN` | latest state the Pi pushed |
 | POST   | `/api/command` | Bearer `HUB_CLIENT_TOKEN` | relay a setpoint to the Pi, await ack |
 | POST   | `/api/write-enable` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | arm/disarm a pump's write path (owner 2026-07-14); Pi applies audit + push ceremony |
+| POST   | `/api/breaker` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | switch an allowlisted SPAN circuit through the panel's LOCAL API (owner 2026-10-18) — see below |
+
+`GET /api/state` also returns `span` (allowlisted circuits' live relay state + power, any breaker
+action in flight) when the bridge sends it; `null` from a bridge that predates breaker control.
+
+`POST /api/breaker` body `{"circuit":"Air-Water 2","action":"power_cycle"|"close"|"open","off_s":60}`
+(`off_s` only for `power_cycle`; default and floor 60, max 600). The bridge enforces every safety
+rule (allowlist, per-circuit OFF opt-in, isUserControllable, one action at a time, never two heat
+pumps off, CLOSE in a `finally`, read-back) and answers with the panel read-back; the hub waits
+`off_s` + `BREAKER_ACK_GRACE_MS` (30 s) for it. `200 {ok,detail,result}` verified · `502` refused
+or not verified (`result` says which) · `501` the connected bridge does not advertise the
+`breaker` capability (older release, or SPAN local not configured) · `503` no Pi / arming off ·
+`504` no answer in time (the action may still complete — read the live state).
 
 `POST /api/command` body:
 
@@ -51,7 +64,7 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | ------------------ | ------- |
 | `HUB_PI_TOKEN`     | Bearer token the Pi presents on its WS handshake. Wrong/absent → WS close `4401`. |
 | `HUB_CLIENT_TOKEN` | Bearer token the optimizer + dashboard present on HTTP. |
-| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` (unset = feature off). Held only by the dashboard's server, released only after a fresh password re-entry. |
+| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both off). Held only by the dashboard's server, released only after a fresh password re-entry. |
 | `PORT`             | HTTP + WS port. Railway injects this automatically; defaults to `8080`. |
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
 | `NTFY_SERVER`      | Optional. ntfy base URL (default `https://ntfy.sh`). |

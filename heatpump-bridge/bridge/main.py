@@ -63,7 +63,6 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
-        hub_client.start()
 
         async def span_notify(title, message, priority="default"):
             from . import notify
@@ -74,8 +73,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             arm_state_path=str(Path(cfg.db_path).resolve().parent / "span-arm.json"))
         span_poller.start()
         app.state.span_poller = span_poller
+        span_breakers = None
+        if cfg.span.host and cfg.span.passphrase:
+            from .span_control import BreakerController
+            span_breakers = BreakerController(
+                cfg.span, span_poller.client, store, notify_cfg=cfg.notifications,
+                cache=span_poller, state_dir=str(Path(cfg.db_path).resolve().parent))
+            await span_breakers.recover()   # finish a power cycle a restart interrupted
+        app.state.span_breakers = span_breakers
+        hub_client.span = span_breakers   # before start(): the first state frame advertises it
+        hub_client.start()
 
         yield
+        if span_breakers is not None:
+            await span_breakers.stop()   # lets a running power cycle finish its hold + CLOSE
         await span_poller.stop()
         await hub_client.stop()
         await exporter.stop()

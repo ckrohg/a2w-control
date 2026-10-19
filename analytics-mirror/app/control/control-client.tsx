@@ -2,11 +2,14 @@
 // @purpose Remote-control page. Cookie-gated (via middleware). Polls the server-side
 // /api/hub/state proxy (~5s) for the latest Pi state the Railway hub holds, and POSTs
 // setpoint changes to /api/hub/command. The browser NEVER sees HUB_CLIENT_TOKEN — both
-// hops go through nodejs route handlers. Setpoint is the only action; power/mode/params
-// stay human-only on the direct LAN/Funnel path and are not exposed here. Temps shown in
+// hops go through nodejs route handlers. Setpoint is the only PUMP action; power/mode/params
+// stay human-only on the direct LAN/Funnel path and are not exposed here. The SPAN breaker card
+// (./span-breaker-card.tsx) switches allowlisted circuits behind the same password arm. Temps shown in
 // °F (whole degrees) but commands SEND value_c in Celsius, since the hub/Pi are Celsius.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useModals } from "../ui/modal";
+import { SpanBreakerCard } from "./span-breaker-card";
+import type { SpanSnapshot } from "@/lib/breaker-state";
 
 type Pump = {
   id: string;
@@ -22,7 +25,7 @@ type Pump = {
   remote_lease_until?: number | null;
   write_enabled?: boolean;
 };
-type StateResp = { pi_connected?: boolean; ts?: number | null; pumps?: Pump[] };
+type StateResp = { pi_connected?: boolean; ts?: number | null; pumps?: Pump[]; span?: SpanSnapshot | null };
 
 const cToF = (c: number | null | undefined) =>
   c == null ? null : (c * 9) / 5 + 32;
@@ -327,6 +330,8 @@ export default function ControlClient() {
           })}
         </div>
       )}
+
+      <SpanBreakerCard span={data?.span} connected={connected} armed={armed} onArm={arm} onDone={poll} />
 
       <HbxTargetCard />
 

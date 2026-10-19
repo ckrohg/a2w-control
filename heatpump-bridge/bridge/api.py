@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api")
 read = require("read")
 write = require("write")
 control = require("control")
+human = require("human")   # SPAN breaker switching: UI session only, never a machine token
 
 
 class SetpointRequest(BaseModel):
@@ -66,6 +67,12 @@ class WriteEnableRequest(BaseModel):
 
 class SessionRequest(BaseModel):
     password: str
+
+
+class BreakerRequest(BaseModel):
+    circuit: str = Field(min_length=1, max_length=80)
+    action: Literal["power_cycle", "close", "open"]
+    off_s: float | None = None   # power_cycle hold; default/floor = span.min_off_s (>= 60 s)
 
 
 def _pollers(request: Request) -> dict[str, PumpPoller]:
@@ -353,6 +360,34 @@ async def configure_w610_endpoint(request: Request, body: GatewayRequest,
                         f"{', '.join(report['changed']) or report.get('error', 'already correct')}")
             break
     return report
+
+
+def _breakers(request: Request):
+    ctl = getattr(request.app.state, "span_breakers", None)
+    if ctl is None:
+        raise HTTPException(503, "SPAN local control is not configured on this bridge")
+    return ctl
+
+
+@router.get("/span/circuits")
+async def span_circuits(request: Request, _p: Principal = Depends(read)):
+    """Allowlisted SPAN breakers with their last-read relay state + power (refreshed every
+    SPAN poll, ~25 s, and after every breaker read-back), plus any action in flight."""
+    return _breakers(request).snapshot()
+
+
+@router.post("/span/breaker")
+async def span_breaker(request: Request, body: BreakerRequest,
+                       principal: Principal = Depends(human)):
+    """Switch an allowlisted SPAN circuit over the panel's LOCAL API (span_control.py).
+    power_cycle blocks for the hold (>= 60 s) and answers with the read-back relay state."""
+    from .span_control import BreakerRefused
+
+    try:
+        return await _breakers(request).execute(body.circuit, body.action, off_s=body.off_s,
+                                                source=principal.source)
+    except BreakerRefused as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.get("/health")

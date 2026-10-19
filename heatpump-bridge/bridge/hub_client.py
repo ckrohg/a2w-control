@@ -6,7 +6,9 @@
 # routed through the EXISTING guarded write path (poller.write_setpoint) — no register is
 # ever written directly, and any non-setpoint action is ignored by design (power/mode/param
 # stay human-only on the direct path). A nack (clamp/rate-limit/offline/floor/write_enabled)
-# is a NORMAL outcome, not an error.
+# is a NORMAL outcome, not an error. One more relayed action, `breaker` (owner decision
+# 2026-10-18), switches an allowlisted SPAN circuit through span_control.BreakerController's
+# guards; it runs in its own task so a 60 s power cycle never stalls setpoint commands.
 from __future__ import annotations
 
 import asyncio
@@ -33,7 +35,9 @@ class HubClient:
     def __init__(self, cfg: HubConfig, pollers: dict[str, PumpPoller]):
         self.cfg = cfg
         self.pollers = pollers
+        self.span = None   # span_control.BreakerController when SPAN local is configured
         self._task: asyncio.Task | None = None
+        self._breaker_tasks: set[asyncio.Task] = set()
 
     @property
     def enabled(self) -> bool:
@@ -119,6 +123,14 @@ class HubClient:
         if action == "write_enable":
             await self._handle_write_enable(ws, msg)
             return
+        if action == "breaker":
+            # Own task: a power cycle holds >= 60 s and must not block this receive loop (other
+            # commands, pings). The controller shields the cycle itself, so a dropped link
+            # never abandons a circuit mid-cycle; only the ack is lost.
+            t = asyncio.create_task(self._breaker_task(ws, msg), name="hub-breaker")
+            self._breaker_tasks.add(t)
+            t.add_done_callback(self._breaker_tasks.discard)
+            return
         if action != "setpoint":
             log.warning("hub: ignoring non-setpoint action %r (command %s)",
                         action, command_id)
@@ -194,11 +206,46 @@ class HubClient:
                     priority="high", tags="warning")
         await self._ack(ws, command_id, True, f"write_enabled={enabled}", None)
 
+    async def _breaker_task(self, ws, msg: dict) -> None:
+        try:
+            await self._handle_breaker(ws, msg)
+        except ConnectionClosed:
+            log.warning("hub: link closed before the breaker ack could be sent "
+                        "(the action itself completed — see the bridge events)")
+
+    async def _handle_breaker(self, ws, msg: dict) -> None:
+        """Dashboard breaker action → BreakerController (allowlist, controllable, global lock,
+        never two heat pumps off, read-back). Acked with the read-back result either way."""
+        from .span_control import BreakerRefused
+
+        command_id = msg.get("command_id")
+        if self.span is None:
+            await self._ack(ws, command_id, False,
+                            "SPAN local control is not configured on this bridge", None)
+            return
+        source = "hub:" + str(msg.get("source") or "armed-dashboard")
+        try:
+            result = await self.span.execute(msg.get("circuit"), msg.get("op"),
+                                             off_s=msg.get("off_s"), source=source)
+        except BreakerRefused as exc:
+            await self._ack(ws, command_id, False, f"refused: {exc}", None,
+                            result={"ok": False, "refused": True, "detail": str(exc),
+                                    "status": exc.status_code})
+            return
+        except Exception as exc:  # noqa: BLE001 — a failure must still produce an ack
+            log.exception("hub: breaker command failed")
+            await self._ack(ws, command_id, False, f"breaker command failed: {exc}", None)
+            return
+        await self._ack(ws, command_id, bool(result.get("ok")), result.get("detail", ""),
+                        None, result=result)
+
     async def _ack(self, ws, command_id, ok: bool, detail: str,
-                   setpoint_c: float | None) -> None:
-        await self._safe_send(ws, {
-            "type": "ack", "command_id": command_id, "ok": ok,
-            "detail": detail, "setpoint_c": setpoint_c})
+                   setpoint_c: float | None, *, result: dict | None = None) -> None:
+        frame = {"type": "ack", "command_id": command_id, "ok": ok,
+                 "detail": detail, "setpoint_c": setpoint_c}
+        if result is not None:
+            frame["result"] = result
+        await self._safe_send(ws, frame)
 
     # --- outbound state -------------------------------------------------------
     def _state_payload(self) -> dict:
@@ -224,7 +271,13 @@ class HubClient:
                 "remote_lease_until": s.get("remote_lease_until"),
                 "write_enabled": p.cfg.write_enabled,
             })
-        return {"type": "state", "ts": time.time(), "pumps": pumps}
+        frame = {"type": "state", "ts": time.time(), "pumps": pumps}
+        if self.span is not None:
+            # capabilities lets the hub refuse a breaker command up front when the connected
+            # bridge predates it, instead of waiting out an ack that will never come.
+            frame["capabilities"] = ["breaker"]
+            frame["span"] = self.span.snapshot()
+        return frame
 
     async def _send_state(self, ws) -> None:
         await self._safe_send(ws, self._state_payload())

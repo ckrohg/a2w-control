@@ -23,6 +23,7 @@ import express, { type Request, type Response } from "express";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import { createDropoutTracker } from "./dropouts";
+import { breakerAckTimeoutMs, bridgeSupportsBreaker, parseGraceMs, validateBreakerBody } from "./breaker";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -52,6 +53,9 @@ const PI_PING_INTERVAL_MS = (() => {
   return 30_000;
 })();
 const COMMAND_ACK_TIMEOUT_MS = 10_000; // await matching ack up to 10s
+// Breaker actions answer after the panel read-back (and a power cycle after its >= 60 s hold),
+// so they get off_s + this grace. Env-overridable only so the e2e test can time out quickly.
+const BREAKER_ACK_GRACE_MS = parseGraceMs(process.env.BREAKER_ACK_GRACE_MS);
 
 // Dead-man watchdog: the Pi checks in every ~15s, so if it goes silent past this threshold the
 // hub pushes an ntfy alert. This is the external dead-man (a dead Pi can't alert about itself)
@@ -212,6 +216,10 @@ interface StateMessage {
   type: "state";
   ts: number;
   pumps: PumpState[];
+  /** Additive (bridges with SPAN breaker control): what the bridge can do, and the allowlisted
+   *  circuits' live relay state. Absent from older bridges — both stay optional. */
+  capabilities?: string[];
+  span?: unknown;
 }
 
 interface AckMessage {
@@ -220,6 +228,8 @@ interface AckMessage {
   ok: boolean;
   detail: string;
   setpoint_c: number | null;
+  /** Breaker acks carry the bridge's read-back outcome; relayed to the dashboard verbatim. */
+  result?: Record<string, unknown> | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +322,7 @@ app.get("/api/state", requireClientAuth, (_req: Request, res: Response) => {
     pi_connected: connected,
     ts: lastState ? lastState.ts : null,
     pumps: lastState ? lastState.pumps : [],
+    span: lastState?.span ?? null,
   });
 });
 
@@ -459,6 +470,83 @@ app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) =
       action: "write_enable" as const,
       pump_id: pumpId,
       enabled,
+      source: "armed-dashboard",
+    }));
+  } catch (err) {
+    if (pending.delete(commandId)) {
+      clearTimeout(timer);
+      res.status(503).json({ ok: false, detail: `relay failed: ${(err as Error).message}` });
+    }
+  }
+});
+
+/**
+ * POST /api/breaker — body {circuit, action: "power_cycle"|"close"|"open", off_s?} (owner decision
+ * 2026-10-18: remote SPAN breaker control through the panel's LOCAL API, because the SPAN app's
+ * cloud path cannot switch circuits here). Gated exactly like /api/write-enable: the client
+ * bearer AND X-Arm-Token (HUB_ARM_TOKEN), which the dashboard releases only after a fresh
+ * password re-entry. The bridge applies every safety rule and answers with the panel READ-BACK;
+ * this route waits off_s + grace for it (a power cycle holds >= 60 s before it can answer).
+ *   200 {ok:true, detail, result}   verified outcome
+ *   502 {ok:false, detail, result}  refused by a bridge guard, or switched but not verified
+ *   501                             the connected bridge predates breaker control
+ *   503 no Pi / arming not configured · 504 no ack in time (the action may still complete:
+ *                                    the dashboard reads the live relay state from /api/state)
+ */
+app.post("/api/breaker", requireClientAuth, (req: Request, res: Response) => {
+  const armToken = process.env.HUB_ARM_TOKEN ?? "";
+  if (!armToken) {
+    res.status(503).json({ ok: false, detail: "arming not configured (HUB_ARM_TOKEN unset)" });
+    return;
+  }
+  if (!constantTimeEqual(String(req.header("x-arm-token") ?? ""), armToken)) {
+    res.status(401).json({ ok: false, detail: "bad arm token" });
+    return;
+  }
+  const v = validateBreakerBody(req.body);
+  if (!v.ok) {
+    res.status(400).json({ ok: false, detail: v.detail });
+    return;
+  }
+  const sock = piSocket;
+  if (!sock || sock.readyState !== WebSocket.OPEN) {
+    res.status(503).json({ ok: false, detail: "no Pi connected" });
+    return;
+  }
+  if (!bridgeSupportsBreaker(lastState)) {
+    res.status(501).json({
+      ok: false,
+      detail: "the connected bridge does not support breaker control yet (or SPAN local is not "
+        + "configured on it) — deploy the bridge release first",
+    });
+    return;
+  }
+  const cmd = v.cmd;
+  const commandId = randomUUID();
+  const timer = setTimeout(() => {
+    if (pending.delete(commandId)) {
+      res.status(504).json({
+        ok: false,
+        detail: "no answer from the bridge in time — the action may still complete; check the "
+          + "live relay state before trying again",
+      });
+    }
+  }, breakerAckTimeoutMs(cmd, BREAKER_ACK_GRACE_MS));
+  pending.set(commandId, {
+    timer,
+    resolve: (ack: AckMessage) => {
+      res.status(ack.ok ? 200 : 502).json({ ok: ack.ok, detail: ack.detail, result: ack.result ?? null });
+    },
+  });
+  console.log(`[hub] breaker ${cmd.op} '${cmd.circuit}' relayed (command ${commandId})`);
+  try {
+    sock.send(JSON.stringify({
+      type: "command" as const,
+      command_id: commandId,
+      action: "breaker" as const,
+      circuit: cmd.circuit,
+      op: cmd.op,
+      off_s: cmd.off_s,
       source: "armed-dashboard",
     }));
   } catch (err) {
@@ -710,7 +798,12 @@ wss.on("connection", (ws: WebSocket) => {
     switch (m.type) {
       case "state": {
         if (typeof m.ts === "number" && Array.isArray(m.pumps)) {
-          lastState = { type: "state", ts: m.ts, pumps: m.pumps as PumpState[] };
+          lastState = {
+            type: "state", ts: m.ts, pumps: m.pumps as PumpState[],
+            capabilities: Array.isArray(m.capabilities)
+              ? m.capabilities.filter((c): c is string => typeof c === "string") : undefined,
+            span: m.span ?? undefined,
+          };
         }
         break;
       }
@@ -722,6 +815,8 @@ wss.on("connection", (ws: WebSocket) => {
             ok: m.ok,
             detail: typeof m.detail === "string" ? m.detail : "",
             setpoint_c: typeof m.setpoint_c === "number" ? m.setpoint_c : null,
+            result: typeof m.result === "object" && m.result !== null && !Array.isArray(m.result)
+              ? (m.result as Record<string, unknown>) : null,
           };
           settleCommand(ack.command_id, ack);
         }

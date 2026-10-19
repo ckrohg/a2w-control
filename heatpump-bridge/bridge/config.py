@@ -192,6 +192,31 @@ class HubConfig(BaseModel):
     state_interval_s: float = 15.0    # how often to push a state frame while connected
 
 
+MIN_OFF_FLOOR_S = 60.0   # owner decision 2026-10-18: the minimum off time for ANY toggle-off
+
+
+class BreakerCircuit(BaseModel):
+    """One SPAN circuit A2W may switch (bridge/span_control.py). Listing a circuit allows CLOSE
+    (on) only; anything that turns power OFF is a per-circuit opt-in:
+      allow_cycle — power_cycle: OPEN, hold >= min_off_s, CLOSE in a finally (the circuit is
+                    always turned back on by the same action — owner decision 2026-10-18 for the
+                    Air-Water 1/2 self-heal and human-initiated power cycles)
+      allow_open  — a bare OPEN that stays off. Heat-pump circuits default to cycle-only so
+                    nothing A2W does can leave a heat pump off indefinitely.
+    heat_pump marks circuits of which at most ONE may be off at a time (A2W refuses to turn a
+    second one off while another reads OPEN)."""
+    name: str = Field(min_length=1)
+    allow_cycle: bool = False
+    allow_open: bool = False
+    heat_pump: bool = False
+
+
+def _default_breakers() -> list[BreakerCircuit]:
+    return [BreakerCircuit(name="Air-Water 1", allow_cycle=True, heat_pump=True),
+            BreakerCircuit(name="Air-Water 2", allow_cycle=True, heat_pump=True),
+            BreakerCircuit(name="Buffer Tank")]   # backup element: close-only, always
+
+
 class SpanConfig(BaseModel):
     # SPAN local-API poller (LAN-only instant circuit power) — the high-res half of the hybrid
     # backup-element logging; spanwatch's hourly cloud (planner side) is the always-there backbone.
@@ -216,6 +241,32 @@ class SpanConfig(BaseModel):
     arm: bool = False           # default owner intent = DISARMED
     arm_live: bool = False      # False = shadow (no SPAN relay writes); True = live (Phase 2)
     arm_cooldown_s: float = 300.0  # anti-flap: min gap between arm actions
+    # Remote breaker control (bridge/span_control.py) — the allowlist and its timings. The SPAN
+    # app's cloud path cannot switch these circuits (2026-10-18); this goes to the panel's LOCAL
+    # API from the Pi. min_off_s has a hard floor of 60 s (owner decision 2026-10-18).
+    breakers: list[BreakerCircuit] = Field(default_factory=_default_breakers)
+    min_off_s: float = MIN_OFF_FLOOR_S     # floor for any toggle-off (power_cycle hold, open->close)
+    max_off_s: float = 600.0               # ceiling on a single power_cycle hold
+    close_attempts: int = Field(default=4, ge=1, le=20)     # CLOSE tries inside the cycle
+    close_retry_delay_s: float = Field(default=5.0, ge=0)   # gap between those tries
+    reclose_interval_s: float = Field(default=60.0, gt=0)   # background re-close after they all fail
+
+    @model_validator(mode="after")
+    def _breaker_safety(self):
+        if not (self.min_off_s >= MIN_OFF_FLOOR_S):  # also rejects NaN
+            raise ValueError(f"span.min_off_s must be >= {MIN_OFF_FLOOR_S:g} s (owner decision 2026-10-18)")
+        if not (self.min_off_s <= self.max_off_s <= 3600):
+            raise ValueError("span.max_off_s must be within [min_off_s, 3600]")
+        names = [b.name.strip() for b in self.breakers]
+        if len(names) != len(set(names)):
+            raise ValueError("span.breakers lists a circuit twice")
+        for b in self.breakers:
+            # The backup element is the failsafe: A2W may make it AVAILABLE, never take it away
+            # (span-backup-arm-spec.md). No config can opt it into an OFF action.
+            if b.name.strip() == self.arm_circuit.strip() and (b.allow_cycle or b.allow_open):
+                raise ValueError(f"span.breakers: '{b.name}' is the backup element "
+                                 "(arm_circuit) — it stays close-only")
+        return self
 
 
 class AppConfig(BaseModel):
