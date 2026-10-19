@@ -7,7 +7,7 @@ import { AutoPilot } from "./autopilot";
 import { WriteError } from "./writes";
 
 function harness(block: Record<string, unknown>, opts: { dryRun?: boolean; fail?: Error } = {}) {
-  const store = { recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), ...block }] }], insertAutopilotLog: async () => {} } as any;
+  const store = { recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), ...block }] }], insertAutopilotLog: async () => {}, activeBoost: async () => null } as any;
   const writer = {
     status: async () => ({ commanded_target_f: 120, curve_in_force: null }),
     setTarget: async () => { if (opts.fail) throw opts.fail; return {}; },

@@ -13,6 +13,7 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
   const store = {
     recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), ...block }] }],
     insertAutopilotLog: async (row: { result: string }) => { logs.push(row); },
+    activeBoost: async () => null,
   } as any;
   const writer = {
     status: async () => ({ commanded_target_f: commanded, curve_in_force: null }),

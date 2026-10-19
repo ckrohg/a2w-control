@@ -577,11 +577,34 @@ export class Store {
     return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun, autoSanitize: s.autoSanitize };
   }
 
-  async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2)`,
+  /**
+   * A new boost SUPERSEDES every open one: its write replaced theirs on the device, and its own restore_at now owns
+   * the return to the as-found curve. Without this a 15-min boost tapped over a 2-h one expired while the older row
+   * still read as active, and the auto-pilot's boost hold kept the shorter boost's target in force for the longer
+   * one's whole timer. One statement, so no reader sees both or neither. `restored` is reused for "retired" (no schema
+   * change): nothing reads a superseded row's flag except dueBoosts/activeBoost, which must both skip it.
+   */
+  async insertBoost(targetF: number, restoreAt: Date): Promise<number> {
+    const r = await this.pool.query(
+      `WITH retired AS (UPDATE hbx_boosts SET restored = true WHERE NOT restored)
+       INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2) RETURNING id`,
       [targetF, restoreAt],
     );
+    return Number(r.rows[0].id);
+  }
+
+  /** Retire ONE boost row — a boost whose write a restore overtook before its row was recorded (writes.ts boost()). */
+  async retireBoost(id: number): Promise<void> {
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE id = $1`, [id]);
+  }
+
+  /**
+   * A human write replaced the boost (dashboard restore / set target): retire the open rows created BEFORE that write
+   * landed — nothing is left to restore for them. Scoped by time, not "every open row", so a delayed retry (the DB was
+   * down) cannot retire a newer boost started afterwards, e.g. by a successor planner instance (codex pass 5).
+   */
+  async retireOpenBoosts(createdBefore: Date): Promise<void> {
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE NOT restored AND created_at <= $1`, [createdBefore]);
   }
 
   /** Boosts whose restore is due (survives planner restarts — durability is the point). */

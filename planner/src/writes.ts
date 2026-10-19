@@ -23,6 +23,11 @@ import { extractConfig, diffConfig, patchEcho } from "./drift";
 import { curveAlreadyInForce, curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
+/**
+ * How long a restore waits for an earlier write slot before it proceeds anyway. Above a healthy slot's worst case
+ * (hub 20 s + SensorLinx PATCH 30 s, a re-auth, the audit rows), so only a genuinely stuck slot is overtaken.
+ */
+export const RESTORE_QUEUE_WAIT_MS = 120_000;
 const SLX_FRESH_MS = 20 * 60 * 1000;
 
 /**
@@ -88,6 +93,18 @@ export function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/**
+ * Per-write boost semantics, evaluated INSIDE the serial slot so no check-then-write gap remains.
+ * yieldToBoost: an automatic writer (auto-pilot, identification) refuses to write while a boost is active — the
+ * refusal is a WriteError whose `stable` is BOOST_YIELD (isBoostYield), which callers record as a hold, not a fault.
+ * It matters most for restore(), which the rate limit never blocks (codex pass 2 on the boost hold).
+ * endsBoost: a human write (dashboard restore / set target) replaces the boost, so it retires the open boost row —
+ * otherwise the auto-pilot would keep holding a boost the owner already cancelled.
+ */
+export type WriteOpts = { yieldToBoost?: boolean; endsBoost?: boolean };
+export const BOOST_YIELD = "yielded to an active boost";
+export function isBoostYield(e: unknown): e is BoostYieldError { return e instanceof BoostYieldError; }
+
 export class WriteError extends Error {
   /**
    * `stable` is the message with its moving parts (ages, counts) removed — the key the auto-pilot dedups its ledger
@@ -96,6 +113,13 @@ export class WriteError extends Error {
    */
   constructor(public status: number, message: string, public readonly stable: string = message) {
     super(message);
+  }
+}
+
+/** The WriteOpts.yieldToBoost refusal; carries the boost so the caller can record what actually holds the plant. */
+export class BoostYieldError extends WriteError {
+  constructor(public readonly boost: { targetF: number; restoreAt: Date }) {
+    super(409, `${BOOST_YIELD} (${boost.targetF}°F until ${boost.restoreAt.toISOString()})`, BOOST_YIELD);
   }
 }
 
@@ -116,6 +140,101 @@ export function curveOverridden(
 
 export class HbxWriter {
   private lastWriteAt = 0;
+  /**
+   * Every device write (setTarget, setCurve, boost, restore, boost expiry) runs one at a time, in arrival order. The
+   * rate limit is checked before the PATCH but lastWriteAt is only set after it, so two writers that both passed the
+   * check could both land — and an auto-pilot write still in flight when the owner taps a boost could land SECOND and
+   * replace the boost (codex pass 1 on the boost hold). Serialised, the second writer sees the first's lastWriteAt
+   * and is refused 429. In-process only; a second planner instance is the writer lease's job (#36). patchDevice has
+   * its own fetch timeout, so a hung PATCH cannot wedge the chain.
+   */
+  private writeChain: Promise<unknown> = Promise.resolve();
+  private restoreQueueWaitMs = RESTORE_QUEUE_WAIT_MS; // an instance field so the suite can shorten it
+  private serial<T>(fn: () => Promise<T>, maxWaitMs?: number): Promise<T> {
+    const prev = this.writeChain;
+    if (maxWaitMs == null) {
+      const run = prev.then(fn, fn);
+      this.writeChain = run.catch(() => {});
+      return run;
+    }
+    // Bounded wait (restore only): the main pool has no query timeouts, so a slot stuck in a hung query would
+    // otherwise block the one write that must never be blocked (codex pass 8). Past the bound the restore runs anyway —
+    // the device PATCH is still ordered by withDeviceLock — and later writers wait for BOTH the stuck slot and it.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const gate = Promise.race([
+      prev,
+      new Promise<void>((r) => { timer = setTimeout(() => { console.warn(`[writer] a write slot has not settled in ${maxWaitMs / 1000} s — the restore proceeds without it`); r(); }, maxWaitMs); }),
+    ]).finally(() => clearTimeout(timer));
+    const run = gate.then(fn, fn);
+    this.writeChain = Promise.allSettled([prev, run]);
+    return run;
+  }
+  /**
+   * A human write (endsBoost) landed but its boost row could not be retired (DB error). The row is now STALE: retried
+   * at the start of every serial slot and every expireBoosts() (each poll, before the auto-pilot reads hbx_boosts), and
+   * until it succeeds the expiry restore is skipped — restoring at the stale restore_at would overwrite the owner's
+   * replacement command (codex pass 3). The auto-pilot meanwhile holds on the stale row: no write, the owner's command
+   * stays. Surfaced in status().boost_cancel_pending and the write response. In-memory: a restart forgets it, and the
+   * stale row then behaves like an ordinary boost (hold, then the as-found restore at its restore_at).
+   */
+  private retirePendingBefore: Date | null = null; // the landing time of the cancel whose retire is pending
+  private get retirePending(): boolean { return this.retirePendingBefore != null; }
+  private async retryPendingRetire(): Promise<boolean> {
+    if (!this.retirePendingBefore) return true;
+    try {
+      await this.store.retireOpenBoosts(this.retirePendingBefore);
+      this.retirePendingBefore = null;
+      console.log("[boost] the cancelled boost row is retired (retry succeeded)");
+      return true;
+    } catch (e) {
+      console.error(`[boost] retiring the cancelled boost row failed again: ${(e as Error).message}`);
+      return false;
+    }
+  }
+  /** One serial slot with the WriteOpts boost semantics around the write. */
+  private guarded(source: string, action: string, requested: unknown, opts: WriteOpts, write: () => Promise<Record<string, unknown>>, maxWaitMs?: number): Promise<Record<string, unknown>> {
+    return this.serial(async () => {
+      // Before the yield check, so a cancelled boost whose row can now be retired no longer makes an automatic writer
+      // yield. If the retry fails the stale row still yields — fail closed, like the auto-pilot's own pre-check: the
+      // owner's replacement command stays in force until the row is gone.
+      await this.retryPendingRetire();
+      if (opts.yieldToBoost) {
+        const b = await this.store.activeBoost();
+        if (b) {
+          const err = new BoostYieldError(b);
+          await this.store.insertHbxWrite({ source, action, requested, result: "rejected", detail: err.message });
+          throw err;
+        }
+      }
+      if (!opts.endsBoost) return write();
+      // The cancel follows the DEVICE, not the bookkeeping: patch() bumps deviceWrites as soon as the PATCH is
+      // accepted, so a write whose later audit / config-version insert (or read-back) threw still ends the boost —
+      // otherwise its timer would restore over the owner's command (codex pass 4).
+      const before = this.deviceWrites;
+      let result: Record<string, unknown>;
+      try { result = await write(); }
+      // The cutoff is the moment the PATCH landed (stamped beside deviceWrites), not now: patch()'s bookkeeping and
+      // ntfy run after it, and a successor planner's boost started in that gap must not be retired (codex pass 6).
+      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt); throw e; }
+      // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
+      return (await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt)) ? result : { ...result, boost_retire_failed: true };
+    }, maxWaitMs);
+  }
+  /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after — and when the last one did. */
+  private deviceWrites = 0;
+  private lastDeviceWriteAt = new Date(0);
+  /** Retire the open boost row for a landed human write; on failure arm the retry. true = retired. */
+  private async retireCancelledBoost(source: string, action: string, landedAt: Date): Promise<boolean> {
+    try { await this.store.retireOpenBoosts(landedAt); return true; }
+    catch (e) {
+      // a second failed cancel widens the window to its own landing time (rows before the earlier one are inside it)
+      this.retirePendingBefore = this.retirePendingBefore && this.retirePendingBefore > landedAt ? this.retirePendingBefore : landedAt;
+      const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
+      console.error(`[boost] ${msg}`);
+      await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
+      return false;
+    }
+  }
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
 
   constructor(
@@ -177,6 +296,7 @@ export class HbxWriter {
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
+      boost_cancel_pending: this.retirePending,
       auto_sanitize_enabled: this.autoSanitizeEnabled,
     };
   }
@@ -211,7 +331,11 @@ export class HbxWriter {
   // sanitize passes DEFAULT_OPTS.sanitizeCapF so its 140°F soak isn't clamped to 135. This only
   // raises the envelope ceiling — the I1 cross-check below is unchanged, so a higher target still
   // requires the pump setpoints to cover it (setpoint ≥ target + margin) or the write is rejected.
-  async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+  async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "set_target", { target_f: targetF }, opts, () => this.setTargetSerial(targetF, source, capF));
+  }
+  private async setTargetSerial(targetF: number, source: string, capF: number): Promise<Record<string, unknown>> {
+    const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
       throw new WriteError(status, detail, stable);
@@ -292,6 +416,7 @@ export class HbxWriter {
       source,
       "set_target",
       `target ${targetF}°F commanded (curve ${dbt}/${mbt} → ${targetF}°F output at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      epoch,
     );
   }
 
@@ -305,7 +430,11 @@ export class HbxWriter {
    * every attempt, and the config-echo verify inside patch(). Excursions (bank, soak, storm, boost,
    * identification probes) stay setTarget writes on top; restore() puts the as-found curve back.
    */
-  async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+  async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "set_curve", { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd }, opts, () => this.setCurveSerial(curve, source, capF));
+  }
+  private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number): Promise<Record<string, unknown>> {
+    const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
     // validated (the guard already refused a wwsd that differs from the live one).
     const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
@@ -348,6 +477,7 @@ export class HbxWriter {
       source,
       "set_curve",
       `curve commanded: ${curve.dbt}°F at ${curve.dot}°F → ${curve.mbt}°F at ${curve.wwsd}°F (output ${outputNow.toFixed(1)}°F at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      epoch,
     );
   }
 
@@ -363,22 +493,59 @@ export class HbxWriter {
       await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "rejected", detail: "minutes must be 15–120" });
       throw new WriteError(422, "minutes must be 15–120");
     }
-    const result = await this.setTarget(targetF, source, capF); // envelope (capF) + I1 + rate limit
-    const restoreAt = new Date(Date.now() + minutes * 60_000);
-    await this.store.insertBoost(targetF, restoreAt);
-    return { ...result, boost_restore_at: restoreAt.toISOString() };
+    // The write AND its hbx_boosts row inside one serial slot: the auto-pilot's boost hold reads that row.
+    return this.serial(async () => {
+      await this.retryPendingRetire();
+      const before = this.deviceWrites;
+      const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
+      // The boost's PATCH is device write before+1 (the in-lock epoch check guarantees none landed ahead of it). Any
+      // later one is a restore that overtook this slot while it was stuck after the PATCH (ntfy, audit): the owner
+      // replaced the boost, so recording it now would hold the auto-pilot on the restored curve (codex pass 10).
+      const overtaken = () => this.deviceWrites !== before + 1;
+      if (overtaken()) {
+        console.warn(`[boost] ${targetF}°F boost was overtaken by a restore before its row was recorded — not recorded`);
+        return { ...result, boost_restore_at: null, boost_superseded: true };
+      }
+      const restoreAt = new Date(Date.now() + minutes * 60_000);
+      const id = await this.store.insertBoost(targetF, restoreAt);
+      this.retirePendingBefore = null; // insertBoost retired every older open row, the stale one included
+      if (overtaken()) {
+        // the restore landed while the insert was in flight — its own retire may have run before the row existed
+        await this.store.retireBoost(id);
+        console.warn(`[boost] ${targetF}°F boost row #${id} retired — a restore overtook it while it was being recorded`);
+        return { ...result, boost_restore_at: null, boost_superseded: true };
+      }
+      return { ...result, boost_restore_at: restoreAt.toISOString() };
+    });
   }
 
-  /** Called every poll: restore any boost whose timer has passed (durable expiry). */
+  /**
+   * Called every poll: restore any boost whose timer has passed (durable expiry). A due row while a NEWER boost is
+   * active (an old row left unrestored through downtime or a failing restore, then the owner boosted again) is retired
+   * without a restore: restoring the as-found curve then would erase the live boost, and the auto-pilot's boost hold
+   * would keep the plant on that curve until the newer boost ran out (codex pass 1). The newer boost's own expiry
+   * restores the curve.
+   */
   async expireBoosts(): Promise<void> {
-    const due = await this.store.dueBoosts();
-    if (!due.length) return;
-    await this.restore("boost-expiry");
-    await this.store.markBoostsRestored(due.map((d) => d.id));
+    return this.serial(async () => {
+      if (!(await this.retryPendingRetire())) return; // a stale (cancelled) row's expiry must not restore over the owner's command
+      const due = await this.store.dueBoosts();
+      if (!due.length) return;
+      const active = await this.store.activeBoost();
+      if (active) {
+        console.log(`[boost] retiring ${due.length} overdue boost row(s) without a restore — a newer boost to ${active.targetF}°F is active until ${active.restoreAt.toISOString()}`);
+      } else {
+        await this.restoreSerial("boost-expiry");
+      }
+      await this.store.markBoostsRestored(due.map((d) => d.id));
+    });
   }
 
   /** Re-apply the as-found curve endpoints. Never rate-limited, never envelope-checked. */
-  async restore(source: string): Promise<Record<string, unknown>> {
+  async restore(source: string, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source), this.restoreQueueWaitMs);
+  }
+  private async restoreSerial(source: string): Promise<Record<string, unknown>> {
     const baseline = await this.store.baselineConfig();
     if (!baseline || typeof baseline.dbt !== "number" || typeof baseline.mbt !== "number") {
       await this.store.insertHbxWrite({ source, action: "restore", requested: null, result: "rejected", detail: "no baseline config version" });
@@ -396,6 +563,12 @@ export class HbxWriter {
     source: string,
     action: string,
     summary: string,
+    /**
+     * deviceWrites when the caller evaluated its guards (rate limit, I1, envelope). A device write landing since then
+     * can only be a restore that overtook this write's stuck slot (serial(maxWaitMs)); this write's guards are then
+     * stale and it must not land over the restore (codex pass 9). Omitted for restore itself: it is the last word.
+     */
+    epoch?: number,
   ): Promise<Record<string, unknown>> {
     // Graceful handover (2026-10-01): once SIGTERM has landed no NEW device write may start — the lease is about to
     // be handed to the successor and a PATCH that began after the barrier could land after the successor's own
@@ -430,9 +603,14 @@ export class HbxWriter {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier went up during the lease check" });
           throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
         }
+        if (epoch != null && this.deviceWrites !== epoch) {
+          await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "superseded: another device write (a restore) landed while this write was being evaluated" });
+          throw new WriteError(429, "superseded: a restore landed while this write was being evaluated — retry next cycle");
+        }
         let dev: Record<string, any>;
         try {
           dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
+          this.deviceWrites++; this.lastDeviceWriteAt = new Date();
         } catch (e) {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
           throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);

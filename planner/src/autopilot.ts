@@ -8,10 +8,11 @@
  * computes + logs what it WOULD set without writing. A2W stays STANDALONE — the shadow plan falls
  * back to the HBX reset curve if TempIQ is down, so the auto-pilot never hard-depends on TempIQ.
  * Every decision is recorded to autopilot_log (dedup'd on change) so the dashboard can show it.
+ * An active boost (hbx_boosts, started from the dashboard) HOLDS the auto-pilot until its restore_at.
  */
 
 import { Store } from "./store";
-import { HbxWriter, WriteError } from "./writes";
+import { HbxWriter, WriteError, isBoostYield } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
 import { APPLY_TOLERANCE_F, curveAlreadyInForce, type ShapedCurve } from "./curve";
 // #173: curveAlreadyInForce + APPLY_TOLERANCE_F live in curve.ts now (shared with writes.ts status() and /health);
@@ -84,16 +85,34 @@ export class AutoPilot {
   }
   get holdActive(): boolean { return this.holdUntil != null && Date.now() < this.holdUntil; }
 
-  /** Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). */
-  private async record(target: number | null, reason: string, result: string, verbose: string, block?: Record<string, unknown> | null): Promise<void> {
+  /**
+   * Set lastResult and record to autopilot_log only when the decision changes (keeps the table small). `cause` joins
+   * the dedup key when two decisions share a result word and a target but not a meaning (a boost hold vs "already
+   * commanded" are both `held`), so the transition between them is still a row.
+   */
+  private async record(target: number | null, reason: string, result: string, verbose: string, block?: Record<string, unknown> | null, cause = ""): Promise<void> {
     this.lastResult = verbose;
     this.lastTargetF = target;
     if (block?.boost === true && target != null) this.lastPreBoost = { at: new Date().toISOString(), toF: target, reason, result };
-    const key = `${result}|${target}`;
+    const key = `${result}|${target}|${cause}`;
     if (key !== this.lastLogged) {
       this.lastLogged = key;
       await this.store.insertAutopilotLog({ targetF: target, reason, result, dryRun: this.dryRun }).catch(() => {});
     }
+  }
+
+  /**
+   * Record a boost hold: the BOOST's target is what holds the plant (the ledger and the heartbeat show it), the plan's
+   * wanted target is named in the reason. Used by the pre-check and by the writer's in-slot yield (a boost that landed
+   * while this write was queued), so both read the same on the dashboard (codex pass 3).
+   */
+  private async holdForBoost(boost: { targetF: number; restoreAt: Date }, target: number, reason: string, block: Record<string, unknown> | null | undefined): Promise<void> {
+    const until = boost.restoreAt.toISOString();
+    const why = `boost ${boost.targetF}°F until ${until} — plan wants ${target}°F (${reason}), resumes after`;
+    // the restore time is in the cause so a second boost at the same target is its own row, not swallowed by the dedup
+    await this.record(boost.targetF, why, "held", `held for boost to ${boost.targetF}°F until ${until} — plan wants ${target}°F, not applied`, null, `boost:${until}`);
+    // a plan pre-boost hour reached during the hold is recorded as held, not lost (the same rule as the identification hold)
+    if (block?.boost === true) this.lastPreBoost = { at: new Date().toISOString(), toF: target, reason, result: "held: boost active" };
   }
 
   /** Pick the shadow plan's current-hour target and apply it (guarded). Called each poll cycle. */
@@ -115,6 +134,14 @@ export class AutoPilot {
     const reason = String(block?.reason ?? "");
     this.lastRunAt = new Date().toISOString();
 
+    // Dashboard boost hold (incident 2026-10-14..16): a boost the owner started (POST /api/hbx/boost → writes.ts
+    // boost(), durable in hbx_boosts) is a human command with its own timer and its own restore. The auto-pilot must
+    // not write its plan over it once the 15-min rate limit clears — before this it did, and a 3 h "Heat now" lasted
+    // ~15 min. Held until restore_at; expireBoosts() then restores the as-found curve and the auto-pilot resumes on
+    // the next unthrottled poll. Checked before every other branch (dry run and shaped-curve mode included): there
+    // is nothing to decide while a human holds the target. Logged as `held`, never a rejection — nothing refused it.
+    const boost = await this.store.activeBoost();
+    if (boost) { await this.holdForBoost(boost, target, reason, block); return; }
     if (this.holdActive) {
       // the block is passed so a boost reached during an identification hold is recorded as held, not lost (codex on #158)
       await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`, block);
@@ -150,7 +177,7 @@ export class AutoPilot {
           return;
         }
         try {
-          await this.writer.setCurve(d.curve, "autopilot");
+          await this.writer.setCurve(d.curve, "autopilot", undefined, { yieldToBoost: true });
           await this.record(target, reason, "set-curve", `commanded ${label} — ${reason}`);
           console.log(`[autopilot] ${this.lastResult}`);
         } catch (e) {
@@ -158,6 +185,7 @@ export class AutoPilot {
             await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
             return;
           }
+          if (isBoostYield(e)) { await this.holdForBoost(e.boost, target, reason, block); return; } // a boost landed while this write was queued
           // #167: a disconnected / stale Pi is refused 503 exactly like an unreachable hub — filed as a rejection
           // (the ledger key is the age-free `stable` form, so a 3-h dropout is ONE row), warned, never paged.
           const msg = e instanceof WriteError ? e.message : (e as Error).message;
@@ -198,7 +226,7 @@ export class AutoPilot {
     }
 
     try {
-      await this.writer.setTarget(target, "autopilot", capF);
+      await this.writer.setTarget(target, "autopilot", capF, { yieldToBoost: true });
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`, block);
       console.log(`[autopilot] ${this.lastResult}`);
     } catch (e) {
@@ -207,6 +235,8 @@ export class AutoPilot {
         await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${target}°F (${reason})`, block);
         return;
       }
+      // the writer re-checks the boost inside its serial slot: one that landed after the check above is still a hold
+      if (isBoostYield(e)) { await this.holdForBoost(e.boost, target, reason, block); return; }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
       // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
       // caught by the standing I1 monitor + the adoption monitor. #167: "cannot verify I1" (hub unreachable,

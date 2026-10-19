@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
-import { WriteError } from "./writes";
+import { WriteError, BoostYieldError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
 const cell = (over: Partial<PlanCell> & { band: [number, number] }, sug: Partial<NonNullable<PlanCell["suggest"]>> = {}): PlanCell => ({
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>}) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -121,7 +121,7 @@ async function main(): Promise<void> {
     const writeFails = [...(over.writeFails ?? [])];
     const store: IdentStore = {
       async getLatestSlx() { return { ts: new Date(clock - (over.slxAgeMs ?? 60_000)), tankF: 130, targetF: over.commanded ?? 135, outdoorF: over.outdoorF ?? 40 }; },
-      async activeBoost() { return null; },
+      async activeBoost() { const b = over.boost?.v ?? null; if (b instanceof Error) throw b; return b; },
       // Default: one block in force whose target IS the settled base, so the plan-settled guard is neutral
       // unless a test moves the plan on purpose (tests pass `planBlocks` and may mutate the array in place).
       async recentPlans() {
@@ -151,12 +151,16 @@ async function main(): Promise<void> {
     const deps: IdentDeps = {
       store,
       writer: {
-        async setTarget(targetF: number, source: string, capF?: number) {
+        async setTarget(targetF: number, source: string, capF?: number, opts?: { yieldToBoost?: boolean }) {
+          over.onSetTarget?.(source);
+          // the real writer checks the boost first inside its serial slot (writes.ts guarded), then the rate limit
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) throw new BoostYieldError(over.boost.v);
           const f = writeFails.shift();
           if (f != null) throw new WriteError(f, f === 429 ? "rate limited" : "rejected");
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
-        async restore(source: string) {
+        async restore(source: string, opts?: { yieldToBoost?: boolean }) {
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new BoostYieldError(over.boost.v); }
           if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
           restores.push(source); return { ok: true };
         },
@@ -646,6 +650,94 @@ async function main(): Promise<void> {
     await h.driver.tick();
     assert.equal(h.rows[0].state, "active");
     assert.deepEqual(h.writes, [{ targetF: 124, source: "identification#1", capF: 135 }]);
+  }
+  // 5e. Boost hold (codex pass 1 on the boost hold): a boost tapped while a probe was arming / rate-limited ends the
+  //     window UNWRITTEN — the 429 retry must never land the probe over the owner's boost once the limit clears.
+  {
+    const seed = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    const boost = { v: { targetF: 132, restoreAt: new Date(T0.getTime() + 3 * 3600_000) } as { targetF: number; restoreAt: Date } | null | Error };
+    const h = harness({ plan: downPlan, commanded: 130, seedRows: [seed()], boost });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "ended"); assert.equal(h.rows[0].endReason, "aborted:boost_active");
+    assert.equal(h.writes.length, 0, "no probe write over an active boost");
+    assert.equal(h.restores.length, 0); assert.equal(h.rows[0].cleanupState, "none", "never written → nothing to clean up");
+    // an unreadable boost table is not "no boost": the probe write is not attempted (tick() catches and retries)
+    const e = harness({ plan: downPlan, commanded: 130, seedRows: [seed()], boost: { v: new Error("connection terminated") } });
+    await e.driver.tick();
+    assert.equal(e.writes.length, 0); assert.equal(e.rows[0].state, "pending_write");
+  }
+  // 5f. Cleanup YIELDS to an active boost — on the urgent abort (boost_active, the as-found restore path) and on a
+  //     pending non-urgent cleanup — even when the device still reads as the probe target. The boost's own expiry
+  //     restores the curve; an unreadable boost table keeps a non-urgent cleanup pending.
+  {
+    const boost = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, boost, liveCommanded: async () => null });
+    await h.driver.tick(); await h.driver.tick();          // arming → active (the probe write)
+    assert.equal(h.rows[0].state, "active"); assert.equal(h.writes.length, 1);
+    boost.v = { targetF: 143, restoreAt: new Date(T0.getTime() + 3 * 3600_000) }; // the owner boosts mid-window
+    await h.driver.tick();
+    assert.equal(h.rows[0].endReason, "aborted:boost_active");
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /a boost to 143 °F is active until .* nothing to return/);
+    assert.equal(h.restores.length, 0, "the urgent restore must not erase the boost");
+    assert.equal(h.writes.length, 1, "no re-command either");
+    const legacy = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 300 * 60_000), state: "ended", arm: "probe", direction: "up", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 8, baseF: 135, targetF: 143, capF: 145, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 200 * 60_000),
+      endedAt: new Date(T0.getTime() - 80 * 60_000), endReason: "completed", durationMin: 120, writeId: 40, writeAccepted: true, dryRun: false,
+      postedOpen: true, postedClosed: true, cell: null, safeToProbe: null, armingTicks: 0, writeAttempts: 1, cleanupState: "pending", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    // the device reads the probe target (143 = the boost target): without the yield this would re-command base 135
+    const p = harness({ plan: upPlan, commanded: 143, seedRows: [legacy()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: { v: { targetF: 143, restoreAt: new Date(T0.getTime() + 3600_000) } } });
+    await p.driver.tick();
+    assert.equal(p.rows[0].cleanupState, "done"); assert.equal(p.writes.length, 0); assert.equal(p.restores.length, 0);
+    const u = harness({ plan: upPlan, commanded: 143, seedRows: [legacy()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: { v: new Error("connection terminated") } });
+    await u.driver.tick();
+    assert.equal(u.rows[0].cleanupState, "pending"); assert.match(u.rows[0].cleanupDetail ?? "", /boost state unreadable/);
+    assert.equal(u.writes.length, 0); assert.equal(u.restores.length, 0);
+  }
+  // 5g. Interleaving (codex pass 2 on the boost hold): the boost lands AFTER cleanup's step-0a check. (i) It lands
+  //     before the re-command's slot → the writer yields → done, no write. (ii) It lands after the re-command was
+  //     refused 429 → the fallback restore, which the rate limit never blocks, yields too → done, no restore.
+  {
+    const ended = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 300 * 60_000), state: "ended", arm: "probe", direction: "up", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 8, baseF: 135, targetF: 143, capF: 145, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 200 * 60_000),
+      endedAt: new Date(T0.getTime() - 80 * 60_000), endReason: "completed", durationMin: 120, writeId: 40, writeAccepted: true, dryRun: false,
+      postedOpen: true, postedClosed: true, cell: null, safeToProbe: null, armingTicks: 0, writeAttempts: 1, cleanupState: "pending", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    const tapped = { targetF: 140, restoreAt: new Date(T0.getTime() + 3600_000) };
+    const b1 = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const i = harness({ plan: upPlan, commanded: 143, seedRows: [ended()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: b1,
+      liveCommanded: async () => { b1.v = tapped; return 143; } }); // the owner taps a boost while cleanup reads the device
+    await i.driver.tick();
+    assert.equal(i.rows[0].cleanupState, "done"); assert.match(i.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
+    assert.equal(i.writes.length, 0); assert.deepEqual(i.restores, []);
+    const b2 = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const ii = harness({ plan: upPlan, commanded: 143, seedRows: [ended()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: b2, writeFails: [429],
+      onSetTarget: () => { /* the boost's write is ahead in the queue: 429 for us, and its row is visible by the restore */ queueMicrotask(() => { b2.v = tapped; }); } });
+    await ii.driver.tick();
+    assert.equal(ii.rows[0].cleanupState, "done"); assert.match(ii.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
+    assert.deepEqual(ii.restores, ["YIELD"], "the restore was attempted and YIELDED — it did not erase the boost");
+  }
+  // 5h. a probe write queued behind a boost yields → the window ends unwritten (no 429 retry loop)
+  {
+    const pw = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    const b = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const h = harness({ plan: downPlan, commanded: 130, seedRows: [pw()], boost: b, onSetTarget: () => { b.v = { targetF: 132, restoreAt: new Date(T0.getTime() + 3600_000) }; } });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "ended"); assert.equal(h.rows[0].endReason, "aborted:boost_active");
+    assert.equal(h.writes.length, 0); assert.equal(h.rows[0].cleanupState, "none");
   }
   // 4d. Cleanup is a NO-OP when the device no longer commands the probe target (a legacy/backfilled row, or
   //     something else already moved the plant) — codex pass 4.
