@@ -18,7 +18,12 @@ export const NO_PI = /no Pi connected/;
 export const READING_GAP_MIN_S = 5 * 60;
 /** How far outside a window a readings gap or a boot may sit and still belong to it (phase_b_log is 5-min grained). */
 export const WINDOW_SLACK_S = 10 * 60;
-/** How far the Pi's boot time (ts − uptime_s) must jump forward to count as a reboot (absorbs clock/NTP jitter). */
+/**
+ * A reboot between two system_stats samples needs uptime evidence, not just a moved boot time (codex pass 1 on #193:
+ * an NTP step forward moves ts − uptime_s exactly like a reboot does): uptime fell, OR the new uptime is shorter than
+ * the time since the previous sample (the Pi booted after it) — with the boot time also jumping by more than this.
+ * A clock step on a Pi up longer than the step trips neither. store.piLinkInputs applies it in SQL.
+ */
 export const BOOT_JUMP_S = 5 * 60;
 
 export type PiVerdict = "gap+reboot" | "gap_only" | "socket_only" | "unknown";
@@ -59,28 +64,58 @@ export function dropoutRuns(rows: PhaseBRow[]): DropoutRun[] {
   return out;
 }
 
+/** Reboots closer together than this are one boot (a fresh Pi's NTP step right after boot re-trips the predicate). */
+export const BOOT_MERGE_S = 15 * 60;
+
+/** Collapse near-duplicate boots (sorted output). */
+export function mergeBoots(boots: Boot[]): Boot[] {
+  const out: Boot[] = [];
+  for (const b of [...boots].sort((x, y) => x.at - y.at)) {
+    if (!out.length || b.at - out[out.length - 1].at > BOOT_MERGE_S) out.push(b);
+  }
+  return out;
+}
+
+export interface ReadingsView { gaps: ReadingGap[]; firstTs: number | null; lastTs: number | null }
+export interface StatsView { boots: Boot[]; firstTs: number | null; lastTs: number | null }
+
 /**
- * Verdict per window. `readings` = what the mirror's readings table can say: null when the table is absent; else the
- * gaps over the period, the oldest reading (no coverage before it) and the newest (a trailing silence up to `nowS`
- * counts as a gap). `boots` = null when system_stats is absent (a gap is then gap_only — no reboot evidence).
+ * Verdict per window (codex pass 1 on #193 tightened every rule):
+ * - the readings gap must substantially belong to the window — at least half of it inside the window ± slack — so an
+ *   unrelated gap just before/after does not turn a socket outage into a gap;
+ * - the reboot must be the one that ended THAT gap — inside [gap start − 1 min, gap end + 2 min] (the Pi boots, then
+ *   its first push closes the gap) — not merely somewhere in the window;
+ * - gap+reboot vs gap_only needs system_stats samples bracketing the gap (first ≤ gap start, last ≥ gap end): absent,
+ *   empty, late-starting stats, or a gap still open now → `unknown`, never a guessed gap_only;
+ * - no readings before the window → `unknown`.
+ * `readings` null = the table is absent; `stats` null likewise. A silence that has not ended (trailing) is a gap.
  */
 export function classifyWindows(
   runs: DropoutRun[],
-  readings: { gaps: ReadingGap[]; firstTs: number | null; lastTs: number | null } | null,
-  boots: Boot[] | null,
+  readings: ReadingsView | null,
+  stats: StatsView | null,
   nowS: number,
 ): DropoutWindow[] {
   const gaps: ReadingGap[] = readings ? [...readings.gaps] : [];
-  if (readings?.lastTs != null && nowS - readings.lastTs > READING_GAP_MIN_S) gaps.push({ start: readings.lastTs, end: nowS });
+  const trailing = readings?.lastTs != null && nowS - readings.lastTs > READING_GAP_MIN_S;
+  if (trailing) gaps.push({ start: readings!.lastTs as number, end: nowS });
+  const boots = stats ? mergeBoots(stats.boots) : [];
   return runs.map((r) => {
     const s = r.start / 1000;
     const e = r.end == null ? nowS : r.end / 1000;
     const lo = s - WINDOW_SLACK_S, hi = e + WINDOW_SLACK_S;
     const covered = readings != null && readings.firstTs != null && readings.firstTs <= s;
-    const gap = gaps.filter((g) => g.start < hi && g.end > lo)
-      .sort((a, b) => (b.end - b.start) - (a.end - a.start))[0] ?? null;
-    const boot = (boots ?? []).find((b) => b.at >= lo && b.at <= hi) ?? null;
-    const verdict: PiVerdict = !covered ? "unknown" : gap ? (boot ? "gap+reboot" : "gap_only") : "socket_only";
+    const inside = (g: ReadingGap) => Math.max(0, Math.min(g.end, hi) - Math.max(g.start, lo));
+    const gap = gaps.filter((g) => inside(g) >= (g.end - g.start) / 2 && inside(g) >= READING_GAP_MIN_S)
+      .sort((x, y) => inside(y) - inside(x))[0] ?? null;
+    const open = gap != null && trailing && gap.end === nowS;
+    const bracketed = gap != null && !open && stats != null && stats.firstTs != null && stats.lastTs != null
+      && stats.firstTs <= gap.start && stats.lastTs >= gap.end;
+    const boot = gap && bracketed ? boots.find((b) => b.at >= gap.start - 60 && b.at <= gap.end + 120) ?? null : null;
+    const verdict: PiVerdict = !covered ? "unknown"
+      : !gap ? "socket_only"
+      : !bracketed ? "unknown"
+      : boot ? "gap+reboot" : "gap_only";
     return {
       start: new Date(r.start).toISOString(),
       end: r.end == null ? null : new Date(r.end).toISOString(),
@@ -93,15 +128,22 @@ export function classifyWindows(
 }
 
 export interface PiLinkInputs {
-  /** newest readings ts per pump (epoch s), or null when the readings table is absent */
+  /** newest readings ts per pump over the WHOLE table (epoch s), or null when the readings table is absent */
   lastByPump: Record<string, number> | null;
-  readings: { gaps: ReadingGap[]; firstTs: number | null; lastTs: number | null } | null;
+  /** gaps + coverage over the analysis range, or null when the table is absent */
+  readings: ReadingsView | null;
   /** newest system_stats row, or null when absent / empty */
   latestStat: { ts: number; uptime_s: number | null } | null;
-  /** reboots detected in system_stats, or null when the table is absent */
-  boots: Boot[] | null;
+  /** reboots (with uptime evidence) + coverage over the analysis range, or null when the table is absent */
+  stats: StatsView | null;
+  /** phase_b_log rows from a day BEFORE the 7-d window, so a run that straddles the edge keeps its real start */
   phaseB: PhaseBRow[];
 }
+
+/** Windows are reported when they ENDED (or are still open) within this — the hub's own convention (#178). */
+export const DROPOUT_WINDOW_S = 7 * 86_400;
+/** How much earlier the inputs start, so runs straddling the 7-d edge are seen whole (store.piLinkInputs). */
+export const LOOKBACK_S = 86_400;
 
 export interface PiHealth {
   computed_at: string;
@@ -126,20 +168,22 @@ export function piHealth(input: PiLinkInputs, nowMs: number): PiHealth {
   for (const [id, ts] of Object.entries(input.lastByPump ?? {})) by[id] = { ts: new Date(ts * 1000).toISOString(), age_s: Math.round(nowS - ts) };
   const tsList = Object.values(input.lastByPump ?? {});
   const newest = tsList.length ? Math.max(...tsList) : null;
-  const windows = classifyWindows(dropoutRuns(input.phaseB), input.readings, input.boots, nowS);
+  const windows = classifyWindows(
+    dropoutRuns(input.phaseB).filter((r) => r.end == null || nowS - r.end / 1000 <= DROPOUT_WINDOW_S),
+    input.readings, input.stats, nowS);
   const verdicts: Record<PiVerdict, number> = { "gap+reboot": 0, gap_only: 0, socket_only: 0, unknown: 0 };
   for (const w of windows) verdicts[w.verdict]++;
-  const boots = input.boots ?? [];
+  const boots = input.stats ? mergeBoots(input.stats.boots) : [];
   const lastBoot = boots.length ? Math.max(...boots.map((b) => b.at)) : null;
   return {
     computed_at: new Date(nowMs).toISOString(),
-    mirror_tables: { readings: input.lastByPump !== null, system_stats: input.boots !== null },
+    mirror_tables: { readings: input.lastByPump !== null, system_stats: input.stats !== null },
     last_reading_age_s: newest == null ? null : Math.round(nowS - newest),
     last_reading_by_pump: by,
     uptime_s: input.latestStat?.uptime_s ?? null,
     uptime_age_s: input.latestStat ? Math.round(nowS - input.latestStat.ts) : null,
-    reboots_24h: input.boots === null ? null : boots.filter((b) => nowS - b.at <= 86_400).length,
-    reboots_7d: input.boots === null ? null : boots.filter((b) => nowS - b.at <= 7 * 86_400).length,
+    reboots_24h: input.stats === null ? null : boots.filter((b) => nowS - b.at <= 86_400).length,
+    reboots_7d: input.stats === null ? null : boots.filter((b) => nowS - b.at <= DROPOUT_WINDOW_S).length,
     last_reboot_at: lastBoot == null ? null : new Date(lastBoot * 1000).toISOString(),
     dropouts_7d: windows,
     summary: {

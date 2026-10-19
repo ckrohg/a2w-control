@@ -941,22 +941,26 @@ export class Store {
    * connection (no laptop query against production — CLAUDE.md). The mirror owns `readings` and `system_stats` (Pi
    * epoch seconds, ~1 row/min); either may be absent in a DB the mirror never wrote (the rehearsal) → null, never an
    * error. The two heavy reductions run in SQL so the planner only ships a handful of rows: readings gaps (> gapS
-   * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS).
+   * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS, with uptime
+   * evidence), each with its table's coverage over the range.
    */
-  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number }): Promise<PiLinkInputs> {
-    const sinceS = nowMs / 1000 - 7 * 86_400 - 3_600; // an hour of context before the 7-d window
+  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; windowS: number; lookbackS: number }): Promise<PiLinkInputs> {
+    // the analysis range starts a day before the 7-d window (runs straddling the edge keep their real start) plus an
+    // hour of context for the first gap / boot
+    const fromS = nowMs / 1000 - o.windowS - o.lookbackS;
     const absent = (e: unknown) => (e as { code?: string }).code === "42P01"; // undefined_table
     let lastByPump: PiLinkInputs["lastByPump"] = null;
     let readings: PiLinkInputs["readings"] = null;
     try {
-      const last = await this.pool.query(
-        `SELECT pump_id, max(ts)::float8 AS ts FROM readings WHERE ts >= $1 GROUP BY pump_id`, [sinceS]);
+      // the newest reading per pump over the WHOLE table: a silence longer than the analysis range must keep an
+      // honest, growing age rather than drop to null (codex pass 1 on #193); index (pump_id, ts)
+      const last = await this.pool.query(`SELECT pump_id, max(ts)::float8 AS ts FROM readings GROUP BY pump_id`);
       const span = await this.pool.query(
-        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1`, [sinceS]);
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1`, [fromS - 3_600]);
       const gaps = await this.pool.query(
         `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
            SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1) d
-         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [sinceS, o.gapS]);
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS]);
       lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
       readings = {
         gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
@@ -965,24 +969,34 @@ export class Store {
       };
     } catch (e) { if (!absent(e)) throw e; }
     let latestStat: PiLinkInputs["latestStat"] = null;
-    let boots: PiLinkInputs["boots"] = null;
+    let stats: PiLinkInputs["stats"] = null;
     try {
       const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats ORDER BY ts DESC LIMIT 1`);
+      const span = await this.pool.query(
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL`, [fromS - 3_600]);
+      // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): the boot time jumped AND (uptime fell OR the new uptime
+      // is shorter than the time since the previous sample) — an NTP step on a long-running Pi moves ts − uptime_s too
       const b = await this.pool.query(
         `SELECT boot_at::float8 AS at FROM (
-           SELECT ts - uptime_s AS boot_at, lag(ts - uptime_s) OVER (ORDER BY ts) AS prev_boot
-           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL
-         ) s WHERE prev_boot IS NOT NULL AND boot_at - prev_boot > $2 ORDER BY boot_at`, [sinceS, o.bootJumpS]);
+           SELECT ts, uptime_s, ts - uptime_s AS boot_at,
+                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up, lag(ts - uptime_s) OVER w AS prev_boot
+           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+         ) s WHERE prev_ts IS NOT NULL AND boot_at - prev_boot > $2 AND (uptime_s < prev_up OR uptime_s < ts - prev_ts)
+         ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
-      boots = b.rows.map((r: any) => ({ at: Number(r.at) }));
+      stats = {
+        boots: b.rows.map((r: any) => ({ at: Number(r.at) })),
+        firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
+        lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
+      };
     } catch (e) { if (!absent(e)) throw e; }
     // phase_b_log is the planner's own: the active-mode rows that say anything about the Pi (a `sent`, or the hub's
-    // `no Pi connected` refusal) over the 7-d window, oldest first
+    // `no Pi connected` refusal), oldest first, from the lookback start (pilink.ts filters windows by END)
     const pb = await this.pool.query(
       `SELECT (EXTRACT(EPOCH FROM ts) * 1000)::float8 AS ts, result FROM phase_b_log
        WHERE ts >= to_timestamp($1) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
-       ORDER BY ts`, [nowMs / 1000 - 7 * 86_400]);
-    return { lastByPump, readings, latestStat, boots, phaseB: pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) })) };
+       ORDER BY ts`, [fromS]);
+    return { lastByPump, readings, latestStat, stats, phaseB: pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) })) };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

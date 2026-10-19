@@ -11,6 +11,7 @@
 import { NextResponse } from "next/server";
 import { sql } from "@/lib/sql";
 import { isAuthed } from "@/lib/auth";
+import { normalizePi, normalizeHub, esc } from "@/lib/pi-tile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -264,8 +265,9 @@ async function buildDigest() {
     } catch { return null; }
   };
   const [plannerHealth, hubHealth] = await Promise.all([health(process.env.PLANNER_URL), health(process.env.HUB_URL)]);
-  const pi = plannerHealth?.pi && typeof plannerHealth.pi === "object" && plannerHealth.pi.summary ? plannerHealth.pi : null;
-  const hubDrops = hubHealth && typeof hubHealth.pi_dropouts_7d === "number" ? hubHealth : null;
+  // validated into finite numbers (lib/pi-tile.ts): a malformed body renders "unavailable", never throws or injects
+  const pi = normalizePi(plannerHealth);
+  const hubDrops = normalizeHub(hubHealth);
 
   // ---- stat tiles ------------------------------------------------------------------
   const tile = (label: string, value: string, sub: string) => `
@@ -287,13 +289,13 @@ async function buildDigest() {
     ${tile("hot water", dhw?.weekKwh != null ? `≈${fmt(dhw.weekKwh, 1)} kWh/wk` : "—",
            dhw ? `<span style="color:${INK2}">${fmt(dhw.dailyKwh, 2)} kWh/d estimate${dhw.cycles != null ? `, ${dhw.cycles} recharge${dhw.cycles === 1 ? "" : "s"} in the estimate` : ""}</span> <span style="color:${MUTED}">· DHW COP ${dhw.cop != null ? fmt(dhw.cop, 1) : "—"}${dhw.caveat ? ` · ${dhw.caveat}${dhw.weekKwh == null ? " — weekly figure withheld" : ""}` : ""}</span>` : `<span style="color:${MUTED}">no TempIQ data</span>`)}
   </tr><tr>
-    ${tile("Pi dropouts this week", pi ? String(pi.summary.count) : "—",
+    ${tile("Pi dropouts this week", pi ? String(pi.count) : "—",
            pi
-             ? `<span style="color:${INK2}">${pi.summary.count ? `longest ${fmt(pi.summary.longest_min, 0)} min · ` : ""}gap+reboot ${pi.summary.verdicts["gap+reboot"]} · gap only ${pi.summary.verdicts.gap_only} · socket only ${pi.summary.verdicts.socket_only}${pi.summary.verdicts.unknown ? ` · unknown ${pi.summary.verdicts.unknown}` : ""}</span> <span style="color:${MUTED}">· ${pi.reboots_7d ?? "—"} reboot${pi.reboots_7d === 1 ? "" : "s"} · planner /health.pi</span>`
+             ? `<span style="color:${INK2}">${pi.count ? `longest ${fmt(pi.longestMin, 0)} min · ` : ""}gap+reboot ${pi.gapReboot} · gap only ${pi.gapOnly} · socket only ${pi.socketOnly}${pi.unknown ? ` · unknown ${pi.unknown}` : ""}</span> <span style="color:${MUTED}">· ${pi.reboots7d ?? "—"} reboot${pi.reboots7d === 1 ? "" : "s"} · planner /health.pi</span>`
              : `<span style="color:${MUTED}">planner /health.pi unavailable</span>`)}
-    ${tile("hub-counted dropouts (7 d)", hubDrops ? String(hubDrops.pi_dropouts_7d) : "—",
+    ${tile("hub-counted dropouts (7 d)", hubDrops ? String(hubDrops.d7) : "—",
            hubDrops
-             ? `<span style="color:${INK2}">24 h: ${hubDrops.pi_dropouts_24h} · longest 24 h ${fmt(hubDrops.longest_dropout_min, 0)} min</span> <span style="color:${MUTED}">· counting since ${hubDrops.tracking_since ? day(Date.parse(hubDrops.tracking_since) / 1000) : "—"}${pi && hubDrops.pi_dropouts_7d !== pi.summary.count ? " — differs from the planner's count (the hub restarts from zero on a redeploy)" : ""}</span>`
+             ? `<span style="color:${INK2}">24 h: ${hubDrops.d24} · longest 24 h ${fmt(hubDrops.longest24Min, 0)} min</span> <span style="color:${MUTED}">· counting since ${hubDrops.since ? esc(day(Date.parse(hubDrops.since) / 1000)) : "—"}${pi && hubDrops.d7 !== pi.count ? " — differs from the planner's count (the hub restarts from zero on a redeploy)" : ""}</span>`
              : `<span style="color:${MUTED}">hub /health has no dropout counters (pre-#178) or is unreachable</span>`)}
   </tr></table>`;
 
