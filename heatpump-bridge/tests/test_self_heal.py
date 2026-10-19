@@ -83,7 +83,7 @@ def alerts(monkeypatch):
 @pytest.fixture
 async def rig(tmp_path, alerts):
     panel = FakeSpan()
-    panel.set("Air-Water 2", instantPowerW=15.0)      # the faulted pump's circuit, idle
+    panel.set("Air-Water 2", instantPowerW=-15.0)     # the faulted pump's circuit, idle
     addr = panel.start()
     span = SpanConfig(host=addr, passphrase="pw", close_retry_delay_s=1.0)
     store = Store(str(tmp_path / "b.db"))
@@ -215,6 +215,24 @@ async def test_live_cycle_then_recovery_verified(rig):
     assert "recovered" in await codes(r.store)
     assert heal.status()["pumps"]["pump2"]["last_outcome"]["outcome"] == "recovered"
     assert any("recovered" in a[1] for a in r.alerts if a[0] == "push")
+
+
+async def test_recovery_is_verified_while_heating_with_the_panels_negative_watts(rig):
+    # The real panel reports consumption as a NEGATIVE instantPowerW (Air-Water 2 heating read
+    # -5694 W on 2026-10-19). A recovered pump that is heating must verify, not "not_recovered".
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    r.p2.snapshot["running"] = True                         # back and heating
+    r.p2.snapshot["state"] = "heating"
+    r.panel.set("Air-Water 2", instantPowerW=-5694.0)
+    for _ in range(8):
+        await r.step(heal)
+    await settle()
+    assert "recovered" in await codes(r.store)
+    assert "not_recovered" not in await codes(r.store)
 
 
 async def test_a_telemetry_gap_restarts_the_clear_hold(rig):
@@ -760,9 +778,10 @@ async def test_span_unreachable_pages_the_manual_step(rig):
     assert mail and "SPAN panel" in mail[0][2]
 
 
-async def test_suspicious_mapping_is_refused(rig):
+@pytest.mark.parametrize("watts", [2600.0, -2600.0])   # the real panel reports draw as NEGATIVE
+async def test_suspicious_mapping_is_refused(rig, watts):
     r = rig
-    r.panel.set("Air-Water 2", instantPowerW=2600.0)   # "idle" pump's circuit draws compressor power
+    r.panel.set("Air-Water 2", instantPowerW=watts)    # "idle" pump's circuit draws compressor power
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
     await r.eligible(heal)
