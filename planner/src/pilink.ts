@@ -106,6 +106,8 @@ export interface StatsView {
   clockSteps?: number[];
   /** hourly buckets of the clock's cumulative sub-threshold slew per boot track (store.piLinkInputs) */
   drift?: { track: number; start: number; end: number; cmin: number; cmax: number }[];
+  /** system_stats silences (> READING_GAP_MIN_S): where the clock's evolution is NOT observed */
+  gaps?: ReadingGap[];
   firstTs: number | null;
   lastTs: number | null;
 }
@@ -262,6 +264,15 @@ export function windowClockTrusted(
   // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to];
   // a re-stamped span is checked for OVERLAP, not by its endpoints (codex pass 19: one enclosing the bracket counts)
   const lo = from - WINDOW_SLACK_S, hi = to + WINDOW_SLACK_S;
+  // CLOCK-EVOLUTION COVERAGE (codex pass 21): the absence of steps and slew is evidence only where system_stats
+  // speaks for the clock — present across the bracket, and silent only where the readings are silent too (the same
+  // pushes carry both; stats missing while readings flow means the clock is unobserved exactly when it matters).
+  const st = input.stats;
+  if (!st || st.firstTs == null || st.lastTs == null || st.firstTs > lo || st.lastTs < Math.min(hi, nowS - 180)) return false;
+  const rgaps = input.readings?.gaps ?? [];
+  const uncovered = (st.gaps ?? []).some((g) => g.start < hi && g.end > lo
+    && !rgaps.some((r) => r.start <= g.start + 120 && r.end >= g.end - 120));
+  if (uncovered) return false;
   // gradual movement: within one boot track, the slew across the bracket must stay within CLOCK_STEP_S (codex pass 20)
   const byTrack = new Map<number, { cmin: number; cmax: number }>();
   for (const b of input.stats?.drift ?? []) {

@@ -253,6 +253,17 @@ async function main() {
     assert.equal((si.stats?.clockSteps ?? []).filter((x) => x > T - 60 && x < T + 3 * H).length, 0, "…and no single step");
     const wS = piHealth(si, at, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T) <= 60);
     assert.equal(wS?.verdict, "unknown", `a gradual slew through the window voids it (got ${wS?.verdict})`);
+    // codex pass 21: the same history with system_stats ABSENT, then with it missing only through the slew — the absence
+    // of steps/slew is no evidence there → still unknown, never socket_only
+    await pool.query(`ALTER TABLE system_stats RENAME TO system_stats_hidden`);
+    const noStats = await store.piLinkInputs(at, OPTS);
+    assert.equal(noStats.stats, null);
+    assert.equal(piHealth(noStats, at, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T) <= 60)?.verdict, "unknown", "stats absent");
+    await pool.query(`ALTER TABLE system_stats_hidden RENAME TO system_stats`);
+    await pool.query(`DELETE FROM system_stats WHERE ts >= $1 AND ts < $2`, [T, T + 130 * 60]);
+    const sparse = await store.piLinkInputs(at, OPTS);
+    assert.equal(piHealth(sparse, at, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T) <= 60)?.verdict, "unknown",
+      "stats missing through the slew while readings flowed");
   }
 
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest

@@ -297,6 +297,15 @@ function observations(off = 3, dropouts: [string, string][] = [
   ] } }, NOW, 4).dropouts_7d[2].verdict;
   assert.equal(slewed(600), "unknown");
   assert.equal(slewed(4), "socket_only");
+  // codex pass 21: no clock-evolution evidence → no trust. stats absent → unknown; stats silent while readings flowed →
+  // unknown; stats silent exactly where readings are silent too (a real blackout) → stands
+  assert.ok(piHealth({ ...clean, stats: null }, NOW, 4).dropouts_7d.every((w) => w.verdict === "unknown"), "system_stats absent");
+  const statsHole = { start: s("2026-10-16T09:40:00Z"), end: s("2026-10-16T12:20:00Z") };
+  assert.equal(piHealth({ ...clean, stats: { ...stats, clockSteps: [], gaps: [statsHole] } }, NOW, 4).dropouts_7d[2].verdict, "unknown",
+    "stats missing while readings flowed: the clock is unobserved exactly then");
+  const w1hole = { start: gaps[0].start, end: gaps[0].end };
+  assert.equal(piHealth({ ...clean, stats: { ...stats, clockSteps: [], gaps: [w1hole] } }, NOW, 4).dropouts_7d[0].verdict, "gap+reboot",
+    "stats silent together with the readings (one push carries both) → still judged");
   // a missing bracket (the planner was down the half hour before a window) → unknown
   const gapObs = observations().filter((o) => !(o.at > s("2026-10-16T09:20:00Z") && o.at <= s("2026-10-16T10:00:00Z")));
   assert.equal(piHealth({ ...clean, clockObs: gapObs }, NOW, 4).dropouts_7d[2].verdict, "unknown");

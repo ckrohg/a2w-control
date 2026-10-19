@@ -1070,6 +1070,12 @@ export class Store {
          ) s WHERE prev_ts IS NOT NULL AND uptime_s >= prev_up - 5
              AND abs((ts - prev_ts) - (uptime_s - prev_up)) > $2
          ORDER BY ts`, [fromS - 3_600, o.clockStepS, nowS + o.futureS]);
+      // stats silences (> gapS between consecutive samples): clock-evolution coverage for pilink.ts — a bracket is only
+      // judged where system_stats speaks for the clock (codex pass 21)
+      const sgaps = await this.pool.query(
+        `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
+           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS, nowS + o.futureS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
       // a candidate sampled inside a clock-contaminated span is never certain: its "settled" history may be the
       // displaced samples themselves (codex pass 8 on #193)
@@ -1096,6 +1102,7 @@ export class Store {
         // window cannot read as resolved while they exist
         clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
         drift: drift.rows.map((r: any) => ({ track: Number(r.track), start: Number(r.start), end: Number(r.end), cmin: Number(r.cmin), cmax: Number(r.cmax) })),
+        gaps: sgaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };
