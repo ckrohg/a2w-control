@@ -10,7 +10,7 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   const rows: { id: number; kind: string; key: string; title: string; detail: string; notified: boolean; cleared: boolean }[] = [];
   let closeUp = true;
   const store: AlertStore = {
-    closeAlertEpisodes: async (kind, key) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (r.kind === kind && r.key === key) r.cleared = true; },
+    closeAlertEpisodeIds: async (ids) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (ids.includes(r.id)) r.cleared = true; },
     openAlertEpisode: async (kind, key, _p, title, detail) => { rows.push({ id: rows.length + 1, kind, key, title, detail, notified: false, cleared: false }); return rows.length; },
     markAlertNotified: async (id) => { rows[id - 1].notified = true; },
     undeliveredAlertEpisodes: async () => rows.filter((r) => !r.cleared && !r.notified).map((r) => ({ id: r.id, kind: r.kind, title: r.title, detail: r.detail })),
@@ -67,7 +67,12 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   await e.open("stage_unserved", "1", "pump1", "⚠ lost too?", "b");
   up = true;
   assert.equal(await e.retry(), 1, "delivered without a row");
+  assert.equal(e.pending(), 1, "…but kept until it is durable (codex pass 4)");
+  dbUp = true;
+  assert.equal(await e.retry(), 0, "persisted as already notified — not sent again");
   assert.equal(e.pending(), 0);
+  assert.equal(rows.at(-1)?.title, "⚠ lost too?");
+  assert.equal(rows.at(-1)?.notified, true);
 
   // codex pass 3: (a) a queued alert whose condition cleared is cancelled — it never reopens a resolved incident
   dbUp = false; up = false;
@@ -93,6 +98,55 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   await h.retry();
   assert.equal(h.pendingCloses(), 0);
   assert.equal(rows.at(-1)?.cleared, true, "closed once the DB is back");
+
+  // codex pass 4: (1) a RECURRENCE before a pending close succeeds is never closed by it
+  closeUp = true; up = true;
+  const r1 = new AlertOutbox(store, send, () => {});
+  await r1.open("fault_called", "2", "pump2", "⚠ first", "E21");
+  const firstId = rows.length;
+  closeUp = false;
+  await r1.close("fault_called", "2");                      // HP2 recovered; the close is refused
+  up = false;
+  await r1.open("fault_called", "2", "pump2", "⚠ again", "E21"); // …HP2 faults again; this page is NOT heard
+  const secondId = rows.length;
+  closeUp = true; up = true;
+  const sentBefore = sent.length;
+  await r1.retry();
+  assert.equal(rows[firstId - 1].cleared, true, "the first episode is closed by ID");
+  assert.equal(rows[secondId - 1].cleared, false, "the recurrence stays open…");
+  assert.equal(rows[secondId - 1].notified, true, "…and its page is re-sent and acknowledged");
+  assert.equal(sent.at(-1), "⚠ again");
+  assert.ok(sent.length > sentBefore);
+  // (2) a resolved, unheard episode whose close is still pending is never paged
+  up = false;
+  const r2 = new AlertOutbox(store, send, () => {});
+  await r2.open("stage_unserved", "1", "pump1", "⚠ obsolete-if-resolved", "b");
+  closeUp = false;
+  await r2.close("stage_unserved", "1");
+  up = true;
+  const n1 = sent.length;
+  await r2.retry();
+  assert.ok(!sent.slice(n1).includes("⚠ obsolete-if-resolved"), "pending close → not re-sent after recovery");
+  closeUp = true;
+  await r2.retry();
+  assert.equal(r2.pendingCloses(), 0);
+  // (3) row could not be written but the page WAS heard: persisted later and marked notified — no resend
+  dbUp = false; up = true;
+  const r3 = new AlertOutbox(flaky, send, () => {});
+  const n2 = sent.length;
+  assert.equal(await r3.open("span_local_stale", "span", null, "⚠ heard once", "x"), true);
+  assert.equal(r3.pending(), 1, "kept until durable");
+  dbUp = true;
+  await r3.retry();
+  assert.equal(r3.pending(), 0);
+  const row = rows.find((x) => x.title === "⚠ heard once");
+  assert.ok(row && row.notified, "recorded as already notified — a restart re-adopts it instead of re-paging");
+  assert.equal(sent.slice(n2).filter((t) => t === "⚠ heard once").length, 1, "sent exactly once");
+  // adopt(): a restart re-adopts open rows so a recovery closes them by ID
+  const r4 = new AlertOutbox(store, send, () => {});
+  r4.adopt([{ id: row!.id, kind: "span_local_stale", key: "span" }]);
+  await r4.close("span_local_stale", "span");
+  assert.equal(row!.cleared, true);
 
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

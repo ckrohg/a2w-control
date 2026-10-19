@@ -52,6 +52,12 @@ async function main() {
   assert.equal(rows[0].detail.windowEnd, iso(now - 20 * day), "detail kept, note merged");
   assert.equal(rows[4].detail, null, "an already-closed row is untouched");
   assert.equal(await store.closeStormEvents("stand-down"), 0, "idempotent");
+  // the STARTUP sweep is scoped to rows started before boot: a storm this process armed meanwhile stays open
+  const boot = new Date(Date.now() - 60_000);
+  await pool.query(`INSERT INTO storm_events (started_at, trigger, detail) VALUES ($1, 'orphan', NULL), (now(), 'armed by this process', NULL)`, [iso(now - 3_600_000)]);
+  assert.equal(await store.closeStormEvents("planner restart while idle", boot), 1);
+  const live = (await pool.query(`SELECT trigger, ended_at FROM storm_events WHERE trigger IN ('orphan', 'armed by this process') ORDER BY id`)).rows;
+  assert.deepEqual(live.map((r: any) => [r.trigger, r.ended_at != null]), [["orphan", true], ["armed by this process", false]]);
 
   // ── #185 / #187: the alert-episode outbox ─────────────────────────────────────────────────────────────────────
   await pool.query(`TRUNCATE alert_episodes RESTART IDENTITY`);
@@ -61,11 +67,14 @@ async function main() {
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [1, 2, 3], "nothing acknowledged yet → all in the outbox");
   await store.markAlertNotified(f);
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u, 3]);
-  await store.closeAlertEpisodes("fault_called", "2");
-  await store.closeAlertEpisodes("span_local_stale", "span");
+  const recur = await store.openAlertEpisode("fault_called", "2", "pump2", "⚠ again", "E21");
+  await store.closeAlertEpisodeIds([f, 3]);
+  assert.deepEqual((await store.openAlertEpisodes()).map((x) => x.id), [u, recur], "closes exactly the IDs given — a recurrence stays open");
+  await store.closeAlertEpisodeIds([recur]);
+  await store.closeAlertEpisodeIds([]);
   assert.deepEqual((await store.openAlertEpisodes()).map((x) => [x.kind, x.key]), [["stage_unserved", "2"]], "a restart re-adopts what is still open");
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u], "a cleared episode leaves the outbox");
-  assert.deepEqual(await store.alertEpisodes24h(), { fault_called: 1, stage_unserved: 1, span_local_stale: 1 });
+  assert.deepEqual(await store.alertEpisodes24h(), { fault_called: 2, stage_unserved: 1, span_local_stale: 1 });
 
   // ── #185: fault codes from pump_snapshots (the mirror's latest-only full snapshot) ────────────────────────────────
   await pool.query(`DROP TABLE IF EXISTS pump_snapshots`);

@@ -728,6 +728,25 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
 }
 
 /**
+ * #183: the storm machine always starts idle (its state is in memory), so any storm_events row still open from BEFORE
+ * this process started is an orphan — close it, or the mirror banner shows "armed" while /health.storm is idle. A storm
+ * still live re-arms on the next trigger poll and opens a fresh row. A failed sweep is retried every tick (codex pass
+ * 4), scoped to rows started before boot, so it can never close a storm this process armed meanwhile.
+ */
+const PROCESS_START = new Date();
+let stormSweepDone = false;
+async function sweepStormOrphans(): Promise<void> {
+  if (stormSweepDone) return;
+  try {
+    const closed = await store.closeStormEvents("planner restart while idle", PROCESS_START);
+    stormSweepDone = true;
+    if (closed) console.log(`[storm] closed ${closed} orphaned storm_events row(s) — planner restart while idle`);
+  } catch (e) {
+    console.error("storm orphan sweep failed (retried next tick):", (e as Error).message);
+  }
+}
+
+/**
  * #185 / #187: open alert episodes are re-adopted at boot — they close on clear instead of re-paging; undelivered ones
  * are re-sent by alerts.retry(). A FAILED load is not "nothing open" (codex pass 3): it is retried every tick until it
  * succeeds. Until then the watches run anyway — a page must never wait on the DB — and a late restore reconciles
@@ -739,6 +758,7 @@ async function restoreAlertState(): Promise<void> {
   if (alertStateRestored) return;
   try {
     const open = await store.openAlertEpisodes();
+    alerts.adopt(open);
     stageWatch.restore(open.filter((o) => o.kind === "stage_unserved" || o.kind === "fault_called")
       .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
     if (open.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
@@ -1876,6 +1896,7 @@ async function loopBody(): Promise<void> {
   // #187 / #185: the SPAN-local check and the alert outbox depend on neither SensorLinx nor the poll's success —
   // they run every tick on their own, so a SensorLinx outage cannot hide a SPAN outage or stall a re-send (codex pass 2)
   await restoreAlertState();
+  await sweepStormOrphans();
   await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
   await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
 
@@ -1897,13 +1918,7 @@ async function main(): Promise<void> {
   lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
   await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
-  // #183: the storm machine always starts idle (its state is in memory), so any storm_events row still open is an
-  // orphan of an earlier process — close it, or the mirror banner shows "armed" while /health.storm is idle. A storm
-  // that is still live re-arms on the next trigger poll and opens a fresh row.
-  {
-    const closed = await store.closeStormEvents("planner restart while idle").catch((e) => { console.error("storm orphan sweep failed:", (e as Error).message); return 0; });
-    if (closed) console.log(`[storm] closed ${closed} orphaned storm_events row(s) — planner restart while idle`);
-  }
+  await sweepStormOrphans(); // #183 — retried every tick until it succeeds
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the

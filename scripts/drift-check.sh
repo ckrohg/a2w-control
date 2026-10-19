@@ -248,11 +248,18 @@ echo "[8] SPAN local stream — the path every SPAN safety action depends on (#1
 # The Pi's LAN poller (span_local.py) lands span_readings in the mirror every ~25 s; the planner reports the newest
 # sample's age at /health.span. The cloud path failing alone is reported there but is not drift.
 if [ -n "$HEALTH" ]; then
-  SPANAGE="$(jq -r '.span.local_last_reading_age_s // empty' <<<"$HEALTH")"
+  # the CURRENT age: /health.span is computed each loop tick and served from memory — add the time since computed_at,
+  # and refuse a failed or stale computation outright (a frozen healthy result must not pass forever)
+  SPANAGE="$(jq -r 'if .span.local_last_reading_age_s == null or .span.computed_at == null then empty
+                    else (.span.local_last_reading_age_s + (now - (.span.computed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601))) | floor end' <<<"$HEALTH")"
+  SPANCOMPUTED_AGO="$(jq -r 'if .span.computed_at == null then empty else (now - (.span.computed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) | floor end' <<<"$HEALTH")"
+  SPANERR="$(jq -r '.span.refresh_error // empty' <<<"$HEALTH")"
   SPANTABLE="$(jq -r 'if .span.local_table == null then "absent" else (.span.local_table|tostring) end' <<<"$HEALTH")"
   CLOUDSTREAK="$(jq -r '.span.cloud.fail_streak // 0' <<<"$HEALTH")"
   if [ "$(jq -r '.span.pending // false' <<<"$HEALTH")" = "true" ]; then
     skip "planner just started — /health.span not computed yet"
+  elif [ -n "$SPANERR" ] || { [ -n "$SPANCOMPUTED_AGO" ] && [ "$SPANCOMPUTED_AGO" -gt 900 ]; }; then
+    fail "/health.span is not being refreshed (computed ${SPANCOMPUTED_AGO:-?}s ago${SPANERR:+; error: $SPANERR}) — the SPAN-local check itself is failing"
   elif [ "$SPANTABLE" = "absent" ]; then
     skip "planner predates /health.span (#187), or span_readings is absent — redeploy the planner to assert it"
   elif [ -z "$SPANAGE" ]; then

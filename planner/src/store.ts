@@ -865,10 +865,10 @@ export class Store {
     await this.pool.query(`UPDATE alert_episodes SET notified_at = now() WHERE id = $1`, [id]);
   }
 
-  /** Close every open episode of this kind and key. */
-  async closeAlertEpisodes(kind: string, key: string): Promise<void> {
-    await this.pool.query(
-      `UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND kind = $1 AND key = $2`, [kind, key]);
+  /** Close exactly these episodes (alerts.ts tracks the IDs open for each kind/key — a recurrence is a new ID). */
+  async closeAlertEpisodeIds(ids: number[]): Promise<void> {
+    if (!ids.length) return;
+    await this.pool.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND id = ANY($1::int[])`, [ids]);
   }
 
   /** Episodes still open (a restart re-adopts them so they close instead of re-paging). */
@@ -944,14 +944,16 @@ export class Store {
    * (pendingCurveWrites) does not stretch it over the weeks it sat open. `note` lands in detail.closed. Returns the
    * number closed.
    */
-  async closeStormEvents(note: string): Promise<number> {
+  async closeStormEvents(note: string, startedBefore?: Date): Promise<number> {
+    // startedBefore scopes the STARTUP sweep to orphans of earlier processes: a retried sweep must never close a storm
+    // this process armed meanwhile (codex pass 4 on the incident-fixes PR)
     const r = await this.pool.query(
       `UPDATE storm_events SET
          ended_at = GREATEST(started_at, LEAST(now(),
            CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)),
          detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('closed', $1::text)
-       WHERE ended_at IS NULL`,
-      [note],
+       WHERE ended_at IS NULL AND ($2::timestamptz IS NULL OR started_at < $2::timestamptz)`,
+      [note, startedBefore ?? null],
     );
     return r.rowCount ?? 0;
   }
