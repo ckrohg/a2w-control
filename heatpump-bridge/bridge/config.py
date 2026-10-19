@@ -280,6 +280,35 @@ class SpanConfig(BaseModel):
         return self
 
 
+class SelfHealConfig(BaseModel):
+    # #189 (owner decision 2026-10-18): power-cycle a heat pump's SPAN circuit when it sits in an
+    # equipment fault a power cycle clears (E21 by default) — bridge/self_heal.py. Fault trigger
+    # only: the Pi cannot see the HBX stage call. Default SHADOW: `live: false` (the issue's
+    # self_heal_live) logs and pages "would cycle" and switches nothing until the owner flips it.
+    enabled: bool = True                 # evaluate at all (shadow unless live)
+    live: bool = False                   # True = actually power-cycle via span_control
+    fault_codes: list[str] = ["E21"]     # equipment faults a breaker power cycle clears
+    grace_min: float = Field(default=10.0, ge=1)        # fault active this long first
+    max_attempts: int = Field(default=2, ge=1, le=5)    # per pump per window, then escalate
+    window_h: float = Field(default=6.0, gt=0)
+    verify_min: float = Field(default=15.0, ge=5, le=120)   # recovery must show within this
+    off_s: float = MIN_OFF_FLOOR_S       # power-cycle hold (>= 60 s, and >= span.min_off_s)
+    running_power_w: float = Field(default=500.0, gt=0)  # SPAN circuit power that means "running"
+    # pump id -> SPAN circuit. VERIFY on the house: no record maps pump1/pump2 to the panel's
+    # circuit names; a swapped map would cycle the healthy pump (self_heal refuses when the
+    # "idle" pump's circuit draws running-level power, but that is a backstop, not the check).
+    circuits: dict[str, str] = Field(default_factory=lambda: {"pump1": "Air-Water 1",
+                                                              "pump2": "Air-Water 2"})
+
+    @model_validator(mode="after")
+    def _floor(self):
+        if not (self.off_s >= MIN_OFF_FLOOR_S):
+            raise ValueError(f"self_heal.off_s must be >= {MIN_OFF_FLOOR_S:g} s (owner decision 2026-10-18)")
+        if len(set(self.circuits.values())) != len(self.circuits):
+            raise ValueError("self_heal.circuits maps two pumps to one circuit")
+        return self
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
@@ -288,16 +317,32 @@ class AppConfig(BaseModel):
     analytics: AnalyticsConfig = AnalyticsConfig()
     hub: HubConfig = HubConfig()
     span: SpanConfig = SpanConfig()
+    self_heal: SelfHealConfig = SelfHealConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
 
-    @field_validator("guardrails", "auth", "notifications", "analytics", "hub", "span", mode="before")
+    @field_validator("guardrails", "auth", "notifications", "analytics", "hub", "span", "self_heal",
+                     mode="before")
     @classmethod
     def _empty_section_to_default(cls, v):
         # a YAML section present but with everything commented out parses to null;
         # treat it as "use defaults" instead of failing to start
         return {} if v is None else v
+
+    @model_validator(mode="after")
+    def _self_heal_circuits(self):
+        if not self.self_heal.enabled:
+            return self
+        by_name = {b.name.strip(): b for b in self.span.breakers}
+        for pid, circuit in self.self_heal.circuits.items():
+            b = by_name.get(circuit.strip())
+            if b is None or not (b.allow_cycle and b.heat_pump):
+                raise ValueError(f"self_heal.circuits: '{circuit}' (for {pid}) must be a span.breakers "
+                                 "heat-pump circuit with allow_cycle")
+        if not (self.span.min_off_s <= self.self_heal.off_s <= self.span.max_off_s):
+            raise ValueError("self_heal.off_s must be within [span.min_off_s, span.max_off_s]")
+        return self
 
 
 def load_config(path: str | os.PathLike | None = None) -> AppConfig:

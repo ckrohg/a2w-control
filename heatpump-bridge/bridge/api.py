@@ -420,6 +420,9 @@ async def health(request: Request, response: Response):
         "heartbeat_configured": bool(request.app.state.config.notifications.heartbeat_url),
         "email_configured": bool(request.app.state.config.notifications.resend_api_key
                                  and request.app.state.config.notifications.resend_to),
+        # #189: shadow/live mode, per-pump status, attempts in the window, last outcome
+        "self_heal": (request.app.state.self_heal.status()
+                      if getattr(request.app.state, "self_heal", None) is not None else None),
     }
 
 
