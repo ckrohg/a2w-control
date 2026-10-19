@@ -400,6 +400,21 @@ async def test_a_peer_without_telemetry_counts_as_down(rig):
     assert "no telemetry" in heal.status()["pumps"]["pump2"]["status"]
 
 
+async def test_stale_target_and_down_peer_pages_both_down_once(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await heal.tick()
+    for _ in range(4):
+        r.ft.t += 300
+        r.p2.snapshot["last_poll_mono"] = r.ft.mono() - 200   # pump2 went silent (E21 last known)
+        r.p1.snapshot["online"] = False                       # and pump1 is offline
+        await heal.tick()
+    await settle()
+    assert r.panel.writes == []
+    assert (await codes(r.store)).count("both_down") == 1
+
+
 async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch):
     r = rig
     heal = r.make(live=True)
