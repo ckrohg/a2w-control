@@ -120,6 +120,8 @@ async def rig(tmp_path, alerts):
     await ctl.stop()
     await store.close()
     panel.stop()
+    # every relay write the self-heal made went out in the panel's real (nested) body
+    assert panel.rejected == [], f"schema-rejected writes: {panel.rejected}"
 
 
 async def codes(store, pid="pump2"):
