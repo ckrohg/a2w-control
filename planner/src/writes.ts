@@ -407,7 +407,8 @@ export class HbxWriter {
     // ADMISSION is counted synchronously, right after the barrier check and before any await: a write that has
     // passed the barrier is in flight from this point (including the dashboard API routes, which are not inside the
     // poll loop), so shutdown's "no device write on the wire" check cannot miss one blocked in the lease query
-    // (codex pass 3 on #162). Released in the finally below on every path.
+    // (codex pass 3 on #162). Released once the write is RECORDED (or failed), before the notification; the finally
+    // below covers every other path.
     writesInFlight++;
     let released = false;
     const release = () => { if (!released) { released = true; writesInFlight--; } };
@@ -435,12 +436,13 @@ export class HbxWriter {
         } catch (e) {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
           throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
-        } finally {
-          release(); // nothing is on the wire any more
         }
+        // still counted as in flight: the self-recorded version + audit row are part of the write — shutdown must not
+        // hand the lease over (and a successor must not record its own curve) before they land (codex pass 2)
         return this.recordWrite(dev, fields, source, action, summary);
       });
-      await this.notify(`HBX ${action} (${source})`, summary); // outside the lock: a slow ntfy never holds it
+      release();
+      await this.notify(`HBX ${action} (${source})`, summary); // outside the lock and the count: a slow ntfy holds neither
       return out;
     } finally {
       release();

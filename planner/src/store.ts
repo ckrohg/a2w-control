@@ -26,15 +26,28 @@ export interface SlxReading {
   connected: boolean | null;
 }
 
+/** Bounds for queries run under the device lock (see Store.locked). */
+export const LOCKED_STATEMENT_TIMEOUT_MS = 10_000;
+export const LOCKED_QUERY_TIMEOUT_MS = 15_000;
+
 export class Store {
   private pool: Pool;
+  /**
+   * #177 (codex pass 2): the queries that run while the device lock is held (writes.ts withDeviceLock — the writer's
+   * self-record, the drift detector's confirmation record) go through this small pool with a SERVER-side
+   * statement_timeout below a CLIENT-side query_timeout: a stalled connection fails in bounded time and releases the
+   * lock instead of queueing every later PATCH (a restore included) behind it, and any statement the server did
+   * run has finished or been cancelled before the client gives up — so a timed-out insert cannot land after a later
+   * write's. All of them are single-row reads/inserts; the main pool keeps no timeout, as before.
+   */
+  private locked: Pool;
 
   constructor(databaseUrl: string) {
-    this.pool = new Pool({
-      connectionString: databaseUrl,
-      max: 3,
-      ssl: /localhost|127\.0\.0\.1/.test(databaseUrl) ? undefined : { rejectUnauthorized: false },
-    });
+    const ssl = /localhost|127\.0\.0\.1/.test(databaseUrl) ? undefined : { rejectUnauthorized: false };
+    this.pool = new Pool({ connectionString: databaseUrl, max: 3, ssl });
+    this.locked = new Pool({ connectionString: databaseUrl, max: 2, ssl, statement_timeout: LOCKED_STATEMENT_TIMEOUT_MS, query_timeout: LOCKED_QUERY_TIMEOUT_MS });
+    // an idle client dropped by the server must not crash the process (the query path already reports its own errors)
+    this.locked.on("error", (e) => console.error("store (locked pool) idle client error:", e.message));
   }
 
   async ensureSchema(): Promise<void> {
@@ -866,7 +879,7 @@ export class Store {
     /** #177: the PATCH response echo (drift.ts patchEcho) — accepted / verify_mismatch only. */
     response?: Record<string, unknown> | null;
   }): Promise<void> {
-    await this.pool.query(
+    await this.locked.query(
       `INSERT INTO hbx_writes (source, action, requested, result, detail, response) VALUES ($1,$2,$3,$4,$5,$6)`,
       [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail, w.response == null ? null : JSON.stringify(w.response)],
     );
@@ -883,8 +896,8 @@ export class Store {
       echo: r.response && typeof r.response === "object" ? r.response : null,
     });
     const [last, recent] = await Promise.all([
-      this.pool.query(`SELECT ts, source, action, requested, response FROM hbx_writes WHERE result = 'accepted' ORDER BY id DESC LIMIT 1`),
-      this.pool.query(
+      this.locked.query(`SELECT ts, source, action, requested, response FROM hbx_writes WHERE result = 'accepted' ORDER BY id DESC LIMIT 1`),
+      this.locked.query(
         `SELECT ts, source, action, requested, response FROM hbx_writes
          WHERE result = 'accepted' AND ts >= $1 ORDER BY id DESC LIMIT 50`, [since]),
     ]);
@@ -1318,7 +1331,7 @@ export class Store {
   }
 
   async latestConfig(): Promise<HbxConfig | null> {
-    const res = await this.pool.query(
+    const res = await this.locked.query(
       `SELECT config FROM hbx_config_versions ORDER BY id DESC LIMIT 1`,
     );
     return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
@@ -1326,7 +1339,7 @@ export class Store {
 
   /** The newest version row's config AND raw device object (#177: the "before" provenance for a curve page). */
   async latestConfigVersion(): Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null> {
-    const res = await this.pool.query(
+    const res = await this.locked.query(
       `SELECT config, raw FROM hbx_config_versions ORDER BY id DESC LIMIT 1`,
     );
     return res.rowCount ? { config: res.rows[0].config as HbxConfig, raw: (res.rows[0].raw ?? null) as Record<string, any> | null } : null;
@@ -1339,7 +1352,7 @@ export class Store {
     extra: Pick<ConfigVersionRecord, "raw" | "rereadRaw" | "verdict" | "diagnosis"> = { raw: null },
   ): Promise<void> {
     const j = (v: unknown) => (v == null ? null : JSON.stringify(v));
-    await this.pool.query(
+    await this.locked.query(
       `INSERT INTO hbx_config_versions (changed_fields, config, raw, reread_raw, verdict, diagnosis) VALUES ($1, $2, $3, $4, $5, $6)`,
       [j(changedFields), JSON.stringify(config), j(extra.raw), j(extra.rereadRaw), extra.verdict ?? null, j(extra.diagnosis)],
     );
@@ -1415,6 +1428,6 @@ export class Store {
   }
 
   async close(): Promise<void> {
-    await this.pool.end();
+    await Promise.all([this.pool.end(), this.locked.end()]);
   }
 }

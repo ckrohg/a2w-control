@@ -252,15 +252,35 @@ export async function handlePolledConfig(
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((m: string) => console.warn(m));
   const config = extractConfig(dev);
+  const lock = deps.lock ?? (<T>(fn: () => Promise<T>) => fn());
+  // Every baseline-changing record happens under the device lock, after re-checking that no planner write has
+  // self-recorded a newer version since this poll read `prev` (codex pass 2: an unlocked insert of a stale
+  // observation would make it the latest config again over our own write). A moved baseline means this poll's
+  // observation is already history — record nothing; the next poll diffs against the new baseline.
+  const baselineMoved = async (): Promise<boolean> => {
+    if (!deps.latest) return false;
+    const cur = await deps.latest();
+    return JSON.stringify(cur?.config ?? null) !== JSON.stringify(prev?.config ?? null);
+  };
+  const stale: DriftOutcome = { kind: "unchanged", config, device: dev, changes: null, diagnosis: null };
   if (prev === null) {
-    await deps.record({ config, changes: null, raw: dev });
-    return { kind: "seeded", config, device: dev, changes: null, diagnosis: null };
+    const seeded = await lock(async () => {
+      if (await baselineMoved()) return false;
+      await deps.record({ config, changes: null, raw: dev });
+      return true;
+    });
+    return seeded ? { kind: "seeded", config, device: dev, changes: null, diagnosis: null } : stale;
   }
   const changes = diffConfig(prev.config, config);
   if (!changes) return { kind: "unchanged", config, device: dev, changes: null, diagnosis: null };
 
   if (!curveChanged(changes)) {
-    await deps.record({ config, changes, raw: dev });
+    const recorded = await lock(async () => {
+      if (await baselineMoved()) return false;
+      await deps.record({ config, changes, raw: dev });
+      return true;
+    });
+    if (!recorded) { log("HBX config drift seen, but a planner write moved the baseline meanwhile — re-checked next poll"); return stale; }
     const summary = fmtChanges(changes);
     log(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
     // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
@@ -270,9 +290,8 @@ export async function handlePolledConfig(
   }
 
   const firstAtMs = now();
-  const lock = deps.lock ?? (<T>(fn: () => Promise<T>) => fn());
-  const lookupWrites = async (): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> => {
-    try { return await deps.plannerWrites(firstAtMs - ECHO_WINDOW_MS); }
+  const lookupWrites = async (atMs: number): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> => {
+    try { return await deps.plannerWrites(atMs - ECHO_WINDOW_MS); }
     catch (e) { log(`planner-write lookup failed (verdict defaults to foreign): ${(e as Error).message}`); return { last: null, recent: [] }; }
   };
   const diagnose = (
@@ -300,7 +319,7 @@ export async function handlePolledConfig(
   // baseline over whatever a planner write may have put there meanwhile (codex pass 1). latestConfig() stays put, so
   // the next poll (or the successor's first poll) sees the same diff and runs the whole check again.
   const unconfirmed = async (why: string): Promise<DriftOutcome> => {
-    const writes = await lookupWrites();
+    const writes = await lookupWrites(firstAtMs);
     const diagnosis = diagnose({
       fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved: false, writes,
       matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: dev,
@@ -317,24 +336,28 @@ export async function handlePolledConfig(
     let reread: Record<string, any>;
     try { reread = await deps.reread(); }
     catch (e) { return { unconfirmed: `re-read failed: ${(e as Error).message}` }; }
-    const rereadAt = new Date(now()).toISOString();
+    const rereadAtMs = now();
+    const rereadAt = new Date(rereadAtMs).toISOString();
     // A planner write may have self-recorded a version during the wait: judge the re-read against THAT.
     let base = prev;
     if (deps.latest) {
       try { base = (await deps.latest()) ?? prev; }
       catch (e) { return { unconfirmed: `latest-version re-fetch failed: ${(e as Error).message}` }; }
     }
-    const baselineMoved = JSON.stringify(base.config) !== JSON.stringify(prev.config);
+    const moved = JSON.stringify(base.config) !== JSON.stringify(prev.config);
     const finalConfig = extractConfig(reread);
     const finalChanges = diffConfig(base.config, finalConfig);
     const confirmed = curveChanged(finalChanges);
-    const writes = await lookupWrites();
+    // The standing change is the RE-READ's, so the echo window ends at the re-read: a planner write that landed
+    // during the wait counts as ours (codex pass 2 — anchored at the first read, a 1 °F transform of a write made
+    // during the 30 s would have paged high as foreign).
+    const writes = await lookupWrites(rereadAtMs);
     // A reverted curve keeps the first read's change in the diagnosis but is not a curve event.
     const fields = confirmed ? (finalChanges as Record<string, FieldChange>) : changes;
-    const v = curveVerdict(fields, writes.recent, firstAtMs);
+    const v = curveVerdict(fields, writes.recent, confirmed ? rereadAtMs : firstAtMs);
     const verdict: CurveDiagnosis["verdict"] = confirmed ? (v?.verdict ?? "foreign") : "reverted";
     const diagnosis = diagnose({
-      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved, writes, matches: v?.matches ?? [],
+      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved: moved, writes, matches: v?.matches ?? [],
       before: base.raw, after: reread,
     });
     await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict: verdict as ConfigVersionRecord["verdict"], diagnosis });

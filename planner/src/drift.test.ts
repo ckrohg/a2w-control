@@ -282,6 +282,47 @@ async function main(): Promise<void> {
     assert.equal(out.diagnosis?.baseline_moved, false);
   }
 
+  // ── 10c. Seed / non-curve drift re-check the baseline under the lock: a planner write that self-recorded since the
+  // poll read `prev` wins — the stale observation is not recorded and not notified (codex pass 2) ────────────────
+  {
+    const prev = prevOf(device(120, 118));
+    const ours = prevOf(device(134, 130));
+    let h = harness({ nowIso: "2026-10-18T21:05:56.000Z", latest: ours });
+    let out = await handlePolledConfig(prev, device(120, 118, { htDif: 6 }), h.deps);
+    assert.equal(h.rows.length + h.pages.length, 0, "a stale non-curve observation never overwrites our newer version");
+    assert.equal(out.changes, null);
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", latest: prev });
+    out = await handlePolledConfig(prev, device(120, 118, { htDif: 6 }), h.deps);
+    assert.equal(h.rows.length, 1, "unmoved baseline → recorded as before");
+    assert.equal(out.kind, "config_drift");
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", latest: ours });
+    out = await handlePolledConfig(null, device(120, 118), h.deps);
+    assert.equal(h.rows.length, 0, "no seed over a version that appeared meanwhile");
+    // and both take the lock
+    let locks = 0;
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z" });
+    h.deps.lock = async (fn) => { locks++; return fn(); };
+    await handlePolledConfig(null, device(120, 118), h.deps);
+    await handlePolledConfig(prev, device(120, 118, { htDif: 6 }), h.deps);
+    assert.equal(locks, 2, "seed and non-curve records run under the device lock");
+  }
+
+  // ── 10d. Moved baseline + a 1 °F transform of the write made DURING the wait → echo, not a high foreign page:
+  // the echo window ends at the re-read (codex pass 2) ──────────────────────────────────────────────────────────
+  {
+    const prev = prevOf(device(120, 118));
+    const ours = device(134, 130);                                    // dashboard write at 21:06:06, inside the 30 s
+    const h = harness({
+      nowIso: "2026-10-18T21:05:56.000Z", reread: device(133, 129), latest: prevOf(ours),
+      writes: [write("2026-10-18T21:06:06.000Z", "set_target", { dbt: 134, mbt: 130 })],
+    });
+    const out = await handlePolledConfig(prev, device(141, 137), h.deps);
+    assert.equal(out.diagnosis?.baseline_moved, true);
+    assert.equal(out.diagnosis?.verdict, "echo_suspected", "our own write made during the wait counts");
+    assert.deepEqual(h.rows[0].changes, diffConfig(extractConfig(ours), extractConfig(device(133, 129))), "judged against the moved baseline");
+    assert.equal(h.pages[0].priority, "default");
+  }
+
   // ── 11. Seed, unchanged, and non-curve drift keep today's behaviour — and every row carries raw ─────────────────
   {
     const dev = device(120, 118);
