@@ -192,6 +192,22 @@ export interface PiLinkInputs {
   stats: StatsView | null;
   /** phase_b_log rows from a day BEFORE the 7-d window, so a run that straddles the edge keeps its real start */
   phaseB: PhaseBRow[];
+  /** any readings / system_stats row stamped ahead of the planner clock (beyond FUTURE_S): the Pi clock runs fast NOW */
+  futureRows?: boolean;
+}
+
+/**
+ * The Pi clock against the planner's, NOW (codex pass 14 on #193): windows come from phase_b_log (planner clock) and are
+ * matched against readings / system_stats (Pi clock). While the Pi clock is misaligned — future-stamped rows exist, or
+ * the live offset measured from the hub's latest frame (planner now − frame ts, index.ts) exceeds CLOCK_STEP_S — every
+ * Pi timestamp since the last detected clock step is shifted by an unknown amount, so every window since then is
+ * `unknown`. Returns where that span starts, or null when aligned.
+ */
+export function misalignedSince(input: PiLinkInputs, nowS: number, liveOffsetS: number | null, fromS: number): number | null {
+  const live = liveOffsetS != null && Math.abs(liveOffsetS) > CLOCK_STEP_S;
+  if (!input.futureRows && !live) return null;
+  const steps = (input.stats?.clockSteps ?? []).filter((t) => t < nowS - 1);
+  return steps.length ? Math.max(...steps) : fromS;
 }
 
 /** Windows are reported when they ENDED (or are still open) within this — the hub's own convention (#178). */
@@ -211,20 +227,28 @@ export interface PiHealth {
   reboots_24h: number | null;
   reboots_7d: number | null;
   last_reboot_at: string | null;
+  /** the Pi clock vs the planner's: misaligned_since non-null = every window since then is unknown */
+  pi_clock: { live_offset_s: number | null; future_rows: boolean; misaligned_since: string | null };
   dropouts_7d: DropoutWindow[];
   summary: { count: number; longest_min: number | null; verdicts: Record<PiVerdict, number> };
 }
 
 /** Assemble /health.pi. The windows come from the planner's own phase_b_log, corroborated by the mirror's tables. */
-export function piHealth(input: PiLinkInputs, nowMs: number): PiHealth {
+export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number | null = null): PiHealth {
   const nowS = nowMs / 1000;
+  const since = misalignedSince(input, nowS, liveOffsetS, nowS - DROPOUT_WINDOW_S - LOOKBACK_S);
+  // the misaligned span voids verdicts through BOTH evidence paths: readings' contamination spans and stats' steps
+  const readingsView = since == null || !input.readings ? input.readings
+    : { ...input.readings, clockIntervals: [...(input.readings.clockIntervals ?? []), { start: since, end: nowS }] };
+  const statsView = since == null || !input.stats ? input.stats
+    : { ...input.stats, clockSteps: [...(input.stats.clockSteps ?? []), since, nowS] };
   const by: PiHealth["last_reading_by_pump"] = {};
   for (const [id, ts] of Object.entries(input.lastByPump ?? {})) by[id] = { ts: new Date(ts * 1000).toISOString(), age_s: Math.round(nowS - ts) };
   const tsList = Object.values(input.lastByPump ?? {});
   const newest = tsList.length ? Math.max(...tsList) : null;
   const windows = classifyWindows(
     dropoutRuns(input.phaseB).filter((r) => r.end == null || nowS - r.end / 1000 <= DROPOUT_WINDOW_S),
-    input.readings, input.stats, nowS);
+    readingsView, statsView, nowS);
   const verdicts: Record<PiVerdict, number> = { "gap+reboot": 0, gap_only: 0, socket_only: 0, unknown: 0 };
   for (const w of windows) verdicts[w.verdict]++;
   const boots = input.stats ? mergeBoots(input.stats.boots) : [];
@@ -239,6 +263,11 @@ export function piHealth(input: PiLinkInputs, nowMs: number): PiHealth {
     reboots_24h: input.stats === null ? null : boots.filter((b) => nowS - b.at <= 86_400).length,
     reboots_7d: input.stats === null ? null : boots.filter((b) => nowS - b.at <= DROPOUT_WINDOW_S).length,
     last_reboot_at: lastBoot == null ? null : new Date(lastBoot * 1000).toISOString(),
+    pi_clock: {
+      live_offset_s: liveOffsetS == null ? null : Math.round(liveOffsetS),
+      future_rows: !!input.futureRows,
+      misaligned_since: since == null ? null : new Date(since * 1000).toISOString(),
+    },
     dropouts_7d: windows,
     summary: {
       count: windows.length,

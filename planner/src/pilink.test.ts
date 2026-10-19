@@ -247,4 +247,24 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   assert.equal(withLiveAges(bare, NOW + 60_000).last_reading_age_s, null);
 }
 
+// ── 8. codex pass 14 on #193: a Pi clock misaligned NOW voids every window since the last clock step ──────────────
+{
+  const base: PiLinkInputs = {
+    lastByPump: { pump1: NOW / 1000 - 30 }, readings: { ...readings, gaps: [] }, latestStat: null,
+    stats: { ...stats, clockSteps: [s("2026-10-17T00:00:00Z")] }, phaseB: rows,
+  };
+  const aligned = piHealth(base, NOW, 4);
+  assert.equal(aligned.pi_clock.misaligned_since, null);
+  assert.equal(aligned.dropouts_7d.at(-1)?.verdict, "socket_only");
+  const fast = piHealth({ ...base, futureRows: true }, NOW);
+  assert.equal(fast.pi_clock.misaligned_since, "2026-10-17T00:00:00.000Z", "since the last clock step");
+  assert.deepEqual(fast.dropouts_7d.map((w) => w.verdict).slice(-2), ["unknown", "unknown"], "the Oct 17 + 18 windows are void");
+  assert.equal(fast.dropouts_7d[2].verdict, "socket_only", "the Oct 16 window, before the step, stands");
+  const live = piHealth(base, NOW, -3_600);
+  assert.equal(live.pi_clock.live_offset_s, -3_600);
+  assert.equal(live.pi_clock.misaligned_since, "2026-10-17T00:00:00.000Z", "the live hub offset alone is enough");
+  const noStep = piHealth({ ...base, stats: { ...stats, clockSteps: [] }, futureRows: true }, NOW);
+  assert.ok(noStep.dropouts_7d.every((w) => w.verdict === "unknown"), "no step known → the whole range is void");
+}
+
 console.log("pilink.test.ts: all assertions passed");

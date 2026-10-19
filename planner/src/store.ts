@@ -953,6 +953,7 @@ export class Store {
     let lastByPump: PiLinkInputs["lastByPump"] = null;
     let readings: PiLinkInputs["readings"] = null;
     let contaminated: { start: number; end: number }[] = [];
+    let futureRows = false; // any mirror row stamped ahead of our clock = the Pi clock runs fast NOW
     try {
       // the newest reading per pump over the WHOLE table: a silence longer than the analysis range must keep an
       // honest, growing age rather than drop to null (codex pass 1 on #193); index (pump_id, ts)
@@ -977,6 +978,8 @@ export class Store {
          FROM (SELECT id, pump_id, ts, lag(ts) OVER (PARTITION BY pump_id ORDER BY id) AS prev_ts FROM readings WHERE ts >= $1) x
          WHERE x.prev_ts - x.ts > $2 ORDER BY x.ts`, [fromS - 3_600, o.clockStepS]);
       contaminated = back.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) }));
+      const rf = await this.pool.query(`SELECT EXISTS (SELECT 1 FROM readings WHERE ts > $1) AS f`, [nowS + o.futureS]);
+      futureRows ||= rf.rows[0]?.f === true;
       lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
       readings = {
         gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
@@ -1020,6 +1023,7 @@ export class Store {
              AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
          ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS, nowS + o.futureS, o.settleS]);
       const future = await this.pool.query(`SELECT count(*)::int AS n FROM system_stats WHERE ts > $1`, [nowS + o.futureS]);
+      futureRows ||= Number(future.rows[0]?.n ?? 0) > 0;
       // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
       // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
       const steps = await this.pool.query(
@@ -1073,7 +1077,7 @@ export class Store {
                             WHERE mode = 'active' AND result = 'sent' AND ts < to_timestamp($1)), '-infinity'::timestamptz)`, [fromS]);
     const phaseB = pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) }));
     if (open.rows[0]?.ts != null) phaseB.unshift({ ts: Number(open.rows[0].ts), result: "failed: no Pi connected" });
-    return { lastByPump, readings, latestStat, stats, phaseB };
+    return { lastByPump, readings, latestStat, stats, phaseB, futureRows };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

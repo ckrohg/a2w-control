@@ -288,6 +288,47 @@ async function main() {
     assert.equal(fin.stats?.boots.length, 0, `readings hole at the flick, at T0+${Math.round((evalS - T0) / 60)} min: nothing certain (${JSON.stringify(fin.stats?.boots)})`);
   }
 
+  // ── codex pass 14 on #193: a PERSISTENT forward offset. The Pi clock jumps +1 h at P (no return); a real outage of
+  // both paths at P+10 h..P+10 h 20 m (planner time) leaves a readings gap stamped an hour late. At the P+13 h refresh
+  // the gap misses the window — without the misalignment rule that reads socket_only. Now: unknown, and /health.pi
+  // says since when; also via the LIVE offset alone (no future rows: the evaluation is made after the data ends).
+  await pool.query(`TRUNCATE readings, system_stats, phase_b_log RESTART IDENTITY`);
+  const P = NOW - 3 * D, Bp = P - 5 * D;
+  const fast = (t: number) => (t >= P ? t + H : t);
+  const silentP = (t: number) => t >= P + 10 * H && t < P + 10 * H + 20 * 60;
+  const rdP: string[] = [], ssP: string[] = [];
+  for (let t = P - 6 * H; t <= P + 13 * H; t += 60) {
+    if (silentP(t)) continue;
+    rdP.push(`(${fast(t)}, 'pump1', true, 'heating')`);
+    ssP.push(`(${fast(t)}, ${t - Bp})`);
+  }
+  for (let i = 0; i < rdP.length; i += 500) {
+    await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${rdP.slice(i, i + 500).join(",")}`);
+    await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ${ssP.slice(i, i + 500).join(",")} ON CONFLICT (ts) DO NOTHING`);
+  }
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $4::bigint, 300) t`, [P - 6 * H, P + 10 * H, P + 10 * H + 20 * 60, P + 13 * H]);
+  const atP = (P + 13 * H) * 1000;
+  const inP = await store.piLinkInputs(atP, OPTS);
+  assert.equal(inP.futureRows, true, "rows stamped an hour ahead of the planner clock");
+  const hP = piHealth(inP, atP);
+  const wP = hP.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60);
+  assert.equal(wP?.verdict, "unknown", `a persistently fast clock voids the verdict (got ${wP?.verdict})`);
+  assert.ok(hP.pi_clock.misaligned_since && Math.abs(Date.parse(hP.pi_clock.misaligned_since) / 1000 - (P + H)) <= 120,
+    `misaligned since the step (${hP.pi_clock.misaligned_since})`);
+  // the live offset alone (the future rows gone, e.g. evaluated once the data has caught up) does the same
+  const late = (P + 15 * H) * 1000;
+  const inL = await store.piLinkInputs(late, OPTS);
+  assert.equal(inL.futureRows, false);
+  assert.equal(piHealth(inL, late, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict,
+    "socket_only", "with NO evidence of misalignment (offset 0, no future rows) the hour-late gap misses the window — the false verdict the rule prevents");
+  const hL = piHealth(inL, late, -3_600);
+  assert.equal(hL.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict, "unknown",
+    "the hub measures the Pi an hour fast → unknown");
+  assert.equal(hL.pi_clock.live_offset_s, -3_600);
+
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }
 
