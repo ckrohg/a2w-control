@@ -190,7 +190,8 @@ export interface DriftDeps {
    * filed as a curve change. Optional; without it the poll-time baseline stands.
    */
   latest?: () => Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null>;
-  notify: (title: string, body: string, priority: string, opts?: { email?: boolean }) => Promise<void>;
+  /** Resolves false when no channel acknowledged the alert (index.ts ntfyDelivered); void = assume delivered. */
+  notify: (title: string, body: string, priority: string, opts?: { email?: boolean }) => Promise<boolean | void>;
   /** writes.ts withDeviceLock — serialises the re-read → record with the planner's own PATCH → record. */
   lock?: <T>(fn: () => Promise<T>) => Promise<T>;
   now?: () => number;
@@ -212,6 +213,8 @@ export interface DriftOutcome {
    * (codex pass 6) — exactly as a failed device read already does; the next poll sees the same diff again.
    */
   unsettled?: boolean;
+  /** For an echo_suspected / foreign page: false = no channel acknowledged it (PendingTracker then keeps any pending one). */
+  delivered?: boolean;
 }
 
 const curveChanged = (c: Record<string, FieldChange> | null): boolean => !!c && ("dbt" in c || "mbt" in c);
@@ -425,9 +428,10 @@ export async function handlePolledConfig(
   }
 
   const evidence = diagnosisBody(diagnosis);
+  let ack: boolean | void;
   if (verdict === "echo_suspected") {
     log(`HBX curve differs from our write — echo suspected (#177):\n${fmtChanges(diagnosis.fields)}`);
-    await deps.notify(
+    ack = await deps.notify(
       ECHO_TITLE,
       `The reset curve on the device no longer matches the planner's last write, but every changed field is within ` +
         `${ECHO_TOLERANCE_F} °F of a value the planner itself wrote in the last 60 min — the signature of the device or ` +
@@ -441,20 +445,20 @@ export async function handlePolledConfig(
     // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
     // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
     // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
-    await deps.notify(
+    ack = await deps.notify(
       FOREIGN_TITLE,
       `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${fmtChanges(diagnosis.fields)}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).\n\n${evidence}`,
       "high",
     );
   }
-  return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis };
+  return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis, delivered: ack !== false };
 }
 
 export const UNCONFIRMED_TITLE = "HBX curve change seen once, could not be confirmed";
 
 /**
- * #177 (codex passes 3–4): an `unconfirmed` curve change is re-checked on the next poll. Only a CONFIRMED curve event
- * (echo_suspected / foreign — it gets its own page) supersedes it silently; a fresh unconfirmed one replaces it. Any
+ * #177 (codex passes 3–4, 10): an `unconfirmed` curve change is re-checked on the next poll. Only a CONFIRMED curve
+ * event (echo_suspected / foreign) whose own page was delivered supersedes it silently; a fresh unconfirmed one replaces it. Any
  * other outcome — no change (a planner write such as boost expiry replaced the curve, or it vanished), non-curve drift,
  * or a different change that reverted — would otherwise lose the observation, so it is announced at default priority
  * with the evidence and no single-writer claim. `resolved` = the pending observation is settled (persist that, so a
@@ -467,7 +471,11 @@ export function pendingUnconfirmedNotice(
   const v = outcome.diagnosis?.verdict;
   if (v === "unconfirmed") return { pending: outcome.diagnosis, notice: null, resolved: false };
   if (!pending) return { pending: null, notice: null, resolved: false };
-  if (v === "echo_suspected" || v === "foreign") return { pending: null, notice: null, resolved: true };
+  // a confirmed page supersedes the pending observation only once it was DELIVERED (codex pass 10) — undelivered, the
+  // pending one stays and is announced on a later poll, so the owner still hears of it
+  if (v === "echo_suspected" || v === "foreign") {
+    return outcome.delivered === false ? { pending, notice: null, resolved: false } : { pending: null, notice: null, resolved: true };
+  }
   return {
     pending: null,
     resolved: true,

@@ -220,6 +220,15 @@ async function main(): Promise<void> {
     assert.equal(h2.pages.length, 1);
     assert.equal(h2.pages[0].priority, "high");
     assert.deepEqual(pendingUnconfirmedNotice(out.diagnosis, out2), { pending: null, notice: null, resolved: true }, "re-detected → its own page, no extra notice");
+    // …but only if that page was DELIVERED (codex pass 10): every channel down → the pending one survives
+    const h2b = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: seen, writes: [] });
+    h2b.deps.notify = async () => false;
+    const out2b = await handlePolledConfig(prev, seen, h2b.deps);
+    assert.equal(out2b.diagnosis?.verdict, "foreign");
+    assert.equal(out2b.delivered, false);
+    assert.deepEqual(pendingUnconfirmedNotice(out.diagnosis, out2b), { pending: out.diagnosis, notice: null, resolved: false },
+      "an undelivered confirmed page does not settle the pending observation");
+    assert.equal(out2.delivered, true, "a void notify counts as delivered (the harness)");
   }
 
   // ── 8b. Failed confirmation, then a planner write (boost expiry restore) replaces the curve before the next poll:

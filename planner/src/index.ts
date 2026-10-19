@@ -1621,7 +1621,7 @@ async function pollOnce(): Promise<void> {
     latest: () => store.latestConfigVersion(),
     plannerWrites: (sinceMs) => store.plannerWrites(new Date(sinceMs)),
     record: (r) => store.insertConfigVersion(r.config, r.changes, r),
-    notify: (title, body, priority, opts) => ntfy(title, body, priority, opts),
+    notify: (title, body, priority, opts) => ntfyDelivered(title, body, priority, opts),
   });
   if (drift.unsettled && !shuttingDown) {
     lastCurveDiagnosis = drift.diagnosis ?? lastCurveDiagnosis;
