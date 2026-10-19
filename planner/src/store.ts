@@ -1027,7 +1027,7 @@ export class Store {
       // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
       // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
       const steps = await this.pool.query(
-        `SELECT ts::float8 AS ts FROM (
+        `SELECT ts::float8 AS ts, ((ts - prev_ts) - (uptime_s - prev_up))::float8 AS delta FROM (
            SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
            FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
          ) s WHERE prev_ts IS NOT NULL AND uptime_s >= prev_up - 5
@@ -1058,6 +1058,8 @@ export class Store {
         // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
         // window cannot read as resolved while they exist
         clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
+        // signed: + = the Pi clock jumped FORWARD by delta s at ts (pilink.ts historicMisalignment)
+        clockStepDeltas: steps.rows.map((r: any) => ({ ts: Number(r.ts), delta: Number(r.delta) })),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };

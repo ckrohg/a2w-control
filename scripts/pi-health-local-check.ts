@@ -131,8 +131,10 @@ async function main() {
   assert.ok(inputs.phaseB.every((r) => r.result === "sent" || /no Pi connected/.test(r.result)), "only rows that speak about the Pi");
 
   const h = piHealth(inputs, NOW * 1000);
-  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "gap+reboot", "unknown", "socket_only", "unknown"],
-    "9-d run predates the readings → unknown; W5's silence was refilled by a slow clock → unknown, never socket_only; W2 holds the clock flick → unknown; W4's 'gap' is a clock step → unknown");
+  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "gap+reboot", "unknown", "unknown", "unknown"],
+    "9-d run predates the readings → unknown; W5's silence was refilled by a slow clock → unknown; W2 holds the clock flick → unknown; " +
+    "W3: the steps AFTER it leave a net offset this synthetic clock never takes back (W4 ends −437 s, the fresh-boot +1800 s) — " +
+    "relative to the aligned present its stamps were off → unknown (codex pass 15); W4's 'gap' is a clock step → unknown");
   assert.ok((inputs.stats?.ambiguous ?? []).some((b) => Math.abs(b.at - (REBOOT1 + 3_600)) <= 5),
     `the flick's displaced samples imply REBOOT1 (its track then) + 1 h — an ambiguous jump, not a reboot (${JSON.stringify(inputs.stats?.ambiguous)})`);
   assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [3 * 24 * 60, 120, 130, 125, 120, 60]);
@@ -145,7 +147,7 @@ async function main() {
   assert.equal(h.reboots_7d, 2);
   assert.ok(h.last_reading_age_s != null && Math.abs(h.last_reading_age_s - (1_860 + 437)) <= 61, `newest reading: the series ends 30 min early, stamped −437 s (${h.last_reading_age_s})`);
   assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 1_860)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
-  assert.deepEqual(h.summary, { count: 6, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 0, socket_only: 1, unknown: 4 } });
+  assert.deepEqual(h.summary, { count: 6, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 0, socket_only: 0, unknown: 5 } });
   // codex pass 7 on #193 — (a) a forward flick still in its catch-up: samples stamped 40 min AHEAD of now (uptime still
   // rising on the current track) are quarantined: no reboot, but a clock step marked at now; (b) a real reboot 5 min
   // ago has too little history to be certain yet → ambiguous until SETTLE_S of samples stay on its track
@@ -328,6 +330,37 @@ async function main() {
   assert.equal(hL.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict, "unknown",
     "the hub measures the Pi an hour fast → unknown");
   assert.equal(hL.pi_clock.live_offset_s, -3_600);
+
+  // ── codex pass 15 on #193: an hour SLOW for two days, then corrected; a real outage of both paths inside the slow
+  // span; evaluated AFTER the correction (no future rows, live offset 0) — must stay unknown ──────────────────────
+  await pool.query(`TRUNCATE readings, system_stats, phase_b_log RESTART IDENTITY`);
+  const Q0 = NOW - 4 * D, Q1 = Q0 + 2 * D, Bq = Q0 - 3 * D;               // slow from Q0, corrected at Q1
+  const slow = (t: number) => (t >= Q0 && t < Q1 ? t - H : t);
+  const out0 = Q0 + D + 10 * H;                                            // the outage, planner time
+  const silentQ = (t: number) => t >= out0 && t < out0 + 20 * 60;
+  const rdQ: string[] = [], ssQ: string[] = [];
+  for (let t = Q0 - 6 * H; t <= Q1 + 6 * H; t += 60) {
+    if (silentQ(t)) continue;
+    rdQ.push(`(${slow(t)}, 'pump1', true, 'heating')`);
+    ssQ.push(`(${slow(t)}, ${t - Bq})`);
+  }
+  for (let i = 0; i < rdQ.length; i += 500) {
+    await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${rdQ.slice(i, i + 500).join(",")}`);
+    await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ${ssQ.slice(i, i + 500).join(",")} ON CONFLICT (ts) DO NOTHING`);
+  }
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $4::bigint, 300) t`, [Q0 - 6 * H, out0, out0 + 20 * 60, Q1 + 6 * H]);
+  const atQ = (Q1 + 6 * H) * 1000;
+  const inQ = await store.piLinkInputs(atQ, OPTS);
+  assert.equal(inQ.futureRows, false, "aligned now: nothing stamped ahead");
+  const hQ = piHealth(inQ, atQ, 0);
+  const wQ = hQ.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - out0) <= 60);
+  assert.equal(wQ?.verdict, "unknown", `an outage inside a corrected slow span stays unknown (got ${wQ?.verdict})`);
+  // (the first slow hour re-stamps [Q0−1 h, Q0) and loses its ts conflicts to the real rows, so the step is seen at ~Q0)
+  assert.ok(hQ.pi_clock.past_misaligned.some((x) => { const a = Date.parse(x.start) / 1000; return a >= Q0 - H - 180 && a <= Q0 + 180 && Math.abs(Date.parse(x.end) / 1000 - Q1) <= 180; }),
+    `the slow span is reconstructed (${JSON.stringify(hQ.pi_clock.past_misaligned)})`);
 
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }

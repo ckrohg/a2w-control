@@ -104,6 +104,8 @@ export interface StatsView {
   ambiguous?: Boot[];
   /** Pi-clock discontinuities (epoch s): ts moved unlike uptime between consecutive samples — an NTP step */
   clockSteps?: number[];
+  /** the same steps, signed: delta > 0 = the clock jumped forward by delta seconds at ts */
+  clockStepDeltas?: { ts: number; delta: number }[];
   firstTs: number | null;
   lastTs: number | null;
 }
@@ -228,20 +230,42 @@ export interface PiHealth {
   reboots_7d: number | null;
   last_reboot_at: string | null;
   /** the Pi clock vs the planner's: misaligned_since non-null = every window since then is unknown */
-  pi_clock: { live_offset_s: number | null; future_rows: boolean; misaligned_since: string | null };
+  pi_clock: { live_offset_s: number | null; future_rows: boolean; misaligned_since: string | null; past_misaligned: { start: string; end: string }[] };
   dropouts_7d: DropoutWindow[];
   summary: { count: number; longest_min: number | null; verdicts: Record<PiVerdict, number> };
 }
 
 /** Assemble /health.pi. The windows come from the planner's own phase_b_log, corroborated by the mirror's tables. */
+/**
+ * Past misalignment (codex pass 15 on #193): with the clock aligned NOW, the signed steps reconstruct its offset back in
+ * time — 0 after the last step, minus each step's delta before it — so a span the clock spent off by more than
+ * CLOCK_STEP_S (a Pi running an hour slow for two days, then corrected) is found even after the correction. Pure.
+ */
+export function historicMisalignment(deltas: { ts: number; delta: number }[], fromS: number, nowS: number): { start: number; end: number }[] {
+  const steps = [...deltas].filter((d) => d.ts < nowS).sort((a, b) => a.ts - b.ts);
+  const out: { start: number; end: number }[] = [];
+  let offset = 0; // the clock's offset (Pi − true) on the segment AFTER steps[i]; 0 after the last one
+  for (let i = steps.length - 1; i >= 0; i--) {
+    offset -= steps[i].delta;                     // …and before it
+    const start = i > 0 ? steps[i - 1].ts : fromS;
+    if (Math.abs(offset) > CLOCK_STEP_S) out.push({ start, end: steps[i].ts });
+  }
+  return out.reverse();
+}
+
 export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number | null = null): PiHealth {
   const nowS = nowMs / 1000;
-  const since = misalignedSince(input, nowS, liveOffsetS, nowS - DROPOUT_WINDOW_S - LOOKBACK_S);
-  // the misaligned span voids verdicts through BOTH evidence paths: readings' contamination spans and stats' steps
-  const readingsView = since == null || !input.readings ? input.readings
-    : { ...input.readings, clockIntervals: [...(input.readings.clockIntervals ?? []), { start: since, end: nowS }] };
-  const statsView = since == null || !input.stats ? input.stats
-    : { ...input.stats, clockSteps: [...(input.stats.clockSteps ?? []), since, nowS] };
+  const fromS = nowS - DROPOUT_WINDOW_S - LOOKBACK_S;
+  const since = misalignedSince(input, nowS, liveOffsetS, fromS);
+  // the clock is aligned now → reconstruct any PAST misaligned span from the signed steps; misaligned now → the span
+  // since the last step (the history before it cannot be anchored to a known-good present)
+  const past = since == null ? historicMisalignment(input.stats?.clockStepDeltas ?? [], fromS, nowS) : [];
+  const spans = [...past, ...(since == null ? [] : [{ start: since, end: nowS }])];
+  // misaligned spans void verdicts through BOTH evidence paths: readings' contamination spans and stats' steps
+  const readingsView = !spans.length || !input.readings ? input.readings
+    : { ...input.readings, clockIntervals: [...(input.readings.clockIntervals ?? []), ...spans] };
+  const statsView = !spans.length || !input.stats ? input.stats
+    : { ...input.stats, clockSteps: [...(input.stats.clockSteps ?? []), ...spans.flatMap((x) => [x.start, x.end])] };
   const by: PiHealth["last_reading_by_pump"] = {};
   for (const [id, ts] of Object.entries(input.lastByPump ?? {})) by[id] = { ts: new Date(ts * 1000).toISOString(), age_s: Math.round(nowS - ts) };
   const tsList = Object.values(input.lastByPump ?? {});
@@ -267,6 +291,7 @@ export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number
       live_offset_s: liveOffsetS == null ? null : Math.round(liveOffsetS),
       future_rows: !!input.futureRows,
       misaligned_since: since == null ? null : new Date(since * 1000).toISOString(),
+      past_misaligned: past.map((x) => ({ start: new Date(x.start * 1000).toISOString(), end: new Date(x.end * 1000).toISOString() })),
     },
     dropouts_7d: windows,
     summary: {

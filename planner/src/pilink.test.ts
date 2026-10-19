@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import {
-  dropoutRuns, classifyWindows, piHealth, withLiveAges, mergeBoots, WINDOW_SLACK_S, DROPOUT_WINDOW_S,
+  dropoutRuns, classifyWindows, piHealth, withLiveAges, mergeBoots, historicMisalignment, WINDOW_SLACK_S, DROPOUT_WINDOW_S,
   type PhaseBRow, type ReadingGap, type Boot, type PiLinkInputs, type StatsView,
 } from "./pilink";
 
@@ -265,6 +265,31 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   assert.equal(live.pi_clock.misaligned_since, "2026-10-17T00:00:00.000Z", "the live hub offset alone is enough");
   const noStep = piHealth({ ...base, stats: { ...stats, clockSteps: [] }, futureRows: true }, NOW);
   assert.ok(noStep.dropouts_7d.every((w) => w.verdict === "unknown"), "no step known → the whole range is void");
+}
+
+// ── 9. codex pass 15 on #193: a PAST misaligned span (an hour slow for two days, then corrected) is found after the
+// correction from the signed steps, and voids the windows inside it ────────────────────────────────────────────
+{
+  const from = s("2026-10-10T00:00:00Z");
+  // slowed −1 h on Oct 14 00:00, corrected +1 h on Oct 16 00:00; a +30 s blip is not a step worth a span
+  const deltas = [{ ts: s("2026-10-14T00:00:00Z"), delta: -3_600 }, { ts: s("2026-10-16T00:00:00Z"), delta: 3_600 }];
+  assert.deepEqual(historicMisalignment(deltas, from, NOW / 1000), [{ start: s("2026-10-14T00:00:00Z"), end: s("2026-10-16T00:00:00Z") }]);
+  assert.deepEqual(historicMisalignment([], from, NOW / 1000), []);
+  // a single step that CORRECTED a slow clock: everything before it was off
+  assert.deepEqual(historicMisalignment([{ ts: s("2026-10-12T00:00:00Z"), delta: 3_600 }], from, NOW / 1000), [{ start: from, end: s("2026-10-12T00:00:00Z") }]);
+  // two steps that cancel within tolerance leave nothing; a later unrelated pair is found on its own
+  assert.deepEqual(historicMisalignment([{ ts: s("2026-10-12T00:00:00Z"), delta: 90 }], from, NOW / 1000), []);
+  const base: PiLinkInputs = {
+    lastByPump: { pump1: NOW / 1000 - 30 }, readings: { ...readings, gaps: [] }, latestStat: null,
+    stats: { ...stats, clockSteps: deltas.map((d) => d.ts), clockStepDeltas: deltas }, phaseB: rows,
+  };
+  const h = piHealth(base, NOW, 0);
+  assert.equal(h.pi_clock.misaligned_since, null, "aligned now");
+  assert.equal(h.pi_clock.past_misaligned.length, 1);
+  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "socket_only", "socket_only", "socket_only"],
+    "Oct 14 15:00 and Oct 15 18:00 lie inside the slow span (Oct 14 00:00 → Oct 16 00:00) → unknown; the rest stand");
+  assert.deepEqual(piHealth({ ...base, stats: { ...stats, clockSteps: [], clockStepDeltas: [] } }, NOW, 0).dropouts_7d.map((w) => w.verdict),
+    ["socket_only", "socket_only", "socket_only", "socket_only", "socket_only"], "without the steps every window would read socket_only");
 }
 
 console.log("pilink.test.ts: all assertions passed");
