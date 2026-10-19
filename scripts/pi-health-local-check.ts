@@ -55,7 +55,7 @@ const silent = (t: number, w: [number, number]) => t > w[0] + 60 && t < w[1] - 6
 async function main() {
   await store.ensureSchema();
   // ── 1. mirror tables ABSENT (the rehearsal's fresh DB): mirror-derived fields null, no throw ──────────────────
-  await pool.query(`DROP TABLE IF EXISTS readings; DROP TABLE IF EXISTS system_stats; TRUNCATE phase_b_log RESTART IDENTITY`);
+  await pool.query(`DROP TABLE IF EXISTS readings, system_stats, readings_hidden, system_stats_hidden; TRUNCATE phase_b_log RESTART IDENTITY`);
   const bare = await store.piLinkInputs(NOW * 1000, OPTS);
   assert.equal(bare.lastByPump, null);
   assert.equal(bare.readings, null);
@@ -230,6 +230,24 @@ async function main() {
     assert.equal(w6?.verdict, "unknown", `stats absent, at T0+${Math.round((evalS - T0) / 60)} min: unknown (got ${w6?.verdict})`);
   }
   await pool.query(`ALTER TABLE system_stats_hidden RENAME TO system_stats`);
+  // codex pass 10 on #193 — readings missing ONLY during the flick (an internal hole: no backward step in readings,
+  // and readings still bracket the candidate): the displaced stats must stay ambiguous through the catch-up
+  await pool.query(`TRUNCATE readings RESTART IDENTITY`);
+  const holed: string[] = [];
+  for (let t = T0 - 3 * H + 60; t <= T0 + 3 * H; t += 60) {
+    if (t >= T0 && t < F1) continue; // no readings at all while the clock was wrong
+    for (const p of ["pump1", "pump2"]) holed.push(`(${t}, '${p}', true, 'heating')`);
+  }
+  for (let i = 0; i < holed.length; i += 500) {
+    await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${holed.slice(i, i + 500).join(",")}`);
+  }
+  for (const evalS of [T0 + H + 15 * 60, T0 + H + 19 * 60]) {
+    const rows = (await pool.query(`SELECT count(*)::int AS n FROM readings WHERE ts > $1 AND ts <= $2`, [F1, evalS])).rows[0].n;
+    assert.ok(rows > 0, "readings resume after the hole (they bracket the candidate)");
+    const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+    assert.equal(fin.readings?.clockIntervals?.length ?? 0, 0, "no backward step is visible in readings");
+    assert.equal(fin.stats?.boots.length, 0, `readings hole at the flick, at T0+${Math.round((evalS - T0) / 60)} min: nothing certain (${JSON.stringify(fin.stats?.boots)})`);
+  }
 
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }

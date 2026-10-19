@@ -999,7 +999,7 @@ export class Store {
       // they sort after the resumed samples and fake a reboot; and a reboot is certain only once SETTLE_S of later
       // history has stayed on its track — until then it is ambiguous (the window reads unknown, the count lags).
       const b = await this.pool.query(
-        `SELECT boot_at::float8 AS at, ts::float8 AS sample_ts,
+        `SELECT boot_at::float8 AS at, ts::float8 AS sample_ts, (max_prev_boot + uptime_s)::float8 AS origin,
                 (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)
                  AND max_next_ts >= ts + $4) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
@@ -1029,7 +1029,14 @@ export class Store {
       // that time) displaced history cannot be excluded, so nothing is certain (codex pass 9 on #193)
       const arrivalCovers = (t: number) => readings != null && readings.firstTs != null && readings.firstTs <= t - 600
         && readings.lastTs != null && readings.lastTs >= t;
-      const certain = (r: any) => r.certain && arrivalCovers(Number(r.sample_ts)) && !dirty(Number(r.sample_ts));
+      // Had the candidate been a sample DISPLACED from the previous boot track, it was taken at origin = previous boot +
+      // its uptime. A real reboot is only certain if the Pi's pushes were flowing normally at that would-be origin —
+      // no readings gap contains it (codex pass 10 on #193: readings missing exactly during a flick bracket the
+      // candidate yet prove nothing). An origin older than the analysis range is a clock error of > 8 days: accepted.
+      const originCovered = (o: number) => readings != null && readings.firstTs != null && (o < readings.firstTs
+        || (readings.lastTs != null && o <= readings.lastTs && !readings.gaps.some((g) => o > g.start - 60 && o < g.end + 60)));
+      const certain = (r: any) => r.certain && arrivalCovers(Number(r.sample_ts)) && originCovered(Number(r.origin))
+        && !dirty(Number(r.sample_ts));
       stats = {
         boots: b.rows.filter(certain).map((r: any) => ({ at: Number(r.at) })),
         ambiguous: b.rows.filter((r: any) => !certain(r)).map((r: any) => ({ at: Number(r.at) })),
