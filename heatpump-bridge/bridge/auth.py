@@ -146,15 +146,24 @@ def require(scope: str):
       'write'   — a writable credential (setpoint; machines allowed).
       'control' — like write, PLUS blocks machine tokens when unattended writes are
                   restricted (power/mode/parameter/setup are human-only by default —
-                  fusion audit risk 2, cold-latch safety)."""
+                  fusion audit risk 2, cold-latch safety).
+      'human'   — like control, but machine tokens are refused UNCONDITIONALLY (SPAN breaker
+                  switching: a person in the UI, never an automated client)."""
     def dependency(request: Request) -> Principal:
         principal = resolve_principal(request)
         mode = request.app.state.config.auth.protect
-        if scope in ("write", "control"):
+        if scope in ("write", "control", "human"):
             if mode in ("writes", "all") and not principal.authenticated:
                 raise HTTPException(401, "authentication required to control the pumps")
             if not principal.can_write:
                 raise HTTPException(403, "this API token is read-only")
+            if scope == "human" and principal.is_machine:
+                raise HTTPException(403, "breaker control is human-only (UI session) — "
+                                         "API tokens are never accepted")
+            if scope == "human" and not principal.authenticated:
+                # whatever the protect mode: a UI session (auto-minted on the LAN page when
+                # protect=off, password login otherwise), never an anonymous request
+                raise HTTPException(401, "breaker control needs a dashboard session")
             if scope == "control" and principal.is_machine and \
                     request.app.state.config.guardrails.restrict_unattended_writes:
                 raise HTTPException(

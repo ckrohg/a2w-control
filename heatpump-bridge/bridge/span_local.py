@@ -10,12 +10,15 @@
 #     stale IP does not break polling.
 #   - best-effort: a SPAN outage gaps THIS series only — control, the bridge, and the
 #     hourly-cloud record are all unaffected. urllib in a thread (no new dependency).
+# Relay writes are CLOSE-ONLY unless the caller holds an OpenPermit, which only the guarded
+# breaker controller (span_control.py) mints — see SpanClient._set_relay_sync.
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +53,9 @@ class SpanClient:
         self._token = token or self._load_token()
         self._base: str | None = None       # last base URL that worked (host or ip)
         self._last_register = 0.0            # cooldown clock for re-registration
+        # One panel conversation at a time: the poll loop and the breaker controller share this
+        # client from worker threads, and a token re-mint mutates _token/_base and the token file.
+        self._lock = threading.RLock()
 
     # --- token persistence (survive restarts so we almost never re-register) --
     def _load_token(self) -> str | None:
@@ -156,17 +162,30 @@ class SpanClient:
             self._token = self._register_sync()  # the resilience keystone
             return self._circuits_sync(self._token)
 
-    async def fetch_circuits(self) -> dict:
-        return await asyncio.to_thread(self._fetch_sync)
+    def _fetch_locked(self) -> dict:
+        with self._lock:
+            return self._fetch_sync()
 
-    # --- writes: CLOSE-ONLY relay control (the safety keystone) ----------------
-    def _set_relay_sync(self, circuit_id: str, want: str) -> str:
-        # HARD invariant: A2W may only CLOSE a circuit (make the backup element AVAILABLE), never
-        # OPEN it. This single property is what makes backup-element control safe — it can never
-        # disable the failsafe, and never switches a live load off. Enforced here so NO caller can
-        # bypass it. (See knowledge/reference/span-backup-arm-spec.md.)
-        if want != "CLOSED":
-            raise ValueError(f"set_relay is CLOSE-ONLY — refused '{want}'")
+    async def fetch_circuits(self) -> dict:
+        return await asyncio.to_thread(self._fetch_locked)
+
+    # --- writes: CLOSE-ONLY by default (the safety keystone) ------------------
+    def _set_relay_sync(self, circuit_id: str, want: str, *,
+                        open_permit: "OpenPermit | None" = None) -> str:
+        # HARD invariant: without an OpenPermit, A2W may only CLOSE a circuit (make it
+        # AVAILABLE), never OPEN it. That property is what makes the backup-element arm safe —
+        # it can never disable the failsafe, and never switches a live load off. Enforced here
+        # so NO caller can bypass it. (See knowledge/reference/span-backup-arm-spec.md.)
+        # The ONE exception (owner decision 2026-10-18): span_control.BreakerController mints a
+        # short-lived OpenPermit for exactly one circuit after every guard has passed (allowlist,
+        # per-circuit OFF opt-in, controllable, global lock, never two heat pumps off). The arm
+        # path never holds a permit, so it stays close-only by construction.
+        if want == "OPEN":
+            if not isinstance(open_permit, OpenPermit):
+                raise ValueError("set_relay is CLOSE-ONLY — refused 'OPEN' (no open permit)")
+            open_permit.check(circuit_id)
+        elif want != "CLOSED":
+            raise ValueError(f"set_relay: unknown relay state {want!r}")
         if not self._token:
             self._token = self._register_sync()
         body = {"relayStateIn": want}
@@ -186,8 +205,36 @@ class SpanClient:
                 last_err = f"{base}: HTTP {status}"; break
         raise ConnectionError(f"set_relay: {last_err}")
 
-    async def set_relay(self, circuit_id: str, want: str = "CLOSED") -> str:
-        return await asyncio.to_thread(self._set_relay_sync, circuit_id, want)
+    async def set_relay(self, circuit_id: str, want: str = "CLOSED", *,
+                        open_permit: "OpenPermit | None" = None) -> str:
+        def _locked():
+            with self._lock:
+                return self._set_relay_sync(circuit_id, want, open_permit=open_permit)
+        return await asyncio.to_thread(_locked)
+
+
+class OpenPermit:
+    """Capability to OPEN one SPAN circuit, once, within a few seconds. Minted only by
+    span_control.BreakerController after its guards pass; SpanClient refuses OPEN without one.
+    Single-use so a stray reference can never be replayed into a second OFF."""
+
+    TTL_S = 30.0
+
+    def __init__(self, circuit_id: str, name: str, reason: str):
+        self.circuit_id = circuit_id
+        self.name = name
+        self.reason = reason
+        self._expires = time.monotonic() + self.TTL_S
+        self._used = False
+
+    def check(self, circuit_id: str) -> None:
+        if self._used:
+            raise ValueError(f"open permit for '{self.name}' already used")
+        if circuit_id != self.circuit_id:
+            raise ValueError(f"open permit is for '{self.name}', not circuit {circuit_id!r}")
+        if time.monotonic() > self._expires:
+            raise ValueError(f"open permit for '{self.name}' expired")
+        self._used = True
 
 
 def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
@@ -252,6 +299,10 @@ class SpanLocalPoller:
         self._last_arm_action = 0.0
         # Latest arm/relay snapshot for the exporter + /api/span/arm (in-memory; cheap).
         self.latest_arm: dict = {}
+        # Latest relay/power of every allowlisted breaker circuit (span_control + /api/span/circuits
+        # + the hub state frame). Refreshed every poll and after every breaker read-back.
+        self.latest_circuits: dict[str, dict | None] = {}
+        self.latest_circuits_ts: float | None = None
 
     def start(self) -> None:
         if self.cfg and self.cfg.host and self.cfg.passphrase:
@@ -269,6 +320,7 @@ class SpanLocalPoller:
         circuits = await self.client.fetch_circuits()
         rows = extract_powers(circuits, self.cfg.circuits)
         ts = time.time()
+        self.note_circuits(circuits, ts)
         for r in rows:
             await self.store.add_span_sample(ts, r["circuit_id"], r["name"], r["power_w"])
         await self._evaluate_arm(circuits, ts)
@@ -278,6 +330,12 @@ class SpanLocalPoller:
             if self.notify:
                 await self.notify("SPAN local recovered", "Instant circuit power logging is back.")
         return rows
+
+    def note_circuits(self, circuits: dict, ts: float) -> None:
+        """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""
+        self.latest_circuits = {b.name: extract_relay(circuits, b.name)
+                                for b in getattr(self.cfg, "breakers", [])}
+        self.latest_circuits_ts = ts
 
     async def _evaluate_arm(self, circuits: dict, ts: float) -> None:
         """Backup-element ARM decision. Phase 1 = SHADOW (logs would-arm, toggles NOTHING).
