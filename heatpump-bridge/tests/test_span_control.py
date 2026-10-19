@@ -80,7 +80,7 @@ async def rig(tmp_path, alerts):
     poller = SpanLocalPoller(cfg, store)
     ft = FakeTime()
     ctl = BreakerController(cfg, poller.client, store, cache=poller, state_dir=str(tmp_path),
-                            sleep=ft.sleep, clock=ft.clock)
+                            sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
     yield panel, ctl, ft, store, alerts, tmp_path
     await ctl.stop()
     await store.close()
@@ -132,6 +132,11 @@ def test_config_floor_and_element_lock():
         SpanConfig(breakers=[BreakerCircuit(name="Buffer Tank", allow_open=True)])
     with pytest.raises(ValidationError, match="close-only"):
         SpanConfig(breakers=[BreakerCircuit(name="Buffer Tank", allow_cycle=True)])
+    with pytest.raises(ValidationError, match="never allow_open"):
+        SpanConfig(breakers=[BreakerCircuit(name="Air-Water 1", allow_cycle=True, heat_pump=True,
+                                            allow_open=True)])
+    with pytest.raises(ValidationError, match="heat_pump must be true"):
+        SpanConfig(breakers=[BreakerCircuit(name="Air-Water 2", allow_cycle=True)])
     d = SpanConfig()
     assert d.min_off_s == 60
     by = {b.name: b for b in d.breakers}
@@ -170,16 +175,85 @@ async def test_power_cycle_honours_a_longer_hold(rig):
     assert 180 in ft.sleeps and r["off_s"] >= 180 and r["ok"]
 
 
-async def test_close_runs_in_finally_when_the_hold_raises(rig):
+async def test_close_runs_in_finally_when_the_cycle_raises(rig, monkeypatch):
     panel, ctl, ft, store, _, _ = rig
-    ft.raise_once = 60.0                    # the hold itself blows up
+    t0 = ft.t
+
+    async def broken_readback(*a, **k):
+        raise RuntimeError("boom after the OPEN")
+    monkeypatch.setattr(ctl, "_readback", broken_readback)
     with pytest.raises(RuntimeError):
         await ctl.execute("Air-Water 2", "power_cycle")
-    assert panel.writes[-1] == ("Air-Water 2", "CLOSED")
-    assert panel.relay("Air-Water 2") == "CLOSED"
-    # the minimum off time still applied before the CLOSE (the remainder was held)
-    assert sum(s for s in ft.sleeps if s >= 59) >= 60 * 2 - 0.001
+    assert panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
+    assert ft.t - t0 >= 60                  # the full hold still ran before the CLOSE
     assert ctl.snapshot()["busy"] is None
+
+
+async def test_a_broken_sleep_cannot_skip_the_hold(rig):
+    panel, ctl, ft, *_ = rig
+    ft.raise_once = 60.0                    # the injected sleep blows up at the hold
+    r = await ctl.execute("Air-Water 2", "power_cycle")
+    assert r["ok"] and panel.relay("Air-Water 2") == "CLOSED"
+    assert panel.writes[-1] == ("Air-Water 2", "CLOSED")
+
+
+async def test_cancelling_the_cycle_task_does_not_shorten_the_hold(rig):
+    panel, ctl, ft, *_ = rig
+    ft.block = 60.0
+    caller = asyncio.create_task(ctl.execute("Air-Water 2", "power_cycle"))
+    while panel.relay("Air-Water 2") != "OPEN" or ctl._task is None:
+        await asyncio.sleep(0.01)
+    inner = ctl._task
+    inner.cancel()                          # e.g. loop teardown
+    await asyncio.sleep(0.05)
+    assert panel.relay("Air-Water 2") == "OPEN"     # still holding
+    assert not inner.done()
+    ft.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await inner                         # re-raised only after...
+    assert panel.relay("Air-Water 2") == "CLOSED"   # ...the CLOSE landed
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+
+async def test_unpersistable_cycle_record_refuses_before_any_write(tmp_path, alerts):
+    panel = FakeSpan()
+    addr = panel.start()
+    store = Store(str(tmp_path / "b.db"))
+    await store.open()
+    try:
+        cfg = SpanConfig(host=addr, passphrase="pw")
+        poller = SpanLocalPoller(cfg, store)
+        ft = FakeTime()
+        ctl = BreakerController(cfg, poller.client, store, cache=poller,
+                                state_dir=str(tmp_path / "no-such-dir"), sleep=ft.sleep,
+                                clock=ft.clock, mono=ft.clock)
+        with pytest.raises(BreakerRefused, match="persist") as e:
+            await ctl.execute("Air-Water 2", "power_cycle")
+        assert e.value.status_code == 503 and panel.writes == []
+    finally:
+        await store.close()
+        panel.stop()
+
+
+async def test_stopping_controller_refuses_new_actions(rig):
+    panel, ctl, *_ = rig
+    await ctl.stop()
+    with pytest.raises(BreakerRefused, match="shutting down") as e:
+        await ctl.execute("Buffer Tank", "close")
+    assert e.value.status_code == 503 and panel.writes == []
+
+
+async def test_duplicate_panel_names_are_refused(rig):
+    panel, ctl, *_ = rig
+    panel.circuits["Air-Water 2 (dup)"] = {"id": "c-aw2b", "relayState": "CLOSED",
+                                           "isUserControllable": True, "instantPowerW": 0.0}
+    # the fake reports names from the dict key; rename the duplicate on the wire
+    real = panel.circuits.pop("Air-Water 2 (dup)")
+    panel.dupes = {"c-aw2b": ("Air-Water 2", real)}
+    with pytest.raises(BreakerRefused, match="refusing to guess"):
+        await ctl.execute("Air-Water 2", "power_cycle")
+    assert panel.writes == []
 
 
 async def test_cycle_survives_its_caller_going_away(rig):
@@ -326,6 +400,20 @@ async def test_recover_closes_a_circuit_a_restart_left_open(rig):
     assert not cycle_file(tmp_path).exists()
 
 
+async def test_recover_with_untimed_open_holds_the_full_minimum(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    panel.set("Air-Water 2", relayState="OPEN")
+    cycle_file(tmp_path).write_text(json.dumps(
+        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": None, "off_s": 60}))
+    t0 = ft.t
+    await ctl.recover()
+    for _ in range(300):
+        if ctl.snapshot()["busy"] is None:
+            break
+        await asyncio.sleep(0.01)
+    assert panel.relay("Air-Water 2") == "CLOSED" and ft.t - t0 >= 60
+
+
 async def test_unreadable_cycle_record_pages(rig):
     panel, ctl, ft, store, alerts, tmp_path = rig
     cycle_file(tmp_path).write_text("{not json")
@@ -360,6 +448,26 @@ async def test_span_client_refuses_open_without_a_permit():
 
 # --- bridge API: human-only ----------------------------------------------------------------
 TOKEN = "t" * 24
+
+
+def test_api_breaker_needs_a_session_even_with_protection_off(tmp_path):
+    panel = FakeSpan()
+    addr = panel.start()
+    try:
+        cfg = AppConfig(
+            pumps=[PumpConfig(id="pump1", name="P1", host="127.0.0.1", port=59999,
+                              poll_interval_s=999)],
+            span=SpanConfig(host=addr, passphrase="pw"),
+            db_path=str(tmp_path / "b.db"), ui_dir="ui")
+        from bridge.main import create_app
+        with TestClient(create_app(cfg)) as c:
+            body = {"circuit": "Buffer Tank", "action": "close"}
+            assert c.post("/api/span/breaker", json=body).status_code == 401   # anonymous
+            c.get("/")                                    # the LAN page mints a session (protect=off)
+            r = c.post("/api/span/breaker", json=body)
+            assert r.status_code == 200 and r.json()["relay_state"] == "CLOSED"
+    finally:
+        panel.stop()
 
 
 def test_api_breaker_is_human_only_and_circuits_readable(tmp_path):

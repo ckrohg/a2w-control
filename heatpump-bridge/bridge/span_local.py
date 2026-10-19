@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +53,9 @@ class SpanClient:
         self._token = token or self._load_token()
         self._base: str | None = None       # last base URL that worked (host or ip)
         self._last_register = 0.0            # cooldown clock for re-registration
+        # One panel conversation at a time: the poll loop and the breaker controller share this
+        # client from worker threads, and a token re-mint mutates _token/_base and the token file.
+        self._lock = threading.RLock()
 
     # --- token persistence (survive restarts so we almost never re-register) --
     def _load_token(self) -> str | None:
@@ -158,8 +162,12 @@ class SpanClient:
             self._token = self._register_sync()  # the resilience keystone
             return self._circuits_sync(self._token)
 
+    def _fetch_locked(self) -> dict:
+        with self._lock:
+            return self._fetch_sync()
+
     async def fetch_circuits(self) -> dict:
-        return await asyncio.to_thread(self._fetch_sync)
+        return await asyncio.to_thread(self._fetch_locked)
 
     # --- writes: CLOSE-ONLY by default (the safety keystone) ------------------
     def _set_relay_sync(self, circuit_id: str, want: str, *,
@@ -199,8 +207,10 @@ class SpanClient:
 
     async def set_relay(self, circuit_id: str, want: str = "CLOSED", *,
                         open_permit: "OpenPermit | None" = None) -> str:
-        return await asyncio.to_thread(self._set_relay_sync, circuit_id, want,
-                                       open_permit=open_permit)
+        def _locked():
+            with self._lock:
+                return self._set_relay_sync(circuit_id, want, open_permit=open_permit)
+        return await asyncio.to_thread(_locked)
 
 
 class OpenPermit:

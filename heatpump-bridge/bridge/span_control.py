@@ -5,12 +5,19 @@
 #   power_cycle  — OPEN, hold >= min_off_s (floor 60 s), CLOSE in a `finally` with retries.
 #                  Only circuits with allow_cycle (Air-Water 1/2 by default). A failed CLOSE pages
 #                  urgent with the manual instruction and keeps retrying in the background.
-#   open         — turn a circuit OFF and leave it off. Only circuits with allow_open (none by
-#                  default), so nothing here can leave a heat pump off indefinitely.
-# Guards: allowlist, isUserControllable, ONE action at a time (global lock), never two heat-pump
-# circuits off at once, read-back of relayState after every write. Every attempt — accepted or
-# refused — is an audit event (mirrored to the cloud) plus a push + email line. The only code
-# that can OPEN a relay is here: it mints a single-use span_local.OpenPermit after the guards.
+#   open         — turn a circuit OFF and leave it off. Only circuits with allow_open — never a
+#                  heat-pump circuit (config refuses it), so nothing here can leave a heat pump
+#                  off indefinitely.
+# Guards: allowlist, isUserControllable, an unambiguous panel name, ONE action at a time (global
+# lock, background re-closes included), never two heat-pump circuits off at once, read-back of
+# relayState after every write. Every attempt — accepted or refused — is an audit event
+# (mirrored to the cloud) plus a push + email line. The only code that can OPEN a relay is here:
+# it mints a single-use span_local.OpenPermit after the guards.
+#
+# Durability: before any OPEN is sent, a cycle record is fsync'd next to the DB (or the cycle is
+# refused). A restart that interrupted a cycle finds it and finishes the CLOSE after the rest of
+# the hold — the full hold when the OPEN's timing is unknown. Cancellation never shortens a hold:
+# the hold and the CLOSE run to completion and only then is the cancellation re-raised.
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +30,7 @@ import time
 from pathlib import Path
 
 from . import notify
-from .span_local import OpenPermit, extract_relay
+from .span_local import OpenPermit
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +39,6 @@ EVENT_PUMP_ID = "span"       # events.pump_id for breaker audit rows (mirrored l
 EVENT_TYPE = "span_breaker"
 READBACK_TRIES = 3           # the panel can lag a write by a beat; re-read before calling it a mismatch
 READBACK_GAP_S = 1.0
-STOP_GRACE_S = 75.0          # on shutdown, let a running cycle finish its hold rather than cut it short
 CYCLE_FILE = "span-breaker-cycle.json"
 
 
@@ -44,9 +50,24 @@ class BreakerRefused(Exception):
         self.status_code = status_code
 
 
+def find_circuit(circuits: dict, name: str) -> dict | None:
+    """The ONE panel circuit with this name → {circuit_id, relay_state, controllable, power_w}.
+    Two circuits sharing a name is refused rather than guessed (BreakerRefused 409)."""
+    hits = [c for c in circuits.values() if (c.get("name") or "").strip() == name]
+    if len(hits) > 1:
+        raise BreakerRefused(f"the panel has {len(hits)} circuits named '{name}' — refusing to guess", 409)
+    if not hits:
+        return None
+    c = hits[0]
+    return {"circuit_id": c.get("id"), "name": name, "relay_state": c.get("relayState"),
+            "controllable": bool(c.get("isUserControllable")),
+            "power_w": float(c.get("instantPowerW") or 0.0)}
+
+
 class BreakerController:
     def __init__(self, cfg, client, store, *, notify_cfg=None, cache=None,
-                 state_dir: str | None = None, sleep=asyncio.sleep, clock=time.time):
+                 state_dir: str | None = None, sleep=asyncio.sleep, clock=time.time,
+                 mono=time.monotonic):
         self.cfg = cfg                  # SpanConfig
         self.client = client            # span_local.SpanClient (or a test double)
         self.store = store
@@ -54,11 +75,13 @@ class BreakerController:
         self.cache = cache              # SpanLocalPoller: latest_circuits shared with the poll loop
         self._cycle_path = Path(state_dir) / CYCLE_FILE if state_dir else None
         self._sleep = sleep             # injectable: tests hold 60 s without waiting 60 s
-        self._clock = clock
+        self._clock = clock             # wall clock: persisted timestamps, reports
+        self._mono = mono               # in-process hold timing (immune to clock steps)
         self._busy: dict | None = None  # the ONE action in flight (global lock)
         self._task: asyncio.Task | None = None
+        self._stopping = False
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
-        self._opened_at: dict[str, float] = {}              # circuit name -> when A2W opened it
+        self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
         self._bg: set[asyncio.Task] = set()
         self.last: dict | None = None
 
@@ -95,16 +118,18 @@ class BreakerController:
         name = circuit.strip() if isinstance(circuit, str) else ""
         label = name or repr(circuit)
         try:
+            if self._stopping:
+                raise BreakerRefused("the bridge is shutting down — try again in a minute", 503)
             spec, hold = self._validate(name, action, off_s)
+            if self._pending_close and action != "close":
+                raise BreakerRefused(
+                    f"'{', '.join(sorted(self._pending_close))}' has not been verified back ON yet — "
+                    "only 'close' is allowed until it is", 409)
             if self._busy is not None:
                 b = self._busy
                 raise BreakerRefused(
                     f"another breaker action is running ({b['action']} on '{b['circuit']}') — "
                     "one at a time", 409)
-            if self._pending_close and action != "close":
-                raise BreakerRefused(
-                    f"'{', '.join(sorted(self._pending_close))}' has not been verified back ON yet — "
-                    "only 'close' is allowed until it is", 409)
         except BreakerRefused as exc:
             await self._refused(label, action, source, str(exc))
             raise
@@ -116,9 +141,10 @@ class BreakerController:
         return await asyncio.shield(self._task)
 
     async def recover(self) -> None:
-        """Startup: a cycle file means a previous process opened a circuit and may not have
-        closed it (crash, power loss, a stop that outlasted its grace). Finish that cycle: wait
-        out the rest of the minimum off time, then CLOSE with the same retries and paging."""
+        """Startup: a cycle record means a previous process opened (or was about to open) a
+        circuit and may not have closed it (crash, power loss, SIGKILL). Finish that cycle: wait
+        out the rest of the hold — all of it when the OPEN's timing was never recorded — then
+        CLOSE with the same retries and paging."""
         rec = self._read_cycle_file()
         if rec is None:
             return
@@ -135,29 +161,39 @@ class BreakerController:
                         "Check that the Air-Water 1 and Air-Water 2 circuits are ON at the SPAN panel.",
                         "urgent")
             return
-        hold = float(rec.get("off_s") or self.cfg.min_off_s)
-        remaining = (float(rec.get("opened_at") or 0) + hold) - self._clock()
-        remaining = min(max(remaining, 0.0), hold)   # a clock jump at boot can't stretch it
+        try:
+            hold = max(float(rec.get("off_s") or 0), float(self.cfg.min_off_s))
+        except (TypeError, ValueError):
+            hold = float(self.cfg.min_off_s)
+        opened_at = rec.get("opened_at")
+        if isinstance(opened_at, (int, float)) and math.isfinite(opened_at):
+            # a clock step across the restart can't stretch it past one hold, nor below zero
+            remaining = min(max(opened_at + hold - self._clock(), 0.0), hold)
+        else:
+            remaining = hold                  # OPEN was dispatched but never timed: full hold
         self._busy = {"circuit": name, "action": "recover_close", "source": "restart",
                       "started": self._clock(), "off_s": hold}
         self._task = asyncio.create_task(self._recover(name, cid, remaining),
                                          name="span-breaker-recover")
 
     async def stop(self) -> None:
+        """Shutdown: refuse new actions, then let any in-flight hold + CLOSE run to completion —
+        never cut a hold short. (A SIGKILL mid-cycle is covered by the cycle record.)"""
+        self._stopping = True
         task = self._task
         if task and not task.done():
-            # Let the hold finish (min off time) and the CLOSE land; only then give up.
-            try:
-                await asyncio.wait_for(asyncio.shield(task), STOP_GRACE_S)
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
-        for t in list(self._pending_close.values()) + list(self._bg):
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(task)
+        # Background re-closes only sleep between attempts while nothing else holds the lock;
+        # the cycle record they leave behind makes the next start resume them.
+        for t in list(self._pending_close.values()):
             t.cancel()
-        for t in list(self._pending_close.values()) + list(self._bg):
+        for t in list(self._pending_close.values()):
             with contextlib.suppress(BaseException):
                 await t
+        for t in list(self._bg):
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(t, 10)
 
     # --- guards ---------------------------------------------------------------
     def _validate(self, name: str, action, off_s):
@@ -168,7 +204,7 @@ class BreakerController:
             raise BreakerRefused(f"'{name}' is not on the breaker allowlist", 403)
         if action == "power_cycle" and not spec.allow_cycle:
             raise BreakerRefused(f"power cycle is not allowed for '{name}'", 403)
-        if action == "open" and not spec.allow_open:
+        if action == "open" and (not spec.allow_open or spec.heat_pump):
             raise BreakerRefused(
                 f"'{name}' may not be switched off and left off "
                 f"({'power cycle only' if spec.allow_cycle else 'close-only'})", 403)
@@ -198,15 +234,18 @@ class BreakerController:
                 circuits = await self._read_panel()
             except Exception as exc:  # noqa: BLE001 — nothing switched yet: a clean refusal
                 raise BreakerRefused(f"SPAN panel unreachable on the LAN: {exc}", 503) from exc
-            circ = extract_relay(circuits, spec.name)
+            circ = find_circuit(circuits, spec.name)
             if circ is None or not circ["circuit_id"]:
                 raise BreakerRefused(f"'{spec.name}' was not found on the panel", 404)
             if not circ["controllable"]:
                 raise BreakerRefused(f"'{spec.name}' reports isUserControllable=false", 409)
             if action in ("power_cycle", "open") and spec.heat_pump:
-                off = [b.name for b in self.cfg.breakers
-                       if b.heat_pump and b.name != spec.name
-                       and (extract_relay(circuits, b.name) or {}).get("relay_state") != "CLOSED"]
+                off = []
+                for b in self.cfg.breakers:
+                    if b.heat_pump and b.name != spec.name:
+                        other = find_circuit(circuits, b.name)
+                        if (other or {}).get("relay_state") != "CLOSED":
+                            off.append(b.name)
                 if off:
                     raise BreakerRefused(
                         f"'{', '.join(off)}' is not confirmed ON — never two heat pumps off at once", 409)
@@ -229,10 +268,10 @@ class BreakerController:
     async def _do_close(self, spec, circ, source: str) -> dict:
         name, cid = spec.name, circ["circuit_id"]
         opened = self._opened_at.get(name)
-        if opened is not None and self._clock() - opened < self.cfg.min_off_s:
-            left = self.cfg.min_off_s - (self._clock() - opened)
+        if opened is not None and self._mono() - opened < self.cfg.min_off_s:
+            left = self.cfg.min_off_s - (self._mono() - opened)
             raise BreakerRefused(
-                f"'{name}' was switched off {self._clock() - opened:.0f} s ago — minimum off time "
+                f"'{name}' was switched off {self._mono() - opened:.0f} s ago — minimum off time "
                 f"is {self.cfg.min_off_s:g} s ({left:.0f} s left)", 409)
         state, err = await self._close_once(cid, name)
         ok = state == "CLOSED"
@@ -251,11 +290,12 @@ class BreakerController:
     async def _do_open(self, spec, circ, source: str) -> dict:
         name, cid = spec.name, circ["circuit_id"]
         err = None
+        self._opened_at[name] = self._mono()   # before dispatch: the min-off guard is conservative
         try:
             await self.client.set_relay(cid, "OPEN", open_permit=OpenPermit(cid, name, f"open ({source})"))
         except Exception as exc:  # noqa: BLE001 — the request may still have landed; read back
             err = str(exc)
-        self._opened_at[name] = self._clock()   # min-off guard even if the read-back is unsure
+        self._opened_at[name] = self._mono()
         state = await self._readback(cid, name, "OPEN")
         ok = state == "OPEN"
         detail = "OFF (verified)" if ok else f"read-back {state or 'unavailable'}" + (f" ({err})" if err else "")
@@ -266,45 +306,83 @@ class BreakerController:
                     "high")
         return result
 
+    async def _hold_until(self, deadline: float) -> bool:
+        """Sleep until mono() >= deadline. A cancellation does NOT cut the hold short (the
+        minimum off time protects the compressor); it is reported back so the caller re-raises
+        it once the CLOSE is done. Returns True if a cancellation arrived."""
+        cancelled = False
+        while True:
+            left = deadline - self._mono()
+            if left <= 0:
+                return cancelled
+            try:
+                await self._sleep(left)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as exc:  # noqa: BLE001 — a broken sleep must not skip the hold
+                log.warning("span breaker: hold sleep failed (%s) — holding with asyncio.sleep", exc)
+                try:
+                    await asyncio.sleep(min(left, 1.0))
+                except asyncio.CancelledError:
+                    cancelled = True
+
+    async def _finish(self, coro):
+        """Run `coro` to completion even if this task is cancelled meanwhile (a CLOSE must not be
+        abandoned half-way). Returns (result, cancelled)."""
+        task = asyncio.ensure_future(coro)
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+
     async def _do_cycle(self, spec, circ, hold: float, source: str) -> dict:
         name, cid = spec.name, circ["circuit_id"]
-        started = self._clock()
-        self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": started,
-                                "off_s": hold, "source": source})
+        # The record goes down BEFORE the OPEN, durably, or nothing is switched: a crash after
+        # the OPEN must always leave the next start enough to switch the circuit back on.
+        if not self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": None,
+                                       "off_s": hold, "source": source}):
+            raise BreakerRefused("could not persist the power-cycle record (disk?) — refusing to "
+                                 "switch anything off", 503)
+        started_wall = self._clock()
+        open_mono: float | None = None    # when the OPEN call returned (conservative start of OFF)
         open_state: str | None = None
         open_err: str | None = None
-        held = cancelled = False
+        cancelled = False
         try:
+            self._opened_at[name] = self._mono()
             try:
                 await self.client.set_relay(cid, "OPEN",
                                             open_permit=OpenPermit(cid, name, f"power_cycle ({source})"))
-            except Exception as exc:  # noqa: BLE001 — may have landed anyway; the read-back decides
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception as exc:  # noqa: BLE001 — may have landed anyway: hold regardless
                 open_err = str(exc)
-            self._opened_at[name] = started
+            open_mono = self._mono()
+            self._opened_at[name] = open_mono
+            # Timed from when the OPEN call RETURNED: a late-landing OPEN still gets its full hold.
+            self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": self._clock(),
+                                    "off_s": hold, "source": source})
             open_state = await self._readback(cid, name, "OPEN")
-            await self._audit_raw("cycle_opened" if open_state == "OPEN" else "cycle_open_unconfirmed",
-                                  "warning" if open_state == "OPEN" else "high",
-                                  f"{name}: power cycle — OFF {'(verified)' if open_state == 'OPEN' else 'NOT confirmed: read-back ' + str(open_state)}"
-                                  f"{' (' + open_err + ')' if open_err else ''}; holding {hold:g} s ({source})",
-                                  {"circuit": name, "relay_state": open_state, "off_s": hold, "source": source})
-            if open_state == "CLOSED" and open_err:
-                held = True   # the OPEN demonstrably never landed: nothing to hold, just confirm ON
-            else:
-                await self._sleep(hold)
-                held = True
+            await self._audit_raw(
+                "cycle_opened" if open_state == "OPEN" else "cycle_open_unconfirmed",
+                "warning" if open_state == "OPEN" else "high",
+                f"{name}: power cycle — OFF "
+                f"{'(verified)' if open_state == 'OPEN' else 'NOT confirmed: read-back ' + str(open_state)}"
+                f"{' (' + open_err + ')' if open_err else ''}; holding {hold:g} s ({source})",
+                {"circuit": name, "relay_state": open_state, "off_s": hold, "source": source})
         except asyncio.CancelledError:
             cancelled = True
-            raise
         finally:
-            if not held and not cancelled:
-                # Something failed mid-hold: the circuit may be off, so the minimum off time
-                # still applies before switching it back on (anti-short-cycle).
-                left = hold - (self._clock() - started)
-                if left > 0:
-                    with contextlib.suppress(Exception):
-                        await self._sleep(left)
-            off_for = self._clock() - started
-            closed_state, attempts, close_err = await self._close_with_retries(cid, name)
+            # Whatever happened above, an OPEN was dispatched: hold the full time (counting from
+            # when it returned, or from now if it never returned), then CLOSE with retries.
+            cancelled |= await self._hold_until((open_mono if open_mono is not None else self._mono()) + hold)
+            off_for = self._clock() - started_wall
+            (closed_state, attempts, close_err), c2 = await self._finish(self._close_with_retries(cid, name))
+            cancelled |= c2
             ok_close = closed_state == "CLOSED"
             if ok_close:
                 self._opened_at.pop(name, None)
@@ -323,7 +401,6 @@ class BreakerController:
             result = self._result(name, "power_cycle", ok, closed_state, "CLOSED", source, detail)
             result["off_s"] = round(off_for, 1)
             result["close_attempts"] = attempts
-            self.last = result
             if ok_close:
                 await self._audit("cycle_done" if ok else "verify_mismatch",
                                   "info" if ok else "high", result)
@@ -333,11 +410,9 @@ class BreakerController:
                             "default" if ok else "high")
             else:
                 await self._audit("close_failed", "critical", result)
-                self._alert(f"URGENT: {name} is OFF - turn it back on",
-                            f"A2W switched '{name}' OFF for a power cycle and could NOT switch it back "
-                            f"ON ({detail}). Turn the '{name}' breaker ON at the SPAN panel now "
-                            f"(physical switch in the panel, or the SPAN app if it works). A2W keeps "
-                            f"retrying every {self.cfg.reclose_interval_s:g} s.", "urgent")
+                self._alert_close_failed(name, detail)
+        if cancelled:
+            raise asyncio.CancelledError()
         return result
 
     async def _recover(self, name: str, cid: str, remaining: float) -> None:
@@ -346,14 +421,13 @@ class BreakerController:
                                   f"{name}: a power cycle was interrupted by a bridge restart — "
                                   f"switching it back ON in {remaining:.0f} s",
                                   {"circuit": name, "remaining_s": remaining})
-            if remaining > 0:
-                await self._sleep(remaining)
-            state, attempts, err = await self._close_with_retries(cid, name)
+            cancelled = await self._hold_until(self._mono() + remaining)
+            (state, attempts, err), c2 = await self._finish(self._close_with_retries(cid, name))
+            cancelled |= c2
             ok = state == "CLOSED"
             result = self._result(name, "recover_close", ok, state, "CLOSED", "restart",
                                   "back ON (verified)" if ok else
                                   f"COULD NOT switch back ON after {attempts} tries ({err or state})")
-            self.last = result
             if ok:
                 self._clear_cycle_file()
                 await self._audit("closed", "high", result)
@@ -363,9 +437,9 @@ class BreakerController:
             else:
                 self._start_reclose(name, cid)
                 await self._audit("close_failed", "critical", result)
-                self._alert(f"URGENT: {name} is OFF - turn it back on",
-                            f"After a bridge restart A2W could not switch '{name}' back ON. Turn the "
-                            f"'{name}' breaker ON at the SPAN panel now. A2W keeps retrying.", "urgent")
+                self._alert_close_failed(name, result["detail"])
+            if cancelled:
+                raise asyncio.CancelledError()
         finally:
             self._busy = None
             self._task = None
@@ -378,14 +452,15 @@ class BreakerController:
         for i in range(READBACK_TRIES):
             try:
                 circuits = await self._read_panel()
-                c = extract_relay(circuits, name)
+                c = find_circuit(circuits, name)
                 state = c["relay_state"] if c and c["circuit_id"] == cid else state
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 — includes an ambiguous name: no state
                 log.warning("span breaker read-back failed (%s): %s", name, exc)
             if state == want:
                 return state
             if i < READBACK_TRIES - 1:
-                await self._sleep(READBACK_GAP_S)
+                with contextlib.suppress(Exception):
+                    await self._sleep(READBACK_GAP_S)
         return state
 
     async def _close_once(self, cid: str, name: str) -> tuple[str | None, str | None]:
@@ -417,25 +492,33 @@ class BreakerController:
                                                         name=f"span-reclose-{name}")
 
     async def _reclose_loop(self, name: str, cid: str) -> None:
-        """Keep trying to switch a circuit we left OFF back ON until a read-back says CLOSED."""
+        """Keep trying to switch a circuit we left OFF back ON until a read-back says CLOSED.
+        Each attempt takes the global lock like any action (skipped while another holds it)."""
         tries = 0
         while True:
             await self._sleep(self.cfg.reclose_interval_s)
-            tries += 1
-            state, err = await self._close_once(cid, name)
+            if self._busy is not None:
+                continue
+            self._busy = {"circuit": name, "action": "reclose", "source": "background",
+                          "started": self._clock(), "off_s": 0.0}
+            try:
+                tries += 1
+                state, err = await self._close_once(cid, name)
+            finally:
+                self._busy = None
             if state == "CLOSED":
                 self._opened_at.pop(name, None)
                 self._clear_cycle_file()
                 self._pending_close.pop(name, None)
                 result = self._result(name, "reclose", True, state, "CLOSED", "background",
                                       f"back ON (verified) after {tries} background retries")
-                self.last = result
                 await self._audit("reclosed", "high", result)
                 self._alert(f"A2W breaker: {name} back ON",
                             f"{name} is back ON (verified) after {tries} background retries.", "high")
                 return
 
     def _finish_pending(self, name: str) -> None:
+        # Only reached under the global lock, so the loop is between attempts (sleeping).
         t = self._pending_close.pop(name, None)
         if t:
             t.cancel()
@@ -447,6 +530,13 @@ class BreakerController:
                 "expected": expected, "verified": state == expected, "source": source,
                 "detail": detail, "ts": self._clock()}
 
+    def _alert_close_failed(self, name: str, detail: str) -> None:
+        self._alert(f"URGENT: {name} is OFF - turn it back on",
+                    f"A2W switched '{name}' OFF for a power cycle and could NOT switch it back "
+                    f"ON ({detail}). Turn the '{name}' breaker ON at the SPAN panel now "
+                    f"(physical switch in the panel, or the SPAN app if it works). A2W keeps "
+                    f"retrying every {self.cfg.reclose_interval_s:g} s.", "urgent")
+
     async def _refused(self, name: str, action, source: str, reason: str) -> None:
         msg = f"{name}: {action} refused ({source}) — {reason}"
         log.warning("span breaker %s", msg)
@@ -455,8 +545,7 @@ class BreakerController:
         self._alert(f"A2W breaker: {action} refused", msg, "default")
 
     async def _audit(self, code: str, severity: str, result: dict) -> None:
-        if code != "refused":
-            self.last = result
+        self.last = result
         await self._audit_raw(code, severity,
                               f"{result['circuit']}: {result['action']} ({result['source']}) → {result['detail']}",
                               result)
@@ -479,18 +568,26 @@ class BreakerController:
             t.add_done_callback(self._bg.discard)
 
     # --- crash-recovery record ------------------------------------------------
-    def _write_cycle_file(self, rec: dict) -> None:
+    def _write_cycle_file(self, rec: dict) -> bool:
+        """Durably replace the cycle record (file fsync + rename + directory fsync)."""
         if not self._cycle_path:
-            return
+            return False
         tmp = self._cycle_path.with_suffix(".tmp")
-        try:  # atomic: a half-written record at this power-outage-prone site is useless
+        try:
             with open(tmp, "w") as f:
                 json.dump(rec, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._cycle_path)
+            dfd = os.open(str(self._cycle_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return True
         except OSError as exc:
             log.warning("span breaker: cycle record write failed: %s", exc)
+            return False
 
     def _read_cycle_file(self) -> dict | None:
         if not self._cycle_path:

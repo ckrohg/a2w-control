@@ -160,6 +160,10 @@ def require(scope: str):
             if scope == "human" and principal.is_machine:
                 raise HTTPException(403, "breaker control is human-only (UI session) — "
                                          "API tokens are never accepted")
+            if scope == "human" and not principal.authenticated:
+                # whatever the protect mode: a UI session (auto-minted on the LAN page when
+                # protect=off, password login otherwise), never an anonymous request
+                raise HTTPException(401, "breaker control needs a dashboard session")
             if scope == "control" and principal.is_machine and \
                     request.app.state.config.guardrails.restrict_unattended_writes:
                 raise HTTPException(

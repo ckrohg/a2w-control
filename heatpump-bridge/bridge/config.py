@@ -193,6 +193,9 @@ class HubConfig(BaseModel):
 
 
 MIN_OFF_FLOOR_S = 60.0   # owner decision 2026-10-18: the minimum off time for ANY toggle-off
+# The owner allowed switching these OFF only for a power cycle. Whatever the configured allowlist
+# says, they stay heat_pump=True (never two off at once) and can never be opted into a bare OPEN.
+HEAT_PUMP_CIRCUITS = ("Air-Water 1", "Air-Water 2")
 
 
 class BreakerCircuit(BaseModel):
@@ -261,6 +264,11 @@ class SpanConfig(BaseModel):
         if len(names) != len(set(names)):
             raise ValueError("span.breakers lists a circuit twice")
         for b in self.breakers:
+            if b.name.strip() in HEAT_PUMP_CIRCUITS and not b.heat_pump:
+                raise ValueError(f"span.breakers: '{b.name}' is a heat-pump circuit — heat_pump must be true")
+            if b.heat_pump and b.allow_open:
+                raise ValueError(f"span.breakers: '{b.name}' is a heat-pump circuit — power cycle only, "
+                                 "never allow_open (owner decision 2026-10-18)")
             # The backup element is the failsafe: A2W may make it AVAILABLE, never take it away
             # (span-backup-arm-spec.md). No config can opt it into an OFF action.
             if b.name.strip() == self.arm_circuit.strip() and (b.allow_cycle or b.allow_open):

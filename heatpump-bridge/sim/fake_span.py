@@ -29,6 +29,7 @@ class FakeSpan:
         self.fail_closes = 0          # next N CLOSE writes answer 500 and change nothing
         self.ignore_writes = False    # 200 to every write, relay never changes (mismatch)
         self.down = False             # every request answers 503
+        self.dupes: dict[str, tuple[str, dict]] = {}   # extra circuits {id: (name, fields)} on the wire
         self.lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
 
@@ -60,6 +61,8 @@ class FakeSpan:
                     return self._send(401, {"detail": "auth"})
                 with fake.lock:
                     body = {"circuits": {c["id"]: {**c, "name": n} for n, c in fake.circuits.items()}}
+                    for cid, (n, c) in fake.dupes.items():
+                        body["circuits"][cid] = {**c, "id": cid, "name": n}
                 return self._send(200, body)
 
             def do_POST(self):

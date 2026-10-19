@@ -85,10 +85,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         hub_client.start()
 
         yield
+        await hub_client.stop()          # stop command intake first...
         if span_breakers is not None:
-            await span_breakers.stop()   # lets a running power cycle finish its hold + CLOSE
+            await span_breakers.stop()   # ...then let a running power cycle finish its hold + CLOSE
         await span_poller.stop()
-        await hub_client.stop()
         await exporter.stop()
         await scheduler.stop()
         for poller in pollers.values():
