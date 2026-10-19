@@ -292,7 +292,7 @@ async function buildDigest() {
     ${tile("Pi dropouts this week", pi ? String(pi.count) : "—",
            pi
              ? `<span style="color:${INK2}">${pi.count ? `longest ${fmt(pi.longestMin, 0)} min · ` : ""}gap+reboot ${pi.gapReboot} · gap only ${pi.gapOnly} · socket only ${pi.socketOnly}${pi.unknown ? ` · unknown ${pi.unknown}` : ""}</span> <span style="color:${MUTED}">· ${pi.reboots7d ?? "—"} reboot${pi.reboots7d === 1 ? "" : "s"} · planner /health.pi</span>`
-             : `<span style="color:${MUTED}">planner /health.pi unavailable</span>`)}
+             : `<span style="color:${MUTED}">planner /health.pi unavailable or stale</span>`)}
     ${tile("hub-counted dropouts (7 d)", hubDrops ? String(hubDrops.d7) : "—",
            hubDrops
              ? `<span style="color:${INK2}">24 h: ${hubDrops.d24} · longest 24 h ${fmt(hubDrops.longest24Min, 0)} min</span> <span style="color:${MUTED}">· counting since ${hubDrops.since ? esc(day(Date.parse(hubDrops.since) / 1000)) : "—"}${pi && hubDrops.d7 !== pi.count ? " — differs from the planner's count (the hub restarts from zero on a redeploy)" : ""}</span>`

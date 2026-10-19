@@ -24,9 +24,18 @@ export interface HubTile {
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const count = (v: unknown): number | null => { const n = num(v); return n != null && n >= 0 && Number.isInteger(n) ? n : null; };
 
-/** planner /health → the tile's numbers, or null when the `pi` block is missing or malformed. */
-export function normalizePi(health: unknown): PiTile | null {
+/**
+ * The planner refreshes /health.pi every 10 min and keeps serving its last good computation when a refresh fails
+ * (`refresh_error`). Older than this, the counts may be last week's — the tile shows "unavailable" instead (codex
+ * pass 6 on #193).
+ */
+export const PI_TILE_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** planner /health → the tile's numbers, or null when the `pi` block is missing, malformed or stale. */
+export function normalizePi(health: unknown, nowMs: number = Date.now()): PiTile | null {
   const pi = (health as { pi?: unknown } | null)?.pi as Record<string, any> | undefined;
+  const computed = pi && typeof pi === "object" && typeof pi.computed_at === "string" ? Date.parse(pi.computed_at) : NaN;
+  if (!Number.isFinite(computed) || nowMs - computed > PI_TILE_MAX_AGE_MS || computed - nowMs > 5 * 60_000) return null;
   const sum = pi && typeof pi === "object" ? pi.summary : null;
   const v = sum && typeof sum === "object" ? sum.verdicts : null;
   if (!sum || !v || typeof v !== "object") return null;
