@@ -227,6 +227,12 @@ class SelfHealer:
 
     def _heating_or_defrost(self, snap: dict, st: dict) -> str | None:
         now = self._mono()
+        # latch whatever any guard sees (the dispatch guard included), so the quiet periods
+        # run from the LAST observation of heating/defrost, wherever it was made
+        if snap.get("running"):
+            st["last_running"] = now
+        if snap.get("defrosting") or snap.get("state") == "defrost":
+            st["last_defrost"] = now
         if snap.get("running") or (st["last_running"] is not None
                                    and now - st["last_running"] < RUNNING_QUIET_S):
             return "is heating (or just stopped)"
@@ -555,8 +561,14 @@ class SelfHealer:
         blocking = [f for f in snap.get("active_faults", []) if _is_blocking(f)]
         target_active = any(str(f.get("code", "")).upper() == str(code).upper() for f in blocking)
         switched_off = snap.get("on") is False or snap.get("state") == "off"
+        relay = None
+        if self.breakers is not None:
+            span = self._span()
+            relay = next((c["relay_state"] for c in (span or {}).get("circuits", [])
+                          if c["name"] == self.cfg.circuits[pid]), None)
+        relay_ok = self.breakers is None or relay == "CLOSED"   # fresh panel read says ON
         clear_now = (fresh and snap.get("identity_ok") is not False and not blocking
-                     and not switched_off)
+                     and not switched_off and relay_ok)
         # the hold only counts FRESH, clear, CONTINUOUSLY observed time: a fault, stale data, or
         # an unobserved stretch between verification ticks (e.g. the loop was busy cycling the
         # other pump) restarts it
@@ -570,7 +582,8 @@ class SelfHealer:
         recovered = clear_now and now - v["cleared_since"] >= CLEAR_HOLD_S and consistent
         facts = {"code": code, "target_fault_active": target_active,
                  "blocking_faults": [str(f.get("code")) for f in blocking], "online": fresh,
-                 "running": running, "circuit_power_w": power, "shadow": v["shadow"],
+                 "running": running, "circuit_power_w": power, "relay_state": relay,
+                 "shadow": v["shadow"],
                  "minutes_since_cycle": round((now - v["cycle"]) / 60, 1)}
         if v["shadow"]:
             if recovered or now >= v["until"]:
@@ -602,6 +615,7 @@ class SelfHealer:
                    else f"replaced by {', '.join(others)}" if others
                    else "offline/stale" if not fresh
                    else "switched off" if switched_off
+                   else f"'{self.cfg.circuits[pid]}' not confirmed ON at the panel ({relay})" if not relay_ok
                    else f"power inconsistent with running ({power} W)" if not consistent
                    else f"not observed clear for {CLEAR_HOLD_S / 60:g} min")
             self._record_outcome(st, "not_recovered", why)

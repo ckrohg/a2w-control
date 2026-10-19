@@ -303,6 +303,47 @@ async def test_info_protections_are_not_faults(rig):
     assert "recovered" in c and "both_down" not in c
 
 
+async def test_an_open_relay_resets_the_recovery_hold(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    for _ in range(5):
+        await r.step(heal)                                  # ~2.5 min clear
+    r.panel.set("Air-Water 2", relayState="OPEN")           # then the breaker opens
+    await r.step(heal)
+    await r.step(heal)
+    assert "recovered" not in await codes(r.store)
+    r.panel.set("Air-Water 2", relayState="CLOSED")
+    for _ in range(8):
+        await r.step(heal)
+    assert "recovered" in await codes(r.store)
+
+
+async def test_heating_seen_at_dispatch_starts_the_quiet_period(rig, monkeypatch):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    real = r.ctl.client.set_relay
+    flips = {"n": 0}
+
+    async def compressor_blip(cid, want="CLOSED", **kw):
+        if want == "OPEN" and flips["n"] == 0:
+            flips["n"] += 1
+            r.p2.snapshot["running"] = True              # seen only by the dispatch guard
+        return await real(cid, want, **kw)
+    monkeypatch.setattr(r.ctl.client, "set_relay", compressor_blip)
+    await r.eligible(heal)
+    assert r.panel.writes == []                          # aborted at dispatch
+    r.p2.snapshot["running"] = False                     # idle again by the next tick
+    await r.step(heal, 30)
+    await r.step(heal, 30)
+    assert r.panel.writes == []                          # still inside the 120 s quiet period
+    await r.step(heal, 90)
+    assert ("Air-Water 2", "OPEN") in r.panel.writes
+
+
 async def test_a_replacement_fault_is_not_recovery(rig):
     r = rig
     heal = r.make(live=True)
