@@ -194,7 +194,14 @@ export interface PiLinkInputs {
   phaseB: PhaseBRow[];
   /** any readings / system_stats row stamped ahead of the planner clock (beyond FUTURE_S): the Pi clock runs fast NOW */
   futureRows?: boolean;
+  /** planner-measured Pi-clock offsets (store pi_clock_observations): at = planner epoch s, offset = planner − Pi */
+  clockObs?: { at: number; offset: number }[];
 }
+
+/** An observation brackets a window when it lies within this of the window's edge. */
+export const OBS_BRACKET_S = 30 * 60;
+/** |planner − frame ts| within this = aligned (a connected frame is ≤ ~15 s old, plus latency). */
+export const OBS_ALIGNED_S = CLOCK_STEP_S;
 
 /** Windows are reported when they ENDED (or are still open) within this — the hub's own convention (#178). */
 export const DROPOUT_WINDOW_S = 7 * 86_400;
@@ -213,47 +220,55 @@ export interface PiHealth {
   reboots_24h: number | null;
   reboots_7d: number | null;
   last_reboot_at: string | null;
-  /** the clock rule (clockGate): a verdict stands only if anchored and no clock event at or after the window */
-  pi_clock: { live_offset_s: number | null; future_rows: boolean; anchored: boolean; anchor: "hub" | "readings" | null; last_clock_event_at: string | null };
+  /** the clock rule (windowClockTrusted): planner-measured observations must bracket a window for its verdict to stand */
+  pi_clock: { live_offset_s: number | null; future_rows: boolean; observations_7d: number; misaligned_observations_7d: number; last_observation: { at: string; offset_s: number } | null };
   dropouts_7d: DropoutWindow[];
   summary: { count: number; longest_min: number | null; verdicts: Record<PiVerdict, number> };
 }
 
 /**
- * THE CLOCK RULE (codex passes 14–17 on #193 — one rule for the whole class). Windows are planner-clock (phase_b_log);
- * the evidence is Pi-clock (readings / system_stats). A window's verdict is trusted only if
- *   (1) the present is ANCHORED: a fresh hub-frame offset (measured ≤ 15 min ago, index.ts) within CLOCK_STEP_S, or the
- *       newest reading stamped within [now − 3 min, now + FUTURE_S] (pushes every 60 s); and
- *   (2) NO clock event lies at or after the window's start (minus slack): no clock step, no contamination span, no
- *       future-stamped rows.
- * An aligned clock with no step since the window was aligned throughout it, so the stamps can be taken at face value.
- * Anything else — misaligned now, a step since (multiple steps, a skipped interval, a corrected past offset, a flick),
- * no anchor — is `unknown`: honest, and the common case (an NTP-disciplined Pi) keeps every verdict. Pure.
+ * THE CLOCK RULE (codex passes 14–18 on #193). Windows are planner-clock (phase_b_log); the evidence is Pi-clock
+ * (readings / system_stats). Reasoning backward from the present cannot see a clock that was corrected inside a
+ * reboot, so a verdict needs PLANNER-CLOCK evidence around the window itself: the offsets the planner measures each
+ * poll from the hub frame (pi_clock_observations). A window's verdict stands only if
+ *   (1) an ALIGNED observation lies within OBS_BRACKET_S before its start, and one within OBS_BRACKET_S after its end
+ *       (an open window: a fresh aligned live offset now);
+ *   (2) no MISALIGNED observation lies between those two; and
+ *   (3) no clock event (a clock step, a re-stamped span, future-stamped rows) lies between them.
+ * The Pi clock was then shown right just before and just after the window and did not jump in between, so its stamps
+ * can be taken at face value. Anything else is `unknown` — honest; an NTP-disciplined Pi with the planner polling keeps
+ * every verdict. Before observations accumulate (a fresh deploy), windows read unknown. Pure.
  */
-export function clockGate(input: PiLinkInputs, nowS: number, liveOffsetS: number | null): {
-  anchored: boolean; anchor: "hub" | "readings" | null; lastEventAt: number | null;
-} {
-  const tsList = Object.values(input.lastByPump ?? {});
-  const newest = tsList.length ? Math.max(...tsList) : null;
-  const hub = liveOffsetS != null && Math.abs(liveOffsetS) <= CLOCK_STEP_S;
-  const rd = !hub && newest != null && newest >= nowS - 180 && newest <= nowS + FUTURE_S && !input.futureRows;
+export function windowClockTrusted(
+  w: { start: number; end: number | null }, input: PiLinkInputs, nowS: number, liveOffsetS: number | null,
+): boolean {
+  const obs = input.clockObs ?? [];
+  const aligned = (o: { offset: number }) => Math.abs(o.offset) <= OBS_ALIGNED_S;
+  const before = obs.filter((o) => o.at <= w.start && o.at >= w.start - OBS_BRACKET_S && aligned(o));
+  if (!before.length) return false;
+  const from = Math.max(...before.map((o) => o.at));
+  let to: number;
+  if (w.end == null) {
+    if (liveOffsetS == null || Math.abs(liveOffsetS) > OBS_ALIGNED_S || input.futureRows) return false;
+    to = nowS;
+  } else {
+    const after = obs.filter((o) => o.at >= w.end! && o.at <= w.end! + OBS_BRACKET_S && aligned(o));
+    if (!after.length) return false;
+    to = Math.min(...after.map((o) => o.at));
+  }
+  if (obs.some((o) => o.at > from && o.at < to && !aligned(o))) return false;
   const events = [
     ...(input.stats?.clockSteps ?? []),
     ...(input.readings?.clockIntervals ?? []).flatMap((c) => [c.start, c.end]),
-    ...(input.futureRows ? [nowS] : []),
-    ...(liveOffsetS != null && Math.abs(liveOffsetS) > CLOCK_STEP_S ? [nowS] : []),
   ];
-  return {
-    anchored: (hub || rd) && !input.futureRows,
-    anchor: hub ? "hub" : rd ? "readings" : null,
-    lastEventAt: events.length ? Math.max(...events) : null,
-  };
+  // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to]
+  return !events.some((t) => t >= from - WINDOW_SLACK_S && t <= to + WINDOW_SLACK_S)
+    && !(input.futureRows && to >= nowS - OBS_BRACKET_S);
 }
 
 /** Assemble /health.pi. The windows come from the planner's own phase_b_log, corroborated by the mirror's tables. */
 export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number | null = null): PiHealth {
   const nowS = nowMs / 1000;
-  const gate = clockGate(input, nowS, liveOffsetS);
   const by: PiHealth["last_reading_by_pump"] = {};
   for (const [id, ts] of Object.entries(input.lastByPump ?? {})) by[id] = { ts: new Date(ts * 1000).toISOString(), age_s: Math.round(nowS - ts) };
   const tsList = Object.values(input.lastByPump ?? {});
@@ -262,10 +277,12 @@ export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number
     dropoutRuns(input.phaseB).filter((r) => r.end == null || nowS - r.end / 1000 <= DROPOUT_WINDOW_S),
     input.readings, input.stats, nowS,
   ).map((w) => {
-    const lo = Date.parse(w.start) / 1000 - WINDOW_SLACK_S;
-    const trusted = gate.anchored && (gate.lastEventAt == null || gate.lastEventAt < lo);
+    const trusted = windowClockTrusted(
+      { start: Date.parse(w.start) / 1000, end: w.end == null ? null : Date.parse(w.end) / 1000 }, input, nowS, liveOffsetS);
     return trusted ? w : { ...w, verdict: "unknown" as PiVerdict };
   });
+  const obs = input.clockObs ?? [];
+  const lastObs = obs.length ? obs[obs.length - 1] : null;
   const verdicts: Record<PiVerdict, number> = { "gap+reboot": 0, gap_only: 0, socket_only: 0, unknown: 0 };
   for (const w of windows) verdicts[w.verdict]++;
   const boots = input.stats ? mergeBoots(input.stats.boots) : [];
@@ -283,10 +300,9 @@ export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number
     pi_clock: {
       live_offset_s: liveOffsetS == null ? null : Math.round(liveOffsetS),
       future_rows: !!input.futureRows,
-      anchored: gate.anchored,
-      anchor: gate.anchor,
-      // windows starting before this (minus slack) read unknown: a clock event at or after them
-      last_clock_event_at: gate.lastEventAt == null ? null : new Date(gate.lastEventAt * 1000).toISOString(),
+      observations_7d: obs.filter((o) => nowS - o.at <= DROPOUT_WINDOW_S).length,
+      misaligned_observations_7d: obs.filter((o) => nowS - o.at <= DROPOUT_WINDOW_S && Math.abs(o.offset) > OBS_ALIGNED_S).length,
+      last_observation: lastObs ? { at: new Date(lastObs.at * 1000).toISOString(), offset_s: Math.round(lastObs.offset) } : null,
     },
     dropouts_7d: windows,
     summary: {

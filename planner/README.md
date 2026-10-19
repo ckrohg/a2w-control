@@ -76,14 +76,16 @@ result with its ages advanced) `pilink.ts` turns the last 7 days into:
 - `last_reading_age_s` (+ per pump), `uptime_s`, `reboots_24h` / `reboots_7d` / `last_reboot_at`
   (a reboot = the boot time `ts − uptime_s` jumping forward by > 5 min), and a `summary`.
 
-**The clock rule.** Windows are planner-clock; the evidence is Pi-clock. A verdict stands only if
-the present is *anchored* — a hub-frame offset measured ≤ 15 min ago within 2 min, or the newest
-reading stamped within the last 3 min — and *no clock event* (a clock step seen in system_stats, a
-re-stamped span seen in readings' ingestion order, future-stamped rows) lies at or after the
-window's start; otherwise it is `unknown`. A reboot is counted only when uptime fell, the new boot
-track persists for 15 min, readings were flowing at its would-be origin, and it is outside any
-re-stamped span. `/health.pi.pi_clock {live_offset_s, future_rows, anchored, anchor,
-last_clock_event_at}` says why a window reads unknown.
+**The clock rule.** Windows are planner-clock; the evidence is Pi-clock. Every poll the planner
+measures the Pi clock against its own (planner now − the hub frame's Pi time) and records it in
+`pi_clock_observations` (9 days). A verdict stands only if an aligned observation (≤ 2 min) lies
+within 30 min before the window and another within 30 min after it (an open window: a fresh aligned
+live offset), no misaligned observation lies between them, and no clock event (a step seen in
+system_stats, a re-stamped span seen in readings' ingestion order, future-stamped rows) does either;
+otherwise `unknown`. A reboot is counted only when uptime fell, the new boot track persists 15 min,
+readings were flowing at its would-be origin, and it is outside any re-stamped span. Right after
+the deploy (no observations yet) windows read `unknown`. `/health.pi.pi_clock` shows the counts and
+the last observation.
 
 The two SQL reductions (readings gaps > 5 min, uptime resets) run in `store.piLinkInputs`; the
 weekly digest shows a tile with this beside the hub's own counters (`pi_dropouts_*`, #178), which

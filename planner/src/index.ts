@@ -512,6 +512,8 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   piClockOffsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
     ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
   piClockOffsetAt = Date.now();
+  // persisted: the planner-clock history of the Pi clock /health.pi needs to trust a dropout verdict (pilink.ts)
+  if (piClockOffsetS != null) await store.insertPiClockObservation(piClockOffsetS).catch((e) => console.error("pi clock observation failed:", (e as Error).message));
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );

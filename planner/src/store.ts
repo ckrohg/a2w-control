@@ -153,6 +153,13 @@ export class Store {
         restore_at timestamptz NOT NULL,
         restored   boolean NOT NULL DEFAULT false
       );
+      -- #165: the Pi clock as the PLANNER measures it — planner now − the hub frame's Pi time, recorded each poll
+      -- while the Pi is connected (a frame is ≤ ~15 s old). The only planner-clock evidence of the Pi clock over time:
+      -- /health.pi trusts a dropout verdict only when aligned observations bracket the window (pilink.ts clockGate).
+      CREATE TABLE IF NOT EXISTS pi_clock_observations (
+        at       timestamptz PRIMARY KEY DEFAULT now(),
+        offset_s real NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS phase_b_log (
         id       serial PRIMARY KEY,
         ts       timestamptz NOT NULL DEFAULT now(),
@@ -936,6 +943,12 @@ export class Store {
     );
   }
 
+  /** #165: record one Pi-clock observation (planner now − hub frame ts); keeps 9 days. */
+  async insertPiClockObservation(offsetS: number): Promise<void> {
+    await this.pool.query(`INSERT INTO pi_clock_observations (offset_s) VALUES ($1) ON CONFLICT (at) DO NOTHING`, [offsetS]);
+    await this.pool.query(`DELETE FROM pi_clock_observations WHERE at < now() - interval '9 days'`);
+  }
+
   /**
    * #165: what the analytics mirror's own tables say about the Pi link, for pilink.ts. READ-ONLY, on the planner's own
    * connection (no laptop query against production — CLAUDE.md). The mirror owns `readings` and `system_stats` (Pi
@@ -1077,7 +1090,11 @@ export class Store {
                             WHERE mode = 'active' AND result = 'sent' AND ts < to_timestamp($1)), '-infinity'::timestamptz)`, [fromS]);
     const phaseB = pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) }));
     if (open.rows[0]?.ts != null) phaseB.unshift({ ts: Number(open.rows[0].ts), result: "failed: no Pi connected" });
-    return { lastByPump, readings, latestStat, stats, phaseB, futureRows };
+    const obs = await this.pool.query(
+      `SELECT EXTRACT(EPOCH FROM at)::float8 AS at, offset_s::float8 AS off FROM pi_clock_observations
+       WHERE at >= to_timestamp($1) AND at <= to_timestamp($2) ORDER BY at`, [fromS - 3_600, nowS]);
+    const clockObs = obs.rows.map((r: any) => ({ at: Number(r.at), offset: Number(r.off) }));
+    return { lastByPump, readings, latestStat, stats, phaseB, futureRows, clockObs };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

@@ -55,7 +55,7 @@ const silent = (t: number, w: [number, number]) => t > w[0] + 60 && t < w[1] - 6
 async function main() {
   await store.ensureSchema();
   // ── 1. mirror tables ABSENT (the rehearsal's fresh DB): mirror-derived fields null, no throw ──────────────────
-  await pool.query(`DROP TABLE IF EXISTS readings, system_stats, readings_hidden, system_stats_hidden, readings_full; TRUNCATE phase_b_log RESTART IDENTITY`);
+  await pool.query(`DROP TABLE IF EXISTS readings, system_stats, readings_hidden, system_stats_hidden, readings_full; TRUNCATE phase_b_log RESTART IDENTITY; TRUNCATE pi_clock_observations`);
   const bare = await store.piLinkInputs(NOW * 1000, OPTS);
   assert.equal(bare.lastByPump, null);
   assert.equal(bare.readings, null);
@@ -131,11 +131,9 @@ async function main() {
   assert.ok(inputs.phaseB.every((r) => r.result === "sent" || /no Pi connected/.test(r.result)), "only rows that speak about the Pi");
 
   // the hub measures the Pi clock aligned now (offset 0) — without that anchor, clock steps in range void every window:
-  const unanch = piHealth(inputs, NOW * 1000, null);
-  assert.equal(unanch.pi_clock.anchored, false, "no fresh hub frame and the newest reading is old → not anchored (codex passes 16–17)");
-  assert.ok(unanch.dropouts_7d.every((w) => w.verdict === "unknown"), "…and every window is unknown, a certain reboot's included");
+  // (no planner-clock observations in this fixture: no verdict can be trusted — the clean proof seeds them below)
   const h = piHealth(inputs, NOW * 1000, 0);
-  assert.equal(h.pi_clock.anchored, true);
+  assert.equal(h.pi_clock.observations_7d, 0);
   // This synthetic week is a clock-CHAOS fixture: its stats clock ends ~23 min off its own past (W4 ends −437 s, the
   // fresh-boot +1800 s, never taken back), so relative to the aligned present every window's stamps were off — all
   // unknown (codex passes 15–16), a certain reboot (W1) included. The clean three-verdict proof is the next block.
@@ -204,6 +202,12 @@ async function main() {
        SELECT to_timestamp(t), 'pump1', 'active', 55,
               CASE WHEN (t >= $2 AND t < $3) OR (t >= $4 AND t < $5) OR (t >= $6 AND t < $7) THEN 'failed: no Pi connected' ELSE 'sent' END
        FROM generate_series($1::bigint, $8::bigint, 300) t`, [C0, A[0], A[1], G[0], G[1], K[0], K[1], C0 + 22 * H]);
+    // the planner's own clock observations: every 5 min, offset ~2 s, none while the Pi is disconnected (A, G, K)
+    await pool.query(`TRUNCATE pi_clock_observations`);
+    await pool.query(
+      `INSERT INTO pi_clock_observations (at, offset_s) SELECT to_timestamp(t), 2 FROM generate_series($1::bigint, $2::bigint, 300) t
+       WHERE NOT ((t > $3 AND t < $4) OR (t > $5 AND t < $6) OR (t > $7 AND t < $8))`,
+      [C0, C0 + 22 * H, A[0], A[1], G[0], G[1], K[0], K[1]]);
     const at = (C0 + 22 * H) * 1000;
     const ci = await store.piLinkInputs(at, OPTS);
     assert.equal(ci.stats?.clockSteps?.length ?? 0, 0, "a clean clock");
@@ -211,7 +215,11 @@ async function main() {
     assert.deepEqual(ch.dropouts_7d.map((w) => w.verdict), ["gap+reboot", "gap_only", "socket_only"], "all three verdicts, on the real SQL");
     assert.ok(Math.abs(Date.parse(ch.dropouts_7d[0].reboot_at ?? "") / 1000 - RB) <= 2, "the reboot that ended the silence is named");
     assert.equal(ch.reboots_24h, 1);
-    assert.deepEqual(ch.pi_clock, { live_offset_s: 0, future_rows: false, anchored: true, anchor: "hub", last_clock_event_at: null });
+    assert.equal(ch.pi_clock.misaligned_observations_7d, 0);
+    assert.ok(ch.pi_clock.observations_7d > 150, `observations: ${ch.pi_clock.observations_7d}`);
+    // the same history WITHOUT the observations: nothing can be trusted (a fresh deploy)
+    await pool.query(`TRUNCATE pi_clock_observations`);
+    assert.ok(piHealth(await store.piLinkInputs(at, OPTS), at, 0).dropouts_7d.every((w) => w.verdict === "unknown"));
   }
 
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
@@ -356,14 +364,18 @@ async function main() {
   const hP = piHealth(inP, atP);
   const wP = hP.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60);
   assert.equal(wP?.verdict, "unknown", `a persistently fast clock voids the verdict (got ${wP?.verdict})`);
-  assert.equal(hP.pi_clock.anchored, false, "future rows: the present is not anchored");
   assert.equal(hP.pi_clock.future_rows, true);
   // the live offset alone (the future rows gone, e.g. evaluated once the data has caught up) does the same
   const late = (P + 15 * H) * 1000;
   const inL = await store.piLinkInputs(late, OPTS);
   assert.equal(inL.futureRows, false);
-  assert.equal(piHealth(inL, late, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict,
-    "socket_only", "if the hub CLAIMED alignment (offset 0) after the step, the stamps are taken at face value — so an honest offset matters:");
+  // the planner's own observations of that fast clock (offset −1 h after P) → unknown, however the present looks
+  await pool.query(`INSERT INTO pi_clock_observations (at, offset_s) SELECT to_timestamp(t), CASE WHEN t >= $2 THEN -3600 ELSE 2 END
+                    FROM generate_series($1::bigint, $3::bigint, 300) t WHERE NOT (t > $4 AND t < $5)`,
+    [P - 6 * H, P, P + 15 * H, P + 10 * H, P + 10 * H + 20 * 60]);
+  assert.equal(piHealth(await store.piLinkInputs(late, OPTS), late, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict,
+    "unknown", "the planner SAW the Pi an hour fast around the window");
+  await pool.query(`TRUNCATE pi_clock_observations`);
   const hL = piHealth(inL, late, -3_600);
   assert.equal(hL.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict, "unknown",
     "the hub measures the Pi an hour fast → unknown");
@@ -396,8 +408,7 @@ async function main() {
   const hQ = piHealth(inQ, atQ, 0);
   const wQ = hQ.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - out0) <= 60);
   assert.equal(wQ?.verdict, "unknown", `an outage inside a corrected slow span stays unknown (got ${wQ?.verdict})`);
-  assert.ok(hQ.pi_clock.last_clock_event_at && Math.abs(Date.parse(hQ.pi_clock.last_clock_event_at) / 1000 - Q1) <= 180,
-    `the correcting step is the last clock event (${hQ.pi_clock.last_clock_event_at}) — every window before it is unknown`);
+  assert.equal(hQ.pi_clock.observations_7d, 0, "(and without planner observations nothing could be trusted anyway)");
 
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }

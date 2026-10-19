@@ -73,6 +73,18 @@ const stats: StatsView = {
   firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z"),
 };
 const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:30Z") };
+/** planner-clock observations every 5 min (offset `off`), none while a dropout has the Pi disconnected */
+function observations(off = 3, dropouts: [string, string][] = [
+  ["2026-10-14T15:00:00Z", "2026-10-14T17:10:00Z"], ["2026-10-15T18:00:00Z", "2026-10-15T20:05:00Z"],
+  ["2026-10-16T10:00:00Z", "2026-10-16T12:00:00Z"], ["2026-10-17T05:31:00Z", "2026-10-17T07:41:00Z"],
+  ["2026-10-18T21:00:00Z", "2026-10-18T22:00:00Z"],
+]): { at: number; offset: number }[] {
+  const out: { at: number; offset: number }[] = [];
+  for (let t = s("2026-10-10T00:00:00Z"); t <= NOW / 1000; t += 300) {
+    if (!dropouts.some(([a, b]) => t > s(a) && t < s(b))) out.push({ at: t, offset: off });
+  }
+  return out;
+}
 {
   const w = classifyWindows(dropoutRuns(rows), readings, stats, NOW / 1000);
   assert.equal(w.length, 5);
@@ -204,9 +216,9 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
 {
   const input: PiLinkInputs = {
     lastByPump: { pump1: s("2026-10-18T21:59:30Z"), pump2: s("2026-10-18T21:58:00Z") },
-    readings, latestStat: { ts: s("2026-10-18T21:59:00Z"), uptime_s: 46_740 }, stats, phaseB: rows,
+    readings, latestStat: { ts: s("2026-10-18T21:59:00Z"), uptime_s: 46_740 }, stats, phaseB: rows, clockObs: observations(),
   };
-  const h = piHealth(input, NOW);
+  const h = piHealth(input, NOW, 4);
   assert.equal(h.last_reading_age_s, 30, "newest reading of any pump");
   assert.deepEqual(h.last_reading_by_pump.pump2, { ts: "2026-10-18T21:58:00.000Z", age_s: 120 });
   assert.equal(h.uptime_s, 46_740);
@@ -234,7 +246,7 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
     ...phaseB(iso(edgeS - 3600), iso(edgeS + 3600), NO_PI),             // 1 h before → 1 h after → in, 120 min
     ...phaseB(iso(edgeS + 3600), iso(edgeS + 7200), "sent"),
   ];
-  const e = piHealth({ ...input, phaseB: straddle }, NOW);
+  const e = piHealth({ ...input, phaseB: straddle, clockObs: [{ at: edgeS - 7_200, offset: 2 }, { at: edgeS + 7_500, offset: 2 }] }, NOW, 4);
   assert.equal(e.dropouts_7d.length, 1, "kept by end, as the hub does");
   assert.equal(e.dropouts_7d[0].start, iso(edgeS - 3600), "its real start, not the edge");
   assert.equal(e.dropouts_7d[0].minutes, 120);
@@ -247,41 +259,40 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   assert.equal(withLiveAges(bare, NOW + 60_000).last_reading_age_s, null);
 }
 
-// ── 8. THE CLOCK RULE (codex passes 14–17 on #193): a verdict stands only if the present is anchored and no clock
-// event lies at or after the window — every misalignment shape reduces to that ──────────────────────────────────
+// ── 8. THE CLOCK RULE (codex passes 14–18 on #193): a verdict stands only if aligned planner-clock observations
+// bracket the window and nothing jumps in between ────────────────────────────────────────────────────────────────
 {
   const clean: PiLinkInputs = {
     lastByPump: { pump1: NOW / 1000 - 30 }, readings: { ...readings }, latestStat: null,
-    stats: { ...stats, clockSteps: [] }, phaseB: rows,
+    stats: { ...stats, clockSteps: [] }, phaseB: rows, clockObs: observations(),
   };
   const want = ["gap+reboot", "gap_only", "socket_only", "gap+reboot", "socket_only"];
-  // anchored by a fresh hub offset, or by the newest reading alone; no events → every verdict stands
-  assert.deepEqual(piHealth(clean, NOW, 4).dropouts_7d.map((w) => w.verdict), want, "anchored by the hub");
-  const byReadings = piHealth(clean, NOW, null);
-  assert.deepEqual(byReadings.pi_clock.anchor, "readings", "newest reading 30 s old anchors the present");
-  assert.deepEqual(byReadings.dropouts_7d.map((w) => w.verdict), want);
-  // NOT anchored: no fresh frame and the newest reading is old (Pi silent) → nothing can be trusted
-  const silent = piHealth({ ...clean, lastByPump: { pump1: NOW / 1000 - 3_600 } }, NOW, null);
-  assert.equal(silent.pi_clock.anchored, false);
-  assert.ok(silent.dropouts_7d.every((w) => w.verdict === "unknown"));
-  // misaligned NOW (the hub says an hour off, or future rows) → unanchored AND an event at now → all unknown
-  assert.ok(piHealth(clean, NOW, -3_600).dropouts_7d.every((w) => w.verdict === "unknown"), "live offset −1 h");
-  assert.ok(piHealth({ ...clean, futureRows: true }, NOW, 2).dropouts_7d.every((w) => w.verdict === "unknown"), "future rows");
-  // a clock step on Oct 17 12:00 (any direction, any count, corrected or not): windows starting before it are unknown,
-  // windows starting after it stand — covers a corrected past offset (pass 15), multiple steps (pass 17), a skipped
-  // interval of a forward step (pass 17: the window precedes the step's Pi stamp → unknown)
-  const stepped = piHealth({ ...clean, stats: { ...stats, clockSteps: [s("2026-10-14T00:00:00Z"), s("2026-10-17T12:00:00Z")] } }, NOW, 0);
-  assert.deepEqual(stepped.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "unknown", "unknown", "socket_only"],
-    "every window before the last step is unknown; the Oct 18 one stands");
-  assert.equal(stepped.pi_clock.last_clock_event_at, "2026-10-17T12:00:00.000Z");
-  // a contamination span (a flick, from readings' ingestion order) is an event too
-  const flick = piHealth({ ...clean, readings: { ...readings, clockIntervals: [{ start: s("2026-10-16T09:00:00Z"), end: s("2026-10-16T09:30:00Z") }] } }, NOW, 0);
-  assert.deepEqual(flick.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "socket_only", "gap+reboot", "socket_only"],
-    "windows starting before the flick are unknown; Oct 16 10:00 starts after it (slack 09:50 > 09:30) and stands");
-  // an event 10 min BEFORE a window's slack does not touch it; one inside the slack does
-  const near = (t: string) => piHealth({ ...clean, stats: { ...stats, clockSteps: [s(t)] } }, NOW, 0).dropouts_7d.at(-1)?.verdict;
-  assert.equal(near("2026-10-18T20:45:00Z"), "socket_only");
-  assert.equal(near("2026-10-18T20:55:00Z"), "unknown");
+  assert.deepEqual(piHealth(clean, NOW, 4).dropouts_7d.map((w) => w.verdict), want, "bracketed by aligned observations");
+  // no observations at all (a fresh deploy) → nothing can be trusted yet
+  assert.ok(piHealth({ ...clean, clockObs: [] }, NOW, 4).dropouts_7d.every((w) => w.verdict === "unknown"));
+  // an open window needs a fresh aligned live offset; without it, or with future rows, it is unknown
+  assert.equal(piHealth(clean, NOW, null).dropouts_7d.at(-1)?.verdict, "unknown");
+  assert.equal(piHealth({ ...clean, futureRows: true }, NOW, 4).dropouts_7d.at(-1)?.verdict, "unknown");
+  // codex pass 18: an hour SLOW until a noon reboot corrects it — the planner SAW the offset → every window in the
+  // slow span is unknown, even though the correction (inside a reboot) left no clock step
+  const slowObs = observations().map((o) => (o.at < s("2026-10-17T12:00:00Z") ? { ...o, offset: 3_600 } : o));
+  assert.deepEqual(piHealth({ ...clean, clockObs: slowObs }, NOW, 4).dropouts_7d.map((w) => w.verdict),
+    ["unknown", "unknown", "unknown", "unknown", "socket_only"], "observed misalignment → unknown; after the fix → stands");
+  // a misaligned observation BETWEEN the bracketing ones (a flick mid-window) → unknown
+  const mid = observations().concat([{ at: s("2026-10-16T11:00:00Z"), offset: 3_600 }]).sort((x, y) => x.at - y.at);
+  assert.equal(piHealth({ ...clean, clockObs: mid }, NOW, 4).dropouts_7d[2].verdict, "unknown");
+  // a clock step / re-stamped span between the brackets → unknown; outside them → irrelevant
+  assert.equal(piHealth({ ...clean, stats: { ...stats, clockSteps: [s("2026-10-16T11:00:00Z")] } }, NOW, 4).dropouts_7d[2].verdict, "unknown");
+  assert.equal(piHealth({ ...clean, stats: { ...stats, clockSteps: [s("2026-10-16T15:00:00Z")] } }, NOW, 4).dropouts_7d[2].verdict, "socket_only");
+  assert.equal(piHealth({ ...clean, readings: { ...readings, clockIntervals: [{ start: s("2026-10-15T19:00:00Z"), end: s("2026-10-15T19:20:00Z") }] } }, NOW, 4)
+    .dropouts_7d[1].verdict, "unknown");
+  // a missing bracket (the planner was down the half hour before a window) → unknown
+  const gapObs = observations().filter((o) => !(o.at > s("2026-10-16T09:20:00Z") && o.at <= s("2026-10-16T10:00:00Z")));
+  assert.equal(piHealth({ ...clean, clockObs: gapObs }, NOW, 4).dropouts_7d[2].verdict, "unknown");
+  const h = piHealth(clean, NOW, 4);
+  assert.equal(h.pi_clock.misaligned_observations_7d, 0);
+  assert.ok(h.pi_clock.observations_7d > 1_000);
+  assert.equal(piHealth({ ...clean, clockObs: slowObs }, NOW, 4).pi_clock.misaligned_observations_7d > 0, true);
 }
 
 console.log("pilink.test.ts: all assertions passed");
