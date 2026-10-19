@@ -38,6 +38,7 @@ SPAN_WAIT_PAGE_S = 600.0     # live, eligible, but no usable panel read for this
 RUNNING_QUIET_S = 120.0      # "not heating" = no compressor seen for this long (anti-short-cycle)
 DEFROST_QUIET_S = 300.0      # and no defrost for this long
 CLEAR_HOLD_S = 180.0         # recovered = no blocking fault, observed fresh, continuously this long
+OBS_GAP_S = 90.0             # verification ticks further apart than this break the continuity
 STATE_FILE = "self-heal.json"
 EVENT_TYPE = "self_heal"
 
@@ -165,10 +166,17 @@ class SelfHealer:
         return [a for a in st["attempts"] if self._age(a) < window]
 
     def _fresh(self, snap: dict) -> bool:
-        ts = snap.get("last_poll_ts")
-        if not snap.get("online") or ts is None:
+        """Fresh by the MONOTONIC poll stamp (wall-clock steps can't revive old data); a snapshot
+        without one (older poller) falls back to the wall stamp."""
+        if not snap.get("online"):
             return False
-        age = self._clock() - float(ts)
+        mono = snap.get("last_poll_mono")
+        if isinstance(mono, (int, float)):
+            age = self._mono() - float(mono)
+        elif snap.get("last_poll_ts") is not None:
+            age = self._clock() - float(snap["last_poll_ts"])
+        else:
+            return False
         return 0 <= age < FRESH_POLL_S             # a future-dated poll is not fresh either
 
     def _span(self) -> dict | None:
@@ -490,8 +498,13 @@ class SelfHealer:
         switched_off = snap.get("on") is False or snap.get("state") == "off"
         clear_now = (fresh and snap.get("identity_ok") is not False and not blocking
                      and not switched_off)
-        # the hold only counts FRESH, clear observations: any gap or fault restarts it
-        v["cleared_since"] = (v["cleared_since"] or now) if clear_now else None
+        # the hold only counts FRESH, clear, CONTINUOUSLY observed time: a fault, stale data, or
+        # an unobserved stretch between verification ticks (e.g. the loop was busy cycling the
+        # other pump) restarts it
+        gap = v.get("last_obs") is not None and now - v["last_obs"] > OBS_GAP_S
+        v["last_obs"] = now
+        v["cleared_since"] = (v["cleared_since"] or now) if clear_now and not gap else (
+            now if clear_now else None)
         power = self._circuit_power(pid)
         running = bool(snap.get("running"))
         consistent = (not running) or (power is not None and power >= self.cfg.running_power_w)

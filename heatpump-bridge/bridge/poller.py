@@ -184,6 +184,7 @@ class PumpPoller:
             "link": "online",
             "link_detail": "",
             "last_poll_ts": time.time(),
+            "last_poll_mono": time.monotonic(),   # freshness immune to wall-clock steps (self_heal)
             "write_enabled": self.cfg.write_enabled,
             **decoded,
             "status_word": regs.get(R.REG_STATUS, 0),
