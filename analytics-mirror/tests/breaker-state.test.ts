@@ -32,6 +32,13 @@ t("armed + fresh + both pumps ON: heat pumps get Power cycle 60 s (enabled) and 
   assert.equal(btn(rows, "Air-Water 2", "close")!.reason, "already ON");
 });
 
+t("bridge min_off_s above 60: the dashboard's 60 s cycle is disabled with the reason", () => {
+  const rows = circuitRows(snap({ min_off_s: 90 }), ok);
+  const b = btn(rows, "Air-Water 2", "power_cycle")!;
+  assert.equal(b.enabled, false);
+  assert.match(b.reason!, /minimum off time is 90 s/);
+});
+
 t("backup element: On only — no power cycle, no Off", () => {
   const rows = circuitRows(snap(), ok);
   assert.deepEqual(rows[2].buttons.map((b) => b.action), ["close"]);
@@ -98,7 +105,8 @@ t("no span data (old bridge / not configured) → no rows", () => {
 const REQ = { circuit: "Air-Water 2", action: "power_cycle" as const };
 
 t("success line ONLY for a verified read-back matching the request", () => {
-  const good = { ok: true, result: { ok: true, verified: true, relay_state: "CLOSED", off_s: 61.2 } };
+  const good = { ok: true, result: { ok: true, circuit: "Air-Water 2", action: "power_cycle",
+                                     verified: true, relay_state: "CLOSED", off_s: 61.2 } };
   const m = outcomeMessage(200, good, REQ);
   assert.equal(m.tone, "ok");
   assert.match(m.text, /off 61 s, back ON — confirmed by the panel read-back/);
@@ -106,8 +114,12 @@ t("success line ONLY for a verified read-back matching the request", () => {
   assert.equal(outcomeMessage(200, { ok: true }, REQ).tone, "warn");
   assert.equal(outcomeMessage(200, { ok: true, result: { verified: false, relay_state: "CLOSED" } }, REQ).tone, "warn");
   assert.equal(outcomeMessage(200, { ok: true, result: { verified: true, relay_state: "OPEN" } }, REQ).tone, "warn");
-  assert.equal(outcomeMessage(200, { ok: true, result: { verified: true, relay_state: "OPEN" } },
+  assert.equal(outcomeMessage(200, { ok: true, result: { circuit: "Kitchen", action: "open", verified: true, relay_state: "OPEN" } },
     { circuit: "Kitchen", action: "open" }).tone, "ok");
+  // a read-back for a different circuit / action, or with no identity, never confirms
+  assert.equal(outcomeMessage(200, { ok: true, result: { ...good.result, circuit: "Air-Water 1" } }, REQ).tone, "warn");
+  assert.equal(outcomeMessage(200, { ok: true, result: { ...good.result, action: "close" } }, REQ).tone, "warn");
+  assert.equal(outcomeMessage(200, { ok: true, result: { verified: true, relay_state: "CLOSED" } }, REQ).tone, "warn");
 });
 
 t("refused / still OFF / unconfirmed / old bridge / timeout / offline map to plain lines", () => {

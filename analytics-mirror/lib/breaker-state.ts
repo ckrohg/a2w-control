@@ -98,7 +98,9 @@ export function circuitRows(
 
     const buttons: ButtonState[] = [];
     if (c.allow_cycle) {
-      const reason = offReason();
+      const reason = offReason() ?? (span.min_off_s > DASHBOARD_OFF_S
+        ? `the bridge's minimum off time is ${span.min_off_s} s — longer than the dashboard's ${DASHBOARD_OFF_S} s cycle`
+        : null);
       buttons.push({ action: "power_cycle", label: ACTION_LABEL.power_cycle, enabled: reason == null, reason });
     }
     {
@@ -153,7 +155,8 @@ export function outcomeMessage(
   const r = body?.result ?? null;
   const detail = body?.detail || body?.error || "";
   const expected = req.action === "open" ? "OPEN" : "CLOSED";
-  if (status === 200 && body?.ok === true && r && r.verified === true && r.relay_state === expected) {
+  const sameRequest = !!r && r.circuit === req.circuit && r.action === req.action;
+  if (status === 200 && body?.ok === true && r && sameRequest && r.verified === true && r.relay_state === expected) {
     if (req.action === "power_cycle") {
       const off = typeof r.off_s === "number" ? `${Math.round(r.off_s)} s` : `${DASHBOARD_OFF_S} s`;
       return { tone: "ok", text: `${req.circuit} power-cycled: off ${off}, back ON — confirmed by the panel read-back.` };
