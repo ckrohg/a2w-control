@@ -496,10 +496,25 @@ export class HbxWriter {
     // The write AND its hbx_boosts row inside one serial slot: the auto-pilot's boost hold reads that row.
     return this.serial(async () => {
       await this.retryPendingRetire();
+      const before = this.deviceWrites;
       const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
+      // The boost's PATCH is device write before+1 (the in-lock epoch check guarantees none landed ahead of it). Any
+      // later one is a restore that overtook this slot while it was stuck after the PATCH (ntfy, audit): the owner
+      // replaced the boost, so recording it now would hold the auto-pilot on the restored curve (codex pass 10).
+      const overtaken = () => this.deviceWrites !== before + 1;
+      if (overtaken()) {
+        console.warn(`[boost] ${targetF}°F boost was overtaken by a restore before its row was recorded — not recorded`);
+        return { ...result, boost_restore_at: null, boost_superseded: true };
+      }
       const restoreAt = new Date(Date.now() + minutes * 60_000);
-      await this.store.insertBoost(targetF, restoreAt);
+      const id = await this.store.insertBoost(targetF, restoreAt);
       this.retirePendingBefore = null; // insertBoost retired every older open row, the stale one included
+      if (overtaken()) {
+        // the restore landed while the insert was in flight — its own retire may have run before the row existed
+        await this.store.retireBoost(id);
+        console.warn(`[boost] ${targetF}°F boost row #${id} retired — a restore overtook it while it was being recorded`);
+        return { ...result, boost_restore_at: null, boost_superseded: true };
+      }
       return { ...result, boost_restore_at: restoreAt.toISOString() };
     });
   }

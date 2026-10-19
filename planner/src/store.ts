@@ -584,12 +584,18 @@ export class Store {
    * one's whole timer. One statement, so no reader sees both or neither. `restored` is reused for "retired" (no schema
    * change): nothing reads a superseded row's flag except dueBoosts/activeBoost, which must both skip it.
    */
-  async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
-    await this.pool.query(
+  async insertBoost(targetF: number, restoreAt: Date): Promise<number> {
+    const r = await this.pool.query(
       `WITH retired AS (UPDATE hbx_boosts SET restored = true WHERE NOT restored)
-       INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2)`,
+       INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2) RETURNING id`,
       [targetF, restoreAt],
     );
+    return Number(r.rows[0].id);
+  }
+
+  /** Retire ONE boost row — a boost whose write a restore overtook before its row was recorded (writes.ts boost()). */
+  async retireBoost(id: number): Promise<void> {
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE id = $1`, [id]);
   }
 
   /**

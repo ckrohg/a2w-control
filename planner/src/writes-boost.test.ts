@@ -18,6 +18,7 @@ function harness(planTargetF = 126) {
   const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean; createdAt?: Date }> = [];
   const apLogs: Array<{ targetF: number | null; reason: string; result: string }> = [];
   const failRetire = { n: 0 }; // retireOpenBoosts throws this many more times
+  const insertGate: { p: Promise<void> | null } = { p: null }; // while set, insertBoost waits on it
   const failConfig = { n: 0 }; // patch()'s post-PATCH accepted-write audit insert throws this many more times
   let gate: Promise<void> | null = null; // while set, patchDevice waits on it (an in-flight PATCH)
   const store = {
@@ -30,7 +31,12 @@ function harness(planTargetF = 126) {
     },
     insertConfigVersion: async () => {},
     // the real insertBoost retires every open row in the same statement (store.ts; checked on PGlite)
-    insertBoost: async (targetF: number, restoreAt: Date) => { for (const b of boosts) b.restored = true; boosts.push({ id: boosts.length + 1, targetF, restoreAt, restored: false, createdAt: new Date() }); },
+    insertBoost: async (targetF: number, restoreAt: Date) => {
+      if (insertGate.p) await insertGate.p;
+      for (const b of boosts) b.restored = true;
+      const id = boosts.length + 1; boosts.push({ id, targetF, restoreAt, restored: false, createdAt: new Date() }); return id;
+    },
+    retireBoost: async (id: number) => { for (const b of boosts) if (b.id === id) b.restored = true; },
     activeBoost: async (): Promise<Boost | null> => { const b = boosts.filter((x) => !x.restored && x.restoreAt.getTime() > Date.now()).at(-1); return b ? { targetF: b.targetF, restoreAt: b.restoreAt } : null; },
     dueBoosts: async () => boosts.filter((x) => !x.restored && x.restoreAt.getTime() <= Date.now()).map((x) => ({ id: x.id, targetF: x.targetF })),
     markBoostsRestored: async (ids: number[]) => { for (const b of boosts) if (ids.includes(b.id)) b.restored = true; },
@@ -51,7 +57,7 @@ function harness(planTargetF = 126) {
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
   const autopilot = new AutoPilot(store, writer, false, async () => {});
-  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, store, slx, hub, live: () => live };
+  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, insertGate, store, slx, hub, live: () => live };
 }
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
@@ -330,6 +336,41 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(await ap, 429, "the stale write is refused inside the device lock");
     assert.equal(h.patches.length, 1, "it never reached the device — the owner's restore stands");
     assert.match(h.audits.at(-1)?.detail ?? "", /^superseded: /);
+  }
+  // (l) codex pass 10: a boost whose PATCH landed stalls in its ntfy; the owner's dashboard restore overtakes it
+  //     (cancelling it). When the boost resumes it must NOT record an open row — no phantom hold on the restored curve.
+  {
+    const h = harness();
+    let unstick!: () => void; let gate: Promise<void> | null = null;
+    const w = new HbxWriter(h.slx, h.store, h.hub, "b", "s", async () => { if (gate) await gate; });
+    (w as any).restoreQueueWaitMs = 30;
+    gate = new Promise<void>((r) => { unstick = r; });
+    const bo = w.boost(129, 60, "dashboard");
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(h.patches.length, 1, "the boost PATCH landed; its ntfy is stalled");
+    gate = null;
+    assert.equal(await status(w.restore("dashboard", { endsBoost: true })), "ok");
+    unstick();
+    const r = await bo;
+    assert.equal(r.boost_superseded, true);
+    assert.equal(h.boosts.filter((b) => !b.restored).length, 0, "no open boost row after the owner's cancel");
+    h.store.recentPlans = async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), tank_target_f: 120, reason: "x" }] }];
+    const ap = new AutoPilot(h.store, w, true, async () => {});
+    await ap.applyLatestPlan();
+    assert.doesNotMatch(ap.lastResult, /boost/, "the auto-pilot is not held");
+  }
+  // (l2) the restore overtakes while the boost's row INSERT is in flight → the inserted row is retired by id
+  {
+    const h = harness();
+    (h.writer as any).restoreQueueWaitMs = 30;
+    let unstick!: () => void; h.insertGate.p = new Promise<void>((r) => { unstick = r; });
+    const bo = h.writer.boost(129, 60, "dashboard");
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(await status(h.writer.restore("dashboard", { endsBoost: true })), "ok"); // its retire finds no row yet
+    h.insertGate.p = null; unstick();
+    const r = await bo;
+    assert.equal(r.boost_superseded, true);
+    assert.equal(h.boosts.length, 1); assert.equal(h.boosts[0].restored, true, "the late row is retired");
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
