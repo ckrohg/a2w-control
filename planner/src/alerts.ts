@@ -9,6 +9,7 @@ export interface AlertStore {
   openAlertEpisode(kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number>;
   markAlertNotified(id: number): Promise<void>;
   undeliveredAlertEpisodes(): Promise<{ id: number; kind: string; title: string; detail: string | null }[]>;
+  closeAlertEpisodes(kind: string, key: string): Promise<void>;
 }
 export type Send = (title: string, body: string) => Promise<boolean>;
 
@@ -33,14 +34,33 @@ export class AlertOutbox {
     return delivered;
   }
 
+  /** Closures whose UPDATE failed — retried first thing every retry() (codex pass 3). kind\u0000key */
+  private unclosed = new Set<string>();
+
   /** Episodes neither recorded nor delivered (in memory only). */
   pending(): number { return this.unrecorded.length; }
+  /** Closures still owed to the DB. */
+  pendingCloses(): number { return this.unclosed.size; }
+
+  /**
+   * The condition cleared: cancel any queued (unrecorded) alert for it — it must never be sent or inserted later and
+   * reopen a resolved incident — and close its rows durably, retrying a failed close on every retry() (codex pass 3).
+   */
+  async close(kind: string, key: string): Promise<void> {
+    this.unrecorded = this.unrecorded.filter((u) => !(u.kind === kind && u.key === key));
+    try { await this.store.closeAlertEpisodes(kind, key); this.unclosed.delete(`${kind}\u0000${key}`); }
+    catch (e) { this.unclosed.add(`${kind}\u0000${key}`); this.log(`alert episode close failed (retried): ${(e as Error).message}`); }
+  }
 
   /**
    * Re-send open, unacknowledged episodes, oldest first; stops at the first failure (channels still down). Unrecorded
    * episodes go first: written to the outbox if the DB is back (then sent with the rest), else sent directly.
    */
   async retry(): Promise<number> {
+    for (const k of [...this.unclosed]) {
+      const [kind, key] = k.split("\u0000");
+      try { await this.store.closeAlertEpisodes(kind, key); this.unclosed.delete(k); } catch { /* still down — next tick */ }
+    }
     let sent = 0;
     const queue = this.unrecorded;
     this.unrecorded = [];

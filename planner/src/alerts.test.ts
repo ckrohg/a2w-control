@@ -8,7 +8,9 @@ import { AlertOutbox, type AlertStore } from "./alerts";
 (async () => {
   // an in-memory alert_episodes table, shared across "restarts"
   const rows: { id: number; kind: string; key: string; title: string; detail: string; notified: boolean; cleared: boolean }[] = [];
+  let closeUp = true;
   const store: AlertStore = {
+    closeAlertEpisodes: async (kind, key) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (r.kind === kind && r.key === key) r.cleared = true; },
     openAlertEpisode: async (kind, key, _p, title, detail) => { rows.push({ id: rows.length + 1, kind, key, title, detail, notified: false, cleared: false }); return rows.length; },
     markAlertNotified: async (id) => { rows[id - 1].notified = true; },
     undeliveredAlertEpisodes: async () => rows.filter((r) => !r.cleared && !r.notified).map((r) => ({ id: r.id, kind: r.kind, title: r.title, detail: r.detail })),
@@ -66,6 +68,31 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   up = true;
   assert.equal(await e.retry(), 1, "delivered without a row");
   assert.equal(e.pending(), 0);
+
+  // codex pass 3: (a) a queued alert whose condition cleared is cancelled — it never reopens a resolved incident
+  dbUp = false; up = false;
+  const g = new AlertOutbox(flaky, send, () => {});
+  await g.open("fault_called", "2", "pump2", "⚠ obsolete", "E21");
+  assert.equal(g.pending(), 1);
+  await g.close("fault_called", "2");
+  assert.equal(g.pending(), 0, "cancelled on recovery");
+  dbUp = true; up = true;
+  const n0 = rows.length;
+  await g.retry();
+  assert.equal(rows.length, n0, "nothing inserted later for a resolved incident");
+  // (b) a FAILED close is retried until the DB takes it — so a restart cannot re-adopt a resolved episode as open
+  const h = new AlertOutbox(store, send, () => {});
+  await h.open("stage_unserved", "2", "pump2", "⚠ HP2 not heating", "b");
+  closeUp = false;
+  await h.close("stage_unserved", "2");
+  assert.equal(h.pendingCloses(), 1);
+  assert.equal(rows.at(-1)?.cleared, false, "the close did not land yet");
+  await h.retry();
+  assert.equal(h.pendingCloses(), 1, "still down");
+  closeUp = true;
+  await h.retry();
+  assert.equal(h.pendingCloses(), 0);
+  assert.equal(rows.at(-1)?.cleared, true, "closed once the DB is back");
 
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

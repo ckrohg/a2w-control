@@ -720,11 +720,32 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
       console.warn(`[stagewatch] ${e.title}: ${e.body}`);
       await openAlert(e.type, e.stage, e.pumpId, e.title, e.body);
     } else {
-      await store.closeAlertEpisodes(e.type, e.stage).catch((err) => console.error("alert episode close failed:", (err as Error).message));
+      await alerts.close(e.type, e.stage);
       await ntfy(e.title, e.body, "default", { resolved: true });
     }
   }
   stageEpisodes24h = await store.alertEpisodes24h().catch(() => stageEpisodes24h);
+}
+
+/**
+ * #185 / #187: open alert episodes are re-adopted at boot — they close on clear instead of re-paging; undelivered ones
+ * are re-sent by alerts.retry(). A FAILED load is not "nothing open" (codex pass 3): it is retried every tick until it
+ * succeeds. Until then the watches run anyway — a page must never wait on the DB — and a late restore reconciles
+ * itself: an adopted episode whose condition has cleared is closed by the next step, and closeAlertEpisodes closes
+ * every row of that kind/key, so a duplicate opened meanwhile closes with it.
+ */
+let alertStateRestored = false;
+async function restoreAlertState(): Promise<void> {
+  if (alertStateRestored) return;
+  try {
+    const open = await store.openAlertEpisodes();
+    stageWatch.restore(open.filter((o) => o.kind === "stage_unserved" || o.kind === "fault_called")
+      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
+    if (open.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
+    alertStateRestored = true;
+  } catch (e) {
+    console.error("alert state restore failed (retried next tick):", (e as Error).message);
+  }
 }
 
 // #185 / #187: the alert outbox (alerts.ts) — pages resolved only on acknowledged delivery, re-sent every poll.
@@ -748,7 +769,7 @@ async function checkSpanLocal(): Promise<void> {
   const n = spanLocalAlarm.step(spanLocal);
   if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
   else if (n) {
-    await store.closeAlertEpisodes("span_local_stale", "span").catch((err) => console.error("alert episode close failed:", (err as Error).message));
+    await alerts.close("span_local_stale", "span");
     await ntfy(n.title, n.body, n.priority, { resolved: true });
   }
 }
@@ -1854,6 +1875,7 @@ async function loopBody(): Promise<void> {
 
   // #187 / #185: the SPAN-local check and the alert outbox depend on neither SensorLinx nor the poll's success —
   // they run every tick on their own, so a SensorLinx outage cannot hide a SPAN outage or stall a re-send (codex pass 2)
+  await restoreAlertState();
   await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
   await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
 
@@ -1874,14 +1896,7 @@ async function main(): Promise<void> {
   else await store.ensureSchemaWithRetry();
   lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
-  {
-    // #185 / #187: open alert episodes are re-adopted — they close on clear instead of re-paging; undelivered ones are
-    // re-sent by alerts.retry() on the first poll
-    const open = await store.openAlertEpisodes().catch(() => []);
-    stageWatch.restore(open.filter((o) => o.kind === "stage_unserved" || o.kind === "fault_called")
-      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
-    if (open.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
-  }
+  await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
   // #183: the storm machine always starts idle (its state is in memory), so any storm_events row still open is an
   // orphan of an earlier process — close it, or the mirror banner shows "armed" while /health.storm is idle. A storm
   // that is still live re-arms on the next trigger poll and opens a fresh row.
