@@ -94,6 +94,7 @@ class BreakerController:
         self._stopping = False
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
         self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
+        self._open_untimed: set[str] = set()                # bare OPEN dispatched, landing time unknown
         self._bg: set[asyncio.Task] = set()
         self._boot_id = read_boot_id()
         self.last: dict | None = None
@@ -298,6 +299,7 @@ class BreakerController:
         ok = state == "CLOSED"
         if ok:
             if self._opened_at.pop(name, None) is not None:
+                self._open_untimed.discard(name)
                 self._persist_opens()
             self._finish_pending(name)
         result = self._result(name, "close", ok, state, "CLOSED", source,
@@ -312,17 +314,24 @@ class BreakerController:
     async def _do_open(self, spec, circ, source: str) -> dict:
         name, cid = spec.name, circ["circuit_id"]
         err = None
-        self._opened_at[name] = self._mono()   # before dispatch: the min-off guard is conservative
+        # Before dispatch: an "untimed" marker, so a restart before we know when the OPEN landed
+        # restarts the full minimum off time rather than trusting a too-early timestamp.
+        self._opened_at[name] = self._mono()
+        self._open_untimed.add(name)
         if not self._persist_opens():
             self._opened_at.pop(name, None)
+            self._open_untimed.discard(name)
             raise BreakerRefused("could not persist the switch-off time (disk?) — refusing to "
                                  "switch anything off", 503)
-        try:
-            await self.client.set_relay(cid, "OPEN", open_permit=OpenPermit(cid, name, f"open ({source})"))
-        except Exception as exc:  # noqa: BLE001 — the request may still have landed; read back
-            err = str(exc)
-        self._opened_at[name] = self._mono()
-        self._persist_opens()
+        _, exc, cancelled = await self._finish(   # wait for the worker even if cancelled
+            self.client.set_relay(cid, "OPEN", open_permit=OpenPermit(cid, name, f"open ({source})")))
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            err = str(exc)                        # may still have landed: the read-back decides
+        self._opened_at[name] = self._mono()      # conservative: when the call returned
+        self._open_untimed.discard(name)
+        self._persist_opens()                     # if this fails, the untimed marker stays on disk
+        if cancelled:
+            raise asyncio.CancelledError()
         state = await self._readback(cid, name, "OPEN")
         ok = state == "OPEN"
         detail = "OFF (verified)" if ok else f"read-back {state or 'unavailable'}" + (f" ({err})" if err else "")
@@ -631,8 +640,8 @@ class BreakerController:
     def _persist_opens(self) -> bool:
         """Bare-OPEN times (power cycles have their own record). Monotonic + boot id, so a restart
         in the same boot keeps the real elapsed time and a reboot restarts the hold."""
-        recs = {n: {"opened_mono": t, "boot_id": self._boot_id} for n, t in self._opened_at.items()
-                if n not in self._pending_close}
+        recs = {n: {"opened_mono": None if n in self._open_untimed else t, "boot_id": self._boot_id}
+                for n, t in self._opened_at.items() if n not in self._pending_close}
         return self._write_durable(self._opens_path, recs)
 
     def _restore_opens(self) -> None:

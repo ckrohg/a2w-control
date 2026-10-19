@@ -411,6 +411,29 @@ async def test_min_off_after_a_bare_open_survives_a_restart(rig):
     assert rebooted._opened_at == {}
 
 
+async def test_untimed_bare_open_restarts_the_hold_after_a_restart(rig, monkeypatch):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    ctl._boot_id = "boot-A"
+    writes = {"n": 0}
+    real = ctl._write_durable
+
+    def fail_after_first(path, obj):          # the post-OPEN timestamp never reaches the disk
+        writes["n"] += 1
+        return real(path, obj) if writes["n"] == 1 else False
+    monkeypatch.setattr(ctl, "_write_durable", fail_after_first)
+    assert (await ctl.execute("Kitchen", "open"))["ok"]
+    rec = json.loads((tmp_path / span_control.OPENS_FILE).read_text())
+    assert rec["Kitchen"]["opened_mono"] is None          # only the untimed marker made it
+    ft.t += 45
+    fresh = BreakerController(ctl.cfg, ctl.client, store, cache=ctl.cache, state_dir=str(tmp_path),
+                              sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+    fresh._boot_id = "boot-A"
+    await fresh.recover()
+    ft.t += 30                                             # 75 s after the OPEN, 30 s after restart
+    with pytest.raises(BreakerRefused, match="minimum off time"):
+        await fresh.execute("Kitchen", "close")
+
+
 async def test_min_off_after_a_reboot_restarts_the_hold(rig):
     panel, ctl, ft, store, alerts, tmp_path = rig
     ctl._boot_id = "boot-A"
