@@ -322,6 +322,18 @@ async def test_other_pump_down_pages_once_and_does_not_cycle(rig):
     assert r.panel.writes == []
 
 
+async def test_a_peer_without_telemetry_counts_as_down(rig):
+    r = rig
+    heal = SelfHealer(SelfHealConfig(live=True), {"pump2": r.p2}, r.ctl, r.store,   # no pump1 poller
+                      state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.mono, boot_id="boot-A")
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    await settle()
+    assert r.panel.writes == []
+    assert "both_down" in await codes(r.store)
+    assert "no telemetry" in heal.status()["pumps"]["pump2"]["status"]
+
+
 async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch):
     r = rig
     heal = r.make(live=True)
