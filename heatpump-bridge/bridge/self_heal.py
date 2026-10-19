@@ -38,6 +38,7 @@ SPAN_WAIT_PAGE_S = 600.0     # live, eligible, but no usable panel read for this
 RUNNING_QUIET_S = 120.0      # "not heating" = no compressor seen for this long (anti-short-cycle)
 DEFROST_QUIET_S = 300.0      # and no defrost for this long
 CLEAR_HOLD_S = 180.0         # recovered = no blocking fault, observed fresh, continuously this long
+ALL_DOWN_PAGE_S = 300.0      # every pump down this long (debounces a bridge restart) -> page
 OBS_GAP_S = 90.0             # verification ticks further apart than this break the continuity
 STATE_FILE = "self-heal.json"
 EVENT_TYPE = "self_heal"
@@ -95,6 +96,8 @@ class SelfHealer:
                 self._pumps[pid]["verify"]["restored"] = True
                 self._pumps[pid]["status"] = "verifying (restored after a restart)"
         self._startup_paged = False
+        self._both_down_paged = False          # one both-down page until a pump is back up
+        self._all_down_since: float | None = None
 
     # --- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -246,6 +249,7 @@ class SelfHealer:
         if not self._startup_paged:
             self._startup_paged = True
             await self._startup_notes()
+        await self._watch_all_down()
         pruned = False
         for st in self._pumps.values():
             recent = self._recent(st)
@@ -282,6 +286,46 @@ class SelfHealer:
                 st["fault_seen"] = (key, self._mono())   # a new onset restarts the in-process grace
             await self._consider(pid, poller, st, fault, fresh)
 
+    def _pump_down(self, pid: str) -> str | None:
+        poller = self.pollers.get(pid)
+        if poller is None:
+            return "no telemetry"
+        s = poller.snapshot
+        if not self._fresh(s):
+            return "offline"
+        if s.get("identity_ok") is False:
+            return "gateway identity check failed"
+        if s.get("on") is False or s.get("state") == "off":
+            return "switched off"
+        st = self._pumps.get(pid)
+        recently_running = s.get("running") or (st is not None and st["last_running"] is not None
+                                                and self._mono() - st["last_running"] < RUNNING_QUIET_S)
+        bad = [str(f.get("code")) for f in s.get("active_faults", []) if _is_blocking(f)]
+        if bad and not recently_running:
+            return f"faulted ({', '.join(bad)})"
+        return None
+
+    async def _watch_all_down(self) -> None:
+        """Independent of triggers and phases: every pump down for ALL_DOWN_PAGE_S pages once,
+        and re-arms when any pump is back. (Shares its de-dup with the per-pump both-down page.)"""
+        if not self.cfg.enabled or not self._pumps:
+            return
+        downs = {pid: self._pump_down(pid) for pid in self._pumps}
+        if not all(downs.values()):
+            self._all_down_since = None
+            self._both_down_paged = False
+            return
+        self._all_down_since = self._all_down_since or self._mono()
+        if self._mono() - self._all_down_since < ALL_DOWN_PAGE_S or self._both_down_paged:
+            return
+        self._both_down_paged = True
+        why = "; ".join(f"{self.pollers[p].cfg.name if p in self.pollers else p}: {d}"
+                        for p, d in downs.items())
+        await self._step(next(iter(self._pumps)), "both_down", "critical",
+                         f"Every heat pump is down ({why}). Self-heal will not power-cycle while "
+                         f"the other pump is down — check both units now.",
+                         {"pumps": downs}, title="URGENT: both heat pumps down", priority="urgent")
+
     async def _startup_notes(self) -> None:
         if not self.cfg.enabled:
             return
@@ -312,10 +356,10 @@ class SelfHealer:
         if not fresh:
             st["status"] = f"{code} active but {name} is offline/stale — waiting"
             other = self._other_down(pid, span=self._span())
-            if other and "both_down" not in st["paged"]:
+            if other and not self._both_down_paged:
                 # Nothing to cycle on stale data — but a pump offline with a last-known fault
                 # AND its peer down is the both-down case, and it pages.
-                st["paged"].add("both_down")
+                self._both_down_paged = True
                 await self._step(pid, "both_down", "critical",
                                  f"{name} is offline (last known: {code}) AND {other}. Check both "
                                  f"units; '{circuit}' can be power-cycled at the SPAN panel by hand.",
@@ -338,8 +382,8 @@ class SelfHealer:
         other = self._other_down(pid, span=span)
         if other:
             st["status"] = f"{code} active but {other} — not cycling (paged)"
-            if "both_down" not in st["paged"]:
-                st["paged"].add("both_down")
+            if not self._both_down_paged:
+                self._both_down_paged = True
                 await self._step(pid, "both_down", "critical",
                                  f"{name}: {code} for {age_min:.0f} min AND {other}. A2W will not "
                                  f"power-cycle while the other pump is down — check both units; "

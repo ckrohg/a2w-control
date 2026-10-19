@@ -125,6 +125,10 @@ async def codes(store, pid="pump2"):
     return [e["code"] for e in await store.get_events(pid, 1) if e["type"] == "self_heal"]
 
 
+async def all_codes(store):
+    return await codes(store, "pump1") + await codes(store, "pump2")
+
+
 async def settle():
     await asyncio.sleep(0.05)   # let fire-and-forget alert tasks run
 
@@ -378,7 +382,7 @@ async def test_other_pump_down_pages_once_and_does_not_cycle(rig):
         await heal.tick()
     await settle()
     assert r.panel.writes == []
-    assert (await codes(r.store)).count("both_down") == 1
+    assert (await all_codes(r.store)).count("both_down") == 1
     assert any("both heat pumps" in a[1] for a in r.alerts if a[0] == "push")
     # a faulted (not just offline) other pump counts too
     r.p1.snapshot["online"] = True
@@ -396,7 +400,7 @@ async def test_a_peer_without_telemetry_counts_as_down(rig):
     await r.eligible(heal)
     await settle()
     assert r.panel.writes == []
-    assert "both_down" in await codes(r.store)
+    assert "both_down" in await all_codes(r.store)
     assert "no telemetry" in heal.status()["pumps"]["pump2"]["status"]
 
 
@@ -413,6 +417,34 @@ async def test_stale_target_and_down_peer_pages_both_down_once(rig):
     await settle()
     assert r.panel.writes == []
     assert (await codes(r.store)).count("both_down") == 1
+
+
+async def test_both_down_pages_even_during_verification(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)                                # cycled; verifying
+    r.p2.fault(code="E18", severity="high")               # E21 became E18...
+    r.p1.snapshot.update(on=False, state="off")           # ...and pump1 is switched off
+    for _ in range(40):
+        await r.step(heal)
+    await settle()
+    assert (await all_codes(r.store)).count("both_down") == 1
+    assert len([a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]) == 1
+    assert len([a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1]]) == 1
+
+
+async def test_a_bridge_restart_does_not_page_both_down(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p1.snapshot["online"] = False                       # not polled yet after a restart
+    r.p2.snapshot["online"] = False
+    await heal.tick()
+    r.ft.t += 60
+    r.p1.fresh(online=True); r.p2.fresh(online=True)      # first polls land within a minute
+    await heal.tick()
+    await settle()
+    assert "both_down" not in await codes(r.store, "pump1")
 
 
 async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch):
@@ -507,7 +539,7 @@ async def test_a_switched_off_peer_counts_as_down(rig):
     await r.eligible(heal)
     await settle()
     assert r.panel.writes == []
-    assert "both_down" in await codes(r.store)
+    assert "both_down" in await all_codes(r.store)
 
 
 async def test_same_code_recurrence_restarts_the_in_process_grace(rig):
