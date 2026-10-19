@@ -17,7 +17,8 @@ const E21 = { active_faults: 1, fault_codes: ["E21"] };
 // ── 1. STAGE_PUMP_MAP parsing ────────────────────────────────────────────────────────────────────────────────────
 assert.deepEqual(parseStagePumpMap(undefined), { map: { ...DEFAULT_STAGE_PUMP_MAP }, error: null });
 assert.deepEqual(parseStagePumpMap('{"1":"pump2","2":"pump1"}'), { map: { "1": "pump2", "2": "pump1" }, error: null }, "a swapped wiring is honoured");
-for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{}"]) {
+for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{}",
+  '{"1":"pump1"}', '{"1":"pump1","2":"pump1"}', '{"1":"pump1","3":"pump2"}']) {
   const r = parseStagePumpMap(bad);
   assert.deepEqual(r.map, { ...DEFAULT_STAGE_PUMP_MAP }, `bad ${bad} → default`);
   assert.match(r.error ?? "", /STAGE_PUMP_MAP ignored/);
@@ -121,9 +122,12 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
     assert.deepEqual(w.step({ nowMs: min(m), stagesCalled: [true, false], pumps: [hp1("heating", { active_faults: 1, fault_codes: [] }), hp2("idle")], lagTMin: 180 }), [],
       "heating with P17 active: no page");
   }
-  // a non-info code with a non-fault state still pages (state lags the code by a poll)
+  // codex pass 2: a STALE mirror code (HP1's cleared E21 still in pump_snapshots) on a pump whose live state is not
+  // fault never pages — codes only annotate a live fault
   const c = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
-  assert.equal(c.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle", { active_faults: 1, fault_codes: ["E21"] }), hp2("idle")], lagTMin: 180 })[0]?.type, "fault_called");
+  assert.deepEqual(c.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("heating", { active_faults: 1, fault_codes: ["E21"] }), hp2("idle")], lagTMin: 180 }), []);
+  assert.deepEqual(c.step({ nowMs: min(5), stagesCalled: [true, false], pumps: [hp1("heating"), hp2("fault", E21)], lagTMin: 180 }), [],
+    "HP2 faulted but its stage is not called: nothing (yet)");
   // skipped polls: called at 0, then nothing until 60 min, then 65 → only 5 min credited, no page
   const g = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
   g.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });

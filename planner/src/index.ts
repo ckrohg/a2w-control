@@ -705,9 +705,14 @@ let lastLagTMin: number | null = null; // the HBX's lag-stage timer, from this p
 async function checkStages(reading: SlxReading, state: HubState | null, anyStageCall: boolean): Promise<void> {
   const live = !anyStageCall ? [] : state && !piStateUnverifiable(state) ? state.pumps : null;
   let pumps: StagePump[] | null = live;
-  if (live && live.some((p) => p.state === "fault" || (p.active_faults ?? 0) > 0)) {
+  if (live && live.some((p) => p.state === "fault")) {
+    // codes only ANNOTATE a live fault, and only from a snapshot ≤ 15 min old (the Pi attaches one every ~5 min)
     const codes = await store.pumpFaultCodes().catch(() => ({} as Record<string, { codes: string[]; ts: number }>));
-    pumps = live.map((p) => ({ ...p, fault_codes: codes[p.id]?.codes }));
+    const nowS = Date.now() / 1000;
+    pumps = live.map((p) => {
+      const c = codes[p.id];
+      return p.state === "fault" && c && Math.abs(nowS - c.ts) <= 15 * 60 ? { ...p, fault_codes: c.codes } : p;
+    });
   }
   const events = stageWatch.step({ nowMs: Date.now(), stagesCalled: reading.stagesCalled, pumps, lagTMin: lastLagTMin });
   for (const e of events) {
@@ -731,6 +736,7 @@ async function openAlert(kind: string, key: string, pumpId: string | null, title
 // #187: the SPAN-local heartbeat (spanlocal.ts) — refreshed every poll, served from here on /health.span.
 const spanLocalAlarm = new SpanLocalAlarm();
 let spanLocal: SpanHealth | null = null;
+let spanLocalError: string | null = null;
 async function checkSpanLocal(): Promise<void> {
   const nowS = Date.now() / 1000;
   const cloud = {
@@ -738,6 +744,7 @@ async function checkSpanLocal(): Promise<void> {
     fail_streak: spanWatch?.failStreak ?? 0, last_error: spanWatch?.lastError ?? null,
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
+  spanLocalError = null;
   const n = spanLocalAlarm.step(spanLocal);
   if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
   else if (n) {
@@ -1748,8 +1755,7 @@ async function pollOnce(): Promise<void> {
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
-  await checkSpanLocal().catch((e) => console.error("span-local check failed:", (e as Error).message));
-  await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
+
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
@@ -1845,6 +1851,11 @@ async function loopBody(): Promise<void> {
       );
     }
   }
+
+  // #187 / #185: the SPAN-local check and the alert outbox depend on neither SensorLinx nor the poll's success —
+  // they run every tick on their own, so a SensorLinx outage cannot hide a SPAN outage or stall a re-send (codex pass 2)
+  await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
+  await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
 
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
@@ -1953,6 +1964,8 @@ async function main(): Promise<void> {
     await once("decay scan", () => decayScanOnce(store));
     await once("realized-savings", () => realized.computeAndStore());
     await once("pi-link", refreshPiLink);
+    await once("span-local", checkSpanLocal);
+    await once("alert re-send", () => alerts.retry());
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-ua-push", () => pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (tempiq) await once("tempiq-push", () => tempiq.tick());
@@ -2002,7 +2015,7 @@ async function main(): Promise<void> {
             },
             // #187: the SPAN LOCAL stream (the Pi's LAN poller → span_readings) beside spanwatch's cloud state. Pages
             // when local is older than 15 min; the cloud failing alone only shows here.
-            span: spanLocal ?? { pending: true },
+            span: spanLocal ? { ...spanLocal, refresh_error: spanLocalError } : { pending: true, refresh_error: spanLocalError },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
               : { pending: true, refresh_error: piLinkError },

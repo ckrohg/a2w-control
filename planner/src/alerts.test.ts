@@ -39,5 +39,33 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   const broken: AlertStore = { ...store, openAlertEpisode: async () => { throw new Error("db down"); } };
   const c = new AlertOutbox(broken, send, () => {});
   assert.equal(await c.open("stage_unserved", "1", "pump1", "t", "b"), true, "the page still goes out");
+  // codex pass 2: the row could NOT be written AND nobody heard the page → kept in memory, retried without a restart
+  let dbUp = false;
+  up = false;
+  const flaky: AlertStore = {
+    ...store,
+    openAlertEpisode: async (...args) => { if (!dbUp) throw new Error("db down"); return store.openAlertEpisode(...args); },
+  };
+  const d = new AlertOutbox(flaky, send, () => {});
+  const before = rows.length;
+  assert.equal(await d.open("fault_called", "2", "pump2", "⚠ lost?", "E21"), false);
+  assert.equal(d.pending(), 1, "neither recorded nor delivered → kept");
+  assert.equal(await d.retry(), 0);
+  assert.equal(d.pending(), 1, "still both down → still kept");
+  dbUp = true;                                   // the DB returns first: the episode becomes an outbox row…
+  assert.equal(await d.retry(), 0, "…channels still down: nothing sent yet");
+  assert.equal(d.pending(), 0);
+  assert.equal(rows.length, before + 1);
+  up = true;
+  assert.equal(await d.retry(), 1, "…and it goes out when they return");
+  assert.equal(rows.at(-1)?.notified, true);
+  // the channels return first instead: sent directly from memory, never lost
+  dbUp = false; up = false;
+  const e = new AlertOutbox(flaky, send, () => {});
+  await e.open("stage_unserved", "1", "pump1", "⚠ lost too?", "b");
+  up = true;
+  assert.equal(await e.retry(), 1, "delivered without a row");
+  assert.equal(e.pending(), 0);
+
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

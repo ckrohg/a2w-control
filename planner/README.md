@@ -73,20 +73,24 @@ stage:
   state (#167: hub unreachable, Pi disconnected, stale frame). Pages **high** (emails), naming the
   unit, its state, any fault code, and the other stage/unit ("HP1 is not called — the HBX waits up
   to lagT (180 min)…").
-- **fault_called** — its mapped pump reports an active fault: an **immediate** high page with the
-  code (from the mirror's `pump_snapshots`; the hub frame carries only a count).
+- **fault_called** — its mapped pump's LIVE derived state is `fault`: an **immediate** high page. The
+  code is added from the mirror's `pump_snapshots` when that snapshot is ≤ 15 min old (the hub frame
+  carries only a count, which includes info-level protections like P17 anti-freeze — never a page).
 
-Both are edge-triggered, persisted in `stage_unserved_episodes`, re-adopted after a restart (they
-close, never re-page), and shown at `/health.unserved {all_idle, stage_pump_map, stages,
-episodes_24h, lag_t_min}`. The all-idle alarm is unchanged.
+Both are edge-triggered and persisted in `alert_episodes` — an OUTBOX: a page is marked notified only
+when a channel acknowledged it, and unacknowledged ones are re-sent every loop tick (even while
+SensorLinx is failing) and after a restart; open episodes are re-adopted at boot (they close, never
+re-page). `/health.unserved {all_idle, stage_pump_map, stages, episodes_24h, lag_t_min}`. A gap of
+more than 15 min between polls credits no called time. The all-idle alarm is unchanged.
 
 **`STAGE_PUMP_MAP`** (env, JSON, default `{"1":"pump1","2":"pump2"}`) is the **physical wiring**
 from each HBX stage relay to the heat pump it starts — not a preference. Verify it at the panel
 before trusting the alarm: with the HBX in its stage test (or on a real call), close stage 1 alone
 and confirm which unit's wall controller shows a demand, then stage 2; or trace the dry-contact pair
 from the HBX stage-1 terminals to the unit's remote on/off input. If the units turn out swapped, set
-`STAGE_PUMP_MAP={"1":"pump2","2":"pump1"}` (the hub's pump ids). An invalid value falls back to the
-default and says so at `/health.unserved.stage_pump_map_error`.
+`STAGE_PUMP_MAP={"1":"pump2","2":"pump1"}` (the hub's pump ids). It must map every stage 1..N
+(N ≥ 2) to a DISTINCT pump; anything else falls back to the default and says so at
+`/health.unserved.stage_pump_map_error`.
 
 **`dmd` is not configuration (#182).** It is a live demand bitmask (1 ↔ 9 ↔ 41, nine flips in two
 days); it left `CONFIG_FIELDS`, and the drift diff compares only `CONFIG_FIELDS`, so a dmd flip
@@ -101,9 +105,10 @@ mirror banner is driven separately.)
 **SPAN-local heartbeat (#187, `spanlocal.ts`).** `/health.span {local_table,
 local_last_reading_age_s, circuits_seen, local_stale, cloud{enabled, last_ok_at, fail_streak,
 last_error}}` — the newest `span_readings` sample per circuit (the Pi's LAN poller, the path every
-SPAN safety action depends on) beside `spanwatch.ts`'s cloud state. A **high** page, edge-triggered,
-when the local stream is older than **15 min**, and a resolved notice on recovery; the cloud failing
-alone shows here but never pages. `scripts/drift-check.sh` [8] asserts local age ≤ 900 s.
+SPAN safety action depends on), at any age, beside `spanwatch.ts`'s cloud state, with `computed_at`
+and `refresh_error`. A **high** page, edge-triggered (same outbox), when the local stream is older than
+**15 min**, and a resolved notice on recovery; the cloud failing alone shows here but never pages. It
+runs every loop tick, independent of the SensorLinx poll. `scripts/drift-check.sh` [8] asserts local age ≤ 900 s.
 
 SQL proven by `scripts/incident-local-check.ts` (local Postgres only).
 

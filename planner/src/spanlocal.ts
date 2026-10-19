@@ -17,6 +17,8 @@ export interface SpanCloudState {
 }
 
 export interface SpanHealth {
+  /** when this was computed — /health serves it from memory; an old one means the check itself is failing */
+  computed_at: string;
   /** false = the mirror table is absent in this DB (rehearsal) — nothing can be said */
   local_table: boolean;
   /** age of the NEWEST local sample of any circuit; null when the table is absent or empty */
@@ -33,6 +35,7 @@ export function spanHealth(byName: Record<string, number> | null, nowS: number, 
     .sort((a, b) => a.name.localeCompare(b.name));
   const newest = circuits.length ? Math.min(...circuits.map((c) => c.age_s)) : null;
   return {
+    computed_at: new Date(nowS * 1000).toISOString(),
     local_table: byName !== null,
     local_last_reading_age_s: newest,
     circuits_seen: circuits,

@@ -31,7 +31,12 @@ export function parseStagePumpMap(raw: string | undefined): { map: Record<string
       if (!/^[1-9]\d*$/.test(k) || typeof id !== "string" || !id.trim()) throw new Error(`bad entry ${JSON.stringify(k)}: ${JSON.stringify(id)}`);
       out[k] = id.trim();
     }
-    if (!Object.keys(out).length) throw new Error("empty");
+    // every physical stage 1..N must be mapped (N ≥ 2 — this plant has two units) to DISTINCT pumps: a partial map
+    // silently leaves a stage unwatched, a duplicate makes one unit "serve" two stages (codex pass 2)
+    const keys = Object.keys(out).map(Number).sort((a, b) => a - b);
+    if (keys.length < 2) throw new Error("fewer than 2 stages mapped");
+    if (keys.some((k, i) => k !== i + 1)) throw new Error(`stages must be 1..${keys.length} with no gaps`);
+    if (new Set(Object.values(out)).size !== keys.length) throw new Error("two stages map to the same pump");
     return { map: out, error: null };
   } catch (e) {
     return { map: { ...DEFAULT_STAGE_PUMP_MAP }, error: `STAGE_PUMP_MAP ignored (${(e as Error).message}) — using the default` };
@@ -70,10 +75,10 @@ interface StageState {
 }
 
 const label = (p: StagePump | undefined, id: string) => p?.name?.trim() || id;
-// The bridge's derived `fault` state already excludes info-level protections (P17 anti-freeze is NORMAL — poller.py
-// _derive_state), while the hub's raw active_faults COUNT includes them: never page on the count (codex pass 1).
-// A non-info code from the mirror's pump_snapshots counts too.
-const faulted = (p: StagePump | undefined) => !!p && (p.state === "fault" || (p.fault_codes?.length ?? 0) > 0);
+// The bridge's LIVE derived `fault` state is the only fault signal: it already excludes info-level protections (P17
+// anti-freeze is NORMAL — poller.py _derive_state), while the hub's raw active_faults COUNT includes them (codex pass
+// 1), and the mirror's pump_snapshots codes can be minutes stale (codex pass 2) — they only ANNOTATE a live fault.
+const faulted = (p: StagePump | undefined) => !!p && p.online && p.state === "fault";
 const describe = (p: StagePump | undefined, id: string): string => {
   if (!p) return `${id} is not in the hub's state (no data)`;
   const codes = p.fault_codes?.length ? `, ${p.fault_codes.join("/")}` : "";
