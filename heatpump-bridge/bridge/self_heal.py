@@ -311,6 +311,16 @@ class SelfHealer:
             return
         if not fresh:
             st["status"] = f"{code} active but {name} is offline/stale — waiting"
+            other = self._other_down(pid, span=self._span())
+            if other and "both_down" not in st["paged"]:
+                # Nothing to cycle on stale data — but a pump offline with a last-known fault
+                # AND its peer down is the both-down case, and it pages.
+                st["paged"].add("both_down")
+                await self._step(pid, "both_down", "critical",
+                                 f"{name} is offline (last known: {code}) AND {other}. Check both "
+                                 f"units; '{circuit}' can be power-cycled at the SPAN panel by hand.",
+                                 {"code": code, "other": other, "target_offline": True},
+                                 title="URGENT: both heat pumps down", priority="urgent")
             return
         age_wall = (self._clock() - float(fault.get("since") or self._clock())) / 60
         age_seen = (self._mono() - st["fault_seen"][1]) / 60
