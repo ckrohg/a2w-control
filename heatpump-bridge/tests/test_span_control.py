@@ -135,6 +135,9 @@ def test_config_floor_and_element_lock():
     with pytest.raises(ValidationError, match="never allow_open"):
         SpanConfig(breakers=[BreakerCircuit(name="Air-Water 1", allow_cycle=True, heat_pump=True,
                                             allow_open=True)])
+    with pytest.raises(ValidationError, match="close-only"):
+        SpanConfig(arm_circuit="Something Else",
+                   breakers=[BreakerCircuit(name="Buffer Tank", allow_open=True)])
     with pytest.raises(ValidationError, match="heat_pump must be true"):
         SpanConfig(breakers=[BreakerCircuit(name="Air-Water 2", allow_cycle=True)])
     d = SpanConfig()
@@ -179,9 +182,15 @@ async def test_close_runs_in_finally_when_the_cycle_raises(rig, monkeypatch):
     panel, ctl, ft, store, _, _ = rig
     t0 = ft.t
 
-    async def broken_readback(*a, **k):
-        raise RuntimeError("boom after the OPEN")
-    monkeypatch.setattr(ctl, "_readback", broken_readback)
+    real = ctl._readback
+    calls = {"n": 0}
+
+    async def broken_once(*a, **k):          # the OPEN's read-back blows up; later ones work
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom after the OPEN")
+        return await real(*a, **k)
+    monkeypatch.setattr(ctl, "_readback", broken_once)
     with pytest.raises(RuntimeError):
         await ctl.execute("Air-Water 2", "power_cycle")
     assert panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
@@ -387,8 +396,10 @@ async def test_open_then_close_respects_min_off_time(rig):
 async def test_recover_closes_a_circuit_a_restart_left_open(rig):
     panel, ctl, ft, store, alerts, tmp_path = rig
     panel.set("Air-Water 2", relayState="OPEN")
+    ctl._boot_id = "boot-A"                   # same boot: the monotonic clock is trusted
     cycle_file(tmp_path).write_text(json.dumps(
-        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": ft.t - 20, "off_s": 60}))
+        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": ft.t - 20,
+         "opened_mono": ft.t - 20, "boot_id": "boot-A", "off_s": 60}))
     await ctl.recover()
     assert ctl.snapshot()["busy"]["action"] == "recover_close"
     for _ in range(300):
@@ -398,6 +409,103 @@ async def test_recover_closes_a_circuit_a_restart_left_open(rig):
     assert panel.relay("Air-Water 2") == "CLOSED"
     assert 40 in ft.sleeps                    # only the remainder of the 60 s was held
     assert not cycle_file(tmp_path).exists()
+
+
+async def test_recover_after_a_reboot_holds_the_full_time(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    panel.set("Air-Water 2", relayState="OPEN")
+    ctl._boot_id = "boot-B"                   # rebooted: wall/mono time since the OPEN unknown
+    cycle_file(tmp_path).write_text(json.dumps(
+        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": ft.t - 600,
+         "opened_mono": 5.0, "boot_id": "boot-A", "off_s": 60}))
+    t0 = ft.t
+    await ctl.recover()
+    for _ in range(300):
+        if ctl.snapshot()["busy"] is None:
+            break
+        await asyncio.sleep(0.01)
+    assert panel.relay("Air-Water 2") == "CLOSED" and ft.t - t0 >= 60
+
+
+async def test_recover_cancelled_during_its_first_audit_still_closes(rig, monkeypatch):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    panel.set("Air-Water 2", relayState="OPEN")
+    cycle_file(tmp_path).write_text(json.dumps(
+        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": None, "off_s": 60}))
+    gate = asyncio.Event()
+    real = store.add_event
+
+    async def slow_add_event(*a, **k):
+        if k.get("code") == "cycle_recover":
+            await gate.wait()
+        return await real(*a, **k)
+    monkeypatch.setattr(store, "add_event", slow_add_event)
+    t0 = ft.t
+    await ctl.recover()
+    task = ctl._task
+    await asyncio.sleep(0.02)
+    task.cancel()                             # cancelled while the audit is still pending
+    await asyncio.sleep(0.02)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert panel.relay("Air-Water 2") == "CLOSED" and ft.t - t0 >= 60
+
+
+async def test_cancel_while_the_open_is_in_flight_holds_from_when_it_lands(rig, monkeypatch):
+    panel, ctl, ft, *_ = rig
+    gate = asyncio.Event()
+    stamps: list[tuple[str, float]] = []
+    real = ctl.client.set_relay
+
+    async def slow_set_relay(cid, want="CLOSED", **kw):
+        if want == "OPEN":
+            await gate.wait()                 # the OPEN is slow to land...
+            ft.t += 30                        # ...30 s late
+        out = await real(cid, want, **kw)
+        stamps.append((want, ft.t))
+        return out
+    monkeypatch.setattr(ctl.client, "set_relay", slow_set_relay)
+    caller = asyncio.create_task(ctl.execute("Air-Water 2", "power_cycle"))
+    while ctl._task is None:
+        await asyncio.sleep(0.01)
+    inner = ctl._task
+    await asyncio.sleep(0.02)
+    inner.cancel()                            # cancelled while the OPEN is still in flight
+    await asyncio.sleep(0.02)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await inner
+    opened = next(t for w, t in stamps if w == "OPEN")
+    closed = next(t for w, t in stamps if w == "CLOSED")
+    assert closed - opened >= 60              # the hold counted from when the OPEN landed
+    assert panel.relay("Air-Water 2") == "CLOSED"
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+
+async def test_interlock_covers_a_heat_pump_dropped_from_the_allowlist(tmp_path, alerts):
+    panel = FakeSpan()
+    addr = panel.start()
+    store = Store(str(tmp_path / "b.db"))
+    await store.open()
+    try:
+        cfg = SpanConfig(host=addr, passphrase="pw",
+                         breakers=[BreakerCircuit(name="Air-Water 2", allow_cycle=True, heat_pump=True)])
+        poller = SpanLocalPoller(cfg, store)
+        ft = FakeTime()
+        ctl = BreakerController(cfg, poller.client, store, cache=poller, state_dir=str(tmp_path),
+                                sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+        panel.set("Air-Water 1", relayState="OPEN")
+        with pytest.raises(BreakerRefused, match="never two heat pumps off"):
+            await ctl.execute("Air-Water 2", "power_cycle")
+        panel.circuits["Renamed"] = panel.circuits.pop("Air-Water 1")   # not on the panel at all
+        with pytest.raises(BreakerRefused, match="not confirmed ON"):
+            await ctl.execute("Air-Water 2", "power_cycle")
+        assert panel.writes == []
+    finally:
+        await store.close()
+        panel.stop()
 
 
 async def test_recover_with_untimed_open_holds_the_full_minimum(rig):

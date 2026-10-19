@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 
 from . import notify
+from .config import BACKUP_ELEMENT_CIRCUIT, HEAT_PUMP_CIRCUITS
 from .span_local import OpenPermit
 
 log = logging.getLogger(__name__)
@@ -40,6 +41,15 @@ EVENT_TYPE = "span_breaker"
 READBACK_TRIES = 3           # the panel can lag a write by a beat; re-read before calling it a mismatch
 READBACK_GAP_S = 1.0
 CYCLE_FILE = "span-breaker-cycle.json"
+
+
+def read_boot_id() -> str | None:
+    """Linux boot id: lets a restarted bridge trust CLOCK_MONOTONIC (since-boot, never stepped)
+    across a process restart, and know when it cannot (a reboot)."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        return None
 
 
 class BreakerRefused(Exception):
@@ -83,6 +93,7 @@ class BreakerController:
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
         self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
         self._bg: set[asyncio.Task] = set()
+        self._boot_id = read_boot_id()
         self.last: dict | None = None
 
     # --- public ---------------------------------------------------------------
@@ -165,12 +176,15 @@ class BreakerController:
             hold = max(float(rec.get("off_s") or 0), float(self.cfg.min_off_s))
         except (TypeError, ValueError):
             hold = float(self.cfg.min_off_s)
-        opened_at = rec.get("opened_at")
-        if isinstance(opened_at, (int, float)) and math.isfinite(opened_at):
-            # a clock step across the restart can't stretch it past one hold, nor below zero
-            remaining = min(max(opened_at + hold - self._clock(), 0.0), hold)
+        opened_mono = rec.get("opened_mono")
+        if (self._boot_id and rec.get("boot_id") == self._boot_id
+                and isinstance(opened_mono, (int, float)) and math.isfinite(opened_mono)):
+            # same boot: the monotonic clock is continuous across the process restart and is
+            # never stepped, so elapsed OFF time is known
+            remaining = min(max(opened_mono + hold - self._mono(), 0.0), hold)
         else:
-            remaining = hold                  # OPEN was dispatched but never timed: full hold
+            # rebooted, untimed, or no boot id: elapsed time can't be trusted — hold it all
+            remaining = hold
         self._busy = {"circuit": name, "action": "recover_close", "source": "restart",
                       "started": self._clock(), "off_s": hold}
         self._task = asyncio.create_task(self._recover(name, cid, remaining),
@@ -204,7 +218,9 @@ class BreakerController:
             raise BreakerRefused(f"'{name}' is not on the breaker allowlist", 403)
         if action == "power_cycle" and not spec.allow_cycle:
             raise BreakerRefused(f"power cycle is not allowed for '{name}'", 403)
-        if action == "open" and (not spec.allow_open or spec.heat_pump):
+        if action in ("open", "power_cycle") and name in (BACKUP_ELEMENT_CIRCUIT, self.cfg.arm_circuit):
+            raise BreakerRefused(f"'{name}' is the backup element — close-only", 403)
+        if action == "open" and (not spec.allow_open or spec.heat_pump or name in HEAT_PUMP_CIRCUITS):
             raise BreakerRefused(
                 f"'{name}' may not be switched off and left off "
                 f"({'power cycle only' if spec.allow_cycle else 'close-only'})", 403)
@@ -239,13 +255,15 @@ class BreakerController:
                 raise BreakerRefused(f"'{spec.name}' was not found on the panel", 404)
             if not circ["controllable"]:
                 raise BreakerRefused(f"'{spec.name}' reports isUserControllable=false", 409)
-            if action in ("power_cycle", "open") and spec.heat_pump:
+            if action in ("power_cycle", "open") and (spec.heat_pump or spec.name in HEAT_PUMP_CIRCUITS):
+                # every heat-pump circuit counts, listed in the allowlist or not: dropping one
+                # from the allowlist must not drop it from the interlock
+                others = {*HEAT_PUMP_CIRCUITS, *(b.name for b in self.cfg.breakers if b.heat_pump)}
                 off = []
-                for b in self.cfg.breakers:
-                    if b.heat_pump and b.name != spec.name:
-                        other = find_circuit(circuits, b.name)
-                        if (other or {}).get("relay_state") != "CLOSED":
-                            off.append(b.name)
+                for other_name in sorted(others - {spec.name}):
+                    other = find_circuit(circuits, other_name)
+                    if (other or {}).get("relay_state") != "CLOSED":
+                        off.append(other_name)
                 if off:
                     raise BreakerRefused(
                         f"'{', '.join(off)}' is not confirmed ON — never two heat pumps off at once", 409)
@@ -327,17 +345,20 @@ class BreakerController:
                     cancelled = True
 
     async def _finish(self, coro):
-        """Run `coro` to completion even if this task is cancelled meanwhile (a CLOSE must not be
-        abandoned half-way). Returns (result, cancelled)."""
+        """Run `coro` to completion even if this task is cancelled meanwhile (an OPEN's worker
+        thread or a CLOSE must never be abandoned half-way). Never raises: returns
+        (result, exception_or_None, cancelled_meanwhile)."""
         task = asyncio.ensure_future(coro)
         cancelled = False
         while True:
             try:
-                return await asyncio.shield(task), cancelled
-            except asyncio.CancelledError:
-                if task.cancelled():
-                    raise
+                return await asyncio.shield(task), None, cancelled
+            except asyncio.CancelledError as exc:
+                if task.done():          # the inner task itself was cancelled (loop teardown)
+                    return None, exc, True
                 cancelled = True
+            except Exception as exc:  # noqa: BLE001
+                return None, exc, cancelled
 
     async def _do_cycle(self, spec, circ, hold: float, source: str) -> dict:
         name, cid = spec.name, circ["circuit_id"]
@@ -354,17 +375,18 @@ class BreakerController:
         cancelled = False
         try:
             self._opened_at[name] = self._mono()
-            try:
-                await self.client.set_relay(cid, "OPEN",
-                                            open_permit=OpenPermit(cid, name, f"power_cycle ({source})"))
-            except asyncio.CancelledError:
-                cancelled = True
-            except Exception as exc:  # noqa: BLE001 — may have landed anyway: hold regardless
-                open_err = str(exc)
+            # Shielded: a cancellation must not stop us waiting for the worker thread, or the
+            # OPEN could land after we have started (and shortened) the hold.
+            _, exc, c1 = await self._finish(
+                self.client.set_relay(cid, "OPEN", open_permit=OpenPermit(cid, name, f"power_cycle ({source})")))
+            cancelled |= c1
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                open_err = str(exc)          # may have landed anyway: hold regardless
             open_mono = self._mono()
             self._opened_at[name] = open_mono
             # Timed from when the OPEN call RETURNED: a late-landing OPEN still gets its full hold.
             self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": self._clock(),
+                                    "opened_mono": open_mono, "boot_id": self._boot_id,
                                     "off_s": hold, "source": source})
             open_state = await self._readback(cid, name, "OPEN")
             await self._audit_raw(
@@ -381,8 +403,9 @@ class BreakerController:
             # when it returned, or from now if it never returned), then CLOSE with retries.
             cancelled |= await self._hold_until((open_mono if open_mono is not None else self._mono()) + hold)
             off_for = self._clock() - started_wall
-            (closed_state, attempts, close_err), c2 = await self._finish(self._close_with_retries(cid, name))
+            res, exc, c2 = await self._finish(self._close_with_retries(cid, name))
             cancelled |= c2
+            closed_state, attempts, close_err = res if res is not None else (None, 0, repr(exc))
             ok_close = closed_state == "CLOSED"
             if ok_close:
                 self._opened_at.pop(name, None)
@@ -416,14 +439,17 @@ class BreakerController:
         return result
 
     async def _recover(self, name: str, cid: str, remaining: float) -> None:
+        deadline = self._mono() + remaining
         try:
-            await self._audit_raw("cycle_recover", "high",
-                                  f"{name}: a power cycle was interrupted by a bridge restart — "
-                                  f"switching it back ON in {remaining:.0f} s",
-                                  {"circuit": name, "remaining_s": remaining})
-            cancelled = await self._hold_until(self._mono() + remaining)
-            (state, attempts, err), c2 = await self._finish(self._close_with_retries(cid, name))
+            _, _, cancelled = await self._finish(self._audit_raw(
+                "cycle_recover", "high",
+                f"{name}: a power cycle was interrupted by a bridge restart — "
+                f"switching it back ON in {remaining:.0f} s",
+                {"circuit": name, "remaining_s": remaining}))
+            cancelled |= await self._hold_until(deadline)
+            res, exc, c2 = await self._finish(self._close_with_retries(cid, name))
             cancelled |= c2
+            state, attempts, err = res if res is not None else (None, 0, repr(exc))
             ok = state == "CLOSED"
             result = self._result(name, "recover_close", ok, state, "CLOSED", "restart",
                                   "back ON (verified)" if ok else

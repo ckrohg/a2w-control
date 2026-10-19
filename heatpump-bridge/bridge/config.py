@@ -196,6 +196,8 @@ MIN_OFF_FLOOR_S = 60.0   # owner decision 2026-10-18: the minimum off time for A
 # The owner allowed switching these OFF only for a power cycle. Whatever the configured allowlist
 # says, they stay heat_pump=True (never two off at once) and can never be opted into a bare OPEN.
 HEAT_PUMP_CIRCUITS = ("Air-Water 1", "Air-Water 2")
+# The backup element (the failsafe) is close-only by NAME, independent of span.arm_circuit.
+BACKUP_ELEMENT_CIRCUIT = "Buffer Tank"
 
 
 class BreakerCircuit(BaseModel):
@@ -271,7 +273,8 @@ class SpanConfig(BaseModel):
                                  "never allow_open (owner decision 2026-10-18)")
             # The backup element is the failsafe: A2W may make it AVAILABLE, never take it away
             # (span-backup-arm-spec.md). No config can opt it into an OFF action.
-            if b.name.strip() == self.arm_circuit.strip() and (b.allow_cycle or b.allow_open):
+            if b.name.strip() in (self.arm_circuit.strip(), BACKUP_ELEMENT_CIRCUIT) \
+                    and (b.allow_cycle or b.allow_open):
                 raise ValueError(f"span.breakers: '{b.name}' is the backup element "
                                  "(arm_circuit) — it stays close-only")
         return self
