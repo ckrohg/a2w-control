@@ -257,12 +257,11 @@ export function windowClockTrusted(
     to = Math.min(...after.map((o) => o.at));
   }
   if (obs.some((o) => o.at > from && o.at < to && !aligned(o))) return false;
-  const events = [
-    ...(input.stats?.clockSteps ?? []),
-    ...(input.readings?.clockIntervals ?? []).flatMap((c) => [c.start, c.end]),
-  ];
-  // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to]
-  return !events.some((t) => t >= from - WINDOW_SLACK_S && t <= to + WINDOW_SLACK_S)
+  // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to];
+  // a re-stamped span is checked for OVERLAP, not by its endpoints (codex pass 19: one enclosing the bracket counts)
+  const lo = from - WINDOW_SLACK_S, hi = to + WINDOW_SLACK_S;
+  return !(input.stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi)
+    && !(input.readings?.clockIntervals ?? []).some((c) => c.start <= hi && c.end >= lo)
     && !(input.futureRows && to >= nowS - OBS_BRACKET_S);
 }
 

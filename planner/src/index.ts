@@ -312,6 +312,8 @@ let piLinkError: string | null = null;
 let piLinkBusy = false;
 let piClockOffsetS: number | null = null; // checkI1 measures it from the hub frame each poll
 let piClockOffsetAt = 0;                   // …when; an observation older than 15 min anchors nothing (codex pass 17)
+let piClockWriteBusy = false;
+let piClockPrunedAt = 0;
 async function refreshPiLink(): Promise<void> {
   if (piLinkBusy) return; // a slow DB must not stack refreshes
   piLinkBusy = true;
@@ -512,8 +514,16 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   piClockOffsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
     ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
   piClockOffsetAt = Date.now();
-  // persisted: the planner-clock history of the Pi clock /health.pi needs to trust a dropout verdict (pilink.ts)
-  if (piClockOffsetS != null) await store.insertPiClockObservation(piClockOffsetS).catch((e) => console.error("pi clock observation failed:", (e as Error).message));
+  // persisted — the planner-clock history /health.pi needs to trust a dropout verdict (pilink.ts) — OFF the control
+  // path: not awaited, one write in flight at most, bounded pool, stamped with the measurement time (codex pass 19)
+  if (piClockOffsetS != null && !piClockWriteBusy) {
+    piClockWriteBusy = true;
+    const prune = Date.now() - piClockPrunedAt > 3_600_000;
+    if (prune) piClockPrunedAt = Date.now();
+    void store.insertPiClockObservation(new Date(piClockOffsetAt), piClockOffsetS, prune)
+      .catch((e) => console.error("pi clock observation failed:", (e as Error).message))
+      .finally(() => { piClockWriteBusy = false; });
+  }
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );

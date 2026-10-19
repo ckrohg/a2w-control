@@ -943,10 +943,14 @@ export class Store {
     );
   }
 
-  /** #165: record one Pi-clock observation (planner now − hub frame ts); keeps 9 days. */
-  async insertPiClockObservation(offsetS: number): Promise<void> {
-    await this.pool.query(`INSERT INTO pi_clock_observations (offset_s) VALUES ($1) ON CONFLICT (at) DO NOTHING`, [offsetS]);
-    await this.pool.query(`DELETE FROM pi_clock_observations WHERE at < now() - interval '9 days'`);
+  /**
+   * #165: record one Pi-clock observation at its MEASUREMENT time (a delayed write cannot move clock evidence later).
+   * Runs on the bounded pool (connect / statement / query timeouts): it is diagnostic and must never hold anything up
+   * (codex pass 19). `prune` drops rows older than 9 days.
+   */
+  async insertPiClockObservation(at: Date, offsetS: number, prune = false): Promise<void> {
+    await this.locked.query(`INSERT INTO pi_clock_observations (at, offset_s) VALUES ($1, $2) ON CONFLICT (at) DO NOTHING`, [at, offsetS]);
+    if (prune) await this.locked.query(`DELETE FROM pi_clock_observations WHERE at < now() - interval '9 days'`);
   }
 
   /**

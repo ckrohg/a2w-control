@@ -286,6 +286,10 @@ function observations(off = 3, dropouts: [string, string][] = [
   assert.equal(piHealth({ ...clean, stats: { ...stats, clockSteps: [s("2026-10-16T15:00:00Z")] } }, NOW, 4).dropouts_7d[2].verdict, "socket_only");
   assert.equal(piHealth({ ...clean, readings: { ...readings, clockIntervals: [{ start: s("2026-10-15T19:00:00Z"), end: s("2026-10-15T19:20:00Z") }] } }, NOW, 4)
     .dropouts_7d[1].verdict, "unknown");
+  // codex pass 19: a re-stamped span ENCLOSING the whole bracket (neither endpoint inside) still voids it — even a
+  // certain reboot (W1)
+  const encl = piHealth({ ...clean, readings: { ...readings, clockIntervals: [{ start: s("2026-10-14T13:00:00Z"), end: s("2026-10-14T19:00:00Z") }] } }, NOW, 4);
+  assert.equal(encl.dropouts_7d[0].verdict, "unknown", "W1's gap+reboot inside an enclosing re-stamped span → unknown");
   // a missing bracket (the planner was down the half hour before a window) → unknown
   const gapObs = observations().filter((o) => !(o.at > s("2026-10-16T09:20:00Z") && o.at <= s("2026-10-16T10:00:00Z")));
   assert.equal(piHealth({ ...clean, clockObs: gapObs }, NOW, 4).dropouts_7d[2].verdict, "unknown");
