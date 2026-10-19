@@ -52,3 +52,478 @@ export function diffConfig(prev: HbxConfig, next: HbxConfig): Record<string, Fie
   }
   return Object.keys(changes).length ? changes : null;
 }
+
+// ── #177: self-diagnosing foreign-curve alert ─────────────────────────────────────────────────────
+// 2026-10-18 21:05:56Z and 22:05:56Z the drift poll paged "FOREIGN HBX CURVE WRITE" twice: 120/118 → 141/137 and
+// 120/118 → 129/125, each exactly 1 °F under the planner's OWN flat band written shortly before (142/138 soak at
+// 20:41Z, 130/126 bank at 21:36Z) and ~5 min after the planner replaced that band with the shaped curve. Nobody used
+// the app and no second writer was found, but the row stored only CONFIG_FIELDS + the diff, so nothing recorded
+// could tell a device/cloud echo of our own write from a real second writer. Everything below exists so the next
+// such page explains itself: the raw device object on every version row, a re-read before paging, the planner's
+// last write beside the row, and a verdict.
+
+/** The reset-curve fields the planner writes (writes.ts setTarget: dbt/mbt; setCurve: dot/dbt/mbt + wwsd unchanged). */
+export const CURVE_FIELDS = ["dbt", "mbt", "dot", "wwsd"] as const;
+/** A changed curve field within this of a value the planner itself wrote is an echo suspect, not a second writer. */
+export const ECHO_TOLERANCE_F = 2;
+/** How far back a planner write counts as "ours" for the echo test. */
+export const ECHO_WINDOW_MS = 60 * 60 * 1000;
+/** Re-read delay: a stale cloud read must not be filed as a writer. */
+export const REREAD_DELAY_MS = 30_000;
+
+/**
+ * Device-side provenance carried by the SensorLinx object (as-found 2026-07-13: changeSource "server",
+ * updatedAt / connectedAt / createdAt ISO strings). The raw object keeps them whole; this is the readable subset
+ * for pages and /health. Any other `…At` key the API adds later is picked up too.
+ */
+export function deviceMeta(dev: Record<string, any> | null | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!dev || typeof dev !== "object") return out;
+  for (const [k, v] of Object.entries(dev)) {
+    if (k === "changeSource" || /At$/.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+/** The PATCH response echo worth keeping beside an hbx_writes row: the written fields, the curve, provenance. */
+export function patchEcho(dev: Record<string, any>, fields: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of new Set([...Object.keys(fields), ...CURVE_FIELDS])) if (k in dev) out[k] = dev[k];
+  return { ...out, ...deviceMeta(dev) };
+}
+
+/** One accepted planner write, as hbx_writes records it. `requested` is what patch() sent (dbt/mbt[/dot/wwsd]). */
+export interface PlannerWrite {
+  at: string;
+  source: string;
+  action: string;
+  requested: Record<string, unknown> | null;
+  /** PATCH response echo (hbx_writes.response, #177); null on rows written before the column existed. */
+  echo: Record<string, unknown> | null;
+  /**
+   * accepted | verify_mismatch — a PATCH the API acknowledged with a DIFFERENT echo (asked 142, told 141) is still our
+   * write as far as the device is concerned, and the most telling one for the echo test (codex pass 7).
+   */
+  result?: string;
+}
+
+export type CurveVerdict = "echo_suspected" | "foreign";
+export interface EchoMatch { field: string; value: unknown; written: number | null; written_at: string | null; delta_f: number | null }
+
+/**
+ * The verdict for a curve change: `echo_suspected` when EVERY changed curve field's new value is within
+ * ECHO_TOLERANCE_F of a value the planner wrote to that same field in the ECHO_WINDOW_MS before `atMs`;
+ * otherwise `foreign`. null when no curve field changed (not a curve event). Pure.
+ */
+export function curveVerdict(
+  changes: Record<string, FieldChange>,
+  writes: PlannerWrite[],
+  atMs: number,
+): { verdict: CurveVerdict; matches: EchoMatch[] } | null {
+  const fields = CURVE_FIELDS.filter((f) => f in changes);
+  if (!fields.length) return null;
+  const inWindow = writes.filter((w) => {
+    const t = Date.parse(w.at);
+    return Number.isFinite(t) && t <= atMs && atMs - t <= ECHO_WINDOW_MS;
+  });
+  const matches: EchoMatch[] = fields.map((field) => {
+    const value = changes[field].new;
+    let best: EchoMatch = { field, value, written: null, written_at: null, delta_f: null };
+    if (typeof value !== "number") return best;
+    for (const w of inWindow) {
+      const v = w.requested?.[field];
+      if (typeof v !== "number") continue;
+      const delta = Math.round((value - v) * 10) / 10;
+      if (best.delta_f === null || Math.abs(delta) < Math.abs(best.delta_f)) {
+        best = { field, value, written: v, written_at: w.at, delta_f: delta };
+      }
+    }
+    return best;
+  });
+  const echo = matches.every((m) => m.delta_f !== null && Math.abs(m.delta_f) <= ECHO_TOLERANCE_F);
+  return { verdict: echo ? "echo_suspected" : "foreign", matches };
+}
+
+/** A row for hbx_config_versions. `raw` = the poll read that saw the change; `rereadRaw` = the confirmation read. */
+export interface ConfigVersionRecord {
+  config: HbxConfig;
+  changes: Record<string, FieldChange> | null;
+  raw: Record<string, any> | null;
+  rereadRaw?: Record<string, any> | null;
+  verdict?: CurveDiagnosis["verdict"] | null;
+  diagnosis?: CurveDiagnosis | null;
+}
+
+/** What /health.drift.last_foreign and the version row's `diagnosis` carry. */
+export interface CurveDiagnosis {
+  at: string;
+  /** The curve change that stands (prev → re-read); for `reverted`, the transient first-read change. */
+  fields: Record<string, FieldChange>;
+  /** unconfirmed = no confirmation read (failed / shutdown): never recorded, never paged, re-checked next poll. */
+  verdict: CurveVerdict | "reverted" | "unconfirmed";
+  /** true = the re-read still showed the change; false = it reverted (no page); null = no re-read (failed / shutdown). */
+  reread_confirmed: boolean | null;
+  reread_at: string | null;
+  reread_error: string | null;
+  /** A planner write self-recorded a new version during the wait; the re-read was judged against it. */
+  baseline_moved: boolean;
+  first_read_at: string;
+  planner_last_write: PlannerWrite | null;
+  planner_writes_60m: PlannerWrite[];
+  matches: EchoMatch[];
+  device_before: Record<string, unknown>;
+  device_after: Record<string, unknown>;
+  paged: "high" | "default" | null;
+}
+
+export interface DriftDeps {
+  /** Re-read the device (index.ts: slx.getDevice). */
+  reread: () => Promise<Record<string, any>>;
+  /** Sleep ms; resolves false when cut short (shutdown) — the re-read is then skipped, never delayed past a handover. */
+  wait: (ms: number) => Promise<boolean>;
+  /** The newest accepted planner write, and every accepted write since sinceMs (hbx_writes). */
+  plannerWrites: (sinceMs: number) => Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }>;
+  record: (row: ConfigVersionRecord) => Promise<void>;
+  /**
+   * The newest recorded version, re-fetched after the wait: a dashboard write (boost, manual target) can land during
+   * the 30 s and self-record its own version — the re-read must be judged against THAT, or our own write would be
+   * filed as a curve change. Optional; without it the poll-time baseline stands.
+   */
+  latest?: () => Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null>;
+  /** Resolves false when no channel acknowledged the alert (index.ts ntfyDelivered); void = assume delivered. */
+  notify: (title: string, body: string, priority: string, opts?: { email?: boolean }) => Promise<boolean | void>;
+  /** writes.ts withDeviceLock — serialises the re-read → record with the planner's own PATCH → record. */
+  lock?: <T>(fn: () => Promise<T>) => Promise<T>;
+  now?: () => number;
+  log?: (msg: string) => void;
+}
+
+export interface DriftOutcome {
+  kind: "seeded" | "unchanged" | "config_drift" | "curve";
+  /** The config now on record (the re-read's when one was taken) — what the rest of the poll should use. */
+  config: HbxConfig;
+  /** The device object `config` came from. */
+  device: Record<string, any>;
+  /** Changes recorded (null when nothing changed for good). */
+  changes: Record<string, FieldChange> | null;
+  diagnosis: CurveDiagnosis | null;
+  /**
+   * true = a curve change was seen but is neither confirmed nor durably recorded (no evidence row: the DB failed, or
+   * SIGTERM). index.ts then fails this poll — no controller may overwrite the curve before the observation is kept
+   * (codex pass 6) — exactly as a failed device read already does; the next poll sees the same diff again.
+   */
+  unsettled?: boolean;
+  /** For an echo_suspected / foreign page: false = no channel acknowledged it (PendingTracker then keeps any pending one). */
+  delivered?: boolean;
+}
+
+const curveChanged = (c: Record<string, FieldChange> | null): boolean => !!c && ("dbt" in c || "mbt" in c);
+const fmtChanges = (c: Record<string, FieldChange>): string =>
+  Object.entries(c).map(([k, v]) => `${k}: ${v.old} -> ${v.new}`).join("\n");
+const fmtMeta = (m: Record<string, unknown>): string =>
+  Object.keys(m).length ? Object.entries(m).map(([k, v]) => `${k}=${v}`).join(" ") : "(none in object)";
+const fmtWrite = (w: PlannerWrite | null): string => {
+  if (!w) return "none on record";
+  const req = w.requested ? Object.entries(w.requested).map(([k, v]) => `${k} ${v}`).join(" / ") : "—";
+  const echo = w.echo ? Object.entries(w.echo).map(([k, v]) => `${k} ${v}`).join(" / ") : "not recorded";
+  return `${w.at} ${w.source}:${w.action}${w.result && w.result !== "accepted" ? ` (${w.result})` : ""} requested ${req}; PATCH echo ${echo}`;
+};
+
+/** The evidence block both curve pages carry — enough to tell an echo from a writer without opening the DB. */
+export function diagnosisBody(d: CurveDiagnosis): string {
+  const reread = d.reread_confirmed === true ? `confirmed at ${d.reread_at}`
+    : d.reread_confirmed === false ? `REVERTED at ${d.reread_at}`
+    : `not taken (${d.reread_error ?? "unknown"})`;
+  const matches = d.matches.map((m) => m.written === null
+    ? `${m.field} ${m.value}: no planner write of ${m.field} in the last 60 min`
+    : `${m.field} ${m.value}: planner wrote ${m.written} at ${m.written_at} (Δ ${m.delta_f} °F)`).join("\n");
+  return [
+    `Changed (recorded → device):\n${fmtChanges(d.fields)}`,
+    `First read ${d.first_read_at}; re-read after ${REREAD_DELAY_MS / 1000} s: ${reread}`,
+    `Nearest planner-written values (±${ECHO_TOLERANCE_F} °F = echo):\n${matches}`,
+    `Planner's last write: ${fmtWrite(d.planner_last_write)}`,
+    `Device metadata before: ${fmtMeta(d.device_before)}`,
+    `Device metadata after:  ${fmtMeta(d.device_after)}`,
+    `Verdict: ${d.verdict}. Raw device objects: hbx_config_versions.raw / reread_raw (#177).`,
+  ].join("\n\n");
+}
+
+export const ECHO_TITLE = "HBX curve differs from our write (possible device/cloud transform)";
+export const FOREIGN_TITLE = "⚠ Foreign HBX curve write — single-writer invariant";
+
+/**
+ * The drift detector's whole decision for one poll: seed, record a non-curve drift, or — on a dbt/mbt diff —
+ * re-read after REREAD_DELAY_MS, page only if the change persists, and say whether it looks like an echo of the
+ * planner's own write (default page, no single-writer claim) or a foreign writer (today's high page). Every curve
+ * event records a row with both reads, even one that reverted (changed_fields null then, so the mirror's drift
+ * badge and the TempIQ window closer — which read changed_fields — never count a transient as a curve change).
+ */
+export async function handlePolledConfig(
+  prev: { config: HbxConfig; raw: Record<string, any> | null } | null,
+  dev: Record<string, any>,
+  deps: DriftDeps,
+): Promise<DriftOutcome> {
+  const now = deps.now ?? Date.now;
+  const log = deps.log ?? ((m: string) => console.warn(m));
+  const config = extractConfig(dev);
+  const lock = deps.lock ?? (<T>(fn: () => Promise<T>) => fn());
+  // Every baseline-changing record happens under the device lock, after re-checking that no planner write has
+  // self-recorded a newer version since this poll read `prev` (codex pass 2: an unlocked insert of a stale
+  // observation would make it the latest config again over our own write). A moved baseline means this poll's
+  // observation is already history — record nothing; the next poll diffs against the new baseline.
+  const baselineMoved = async (): Promise<boolean> => {
+    if (!deps.latest) return false;
+    const cur = await deps.latest();
+    return JSON.stringify(cur?.config ?? null) !== JSON.stringify(prev?.config ?? null);
+  };
+  const stale: DriftOutcome = { kind: "unchanged", config, device: dev, changes: null, diagnosis: null };
+  if (prev === null) {
+    const seeded = await lock(async () => {
+      if (await baselineMoved()) return false;
+      await deps.record({ config, changes: null, raw: dev });
+      return true;
+    });
+    return seeded ? { kind: "seeded", config, device: dev, changes: null, diagnosis: null } : stale;
+  }
+  const changes = diffConfig(prev.config, config);
+  if (!changes) return { kind: "unchanged", config, device: dev, changes: null, diagnosis: null };
+
+  if (!curveChanged(changes)) {
+    const recorded = await lock(async () => {
+      if (await baselineMoved()) return false;
+      await deps.record({ config, changes, raw: dev });
+      return true;
+    });
+    if (!recorded) { log("HBX config drift seen, but a planner write moved the baseline meanwhile — re-checked next poll"); return stale; }
+    const summary = fmtChanges(changes);
+    log(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
+    // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
+    // history and the /hbx page, not in a daily email that would dilute the warn tier.
+    await deps.notify("HBX config changed (outside the planner)", summary, "high", { email: false });
+    return { kind: "config_drift", config, device: dev, changes, diagnosis: null };
+  }
+
+  const firstAtMs = now();
+  type Writes = { last: PlannerWrite | null; recent: PlannerWrite[] };
+  const NO_WRITES: Writes = { last: null, recent: [] };
+  // null = the history could not be read — distinct from "no planner writes": an unavailable history must never
+  // turn into a foreign-writer claim (codex pass 7)
+  const lookupWrites = async (atMs: number): Promise<Writes | null> => {
+    try { return await deps.plannerWrites(atMs - ECHO_WINDOW_MS); }
+    catch (e) { log(`planner-write lookup failed: ${(e as Error).message}`); return null; }
+  };
+  const diagnose = (
+    o: { fields: Record<string, FieldChange>; verdict: CurveDiagnosis["verdict"]; confirmed: boolean | null; rereadAt: string | null;
+         rereadError: string | null; baselineMoved: boolean; writes: { last: PlannerWrite | null; recent: PlannerWrite[] };
+         matches: EchoMatch[]; before: Record<string, any> | null; after: Record<string, any> },
+  ): CurveDiagnosis => ({
+    at: new Date(firstAtMs).toISOString(),
+    fields: o.fields,
+    verdict: o.verdict,
+    reread_confirmed: o.confirmed,
+    reread_at: o.rereadAt,
+    reread_error: o.rereadError,
+    baseline_moved: o.baselineMoved,
+    first_read_at: new Date(firstAtMs).toISOString(),
+    planner_last_write: o.writes.last,
+    planner_writes_60m: o.writes.recent,
+    matches: o.matches,
+    device_before: deviceMeta(o.before),
+    device_after: deviceMeta(o.after),
+    paged: o.verdict === "foreign" ? "high" : o.verdict === "echo_suspected" ? "default" : null,
+  });
+  // No confirmation read (it failed, or SIGTERM cut the wait / the read short): the baseline does NOT advance and
+  // nobody is paged — the change has not been shown to persist (#177), and recording the first read as the config
+  // would overwrite whatever a planner write may have put there meanwhile (codex pass 1). latestConfig() stays put, so
+  // the next poll (or the successor's first poll) sees the same diff and runs the whole check again. A failed re-read
+  // (not a shutdown) still leaves an evidence row, and if the next poll no longer sees the change — our own write
+  // superseded it, or it vanished — pendingUnconfirmedNotice() says so at default priority (codex pass 3).
+  const unconfirmedDiagnosis = async (
+    why: string, baselineMoved = false, o: { writes?: Writes | null; rereadAt?: string | null; after?: Record<string, any> } = {},
+  ): Promise<CurveDiagnosis> => {
+    const writes = (o.writes === undefined ? await lookupWrites(firstAtMs) : o.writes) ?? NO_WRITES;
+    return diagnose({
+      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: o.rereadAt ?? null, rereadError: why, baselineMoved, writes,
+      matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: o.after ?? dev,
+    });
+  };
+  const unconfirmed = async (why: string, recorded?: CurveDiagnosis): Promise<DriftOutcome> => {
+    const diagnosis = recorded ?? await unconfirmedDiagnosis(why);
+    const unsettled = !recorded;
+    log(`HBX curve change seen but not confirmed (${why}) — not recorded, not paged; the next poll re-checks:\n${fmtChanges(changes)}`);
+    return { kind: "curve", config, device: dev, changes: null, diagnosis, unsettled };
+  };
+  if (!(await deps.wait(REREAD_DELAY_MS))) return unconfirmed("re-read skipped: planner shutting down");
+
+  // Re-read → baseline → verdict → record, all under the device lock (writes.ts withDeviceLock): no planner write can
+  // land between the confirmation read and the row, so the read is judged against every write that has completed.
+  type Locked = { unconfirmed: string; diagnosis?: CurveDiagnosis } | { diagnosis: CurveDiagnosis; finalDev: Record<string, any>; finalConfig: HbxConfig; finalChanges: Record<string, FieldChange> | null };
+  const locked: Locked = await lock(async (): Promise<Locked> => {
+    let reread: Record<string, any>;
+    try { reread = await deps.reread(); }
+    catch (e) {
+      const why = `re-read failed: ${(e as Error).message}`;
+      if (/shutting down/.test(why)) return { unconfirmed: why };
+      // Keep the evidence durably (codex passes 3 + 5): an evidence row whose config is the CURRENT baseline (the
+      // newest recorded version, re-read under the lock — a planner write during the wait included), so it can never
+      // move the baseline or close a TempIQ window (changed_fields NULL), carrying the first read whole. A restart
+      // before the next poll reloads it (store.pendingUnconfirmed).
+      try {
+        const cur = (deps.latest ? await deps.latest() : null) ?? prev;
+        const d = await unconfirmedDiagnosis(why, JSON.stringify(cur.config) !== JSON.stringify(prev.config));
+        await deps.record({ config: cur.config, changes: null, raw: dev, rereadRaw: null, verdict: "unconfirmed", diagnosis: d });
+        return { unconfirmed: why, diagnosis: d };
+      } catch (e2) { log(`unconfirmed evidence row not written: ${(e2 as Error).message}`); }
+      return { unconfirmed: why };
+    }
+    const rereadAtMs = now();
+    const rereadAt = new Date(rereadAtMs).toISOString();
+    // A planner write may have self-recorded a version during the wait: judge the re-read against THAT.
+    let base = prev;
+    if (deps.latest) {
+      try { base = (await deps.latest()) ?? prev; }
+      catch (e) { return { unconfirmed: `latest-version re-fetch failed: ${(e as Error).message}` }; }
+    }
+    const moved = JSON.stringify(base.config) !== JSON.stringify(prev.config);
+    const finalConfig = extractConfig(reread);
+    const finalChanges = diffConfig(base.config, finalConfig);
+    const confirmed = curveChanged(finalChanges);
+    // The standing change is the RE-READ's, so the echo window ends at the re-read: a planner write that landed
+    // during the wait counts as ours (codex pass 2 — anchored at the first read, a 1 °F transform of a write made
+    // during the 30 s would have paged high as foreign).
+    const writes = await lookupWrites(rereadAtMs);
+    // Not yet a verdict (codex pass 7) — keep both reads as evidence on a row whose config is the CURRENT baseline,
+    // page nobody, and let the next poll re-check: (a) the re-read shows a DIFFERENT curve from the first read — it
+    // too has been seen only once (a planner write during the wait included); (b) the planner-write history could not
+    // be read — classifying without it would turn a transform of our own write into a foreign-writer page.
+    const sameCurve = CURVE_FIELDS.every((f) => JSON.stringify(config[f]) === JSON.stringify(finalConfig[f]));
+    if (confirmed && (!sameCurve || writes === null)) {
+      const why = !sameCurve ? "the re-read showed a different curve from the first read — a new candidate, re-checked next poll"
+        : "the planner-write history could not be read — classification retried next poll";
+      const d = await unconfirmedDiagnosis(why, moved, { writes, rereadAt, after: reread });
+      await deps.record({ config: base.config, changes: null, raw: dev, rereadRaw: reread, verdict: "unconfirmed", diagnosis: d });
+      return { unconfirmed: why, diagnosis: d };
+    }
+    // A reverted curve keeps the first read's change in the diagnosis but is not a curve event.
+    const fields = confirmed ? (finalChanges as Record<string, FieldChange>) : changes;
+    const v = curveVerdict(fields, (writes ?? NO_WRITES).recent, confirmed ? rereadAtMs : firstAtMs);
+    const verdict: CurveDiagnosis["verdict"] = confirmed ? (v?.verdict ?? "foreign") : "reverted";
+    const diagnosis = diagnose({
+      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved: moved, writes: writes ?? NO_WRITES, matches: v?.matches ?? [],
+      before: base.raw, after: reread,
+    });
+    await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict, diagnosis });
+    return { diagnosis, finalDev: reread, finalConfig, finalChanges };
+  });
+  if ("unconfirmed" in locked) return unconfirmed(locked.unconfirmed, locked.diagnosis);
+  const { diagnosis, finalDev, finalConfig, finalChanges } = locked;
+  const verdict = diagnosis.verdict;
+
+  if (verdict === "reverted") {
+    // The change did not persist — a stale/transient cloud read (or superseded by our own write), not a writer.
+    // Both reads are recorded; nobody is paged. A NON-curve field that did change for good is still drift.
+    log(`HBX curve change reverted on re-read (transient, not paged):\n${fmtChanges(changes)}`);
+    if (finalChanges) await deps.notify("HBX config changed (outside the planner)", fmtChanges(finalChanges), "high", { email: false });
+    return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis };
+  }
+
+  const evidence = diagnosisBody(diagnosis);
+  let ack: boolean | void;
+  if (verdict === "echo_suspected") {
+    log(`HBX curve differs from our write — echo suspected (#177):\n${fmtChanges(diagnosis.fields)}`);
+    ack = await deps.notify(
+      ECHO_TITLE,
+      `The reset curve on the device no longer matches the planner's last write, but every changed field is within ` +
+        `${ECHO_TOLERANCE_F} °F of a value the planner itself wrote in the last 60 min — the signature of the device or ` +
+        `the SensorLinx cloud echoing/transforming an earlier planner write, not of a second writer.\n\n${evidence}`,
+      "default",
+      { email: true }, // the email IS the evidence (#177 acceptance)
+    );
+  } else {
+    log(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${fmtChanges(diagnosis.fields)}`);
+    // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
+    // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
+    // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
+    // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
+    ack = await deps.notify(
+      FOREIGN_TITLE,
+      `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${fmtChanges(diagnosis.fields)}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).\n\n${evidence}`,
+      "high",
+    );
+  }
+  return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis, delivered: ack !== false };
+}
+
+export const UNCONFIRMED_TITLE = "HBX curve change seen once, could not be confirmed";
+
+/**
+ * #177 (codex passes 3–4, 10): an `unconfirmed` curve change is re-checked on the next poll. Only a CONFIRMED curve
+ * event (echo_suspected / foreign) whose own page was delivered supersedes it silently; a fresh unconfirmed one replaces it. Any
+ * other outcome — no change (a planner write such as boost expiry replaced the curve, or it vanished), non-curve drift,
+ * or a different change that reverted — would otherwise lose the observation, so it is announced at default priority
+ * with the evidence and no single-writer claim. `resolved` = the pending observation is settled (persist that, so a
+ * restart does not re-announce it — index.ts reloads the newest unresolved one at boot).
+ */
+export function pendingUnconfirmedNotice(
+  pending: CurveDiagnosis | null,
+  outcome: DriftOutcome,
+): { pending: CurveDiagnosis | null; notice: { title: string; body: string } | null; resolved: boolean } {
+  const v = outcome.diagnosis?.verdict;
+  if (v === "unconfirmed") return { pending: outcome.diagnosis, notice: null, resolved: false };
+  if (!pending) return { pending: null, notice: null, resolved: false };
+  // a confirmed page supersedes the pending observation only once it was DELIVERED (codex pass 10) — undelivered, the
+  // pending one stays and is announced on a later poll, so the owner still hears of it
+  if (v === "echo_suspected" || v === "foreign") {
+    return outcome.delivered === false ? { pending, notice: null, resolved: false } : { pending: null, notice: null, resolved: true };
+  }
+  return {
+    pending: null,
+    resolved: true,
+    notice: {
+      title: UNCONFIRMED_TITLE,
+      body: `At ${pending.first_read_at} the device showed a reset-curve change the planner did not write, but it could ` +
+        `not be confirmed (${pending.reread_error ?? "no confirmation"}), and by the next check the change was no longer ` +
+        `there to confirm (a planner write replaced the curve, or the read was transient). Not a confirmed second ` +
+        `writer.\n\n${diagnosisBody(pending)}`,
+    },
+  };
+}
+
+/**
+ * #177 (codex pass 7): owns the pending `unconfirmed` observation for index.ts. The boot-time reload from the DB
+ * (store.pendingUnconfirmed) is retried on every step until it succeeds once — a transient failure at startup must
+ * not drop a persisted observation for the process's lifetime. A resolve that fails is logged; the worst case is the
+ * same notice once more after a restart, never a lost one.
+ */
+export class PendingTracker {
+  private loaded = false;
+  pending: CurveDiagnosis | null = null;
+  constructor(
+    private readonly load: () => Promise<CurveDiagnosis | null>,
+    private readonly resolve: () => Promise<void>,
+    private readonly log: (m: string) => void = (m) => console.error(m),
+  ) {}
+  async ensureLoaded(): Promise<void> {
+    if (this.loaded) return;
+    try { const p = await this.load(); this.pending ??= p; this.loaded = true; }
+    catch (e) { this.log(`pending unconfirmed reload failed (retried next poll): ${(e as Error).message}`); }
+  }
+  /**
+   * Fold this poll's outcome in. A due notice is SENT — and acknowledged by a channel — before the observation is
+   * marked resolved (codex passes 8–9): a crash, SIGTERM or delivery failure in between leaves it pending in the DB,
+   * so it is announced later — at worst twice, never lost. Returns the notice that was delivered, if any.
+   */
+  async step(outcome: DriftOutcome, send: (n: { title: string; body: string }) => Promise<boolean>): Promise<{ title: string; body: string } | null> {
+    await this.ensureLoaded();
+    const c = pendingUnconfirmedNotice(this.pending, outcome);
+    // false = no channel acknowledged it (index.ts ntfy): keep it pending and unresolved — the next poll tries again
+    // (codex pass 9). The outcome that made it due (no change) will still be there, so it is simply re-sent.
+    if (c.notice && !(await send(c.notice))) {
+      this.log("unconfirmed-change notice not acknowledged by any channel — kept pending, retried next poll");
+      return null;
+    }
+    this.pending = c.pending;
+    if (c.resolved) await this.resolve().catch((e) => this.log(`resolveUnconfirmed failed: ${(e as Error).message}`));
+    return c.notice;
+  }
+}

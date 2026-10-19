@@ -7,7 +7,7 @@
  * under tsx like the other planner suites: npx tsx planner/src/writes.test.ts
  */
 import assert from "node:assert/strict";
-import { HbxWriter, WriteError, PI_STATE_FRESH_MS, PI_CLOCK_SKEW_MAX_S, piStateUnverifiable } from "./writes";
+import { HbxWriter, WriteError, PI_STATE_FRESH_MS, PI_CLOCK_SKEW_MAX_S, piStateUnverifiable, deviceWritesInFlight, withDeviceLock } from "./writes";
 import type { HubState } from "./hub";
 
 const nowS = () => Math.floor(Date.now() / 1000);
@@ -165,5 +165,40 @@ async function rejects(p: Promise<unknown>, status: number, re: RegExp): Promise
     cif = (await h.writer.status()).curve_in_force as { shaped: boolean };
     assert.equal(cif.shaped, false, "a plan without a shaped curve → false");
     console.log("writes.test.ts (#173 shaped predicate): all assertions passed");
+  }
+
+  // ── 8. #177: the write stays COUNTED in flight through its self-recorded version + accepted audit row (shutdown
+  // must not hand the lease over before they land — codex pass 2), is released before the notification, and the
+  // PATCH → record runs under the device lock the drift detector shares ─────────────────────────────────────────
+  {
+    const seen: Array<[string, number]> = [];
+    const old = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 };
+    let live = { ...old };
+    const store = {
+      getLatestSlx: async () => ({ ts: new Date(), tankF: 120, targetF: 128, outdoorF: 30 }),
+      latestConfig: async () => ({ ...old }),            // the version before this write → a diff to self-record
+      baselineConfig: async () => ({ ...old }),
+      activeBoost: async () => null,
+      insertHbxWrite: async (w: Audit) => { seen.push([`audit:${w.result}`, deviceWritesInFlight()]); },
+      insertConfigVersion: async (_c: unknown, _ch: unknown, extra: { raw: unknown }) => {
+        seen.push(["version", deviceWritesInFlight()]);
+        assert.ok(extra?.raw && typeof extra.raw === "object", "the self-recorded row carries the raw PATCH response");
+      },
+    } as any;
+    const slx = { patchDevice: async (_b: string, _s: string, f: Record<string, number>) => { seen.push(["patch", deviceWritesInFlight()]); live = { ...live, ...f }; return { ...live, changeSource: "server" }; } } as any;
+    const hub = { getState: async () => ({ pi_connected: true, ts: nowS() - 15, pumps: pumps(60) }) } as any;
+    const w = new HbxWriter(slx, store, hub, "b", "s", async () => { seen.push(["notify", deviceWritesInFlight()]); });
+    // hold the device lock (as the detector does mid-confirmation): the write must wait for it
+    let releaseLock!: () => void;
+    const held = withDeviceLock(() => new Promise<void>((r) => { releaseLock = r; }));
+    const p = w.setTarget(128, "test");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(!seen.some(([k]) => k === "patch"), "no PATCH while another holder has the device lock");
+    releaseLock(); await held;
+    await p;
+    assert.deepEqual(seen, [["patch", 1], ["version", 1], ["audit:accepted", 1], ["notify", 0]],
+      "counted through the version + audit rows, released before the notification");
+    assert.equal(deviceWritesInFlight(), 0);
+    console.log("writes.test.ts (#177 device lock + in-flight accounting): all assertions passed");
   }
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -11,7 +11,7 @@
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { IdentWindow } from "./identify";
-import type { HbxConfig, FieldChange } from "./drift";
+import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 
 export interface SlxReading {
   ts: Date;
@@ -26,15 +26,33 @@ export interface SlxReading {
   connected: boolean | null;
 }
 
+/** Bounds for queries run under the device lock (see Store.locked). */
+export const LOCKED_TIMEOUTS_MS = { connect: 10_000, statement: 10_000, query: 15_000 };
+
 export class Store {
   private pool: Pool;
+  /**
+   * #177 (codex pass 2): the queries that run while the device lock is held (writes.ts withDeviceLock — the writer's
+   * self-record, the drift detector's confirmation record) go through this small pool with a SERVER-side
+   * statement_timeout below a CLIENT-side query_timeout, and a bounded connect/checkout: a stalled connection fails in bounded time and releases the
+   * lock instead of queueing every later PATCH (a restore included) behind it, and any statement the server did
+   * run has finished or been cancelled before the client gives up — so a timed-out insert cannot land after a later
+   * write's. All of them are single-row reads/inserts; the main pool keeps no timeout, as before.
+   */
+  private locked: Pool;
 
-  constructor(databaseUrl: string) {
-    this.pool = new Pool({
-      connectionString: databaseUrl,
-      max: 3,
-      ssl: /localhost|127\.0\.0\.1/.test(databaseUrl) ? undefined : { rejectUnauthorized: false },
+  constructor(databaseUrl: string, lockedTimeoutsMs: typeof LOCKED_TIMEOUTS_MS = LOCKED_TIMEOUTS_MS) {
+    const ssl = /localhost|127\.0\.0\.1/.test(databaseUrl) ? undefined : { rejectUnauthorized: false };
+    this.pool = new Pool({ connectionString: databaseUrl, max: 3, ssl });
+    // connectionTimeoutMillis bounds checkout + connection startup (TLS/auth) too (codex pass 3)
+    this.locked = new Pool({
+      connectionString: databaseUrl, max: 2, ssl,
+      connectionTimeoutMillis: lockedTimeoutsMs.connect,
+      statement_timeout: lockedTimeoutsMs.statement,
+      query_timeout: lockedTimeoutsMs.query,
     });
+    // an idle client dropped by the server must not crash the process (the query path already reports its own errors)
+    this.locked.on("error", (e) => console.error("store (locked pool) idle client error:", e.message));
   }
 
   async ensureSchema(): Promise<void> {
@@ -57,6 +75,14 @@ export class Store {
         changed_fields jsonb,
         config         jsonb NOT NULL
       );
+      -- #177: the drift row must explain itself. raw = the full SensorLinx device object the row was read from
+      -- (changeSource / updatedAt / connectedAt kept whole); on a curve diff, reread_raw = the confirmation read
+      -- ~30 s later, verdict = echo_suspected | foreign | reverted, diagnosis = the planner's last write, the
+      -- writes the echo test used, both read times. Additive; rows before this migration have them NULL.
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS raw        jsonb;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS reread_raw jsonb;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS verdict    text;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS diagnosis  jsonb;
       CREATE TABLE IF NOT EXISTS shadow_plans (
         id          serial PRIMARY KEY,
         computed_at timestamptz NOT NULL DEFAULT now(),
@@ -88,6 +114,9 @@ export class Store {
         result     text NOT NULL,
         detail     text
       );
+      -- #177: the PATCH response echo (written fields + curve + device provenance) — what the device/cloud SAID it
+      -- now holds, beside what we asked for. NULL on rejected attempts and on rows before this migration.
+      ALTER TABLE hbx_writes ADD COLUMN IF NOT EXISTS response jsonb;
       CREATE TABLE IF NOT EXISTS autopilot_log (
         id        serial PRIMARY KEY,
         ts        timestamptz NOT NULL DEFAULT now(),
@@ -852,11 +881,66 @@ export class Store {
   /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */
   async insertHbxWrite(w: {
     source: string; action: string; requested: unknown; result: string; detail: string;
+    /** #177: the PATCH response echo (drift.ts patchEcho) — accepted / verify_mismatch only. */
+    response?: Record<string, unknown> | null;
   }): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO hbx_writes (source, action, requested, result, detail) VALUES ($1,$2,$3,$4,$5)`,
-      [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail],
+    await this.locked.query(
+      `INSERT INTO hbx_writes (source, action, requested, result, detail, response) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail, w.response == null ? null : JSON.stringify(w.response)],
     );
+  }
+
+  /**
+   * #177: the planner's device writes for the foreign-curve verdict — accepted ones and acknowledged verify_mismatch
+   * ones — the newest (whenever it was) and every one since `since`, newest first. `requested` is exactly what patch()
+   * sent the device.
+   */
+  async plannerWrites(since: Date): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> {
+    const toWrite = (r: any): PlannerWrite => ({
+      at: new Date(r.ts).toISOString(), source: String(r.source), action: String(r.action),
+      requested: r.requested && typeof r.requested === "object" ? r.requested : null,
+      echo: r.response && typeof r.response === "object" ? r.response : null,
+      result: String(r.result),
+    });
+    // verify_mismatch = the PATCH reached the device and was acknowledged with a different echo — still our write
+    const [last, recent] = await Promise.all([
+      this.locked.query(`SELECT ts, source, action, requested, response, result FROM hbx_writes WHERE result IN ('accepted', 'verify_mismatch') ORDER BY id DESC LIMIT 1`),
+      this.locked.query(
+        `SELECT ts, source, action, requested, response, result FROM hbx_writes
+         WHERE result IN ('accepted', 'verify_mismatch') AND ts >= $1 ORDER BY id DESC LIMIT 50`, [since]),
+    ]);
+    return { last: last.rowCount ? toWrite(last.rows[0]) : null, recent: recent.rows.map(toWrite) };
+  }
+
+  /**
+   * #177 (codex passes 4, 11): the newest `unconfirmed` observation not yet settled (no resolved_at). resolved_at is the
+   * ONLY settlement signal — PendingTracker stamps it after an acknowledged notice or a DELIVERED confirmed page; a
+   * later confirmed row whose page reached nobody must not hide it. index.ts reloads it at boot so a restart between
+   * the evidence row and the next poll does not lose the follow-up notice.
+   */
+  async pendingUnconfirmed(): Promise<CurveDiagnosis | null> {
+    const r = await this.pool.query(
+      `SELECT diagnosis FROM hbx_config_versions
+       WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL
+       ORDER BY id DESC LIMIT 1`,
+    );
+    return r.rowCount ? (r.rows[0].diagnosis as CurveDiagnosis) : null;
+  }
+
+  /** #177: mark every open `unconfirmed` observation settled (its notice went out, or a confirmed event superseded it). */
+  async resolveUnconfirmed(): Promise<void> {
+    await this.pool.query(
+      `UPDATE hbx_config_versions SET diagnosis = diagnosis || jsonb_build_object('resolved_at', now())
+       WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL`,
+    );
+  }
+
+  /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */
+  async latestCurveDiagnosis(): Promise<CurveDiagnosis | null> {
+    const r = await this.pool.query(
+      `SELECT diagnosis FROM hbx_config_versions WHERE verdict IS NOT NULL AND diagnosis IS NOT NULL ORDER BY id DESC LIMIT 1`,
+    );
+    return r.rowCount ? (r.rows[0].diagnosis as CurveDiagnosis) : null;
   }
 
   /**
@@ -1278,19 +1362,30 @@ export class Store {
   }
 
   async latestConfig(): Promise<HbxConfig | null> {
-    const res = await this.pool.query(
+    const res = await this.locked.query(
       `SELECT config FROM hbx_config_versions ORDER BY id DESC LIMIT 1`,
     );
     return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
   }
 
+  /** The newest version row's config AND raw device object (#177: the "before" provenance for a curve page). */
+  async latestConfigVersion(): Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null> {
+    const res = await this.locked.query(
+      `SELECT config, raw FROM hbx_config_versions ORDER BY id DESC LIMIT 1`,
+    );
+    return res.rowCount ? { config: res.rows[0].config as HbxConfig, raw: (res.rows[0].raw ?? null) as Record<string, any> | null } : null;
+  }
+
   async insertConfigVersion(
     config: HbxConfig,
     changedFields: Record<string, FieldChange> | null,
+    // #177: the raw device object(s) and the curve verdict. Optional so every older call shape still works.
+    extra: Pick<ConfigVersionRecord, "raw" | "rereadRaw" | "verdict" | "diagnosis"> = { raw: null },
   ): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO hbx_config_versions (changed_fields, config) VALUES ($1, $2)`,
-      [changedFields === null ? null : JSON.stringify(changedFields), JSON.stringify(config)],
+    const j = (v: unknown) => (v == null ? null : JSON.stringify(v));
+    await this.locked.query(
+      `INSERT INTO hbx_config_versions (changed_fields, config, raw, reread_raw, verdict, diagnosis) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [j(changedFields), JSON.stringify(config), j(extra.raw), j(extra.rereadRaw), extra.verdict ?? null, j(extra.diagnosis)],
     );
   }
 
@@ -1364,6 +1459,6 @@ export class Store {
   }
 
   async close(): Promise<void> {
-    await this.pool.end();
+    await Promise.all([this.pool.end(), this.locked.end()]);
   }
 }

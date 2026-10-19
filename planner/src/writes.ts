@@ -19,7 +19,7 @@ import { SensorLinxClient } from "./sensorlinx";
 import { Store } from "./store";
 import { HubClient, type HubState } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
-import { extractConfig, diffConfig } from "./drift";
+import { extractConfig, diffConfig, patchEcho } from "./drift";
 import { curveAlreadyInForce, curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
@@ -75,6 +75,18 @@ export function raiseWriteBarrier(): void { writeBarrier = true; }
 export function isWriteBarrierUp(): boolean { return writeBarrier; }
 /** Device PATCHes currently on the wire. */
 export function deviceWritesInFlight(): number { return writesInFlight; }
+
+// #177 (codex pass 1): one in-process lock around "the device's curve changes → the change is recorded". patch()
+// holds it from the PATCH through its self-recorded config version; the drift detector holds it from its 30-s
+// confirmation re-read through its own record. Without it a dashboard write could land between the detector's
+// re-read and its record (our own write paged as a curve change, or a stale curve recorded over ours). The planner
+// is the sole writer (#36), so an in-process lock covers every write path; it is never held across the 30-s wait.
+let deviceLock: Promise<unknown> = Promise.resolve();
+export function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = deviceLock.then(fn, fn);
+  deviceLock = run.catch(() => {});
+  return run;
+}
 
 export class WriteError extends Error {
   /**
@@ -395,9 +407,11 @@ export class HbxWriter {
     // ADMISSION is counted synchronously, right after the barrier check and before any await: a write that has
     // passed the barrier is in flight from this point (including the dashboard API routes, which are not inside the
     // poll loop), so shutdown's "no device write on the wire" check cannot miss one blocked in the lease query
-    // (codex pass 3 on #162). Released in the finally below on every path.
+    // (codex pass 3 on #162). Released once the write is RECORDED (or failed), before the notification; the finally
+    // below covers every other path.
     writesInFlight++;
-    let dev: Record<string, any>;
+    let released = false;
+    const release = () => { if (!released) { released = true; writesInFlight--; } };
     try {
       // Single-writer lease gate (flag-gated; null = disabled). If this instance does not hold a
       // fresh lease, another planner is the active writer — refuse BEFORE touching the device.
@@ -409,25 +423,44 @@ export class HbxWriter {
           throw new WriteError(423, "refused: this instance does not hold the single-writer lease (another planner is the active writer). See README §Single-writer invariant, #36.");
         }
       }
-      // the barrier may have gone up while the lease query was in flight — the lease answer is then stale by design
-      if (writeBarrier) {
-        await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier went up during the lease check" });
-        throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
-      }
-      try {
-        dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
-      } catch (e) {
-        await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
-        throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
-      }
+      const out = await withDeviceLock(async () => {
+        // the barrier may have gone up while the lease query (or the wait for the device lock) was in flight — the
+        // lease answer is then stale by design
+        if (writeBarrier) {
+          await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier went up during the lease check" });
+          throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
+        }
+        let dev: Record<string, any>;
+        try {
+          dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
+        } catch (e) {
+          await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
+          throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
+        }
+        // still counted as in flight: the self-recorded version + audit row are part of the write — shutdown must not
+        // hand the lease over (and a successor must not record its own curve) before they land (codex pass 2)
+        return this.recordWrite(dev, fields, source, action, summary);
+      });
+      release();
+      await this.notify(`HBX ${action} (${source})`, summary); // outside the lock and the count: a slow ntfy holds neither
+      return out;
     } finally {
-      writesInFlight--;
+      release();
     }
+  }
 
+  /** Verify the PATCH echo and self-record the write — runs inside withDeviceLock, straight after the PATCH. */
+  private async recordWrite(
+    dev: Record<string, any>,
+    fields: Record<string, number>,
+    source: string,
+    action: string,
+    summary: string,
+  ): Promise<Record<string, unknown>> {
     const mismatches = Object.entries(fields).filter(([k, v]) => dev[k] !== v);
     if (mismatches.length) {
       const detail = `read-back mismatch: ${mismatches.map(([k, v]) => `${k} wanted ${v} got ${dev[k]}`).join("; ")}`;
-      await this.store.insertHbxWrite({ source, action, requested: fields, result: "verify_mismatch", detail });
+      await this.store.insertHbxWrite({ source, action, requested: fields, result: "verify_mismatch", detail, response: patchEcho(dev, fields) });
       throw new WriteError(502, detail);
     }
 
@@ -438,12 +471,13 @@ export class HbxWriter {
     const changes = prev ? diffConfig(prev, newCfg) : null;
     if (changes) {
       (changes as Record<string, unknown>)["_source"] = `${source}:${action}`;
-      await this.store.insertConfigVersion(newCfg, changes);
+      // #177: the PATCH response IS the device object — keep it whole, so a later "foreign" diff can be read
+      // against exactly what the cloud said it held right after our write.
+      await this.store.insertConfigVersion(newCfg, changes, { raw: dev });
     }
 
     this.lastWriteAt = Date.now();
-    await this.store.insertHbxWrite({ source, action, requested: fields, result: "accepted", detail: summary });
-    await this.notify(`HBX ${action} (${source})`, summary);
+    await this.store.insertHbxWrite({ source, action, requested: fields, result: "accepted", detail: summary, response: patchEcho(dev, fields) });
     return { ok: true, ...fields, detail: summary };
   }
 }
