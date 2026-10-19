@@ -1,0 +1,142 @@
+{
+ "source": "SPAN panel GET /api/openapi.json, firmware r202639, saved 2026-10-18",
+ "info": {
+  "title": "Span",
+  "description": "Span Panel REST API. The v1 REST endpoints are deprecated and will be removed on 2026-12-31; see the migration guide in the SPAN API Client Docs.",
+  "version": "v1+v2"
+ },
+ "post": {
+  "requestBody": {
+   "content": {
+    "application/json": {
+     "schema": {
+      "$ref": "#/components/schemas/Body_set_circuit_state_api_v1_circuits__circuitId__post"
+     }
+    }
+   }
+  },
+  "responses": {
+   "422": {
+    "description": "The request could not be processed",
+    "content": {
+     "application/json": {
+      "schema": {
+       "$ref": "#/components/schemas/ErrorOut"
+      }
+     }
+    }
+   }
+  }
+ },
+ "schemas": {
+  "ErrorOut": {
+   "title": "ErrorOut",
+   "required": [
+    "detail"
+   ],
+   "type": "object",
+   "properties": {
+    "detail": {
+     "title": "Detail",
+     "type": "string"
+    }
+   },
+   "description": "An error response. detail is a single human-readable message."
+  },
+  "Body_set_circuit_state_api_v1_circuits__circuitId__post": {
+   "title": "Body_set_circuit_state_api_v1_circuits__circuitId__post",
+   "type": "object",
+   "properties": {
+    "relayStateIn": {
+     "$ref": "#/components/schemas/RelayStateIn"
+    },
+    "priorityIn": {
+     "$ref": "#/components/schemas/PriorityIn"
+    },
+    "circuitNameIn": {
+     "$ref": "#/components/schemas/CircuitNameIn"
+    },
+    "userControllableIn": {
+     "$ref": "#/components/schemas/BooleanIn"
+    },
+    "sheddableIn": {
+     "$ref": "#/components/schemas/BooleanIn"
+    },
+    "neverBackupIn": {
+     "$ref": "#/components/schemas/BooleanIn"
+    }
+   }
+  },
+  "RelayStateIn": {
+   "title": "RelayStateIn",
+   "required": [
+    "relayState"
+   ],
+   "type": "object",
+   "properties": {
+    "relayState": {
+     "$ref": "#/components/schemas/RelayState"
+    }
+   }
+  },
+  "RelayState": {
+   "title": "RelayState",
+   "enum": [
+    "UNKNOWN",
+    "OPEN",
+    "CLOSED"
+   ],
+   "type": "string",
+   "description": "An enumeration."
+  },
+  "PriorityIn": {
+   "title": "PriorityIn",
+   "required": [
+    "priority"
+   ],
+   "type": "object",
+   "properties": {
+    "priority": {
+     "$ref": "#/components/schemas/Priority"
+    }
+   }
+  },
+  "Priority": {
+   "title": "Priority",
+   "enum": [
+    "UNKNOWN",
+    "NON_ESSENTIAL",
+    "NICE_TO_HAVE",
+    "MUST_HAVE"
+   ],
+   "type": "string",
+   "description": "An enumeration."
+  },
+  "CircuitNameIn": {
+   "title": "CircuitNameIn",
+   "required": [
+    "name"
+   ],
+   "type": "object",
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   }
+  },
+  "BooleanIn": {
+   "title": "BooleanIn",
+   "required": [
+    "value"
+   ],
+   "type": "object",
+   "properties": {
+    "value": {
+     "title": "Value",
+     "type": "boolean"
+    }
+   }
+  }
+ }
+}

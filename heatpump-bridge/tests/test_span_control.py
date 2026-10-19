@@ -2,7 +2,8 @@
 # socket (sim/fake_span.py): allowlist + per-circuit OFF opt-ins, the 60 s floor, CLOSE in a
 # finally (exception AND a vanished caller), CLOSE retries + urgent page + background re-close,
 # the global lock, isUserControllable, never two heat pumps off, read-back mismatch, crash
-# recovery from the cycle record, the OpenPermit keystone, the human-only API, and the hub relay.
+# recovery from the cycle record, the OpenPermit keystone, the human-only API, the hub relay, and
+# the relay-write wire format against the panel's own published schema.
 # Time is faked (injected sleep/clock) so a 60 s hold costs nothing.
 from __future__ import annotations
 
@@ -820,3 +821,58 @@ async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(
         await client.stop()
         server.close()
         await server.wait_closed()
+
+
+# --- wire format: the panel's own schema --------------------------------------------------------
+# The 2026-10-19 Air-Water 2 test failed at the panel with HTTP 422: the bridge sent a flat
+# {"relayStateIn": "OPEN"} and the panel's schema nests it. The fake now validates against the
+# schema cut from the real panel's /api/openapi.json, so a body the panel would refuse fails here.
+
+def _client(panel: FakeSpan) -> SpanClient:
+    return SpanClient(panel.start(), "hunter2-passphrase", token=FakeSpan.TOKEN)
+
+
+async def test_relay_write_body_matches_the_panels_schema():
+    panel = FakeSpan()
+    try:
+        client = _client(panel)
+        permit = OpenPermit("c-aw2", "Air-Water 2", "wire-format test")
+        assert await client.set_relay("c-aw2", "OPEN", open_permit=permit) == "OPEN"
+        assert await client.set_relay("c-aw2", "CLOSED") == "CLOSED"
+        assert panel.rejected == []
+        assert panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
+    finally:
+        panel.stop()
+
+
+def test_fake_refuses_the_flat_body_the_real_panel_refused():
+    panel = FakeSpan()
+    try:
+        client = _client(panel)
+        status, payload = client._request(client._candidates()[0], "/api/v1/circuits/c-aw2",
+                                          method="POST", body={"relayStateIn": "OPEN"},
+                                          token=FakeSpan.TOKEN)
+        assert status == 422 and "relayStateIn" in payload["detail"]
+        assert panel.relay("Air-Water 2") == "CLOSED" and panel.writes == []
+        status, payload = client._request(client._candidates()[0], "/api/v1/circuits/c-aw2",
+                                          method="POST", body={"relayStateIn": {"relayState": "ON"}},
+                                          token=FakeSpan.TOKEN)
+        assert status == 422 and panel.writes == []
+    finally:
+        panel.stop()
+
+
+async def test_a_refused_write_carries_the_panels_detail(monkeypatch):
+    panel = FakeSpan()
+    try:
+        client = _client(panel)
+        monkeypatch.setattr(client, "_request", lambda *a, **k: (422, {"detail": "relay is locked"}))
+        with pytest.raises(ConnectionError, match=r"HTTP 422 — relay is locked"):
+            await client.set_relay("c-aw2", "CLOSED")
+        # FastAPI's own validation shape: a list of {loc, msg}
+        monkeypatch.setattr(client, "_request", lambda *a, **k: (
+            422, {"detail": [{"loc": ["body", "relayStateIn"], "msg": "value is not a valid dict"}]}))
+        with pytest.raises(ConnectionError, match=r"body\.relayStateIn: value is not a valid dict"):
+            await client.set_relay("c-aw2", "CLOSED")
+    finally:
+        panel.stop()
