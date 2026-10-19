@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
-import { WriteError, BOOST_YIELD } from "./writes";
+import { WriteError, BoostYieldError } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
 const cell = (over: Partial<PlanCell> & { band: [number, number] }, sug: Partial<NonNullable<PlanCell["suggest"]>> = {}): PlanCell => ({
@@ -154,13 +154,13 @@ async function main(): Promise<void> {
         async setTarget(targetF: number, source: string, capF?: number, opts?: { yieldToBoost?: boolean }) {
           over.onSetTarget?.(source);
           // the real writer checks the boost first inside its serial slot (writes.ts guarded), then the rate limit
-          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) throw new WriteError(409, `${BOOST_YIELD} (fake)`, BOOST_YIELD);
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) throw new BoostYieldError(over.boost.v);
           const f = writeFails.shift();
           if (f != null) throw new WriteError(f, f === 429 ? "rate limited" : "rejected");
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
         async restore(source: string, opts?: { yieldToBoost?: boolean }) {
-          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new WriteError(409, `${BOOST_YIELD} (fake)`, BOOST_YIELD); }
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new BoostYieldError(over.boost.v); }
           if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
           restores.push(source); return { ok: true };
         },

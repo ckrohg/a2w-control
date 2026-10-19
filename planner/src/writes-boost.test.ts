@@ -16,6 +16,8 @@ function harness(planTargetF = 126) {
   const cfg = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 };
   let live: Record<string, number> = { ...cfg };
   const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean }> = [];
+  const apLogs: Array<{ targetF: number | null; reason: string; result: string }> = [];
+  const failRetire = { n: 0 }; // retireOpenBoosts throws this many more times
   let gate: Promise<void> | null = null; // while set, patchDevice waits on it (an in-flight PATCH)
   const store = {
     getLatestSlx: async () => ({ ts: new Date(), tankF: 120, targetF: 128, outdoorF: 30 }),
@@ -28,10 +30,10 @@ function harness(planTargetF = 126) {
     activeBoost: async (): Promise<Boost | null> => { const b = boosts.filter((x) => !x.restored && x.restoreAt.getTime() > Date.now()).at(-1); return b ? { targetF: b.targetF, restoreAt: b.restoreAt } : null; },
     dueBoosts: async () => boosts.filter((x) => !x.restored && x.restoreAt.getTime() <= Date.now()).map((x) => ({ id: x.id, targetF: x.targetF })),
     markBoostsRestored: async (ids: number[]) => { for (const b of boosts) if (ids.includes(b.id)) b.restored = true; },
-    retireOpenBoosts: async () => { for (const b of boosts) b.restored = true; },
+    retireOpenBoosts: async () => { if (failRetire.n > 0) { failRetire.n--; throw new Error("connection terminated"); } for (const b of boosts) b.restored = true; },
     // for an AutoPilot over this REAL writer
     recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), tank_target_f: planTargetF, reason: "DHW window floor" }] }],
-    insertAutopilotLog: async () => {},
+    insertAutopilotLog: async (l: { targetF: number | null; reason: string; result: string }) => { apLogs.push(l); },
   } as any;
   const slx = { patchDevice: async (_b: string, _s: string, fields: Record<string, number>) => {
     if (gate) await gate;
@@ -42,7 +44,7 @@ function harness(planTargetF = 126) {
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
   const autopilot = new AutoPilot(store, writer, false, async () => {});
-  return { writer, autopilot, patches, audits, boosts, hold, live: () => live };
+  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, live: () => live };
 }
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
@@ -190,8 +192,42 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     const ap = h.autopilot.applyLatestPlan();
     await settle(); await settle(); release();
     assert.equal(await bo, "ok"); await ap;
-    assert.match(h.autopilot.lastResult, /^held: a boost started while this write was queued — 120°F not applied$/, `got: ${h.autopilot.lastResult}`);
+    // recorded exactly like the pre-check's hold (codex pass 3): the BOOST's target holds the plant, the plan's is in the reason
+    assert.match(h.autopilot.lastResult, /^held for boost to 129°F until .* — plan wants 120°F, not applied$/, `got: ${h.autopilot.lastResult}`);
+    assert.equal(h.autopilot.lastTargetF, 129);
+    const row = h.apLogs.at(-1)!;
+    assert.equal(row.result, "held"); assert.equal(row.targetF, 129);
+    assert.match(row.reason, /^boost 129°F until .* — plan wants 120°F \(DHW window floor\), resumes after$/);
     assert.equal(h.patches.length, 1, "only the boost reached the device");
+  }
+  // (f) the dashboard cancel lands but retiring the boost row fails ONCE (codex pass 3): the response and status() say
+  //     so, the expiry restore is held while the row is stale, and the next slot / poll retires it
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 60, "dashboard")), "ok");
+    (h.writer as any).lastWriteAt = 0;
+    h.failRetire.n = 2; // the cancel's retire AND the first retry fail
+    const r = await h.writer.setTarget(127, "dashboard", undefined, { endsBoost: true });
+    assert.equal(r.boost_retire_failed, true, "the response says the cancel is incomplete");
+    assert.equal((await h.writer.status()).boost_cancel_pending, true, "…and so does the writer status the dashboard reads");
+    h.boosts[0].restoreAt = new Date(Date.now() - 1000); // the stale boost's timer runs out while the DB is still failing
+    await h.writer.expireBoosts();
+    assert.equal(h.patches.length, 2, "NO expiry restore over the owner's 127 °F while the row is stale");
+    await h.writer.expireBoosts(); // the DB is back: the retry succeeds
+    assert.equal((await h.writer.status()).boost_cancel_pending, false);
+    assert.ok(h.boosts.every((b) => b.restored), "the stale row is retired");
+    assert.equal(h.patches.length, 2, "and it is retired, not restored — the owner's command stands");
+  }
+  // (f2) a NEW boost while a cancel is still pending retires the stale row itself and is the only active one
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 60, "dashboard")), "ok");
+    (h.writer as any).lastWriteAt = 0; h.failRetire.n = 2;
+    await h.writer.restore("dashboard", { endsBoost: true });
+    (h.writer as any).lastWriteAt = 0;
+    assert.equal(await status(h.writer.boost(128, 30, "dashboard")), "ok");
+    assert.equal((await h.writer.status()).boost_cancel_pending, false);
+    assert.deepEqual(h.boosts.map((b) => b.restored), [true, false], "only the new boost is open");
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

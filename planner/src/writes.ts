@@ -98,7 +98,7 @@ export function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
  */
 export type WriteOpts = { yieldToBoost?: boolean; endsBoost?: boolean };
 export const BOOST_YIELD = "yielded to an active boost";
-export function isBoostYield(e: unknown): boolean { return e instanceof WriteError && e.stable === BOOST_YIELD; }
+export function isBoostYield(e: unknown): e is BoostYieldError { return e instanceof BoostYieldError; }
 
 export class WriteError extends Error {
   /**
@@ -108,6 +108,13 @@ export class WriteError extends Error {
    */
   constructor(public status: number, message: string, public readonly stable: string = message) {
     super(message);
+  }
+}
+
+/** The WriteOpts.yieldToBoost refusal; carries the boost so the caller can record what actually holds the plant. */
+export class BoostYieldError extends WriteError {
+  constructor(public readonly boost: { targetF: number; restoreAt: Date }) {
+    super(409, `${BOOST_YIELD} (${boost.targetF}°F until ${boost.restoreAt.toISOString()})`, BOOST_YIELD);
   }
 }
 
@@ -142,23 +149,53 @@ export class HbxWriter {
     this.writeChain = run.catch(() => {});
     return run;
   }
+  /**
+   * A human write (endsBoost) landed but its boost row could not be retired (DB error). The row is now STALE: retried
+   * at the start of every serial slot and every expireBoosts() (each poll, before the auto-pilot reads hbx_boosts), and
+   * until it succeeds the expiry restore is skipped — restoring at the stale restore_at would overwrite the owner's
+   * replacement command (codex pass 3). The auto-pilot meanwhile holds on the stale row: no write, the owner's command
+   * stays. Surfaced in status().boost_cancel_pending and the write response. In-memory: a restart forgets it, and the
+   * stale row then behaves like an ordinary boost (hold, then the as-found restore at its restore_at).
+   */
+  private retirePending = false;
+  private async retryPendingRetire(): Promise<boolean> {
+    if (!this.retirePending) return true;
+    try {
+      await this.store.retireOpenBoosts();
+      this.retirePending = false;
+      console.log("[boost] the cancelled boost row is retired (retry succeeded)");
+      return true;
+    } catch (e) {
+      console.error(`[boost] retiring the cancelled boost row failed again: ${(e as Error).message}`);
+      return false;
+    }
+  }
   /** One serial slot with the WriteOpts boost semantics around the write. */
   private guarded(source: string, action: string, requested: unknown, opts: WriteOpts, write: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
     return this.serial(async () => {
+      // Before the yield check, so a cancelled boost whose row can now be retired no longer makes an automatic writer
+      // yield. If the retry fails the stale row still yields — fail closed, like the auto-pilot's own pre-check: the
+      // owner's replacement command stays in force until the row is gone.
+      await this.retryPendingRetire();
       if (opts.yieldToBoost) {
         const b = await this.store.activeBoost();
         if (b) {
-          const detail = `${BOOST_YIELD} (${b.targetF}°F until ${b.restoreAt.toISOString()})`;
-          await this.store.insertHbxWrite({ source, action, requested, result: "rejected", detail });
-          throw new WriteError(409, detail, BOOST_YIELD);
+          const err = new BoostYieldError(b);
+          await this.store.insertHbxWrite({ source, action, requested, result: "rejected", detail: err.message });
+          throw err;
         }
       }
       const result = await write();
       if (opts.endsBoost) {
-        // The write has landed; a failed retire must not turn it into an error response. Logged loudly instead: the
-        // auto-pilot would hold for the stale row until its restore_at, and expireBoosts would then restore.
+        // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
         try { await this.store.retireOpenBoosts(); }
-        catch (e) { console.error(`[boost] ${source} ${action} landed but the open boost row was not retired: ${(e as Error).message}`); return { ...result, boost_retire_failed: true }; }
+        catch (e) {
+          this.retirePending = true;
+          const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
+          console.error(`[boost] ${msg}`);
+          await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
+          return { ...result, boost_retire_failed: true };
+        }
       }
       return result;
     });
@@ -224,6 +261,7 @@ export class HbxWriter {
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
+      boost_cancel_pending: this.retirePending,
       auto_sanitize_enabled: this.autoSanitizeEnabled,
     };
   }
@@ -418,9 +456,11 @@ export class HbxWriter {
     }
     // The write AND its hbx_boosts row inside one serial slot: the auto-pilot's boost hold reads that row.
     return this.serial(async () => {
+      await this.retryPendingRetire();
       const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
       const restoreAt = new Date(Date.now() + minutes * 60_000);
       await this.store.insertBoost(targetF, restoreAt);
+      this.retirePending = false; // insertBoost retired every older open row, the stale one included
       return { ...result, boost_restore_at: restoreAt.toISOString() };
     });
   }
@@ -434,6 +474,7 @@ export class HbxWriter {
    */
   async expireBoosts(): Promise<void> {
     return this.serial(async () => {
+      if (!(await this.retryPendingRetire())) return; // a stale (cancelled) row's expiry must not restore over the owner's command
       const due = await this.store.dueBoosts();
       if (!due.length) return;
       const active = await this.store.activeBoost();

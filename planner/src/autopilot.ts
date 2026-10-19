@@ -101,6 +101,20 @@ export class AutoPilot {
     }
   }
 
+  /**
+   * Record a boost hold: the BOOST's target is what holds the plant (the ledger and the heartbeat show it), the plan's
+   * wanted target is named in the reason. Used by the pre-check and by the writer's in-slot yield (a boost that landed
+   * while this write was queued), so both read the same on the dashboard (codex pass 3).
+   */
+  private async holdForBoost(boost: { targetF: number; restoreAt: Date }, target: number, reason: string, block: Record<string, unknown> | null | undefined): Promise<void> {
+    const until = boost.restoreAt.toISOString();
+    const why = `boost ${boost.targetF}°F until ${until} — plan wants ${target}°F (${reason}), resumes after`;
+    // the restore time is in the cause so a second boost at the same target is its own row, not swallowed by the dedup
+    await this.record(boost.targetF, why, "held", `held for boost to ${boost.targetF}°F until ${until} — plan wants ${target}°F, not applied`, null, `boost:${until}`);
+    // a plan pre-boost hour reached during the hold is recorded as held, not lost (the same rule as the identification hold)
+    if (block?.boost === true) this.lastPreBoost = { at: new Date().toISOString(), toF: target, reason, result: "held: boost active" };
+  }
+
   /** Pick the shadow plan's current-hour target and apply it (guarded). Called each poll cycle. */
   async applyLatestPlan(): Promise<void> {
     const plans = await this.store.recentPlans(6);
@@ -127,15 +141,7 @@ export class AutoPilot {
     // the next unthrottled poll. Checked before every other branch (dry run and shaped-curve mode included): there
     // is nothing to decide while a human holds the target. Logged as `held`, never a rejection — nothing refused it.
     const boost = await this.store.activeBoost();
-    if (boost) {
-      const until = boost.restoreAt.toISOString();
-      const why = `boost ${boost.targetF}°F until ${until} — plan wants ${target}°F (${reason}), resumes after`;
-      // the restore time is in the cause so a second boost at the same target is its own row, not swallowed by the dedup
-      await this.record(boost.targetF, why, "held", `held for boost to ${boost.targetF}°F until ${until} — plan wants ${target}°F, not applied`, null, `boost:${until}`);
-      // a plan pre-boost hour reached during the hold is recorded as held, not lost (the same rule as the identification hold)
-      if (block?.boost === true) this.lastPreBoost = { at: new Date().toISOString(), toF: target, reason, result: "held: boost active" };
-      return;
-    }
+    if (boost) { await this.holdForBoost(boost, target, reason, block); return; }
     if (this.holdActive) {
       // the block is passed so a boost reached during an identification hold is recorded as held, not lost (codex on #158)
       await this.record(target, reason, "held", `held for ${this.holdReason} — plan wants ${target}°F, not applied`, block);
@@ -179,7 +185,7 @@ export class AutoPilot {
             await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
             return;
           }
-          if (isBoostYield(e)) { await this.record(target, reason, "held", `held: a boost started while this write was queued — ${label} not applied`, null, "boost-yield"); return; }
+          if (isBoostYield(e)) { await this.holdForBoost(e.boost, target, reason, block); return; } // a boost landed while this write was queued
           // #167: a disconnected / stale Pi is refused 503 exactly like an unreachable hub — filed as a rejection
           // (the ledger key is the age-free `stable` form, so a 3-h dropout is ONE row), warned, never paged.
           const msg = e instanceof WriteError ? e.message : (e as Error).message;
@@ -230,7 +236,7 @@ export class AutoPilot {
         return;
       }
       // the writer re-checks the boost inside its serial slot: one that landed after the check above is still a hold
-      if (isBoostYield(e)) { await this.record(target, reason, "held", `held: a boost started while this write was queued — ${target}°F not applied`, block, "boost-yield"); return; }
+      if (isBoostYield(e)) { await this.holdForBoost(e.boost, target, reason, block); return; }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
       // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
       // caught by the standing I1 monitor + the adoption monitor. #167: "cannot verify I1" (hub unreachable,
