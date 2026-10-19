@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"PostToolUse\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "command": "BODY=$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"PostToolUse\"}'; D=\"${CLAUDE_PROJECT_DIR:-.}\"; [ -f \"$D/.tenet/context-hub.port\" ] || { G=$(sed -n 's/^gitdir: //p' \"$D/.git\" 2>/dev/null); [ -n \"$G\" ] && D=\"${G%/.git/worktrees/*}\"; }; PORT=$(tr -dc 0-9 < \"$D/.tenet/context-hub.port\" 2>/dev/null); if [ -n \"$PORT\" ] && [ \"$PORT\" -le 65535 ]; then printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST \"http://localhost:$PORT/api/hooks\" -H 'Content-Type: application/json' -d @- --connect-timeout 2 --max-time 5 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"Stop\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "command": "BODY=$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"Stop\"}'; D=\"${CLAUDE_PROJECT_DIR:-.}\"; [ -f \"$D/.tenet/context-hub.port\" ] || { G=$(sed -n 's/^gitdir: //p' \"$D/.git\" 2>/dev/null); [ -n \"$G\" ] && D=\"${G%/.git/worktrees/*}\"; }; PORT=$(tr -dc 0-9 < \"$D/.tenet/context-hub.port\" 2>/dev/null); if [ -n \"$PORT\" ] && [ \"$PORT\" -le 65535 ]; then printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST \"http://localhost:$PORT/api/hooks\" -H 'Content-Type: application/json' -d @- --connect-timeout 2 --max-time 5 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"PreCompact\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "command": "BODY=$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"PreCompact\"}'; D=\"${CLAUDE_PROJECT_DIR:-.}\"; [ -f \"$D/.tenet/context-hub.port\" ] || { G=$(sed -n 's/^gitdir: //p' \"$D/.git\" 2>/dev/null); [ -n \"$G\" ] && D=\"${G%/.git/worktrees/*}\"; }; PORT=$(tr -dc 0-9 < \"$D/.tenet/context-hub.port\" 2>/dev/null); if [ -n \"$PORT\" ] && [ \"$PORT\" -le 65535 ]; then printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST \"http://localhost:$PORT/api/hooks\" -H 'Content-Type: application/json' -d @- --connect-timeout 2 --max-time 5 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"SubagentStart\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "command": "BODY=$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"SubagentStart\"}'; D=\"${CLAUDE_PROJECT_DIR:-.}\"; [ -f \"$D/.tenet/context-hub.port\" ] || { G=$(sed -n 's/^gitdir: //p' \"$D/.git\" 2>/dev/null); [ -n \"$G\" ] && D=\"${G%/.git/worktrees/*}\"; }; PORT=$(tr -dc 0-9 < \"$D/.tenet/context-hub.port\" 2>/dev/null); if [ -n \"$PORT\" ] && [ \"$PORT\" -le 65535 ]; then printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST \"http://localhost:$PORT/api/hooks\" -H 'Content-Type: application/json' -d @- --connect-timeout 2 --max-time 5 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
@@ -65,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PORT=$(cat .tenet/context-hub.port 2>/dev/null); if [ -n \"$PORT\" ]; then curl -s -X POST http://localhost:$PORT/api/hooks -H 'Content-Type: application/json' -d '{\"event\":\"SubagentStop\"}' --connect-timeout 2 2>/dev/null; fi; exit 0",
+            "command": "BODY=$(perl -e 'alarm 2; local $/; print scalar <STDIN>' 2>/dev/null); [ -n \"$BODY\" ] || BODY='{\"hook_event_name\":\"SubagentStop\"}'; D=\"${CLAUDE_PROJECT_DIR:-.}\"; [ -f \"$D/.tenet/context-hub.port\" ] || { G=$(sed -n 's/^gitdir: //p' \"$D/.git\" 2>/dev/null); [ -n \"$G\" ] && D=\"${G%/.git/worktrees/*}\"; }; PORT=$(tr -dc 0-9 < \"$D/.tenet/context-hub.port\" 2>/dev/null); if [ -n \"$PORT\" ] && [ \"$PORT\" -le 65535 ]; then printf '%s' \"$BODY\" | curl -s -o /dev/null -X POST \"http://localhost:$PORT/api/hooks\" -H 'Content-Type: application/json' -d @- --connect-timeout 2 --max-time 5 2>/dev/null; fi; exit 0",
             "async": true
           }
         ]
