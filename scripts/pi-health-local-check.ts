@@ -55,7 +55,7 @@ const silent = (t: number, w: [number, number]) => t > w[0] + 60 && t < w[1] - 6
 async function main() {
   await store.ensureSchema();
   // ── 1. mirror tables ABSENT (the rehearsal's fresh DB): mirror-derived fields null, no throw ──────────────────
-  await pool.query(`DROP TABLE IF EXISTS readings, system_stats, readings_hidden, system_stats_hidden; TRUNCATE phase_b_log RESTART IDENTITY`);
+  await pool.query(`DROP TABLE IF EXISTS readings, system_stats, readings_hidden, system_stats_hidden, readings_full; TRUNCATE phase_b_log RESTART IDENTITY`);
   const bare = await store.piLinkInputs(NOW * 1000, OPTS);
   assert.equal(bare.lastByPump, null);
   assert.equal(bare.readings, null);
@@ -231,6 +231,26 @@ async function main() {
     `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
      SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
      FROM generate_series($1::bigint, $4::bigint, 300) t`, [T0 - 3 * H, T0, T0 + 25 * 60, T0 + 3 * H]);
+  // codex pass 13 on #193 — readings that only BEGIN after the flick (T0+30 min): the origin is inside the analysis
+  // range but before readings coverage → no evidence → nothing certain through the catch-up
+  {
+    const kept = (await pool.query(`SELECT count(*)::int AS n FROM readings`)).rows[0].n;
+    await pool.query(`CREATE TABLE readings_full AS SELECT * FROM readings`);
+    // keep everything from T0+30 min on EXCEPT the displaced rows (they were ingested before the return, so their ids
+    // precede the first row stamped at the return time)
+    await pool.query(
+      `DELETE FROM readings WHERE ts < $1
+          OR (ts >= $2 AND ts < $3 AND id < (SELECT min(id) FROM readings_full WHERE ts >= $4 AND ts < $4 + 120))`,
+      [T0 + 30 * 60, T0 + H, F1 + H, F1]);
+    // (T0+75: every visible stats row past T0+60 is displaced — the moment the displaced rows fake a settled boot)
+    for (const evalS of [T0 + H + 15 * 60, T0 + 3 * H]) {
+      const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+      assert.ok(fin.readings?.firstTs != null && fin.readings.firstTs >= T0 + 30 * 60 - 60, "readings begin after the flick");
+      assert.equal(fin.stats?.boots.length, 0, `late-starting readings, at T0+${Math.round((evalS - T0) / 60)} min: nothing certain (${JSON.stringify(fin.stats?.boots)})`);
+    }
+    await pool.query(`TRUNCATE readings; INSERT INTO readings SELECT * FROM readings_full; DROP TABLE readings_full`);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM readings`)).rows[0].n, kept);
+  }
   // codex pass 9 on #193 — the same flick with ONE mirror table missing at a time:
   // (a) readings absent: no arrival-order evidence → no reboot is ever certain during the catch-up
   await pool.query(`ALTER TABLE readings RENAME TO readings_hidden`);

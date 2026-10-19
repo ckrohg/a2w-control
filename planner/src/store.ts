@@ -1041,8 +1041,11 @@ export class Store {
       // its uptime. A real reboot is only certain if the Pi's pushes were flowing normally at that would-be origin —
       // no readings gap contains it (codex pass 10 on #193: readings missing exactly during a flick bracket the
       // candidate yet prove nothing). An origin older than the analysis range is a clock error of > 8 days: accepted.
-      const originCovered = (o: number) => readings != null && readings.firstTs != null && (o < readings.firstTs
-        || (readings.lastTs != null && o <= readings.lastTs && !readings.gaps.some((g) => o > g.start - 60 && o < g.end + 60)));
+      // (the out-of-range exception is against the ANALYSIS boundary, not the first reading: an origin inside the range
+      // but before readings begin has no evidence either way — codex pass 13 on #193)
+      const originCovered = (o: number) => readings != null && readings.firstTs != null && (o < fromS - 3_600
+        || (o >= readings.firstTs && readings.lastTs != null && o <= readings.lastTs
+            && !readings.gaps.some((g) => o > g.start - 60 && o < g.end + 60)));
       const certain = (r: any) => r.certain && arrivalCovers(Number(r.sample_ts)) && originCovered(Number(r.origin))
         && !dirty(Number(r.sample_ts));
       stats = {
