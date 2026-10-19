@@ -211,27 +211,18 @@ class SelfHealer:
         hits = [f for f in snap.get("active_faults", []) if str(f.get("code", "")).upper() in codes]
         return min(hits, key=lambda f: f.get("since") or 0) if hits else None
 
+    def _expected_pumps(self) -> list[str]:
+        return list(dict.fromkeys([*self.cfg.circuits, *self.pollers]))
+
     def _other_down(self, pid: str, *, span: dict | None) -> str | None:
-        for oid in self.cfg.circuits:     # every pump self-heal knows about must be visible
-            if oid != pid and oid not in self.pollers:
-                return f"{oid} has no telemetry on this bridge"
-        for oid, other in self.pollers.items():
+        """The FIRST other pump that is down, by the same predicate the all-down watcher uses."""
+        for oid in self._expected_pumps():
             if oid == pid:
                 continue
-            s, name = other.snapshot, other.cfg.name
-            if not self._fresh(s):
-                return f"{name} is offline"
-            if s.get("identity_ok") is False:
-                return f"{name}'s gateway identity check failed"
-            if s.get("on") is False or s.get("state") == "off":
-                return f"{name} is switched off"
-            bad = [f for f in s.get("active_faults", []) if _is_blocking(f)]
-            if bad:
-                return f"{name} is faulted ({', '.join(str(f.get('code')) for f in bad)})"
-        if span is not None:
-            for c in span["circuits"]:
-                if c["heat_pump"] and c["name"] != self.cfg.circuits[pid] and c["relay_state"] != "CLOSED":
-                    return f"{c['name']} is not ON at the panel"
+            why = self._pump_down(oid, span=span)
+            if why:
+                name = self.pollers[oid].cfg.name if oid in self.pollers else oid
+                return f"{name} {why}" if not why.startswith("has ") else f"{oid} {why}"
         return None
 
     def _heating_or_defrost(self, snap: dict, st: dict) -> str | None:
@@ -286,23 +277,31 @@ class SelfHealer:
                 st["fault_seen"] = (key, self._mono())   # a new onset restarts the in-process grace
             await self._consider(pid, poller, st, fault, fresh)
 
-    def _pump_down(self, pid: str) -> str | None:
+    def _pump_down(self, pid: str, *, span: dict | None) -> str | None:
+        """ONE definition of "this pump can't heat", shared by the cycle guard (_other_down) and
+        the all-down watcher, so paging and re-arming can never disagree. Faulted counts only
+        while the pump is not heating (an E21 that keeps heating is not down)."""
         poller = self.pollers.get(pid)
         if poller is None:
-            return "no telemetry"
+            return "has no telemetry on this bridge"
         s = poller.snapshot
         if not self._fresh(s):
-            return "offline"
+            return "is offline"
         if s.get("identity_ok") is False:
-            return "gateway identity check failed"
+            return "failed its gateway identity check"
         if s.get("on") is False or s.get("state") == "off":
-            return "switched off"
+            return "is switched off"
         st = self._pumps.get(pid)
         recently_running = s.get("running") or (st is not None and st["last_running"] is not None
                                                 and self._mono() - st["last_running"] < RUNNING_QUIET_S)
         bad = [str(f.get("code")) for f in s.get("active_faults", []) if _is_blocking(f)]
         if bad and not recently_running:
-            return f"faulted ({', '.join(bad)})"
+            return f"is faulted ({', '.join(bad)})"
+        circuit = self.cfg.circuits.get(pid)
+        if span is not None and circuit:
+            for c in span["circuits"]:
+                if c["name"] == circuit and c["relay_state"] != "CLOSED":
+                    return "is not ON at the panel"
         return None
 
     async def _watch_all_down(self) -> None:
@@ -310,7 +309,8 @@ class SelfHealer:
         and re-arms when any pump is back. (Shares its de-dup with the per-pump both-down page.)"""
         if not self.cfg.enabled or not self._pumps:
             return
-        downs = {pid: self._pump_down(pid) for pid in self._pumps}
+        span = self._span()
+        downs = {pid: self._pump_down(pid, span=span) for pid in self._expected_pumps()}
         if not all(downs.values()):
             self._all_down_since = None
             self._both_down_paged = False
@@ -319,7 +319,7 @@ class SelfHealer:
         if self._mono() - self._all_down_since < ALL_DOWN_PAGE_S or self._both_down_paged:
             return
         self._both_down_paged = True
-        why = "; ".join(f"{self.pollers[p].cfg.name if p in self.pollers else p}: {d}"
+        why = "; ".join(f"{self.pollers[p].cfg.name if p in self.pollers else p} {d}"
                         for p, d in downs.items())
         await self._step(next(iter(self._pumps)), "both_down", "critical",
                          f"Every heat pump is down ({why}). Self-heal will not power-cycle while "
@@ -577,8 +577,10 @@ class SelfHealer:
                 outcome = "cleared on its own" if recovered else "still active (nothing was switched)"
                 st["phase"], st["verify"] = "idle", None
                 self._record_outcome(st, "shadow_" + ("cleared" if recovered else "active"), outcome)
-                await self._audit(pid, "shadow_verify", "info",
-                                  f"{name}: shadow verification — {code} {outcome}", facts)
+                await self._step(pid, "shadow_verify", "info",
+                                 f"{name}: shadow verification — {code} {outcome}.", facts,
+                                 title=f"A2W self-heal (shadow): {name} {code} {outcome.split(' (')[0]}",
+                                 priority="default")
             else:
                 st["status"] = "SHADOW: watching what a cycle would have had to fix"
             return
