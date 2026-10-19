@@ -101,7 +101,8 @@ export interface StatsView {
  *   unrelated gap just before/after does not turn a socket outage into a gap;
  * - the reboot must be the one that ended THAT gap — inside [gap start − 1 min, gap end + 2 min] (the Pi boots, then
  *   its first push closes the gap) — not merely somewhere in the window;
- * - a gap overlapping the window that does NOT clearly belong to it → `unknown`: continuity is never assumed;
+ * - a gap overlapping the window that does NOT clearly belong to it, or a Pi-clock step within window ± slack →
+ *   `unknown` (unless a certain reboot was found): continuity is never assumed;
  * - gap+reboot vs gap_only needs system_stats samples bracketing the gap (first ≤ gap start, last ≥ gap end): absent,
  *   empty, late-starting stats, a gap still open now, or only an AMBIGUOUS boot jump in it → `unknown`, never a
  *   guessed gap_only;
@@ -133,8 +134,12 @@ export function classifyWindows(
     // unresolved one (still open, not bracketed by stats, only an ambiguous boot, or a clock step at its edges — the
     // "gap" may be the Pi's clock jumping, not a silence) makes the verdict unknown; only all-resolved is gap_only
     const mine = gaps.filter(belongs);
-    // a gap that overlaps the window itself but does not clearly belong to it: continuity is NOT established
-    const unclear = !mine.length && gaps.some((g) => core(g) > 0);
+    // a gap that overlaps the window itself but does not clearly belong to it — whether or not another gap does: its
+    // uncertainty is kept (codex pass 4 on #193); continuity is NOT established
+    const unclear = gaps.some((g) => core(g) > 0 && !belongs(g));
+    // a Pi-clock step anywhere in the window ± slack: timestamp order no longer proves arrival order, so a silence may
+    // have been papered over (a backward step refills the gap) — never socket_only / gap_only on that evidence
+    const stepNear = (stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi);
     const near = (g: ReadingGap, t: number) => t >= g.start - 120 && t <= g.end + 120;
     let boot: Boot | null = null;
     let unresolved = false;
@@ -147,10 +152,10 @@ export function classifyWindows(
       if (!bracketed || (stats?.ambiguous ?? []).some((b) => near(g, b.at)) || (stats?.clockSteps ?? []).some((t) => near(g, t))) unresolved = true;
     }
     const longest = mine.reduce<ReadingGap | null>((a, g) => (!a || g.end - g.start > a.end - a.start ? g : a), null);
-    const verdict: PiVerdict = !covered || unclear ? "unknown"
-      : !mine.length ? "socket_only"
+    const verdict: PiVerdict = !covered ? "unknown"
       : boot ? "gap+reboot"
-      : unresolved ? "unknown" : "gap_only";
+      : unclear || stepNear || unresolved ? "unknown"
+      : !mine.length ? "socket_only" : "gap_only";
     return {
       start: new Date(r.start).toISOString(),
       end: r.end == null ? null : new Date(r.end).toISOString(),

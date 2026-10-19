@@ -160,6 +160,15 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   const step = { start: s("2026-10-16T10:29:00Z"), end: s("2026-10-16T10:40:00Z") };
   assert.equal(classifyWindows(run, { ...base, gaps: [step] }, { ...st, clockSteps: [s("2026-10-16T10:40:00Z")] }, NOW / 1000)[0].verdict, "unknown");
   assert.equal(classifyWindows(run, { ...base, gaps: [step] }, st, NOW / 1000)[0].verdict, "gap_only", "the same gap without the step is resolved");
+  // codex pass 4: a clock step inside the window with NO readings gap (a backward step refilled it) → unknown
+  assert.equal(classifyWindows(run, { ...base, gaps: [] }, { ...st, clockSteps: [s("2026-10-16T10:01:00Z")] }, NOW / 1000)[0].verdict, "unknown");
+  assert.equal(classifyWindows(run, { ...base, gaps: [] }, { ...st, clockSteps: [s("2026-10-16T15:00:00Z")] }, NOW / 1000)[0].verdict,
+    "socket_only", "a step far outside the window is irrelevant");
+  // codex pass 4: a resolved closed gap does not hide an overlapping, non-belonging, still-open silence
+  const closed = { start: s("2026-10-16T10:30:00Z"), end: s("2026-10-16T10:40:00Z") };
+  const late = { start: s("2026-10-16T11:55:00Z"), end: s("2026-10-17T09:00:00Z") };
+  assert.equal(classifyWindows(run, { ...base, gaps: [closed, late] }, st, NOW / 1000)[0].verdict, "unknown");
+  assert.equal(classifyWindows(run, { ...base, gaps: [closed] }, st, NOW / 1000)[0].verdict, "gap_only", "without it: gap_only");
 }
 
 // ── 5. No reboot evidence possible → unknown, never a guessed gap_only (codex pass 1 on #193) ──────────────────────
