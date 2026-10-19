@@ -340,8 +340,9 @@ async def test_heating_seen_at_dispatch_starts_the_quiet_period(rig, monkeypatch
     r.p2.snapshot["running"] = False                     # idle again by the next tick
     await r.step(heal, 30)
     await r.step(heal, 30)
-    assert r.panel.writes == []                          # still inside the 120 s quiet period
-    await r.step(heal, 90)
+    assert r.panel.writes == []                          # inside the 120 s quiet period
+    assert heal._pumps["pump2"]["last_running"] is not None  # latched by the dispatch guard
+    await r.step(heal, 250)                              # past the quiet period + abort cooldown
     assert ("Air-Water 2", "OPEN") in r.panel.writes
 
 
@@ -585,6 +586,32 @@ async def test_guard_at_the_dispatch_boundary_aborts_with_nothing_sent(rig, monk
     assert not (r.tmp_path / span_control.CYCLE_FILE).exists()
     assert "cycle_aborted" in await codes(r.store)
     assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 0
+
+
+async def test_repeated_aborts_cool_down_dedupe_and_page_manual(rig, monkeypatch):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    real = r.ctl.client.set_relay
+
+    async def always_late(cid, want="CLOSED", **kw):
+        if want == "OPEN":
+            r.p2.snapshot["defrosting"] = True       # something always changes at dispatch
+        return await real(cid, want, **kw)
+    monkeypatch.setattr(r.ctl.client, "set_relay", always_late)
+    await heal.tick()
+    for _ in range(80):                              # 40 min of ticks
+        r.p2.snapshot["defrosting"] = False
+        await r.step(heal)
+    await settle()
+    c = await codes(r.store)
+    assert r.panel.writes == []
+    assert 3 <= c.count("cycle_aborted") <= 8        # ~one per 5 min cooldown, not every tick
+    aborted_push = [a for a in r.alerts if a[0] == "push" and "cycle aborted" in a[1]]
+    assert len(aborted_push) == 1                    # notified once per episode
+    starts = [a for a in r.alerts if a[0] == "push" and "power-cycling" in a[1]]
+    assert len(starts) == 1                          # retries are not re-announced
+    assert c.count("cycle_refused") == 1             # the manual-step page after 3 aborts
 
 
 async def test_a_new_fault_episode_does_not_inherit_the_grace(rig, monkeypatch):
