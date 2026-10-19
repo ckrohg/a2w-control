@@ -13,43 +13,63 @@ import {
 
 const FAST_MS = 5_000; // while waiting for read-back / adoption
 const SLOW_MS = 30_000;
+const FETCH_TIMEOUT_MS = 10_000;
 
 export function useBoost() {
   const { confirm, Modals } = useModals();
   const [phase, setPhase] = useState<BoostPhase>({ phase: "idle" });
   const [st, setSt] = useState<WriterStatus | null>(null);
+  const [stAtMs, setStAtMs] = useState<number | null>(null); // when `st` was last read successfully
   const [stErr, setStErr] = useState("");
   const [hub, setHub] = useState<HubState | null>(null);
   const [hubErr, setHubErr] = useState("");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const stRef = useRef<WriterStatus | null>(null);
   const hubRef = useRef<HubState | null>(null);
+  // Responses can arrive out of order (a slow poll after a fast one) — only the newest request wins.
+  const stSeq = useRef(0);
+  const hubSeq = useRef(0);
 
   const loadStatus = useCallback(async () => {
+    const seq = ++stSeq.current;
+    let next: WriterStatus | null = null, err = "";
     try {
-      const res = await fetch("/api/planner/target", { cache: "no-store" });
+      const res = await fetch("/api/planner/target", { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       const body: WriterStatus & { error?: string } = await res.json().catch(() => ({}) as WriterStatus);
-      if (res.ok) { setSt(body); stRef.current = body; setStErr(""); }
-      else { setSt(null); stRef.current = null; setStErr(body.error || `planner error (${res.status})`); }
+      if (res.ok) next = body;
+      else err = body.error || `planner error (${res.status})`;
     } catch {
-      setSt(null); stRef.current = null; setStErr("could not reach the dashboard server");
-    } finally {
-      setNowMs(Date.now());
+      err = "could not reach the dashboard server";
     }
+    if (seq !== stSeq.current) return;
+    setSt(next); stRef.current = next; setStErr(err);
+    if (next) setStAtMs(Date.now());
+    setNowMs(Date.now());
   }, []);
 
   const loadHub = useCallback(async () => {
+    const seq = ++hubSeq.current;
+    let next: HubState | null = null, err = "";
     try {
-      const res = await fetch("/api/hub/state", { cache: "no-store" });
+      const res = await fetch("/api/hub/state", { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       const body: HubState & { error?: string } = await res.json().catch(() => ({}) as HubState);
-      if (res.ok) { setHub(body); hubRef.current = body; setHubErr(""); }
-      else { setHub(null); hubRef.current = null; setHubErr(body.error || `hub error (${res.status})`); }
+      if (res.ok) next = body;
+      else err = body.error || `hub error (${res.status})`;
     } catch {
-      setHub(null); hubRef.current = null; setHubErr("could not reach the dashboard server");
+      err = "could not reach the dashboard server";
     }
+    if (seq !== hubSeq.current) return;
+    setHub(next); hubRef.current = next; setHubErr(err);
   }, []);
 
-  const view = useMemo(() => boostView(phase, st, nowMs), [phase, st, nowMs]);
+  // The clock ticks on its own, so read-back age and the "unconfirmed" timeout advance even when a
+  // poll is slow.
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 5_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const view = useMemo(() => boostView(phase, st, nowMs, stAtMs), [phase, st, nowMs, stAtMs]);
 
   // Remember that the read-back showed this boost, so its later disappearance reads as "ended",
   // never as "unconfirmed".
@@ -59,7 +79,7 @@ export function useBoost() {
     }
   }, [phase, view.key]);
 
-  const waiting = view.key === "verifying" || view.key === "commanded" || view.key === "sending";
+  const waiting = ["verifying", "commanded", "sending", "expired_unrestored", "stale"].includes(view.key);
   useEffect(() => {
     loadStatus();
     loadHub();
@@ -83,6 +103,7 @@ export function useBoost() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(req),
+        signal: AbortSignal.timeout(30_000),
       });
       const out: { error?: string; detail?: string; boost_restore_at?: string } = await res.json().catch(() => ({}));
       if (!res.ok) setPhase({ phase: "rejected", req, status: res.status, error: out.error || out.detail || "" });

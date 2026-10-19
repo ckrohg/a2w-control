@@ -12,6 +12,8 @@ export const BOOST_MIN_MINUTES = 15;
 export const BOOST_MAX_MINUTES = 120;
 /** How long after an accepted POST we wait for the writer status to show the boost row. */
 export const READBACK_TIMEOUT_MS = 90_000;
+/** A writer status older than this is not a confirmation (Codex pass 1): a hung poll must not keep "in force" up. */
+export const READBACK_STALE_MS = 90_000;
 /** writes.ts status(): adoption_pending = |commanded − operative| > 3. Same tolerance here. */
 const ADOPT_TOL_F = 3;
 
@@ -37,6 +39,23 @@ const PI_FRESH_S = 10 * 60;
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 const r0 = (v: number) => Math.round(v);
+
+/** Hour of day (0–23) in America/New_York — the Plan chart's 24 blocks are Eastern hours. */
+export function etHour(ms: number): number {
+  const h = Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hourCycle: "h23", timeZone: "America/New_York" }).format(new Date(ms)));
+  return Number.isFinite(h) ? h % 24 : 0;
+}
+
+/**
+ * The chart span of a boost on record: from the current Eastern hour through the hour its timer
+ * ends. Eastern offsets are whole hours, so UTC hour boundaries are Eastern hour boundaries.
+ */
+export function boostChartSpan(nowMs: number, restoreAtIso: string): { start: number; hours: number } {
+  const hourStart = nowMs - (nowMs % 3_600_000);
+  const end = Date.parse(restoreAtIso);
+  const hours = Number.isFinite(end) ? Math.max(1, Math.ceil((end - hourStart) / 3_600_000)) : 1;
+  return { start: etHour(nowMs), hours: Math.min(hours, 24) };
+}
 
 export function fmtMinutes(min: number): string {
   if (min % 60 === 0) return `${min / 60} h`;
@@ -131,7 +150,7 @@ export type BoostPhase =
   // seen = the read-back has shown this boost at least once (set by the caller from boostView)
   | { phase: "accepted"; req: BoostRequest; atMs: number; restoreAt: string | null; seen?: boolean };
 
-export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended"; tone: Tone; text: string };
+export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale"; tone: Tone; text: string };
 
 function sameRestore(a: string, b: string): boolean {
   const ta = Date.parse(a), tb = Date.parse(b);
@@ -147,7 +166,17 @@ function fmtClock(iso: string): string {
  * nothing about the device until the writer status shows the boost row AND the commanded curve;
  * "in force" needs the operative target (temp1.target) to have landed on it.
  */
-export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number): BoostView {
+export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number, stAtMs: number | null = nowMs): BoostView {
+  const v = boostViewFresh(p, st, nowMs);
+  // A read-back is only as good as its age: past READBACK_STALE_MS nothing reads as confirmed.
+  if (st != null && stAtMs != null && nowMs - stAtMs > READBACK_STALE_MS && v.key !== "sending" && v.key !== "rejected") {
+    const min = Math.max(1, Math.round((nowMs - stAtMs) / 60_000));
+    return { key: "stale", tone: "pending", text: `writer status not refreshed for ${min} min — last read-back said: ${v.text}` };
+  }
+  return v;
+}
+
+function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): BoostView {
   if (p.phase === "idle") {
     if (st?.active_boost) return activeView(st.active_boost, st);
     return { key: "idle", tone: "neutral", text: "no boost active" };
@@ -162,7 +191,14 @@ export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number)
   const ours = ab != null && ab.target_f === p.req.target_f && (p.restoreAt == null || sameRestore(ab.restore_at, p.restoreAt));
   if (!ours) {
     if (p.seen && ab == null && st != null) {
-      return { key: "ended", tone: "neutral", text: `boost to ${p.req.target_f} °F ended — the planner restored the curve` };
+      // The row drops out of active_boost when restore_at passes, WHETHER OR NOT expireBoosts() has
+      // restored the curve yet (store.ts activeBoost: restore_at > now()). Only a commanded target that
+      // has moved off the boost says the curve changed — and even then we say what it is, not why.
+      const cmd = st.commanded_target_f;
+      if (cmd != null && Math.abs(cmd - p.req.target_f) > ADOPT_TOL_F) {
+        return { key: "ended", tone: "neutral", text: `boost to ${p.req.target_f} °F ended — commanded target is now ${cmd} °F` };
+      }
+      return { key: "expired_unrestored", tone: "pending", text: `boost timer for ${p.req.target_f} °F has passed, but the writer status still shows commanded ${cmd ?? "?"} °F — the restore is not confirmed yet` };
     }
     if (nowMs - p.atMs > READBACK_TIMEOUT_MS) {
       return {

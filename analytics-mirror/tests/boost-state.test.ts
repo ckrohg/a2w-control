@@ -4,7 +4,7 @@
 // Run: npx tsx tests/boost-state.test.ts
 import assert from "node:assert/strict";
 import {
-  boostView, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
+  boostView, boostChartSpan, etHour, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
   type WriterStatus, type BoostPhase, type HubState,
 } from "../lib/boost-state";
 
@@ -85,9 +85,27 @@ t("commanded curve moved off the boost (auto-pilot wrote over it) → superseded
   assert.match(v.text, /commanded target is now 121 °F/);
 });
 
-t("seen, then the row disappears → ended", () => {
+t("seen, then the row disappears and the curve moved off → ended, quoting the new commanded target", () => {
   const v = boostView({ ...accepted, seen: true } as BoostPhase, before, NOW + 121 * 60_000);
   assert.equal(v.key, "ended");
+  assert.equal(v.text, "boost to 132 °F ended — commanded target is now 120 °F");
+  assert.ok(!/restored the curve/.test(v.text));
+});
+
+t("seen, row gone at expiry but commanded still on the boost → restore NOT confirmed (Codex pass 1)", () => {
+  const v = boostView({ ...accepted, seen: true } as BoostPhase, { ...inForce, active_boost: null }, NOW + 121 * 60_000);
+  assert.equal(v.key, "expired_unrestored");
+  assert.equal(v.tone, "pending");
+  assert.match(v.text, /restore is not confirmed yet/);
+});
+
+t("a stale read-back never reads as in force (Codex pass 1: hung polls)", () => {
+  const v = boostView(accepted, inForce, NOW + 600_000, NOW + 600_000 - 91_000);
+  assert.equal(v.key, "stale");
+  assert.equal(v.tone, "pending");
+  assert.match(v.text, /^writer status not refreshed for 2 min — last read-back said: in force/);
+  assert.equal(boostView(accepted, inForce, NOW + 600_000, NOW + 600_000 - 89_000).key, "in_force");
+  assert.equal(boostView({ phase: "rejected", req, status: 429, error: "rate limited" }, inForce, NOW, NOW - 600_000).key, "rejected");
 });
 
 t("never seen and the row is absent past the timer → unconfirmed, not ended", () => {
@@ -157,6 +175,15 @@ t("pumps line: live, none heating, stale", () => {
   assert.equal(pumpsLine(none, NOW / 1000), "HP1 idle · HP2 offline — no pump is heating");
   assert.equal(pumpsLine({ ...live, pi_connected: false, ts: NOW / 1000 - 1500 }, NOW / 1000), "last known (25 min old, Pi disconnected): HP1 heating · HP2 idle");
   assert.equal(pumpsLine(null, NOW / 1000, "hub not configured"), "pump state unavailable (hub not configured)");
+});
+
+t("chart span is in Eastern hours and ends with the timer (Codex pass 1)", () => {
+  assert.equal(etHour(Date.parse("2026-10-16T04:43:00Z")), 0); // 12:43 AM EDT
+  assert.equal(etHour(Date.parse("2026-01-16T04:43:00Z")), 23); // 11:43 PM EST
+  // boost tapped at 12:43 AM for 2 h → restores 2:43 AM → blocks 0, 1, 2
+  assert.deepEqual(boostChartSpan(NOW, restore), { start: 0, hours: 3 });
+  // an hour later the start moves with the clock and the end stays put
+  assert.deepEqual(boostChartSpan(NOW + 3_600_000, restore), { start: 1, hours: 2 });
 });
 
 console.log(`boost-state: ${n} passed`);

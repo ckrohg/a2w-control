@@ -3,6 +3,7 @@
 // relay state + A2W's arm intent + the recent SHADOW "would-arm" decisions, and a one-tap toggle to
 // arm/disarm A2W. Phase 1 = shadow: nothing is toggled on SPAN; this only controls whether A2W *would*.
 import { useState } from "react";
+import { SPAN_STALE_S } from "@/lib/backup-state";
 
 export type ArmState = {
   circuit: string | null; relay_state: string | null; armed: boolean | null;
@@ -18,8 +19,9 @@ export function SpanArmCard({ state, events, nowS }: { state: ArmState | null; e
   const armed = desired ?? false;
   const relayOpen = state?.relay_state === "OPEN";
   // #184: a relay reading older than 15 min is not a state — say how old it is instead.
-  const relayAgeMin = state?.ts != null ? Math.round((nowS - (state.ts > 1e12 ? state.ts / 1000 : state.ts)) / 60) : null;
-  const relayStale = relayAgeMin == null || relayAgeMin > 15;
+  const relayAgeS = state?.ts != null ? nowS - (state.ts > 1e12 ? state.ts / 1000 : state.ts) : null;
+  const relayAgeMin = relayAgeS != null ? Math.round(relayAgeS / 60) : null;
+  const relayStale = relayAgeS == null || relayAgeS > SPAN_STALE_S; // seconds, same rule as lib/backup-state
   const live = !!state?.live;
 
   async function toggle(next: boolean) {

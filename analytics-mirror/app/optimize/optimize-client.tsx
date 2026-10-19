@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useBoost } from "../ui/use-boost";
-import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, estimateLines, fmtMinutes } from "@/lib/boost-state";
+import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes } from "@/lib/boost-state";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
 
@@ -502,13 +502,14 @@ export default function OptimizeClient({
   const [identMode, setIdentMode] = useState<IdentMode>(initialIdentification);
   const [identBusy, setIdentBusy] = useState(false);
   const [identMsg, setIdentMsg] = useState("");
-  const bst = useBoost();
   const [customOpen, setCustomOpen] = useState(false);
   const [customF, setCustomF] = useState(STRICT_CAP_F);
   const [customMin, setCustomMin] = useState(BOOST_MAX_MINUTES);
   // display-only ✓ toggles for the Request-mode "changes waiting" chips
   const [approved, setApproved] = useState<Set<number>>(new Set());
-  const nowH = useMemo(() => new Date().getHours(), []);
+  const bst = useBoost();
+  // Eastern hour, advancing with the boost hook's clock (the chart's blocks are Eastern hours).
+  const nowH = etHour(bst.nowMs);
 
   const hasPlan = blocks.length > 0;
   const copyM = COPY[mode];
@@ -550,7 +551,7 @@ export default function OptimizeClient({
   // The chart overlay and the estimate follow the boost ON RECORD (read-back), never a click.
   const ab = bst.st?.active_boost ?? null;
   const boost: Boost | null = ab
-    ? { start: nowH, hours: Math.max(1, Math.ceil((Date.parse(ab.restore_at) - bst.nowMs) / 3_600_000)), target: ab.target_f }
+    ? { ...boostChartSpan(bst.nowMs, ab.restore_at), target: ab.target_f }
     : null;
   const estTarget = ab?.target_f ?? null;
   const est = estimateLines(bst.st?.tank_f ?? null, estTarget ?? STRICT_CAP_F);
