@@ -483,7 +483,7 @@ async function main(): Promise<void> {
     assert.equal(t.pending, null);
     const unchanged = await handlePolledConfig(prevOf(device(142, 138)), device(142, 138), harness({ nowIso: "2026-10-18T21:10:56.000Z" }).deps);
     const sent: string[] = [];
-    const send = async (n: { title: string }) => { assert.equal(resolves, 0, "sent BEFORE it is marked resolved (codex pass 8)"); sent.push(n.title); };
+    const send = async (n: { title: string }) => { assert.equal(resolves, 0, "sent BEFORE it is marked resolved (codex pass 8)"); sent.push(n.title); return true; };
     const notice = await t.step(unchanged, send); // first poll: reload retried, succeeds, the change is gone → notice
     assert.equal(loads, 2, "reload retried on the next step");
     assert.equal(notice?.title, UNCONFIRMED_TITLE);
@@ -496,6 +496,16 @@ async function main(): Promise<void> {
     const t2 = new PendingTracker(async () => pendingDiag, async () => { r2++; }, () => {});
     await assert.rejects(t2.step(unchanged, async () => { throw new Error("SIGKILL mid-send"); }));
     assert.equal(r2, 0, "an undelivered notice is never marked resolved");
+    // production shape: ntfy() never throws — it resolves FALSE when every channel failed / refused (codex pass 9)
+    let r3 = 0, tries = 0;
+    const t3 = new PendingTracker(async () => pendingDiag, async () => { r3++; }, () => {});
+    assert.equal(await t3.step(unchanged, async () => { tries++; return false; }), null, "not acknowledged → not reported as sent");
+    assert.equal(r3, 0, "…and not resolved");
+    assert.equal(t3.pending, pendingDiag, "…and still pending in memory");
+    assert.equal((await t3.step(unchanged, async () => { tries++; return true; }))?.title, UNCONFIRMED_TITLE, "retried next poll, delivered");
+    assert.equal(tries, 2);
+    assert.equal(r3, 1, "resolved only after acknowledged delivery");
+    assert.equal(t3.pending, null);
   }
 
   // ── 11. Seed, unchanged, and non-curve drift keep today's behaviour — and every row carries raw ─────────────────

@@ -371,6 +371,18 @@ export function alertSubject(title: string, priority: string, resolved = false):
 
 async function ntfy(title: string, body: string, priority = "default",
                     opts: { resolved?: boolean; email?: boolean } = {}): Promise<void> {
+  await ntfyDelivered(title, body, priority, opts);
+}
+
+/**
+ * Push (+ email by priority). Resolves true when at least one configured channel ACKNOWLEDGED the alert (2xx) — or
+ * when no channel is configured at all (rehearsal / local: the log line is the delivery) — and false when every
+ * configured channel failed or refused. ntfy() is the fire-and-log form every alert uses; #177's pending-notice path
+ * calls this one and resolves its evidence only on true (codex pass 9).
+ */
+async function ntfyDelivered(title: string, body: string, priority = "default",
+                             opts: { resolved?: boolean; email?: boolean } = {}): Promise<boolean> {
+  let delivered = false;
   if (!NTFY_TOPIC) {
     // No topic (rehearsal, local runs): the page is still a fact — log it so a harness can assert what WOULD have paged.
     console.log(`[ntfy] (no topic) ${priority}${opts.resolved ? " resolved" : ""}: ${title}`);
@@ -394,7 +406,7 @@ async function ntfy(title: string, body: string, priority = "default",
           signal: AbortSignal.timeout(10_000),
         });
         if (!r.ok) console.error("ntfy push rejected:", r.status);
-        else if (attempt > 1) console.log(`ntfy delivered on attempt ${attempt}`);
+        else { delivered = true; if (attempt > 1) console.log(`ntfy delivered on attempt ${attempt}`); }
         break;
       } catch (e) {
         console.error(`ntfy send attempt ${attempt}/${delays.length} failed:`, describeFetchError(e));
@@ -420,10 +432,13 @@ async function ntfy(title: string, body: string, priority = "default",
         signal: AbortSignal.timeout(10_000),
       });
       if (!r.ok) console.error("resend email failed:", r.status);
+      else delivered = true;
     } catch (e) {
       console.error("resend email failed:", (e as Error).message);
     }
   }
+  const anyChannel = !!NTFY_TOPIC || (wantsEmail && !!RESEND_API_KEY && !!RESEND_TO);
+  return delivered || !anyChannel;
 }
 
 function toReading(dev: Record<string, any>): SlxReading {
@@ -1619,7 +1634,7 @@ async function pollOnce(): Promise<void> {
   if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
   {
     // an unconfirmed curve change is re-checked by the next poll; if that poll no longer sees it, say so (#177)
-    await pendingUnconfirmed.step(drift, (n) => ntfy(n.title, n.body, "default", { email: true }));
+    await pendingUnconfirmed.step(drift, (n) => ntfyDelivered(n.title, n.body, "default", { email: true }));
   }
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
