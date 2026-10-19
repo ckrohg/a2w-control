@@ -40,6 +40,9 @@ export class SpanWatch {
   private loggedOk = false;
   public lastKwh: number | null = null;
   public lastError: string | null = null;
+  /** #187: when the cloud path last answered, and how many ticks in a row have failed since (/health.span.cloud) */
+  public lastOkAt: string | null = null;
+  public failStreak = 0;
 
   constructor(
     private readonly username: string,
@@ -126,11 +129,14 @@ export class SpanWatch {
       if (!hit) {
         const names = panels.flatMap((p) => (p.spaces ?? []).map((s: any) => s.name)).filter(Boolean);
         this.lastError = `no circuit matching "${this.circuitMatch}" — available: ${names.join(" | ")}`;
+        this.failStreak++;
         console.warn(`[spanwatch] ${this.lastError}`);
         return;
       }
       this.lastError = null;
       this.lastKwh = hit.kwh;
+      this.lastOkAt = new Date().toISOString();
+      this.failStreak = 0;
       if (!this.loggedOk) {
         this.loggedOk = true;
         console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${hit.kwh} ${hit.unit} this hour (alarm > ${this.alarmKwh} kWh)`);
@@ -149,6 +155,7 @@ export class SpanWatch {
     } catch (e) {
       // Never alarm on a read/auth failure (transient) — backup_called is the redundant net. Just log.
       this.lastError = (e as Error).message;
+      this.failStreak++;
       console.warn(`[spanwatch] tick failed: ${this.lastError}`);
     }
   }

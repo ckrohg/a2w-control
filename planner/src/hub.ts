@@ -21,6 +21,8 @@ export interface HubPump {
   // armed (the Pi records a lease only when baseline_setpoint_c is set — poller.py:600).
   remote_lease_until?: number | null;
   write_enabled?: boolean;
+  /** COUNT of the pump's active faults (bridge hub_client.py state frame); the codes are in the mirror's pump_snapshots */
+  active_faults?: number | null;
 }
 
 export interface HubState {

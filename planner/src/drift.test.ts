@@ -540,6 +540,26 @@ async function main(): Promise<void> {
     assert.equal(h.pages[0].email, false);
   }
 
+  // ── 11b. #182: dmd is a live demand bitmask, not configuration — a dmd-only change makes no version row and no page,
+  // including the first poll after the deploy, when the stored baseline still carries dmd ────────────────────────
+  {
+    const withDmd = (dmd: number) => device(120, 118, { dmd });
+    const prevStored = { config: { ...extractConfig(withDmd(9)), dmd: 9 }, raw: withDmd(9) }; // a pre-#182 row
+    for (const next of [withDmd(41), withDmd(1), withDmd(9)]) {
+      const h = harness({ nowIso: "2026-10-16T04:00:50.000Z" });
+      const out = await handlePolledConfig(prevStored, next, h.deps);
+      assert.equal(out.kind, "unchanged", `dmd ${next.dmd}: not configuration`);
+      assert.equal(h.rows.length + h.pages.length + h.waits.length, 0, "no version row, no page, no re-read");
+    }
+    assert.ok(!("dmd" in extractConfig(withDmd(41))), "dmd is not extracted");
+    assert.equal(diffConfig({ dmd: 9, htDif: 4 }, { dmd: 41, htDif: 4 }), null);
+    assert.deepEqual(diffConfig({ dmd: 9, htDif: 4 }, { dmd: 41, htDif: 5 }), { htDif: { old: 4, new: 5 } }, "a real setting beside it still shows");
+    // and a real change beside a dmd flip is recorded without the dmd noise
+    const h = harness({ nowIso: "2026-10-16T04:00:50.000Z" });
+    await handlePolledConfig(prevStored, device(120, 118, { dmd: 41, htDif: 6 }), h.deps);
+    assert.deepEqual(h.rows[0].changes, { htDif: { old: 4, new: 6 } });
+  }
+
   // ── 12. Provenance helpers ──────────────────────────────────────────────────────────────────────────────────────
   {
     const dev = device(120, 118);

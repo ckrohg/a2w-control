@@ -60,6 +60,53 @@ the plan's `meta.pre_boosts` records what was applied. Raises only — a pre-boo
 shower colder. Acceptance (#135): evening-window troughs ≥ `dhwFloorF` on normal days, element minutes
 attributable to DHW sags → ~0 without relying on `lagT`, whole-system daily kWh not up.
 
+## Per-stage unserved alarm (#185) and the other 2026-10-16 incident fixes
+
+**Per-stage alarm (`stagewatch.ts`).** The all-idle alarm ("⚠ Heat call active but NO pump is
+running") pages only when *no* pump heats, so a one-unit failure is invisible while the other unit
+carries — or idles uncalled. On Oct 16 00:30–00:54 ET the HBX called stage 2 only, HP2 was FAULT
+(E21) and HP1 sat idle: the HBX stages by dry contact, does not know a unit is faulted, and with
+rotation ON waits `lagT` (180 min) before adding the lag stage. Now, every poll, for each called
+stage:
+- **stage_unserved** — its mapped pump is not `heating` after a **10-min** start grace of called
+  time. The clock is **suspended while that pump defrosts** and never runs on unverifiable hub
+  state (#167: hub unreachable, Pi disconnected, stale frame). Pages **high** (emails), naming the
+  unit, its state, any fault code, and the other stage/unit ("HP1 is not called — the HBX waits up
+  to lagT (180 min)…").
+- **fault_called** — its mapped pump reports an active fault: an **immediate** high page with the
+  code (from the mirror's `pump_snapshots`; the hub frame carries only a count).
+
+Both are edge-triggered, persisted in `stage_unserved_episodes`, re-adopted after a restart (they
+close, never re-page), and shown at `/health.unserved {all_idle, stage_pump_map, stages,
+episodes_24h, lag_t_min}`. The all-idle alarm is unchanged.
+
+**`STAGE_PUMP_MAP`** (env, JSON, default `{"1":"pump1","2":"pump2"}`) is the **physical wiring**
+from each HBX stage relay to the heat pump it starts — not a preference. Verify it at the panel
+before trusting the alarm: with the HBX in its stage test (or on a real call), close stage 1 alone
+and confirm which unit's wall controller shows a demand, then stage 2; or trace the dry-contact pair
+from the HBX stage-1 terminals to the unit's remote on/off input. If the units turn out swapped, set
+`STAGE_PUMP_MAP={"1":"pump2","2":"pump1"}` (the hub's pump ids). An invalid value falls back to the
+default and says so at `/health.unserved.stage_pump_map_error`.
+
+**`dmd` is not configuration (#182).** It is a live demand bitmask (1 ↔ 9 ↔ 41, nine flips in two
+days); it left `CONFIG_FIELDS`, and the drift diff compares only `CONFIG_FIELDS`, so a dmd flip
+makes no version row and no "HBX config changed" page (the false 12:00 AM banner of Oct 16).
+
+**Storm rows close (#183, planner half).** Stand-down closes **every** open `storm_events` row, and
+every planner start (the storm machine always starts idle) closes any row still open with
+`detail.closed = "planner restart while idle"`. An orphan ends at its own `windowEnd`, not today,
+so the TempIQ window classifier's storm lookup does not stretch it over the weeks it sat open. (The
+mirror banner is driven separately.)
+
+**SPAN-local heartbeat (#187, `spanlocal.ts`).** `/health.span {local_table,
+local_last_reading_age_s, circuits_seen, local_stale, cloud{enabled, last_ok_at, fail_streak,
+last_error}}` — the newest `span_readings` sample per circuit (the Pi's LAN poller, the path every
+SPAN safety action depends on) beside `spanwatch.ts`'s cloud state. A **high** page, edge-triggered,
+when the local stream is older than **15 min**, and a resolved notice on recovery; the cloud failing
+alone shows here but never pages. `scripts/drift-check.sh` [8] asserts local age ≤ 900 s.
+
+SQL proven by `scripts/incident-local-check.ts` (local Postgres only).
+
 ## Pi link — `/health.pi` (#165)
 
 Answers "which failure was that dropout?" from tables the planner already shares with the analytics
@@ -194,6 +241,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
 | `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `STAGE_PUMP_MAP` | no | JSON map of HBX stage relay → hub pump id, default `{"1":"pump1","2":"pump2"}`. The PHYSICAL wiring the per-stage unserved alarm (#185) checks against — verify it at the panel (§Per-stage unserved alarm). |
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |

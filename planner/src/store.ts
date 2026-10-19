@@ -146,6 +146,16 @@ export class Store {
         cleared_at timestamptz,
         detail     text
       );
+      -- #185: per-stage unserved-call episodes (stagewatch.ts): kind stage_unserved | fault_called, one row per edge.
+      CREATE TABLE IF NOT EXISTS stage_unserved_episodes (
+        id         serial PRIMARY KEY,
+        kind       text NOT NULL,
+        stage      text NOT NULL,
+        pump_id    text NOT NULL,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        cleared_at timestamptz,
+        detail     text
+      );
       CREATE TABLE IF NOT EXISTS hbx_boosts (
         id         serial PRIMARY KEY,
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -837,11 +847,88 @@ export class Store {
     );
   }
 
-  async closeStormEvent(): Promise<void> {
+  /** #185: open a per-stage episode (stagewatch.ts edge). */
+  async openStageEpisode(kind: string, stage: string, pumpId: string, detail: string): Promise<void> {
     await this.pool.query(
-      `UPDATE storm_events SET ended_at = now()
-       WHERE ended_at IS NULL AND id = (SELECT max(id) FROM storm_events)`,
+      `INSERT INTO stage_unserved_episodes (kind, stage, pump_id, detail) VALUES ($1, $2, $3, $4)`, [kind, stage, pumpId, detail]);
+  }
+
+  /** #185: close every open episode of this kind on this stage. */
+  async closeStageEpisodes(kind: string, stage: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE stage_unserved_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND kind = $1 AND stage = $2`, [kind, stage]);
+  }
+
+  /** #185: episodes still open (a restart re-adopts them so they close instead of re-paging). */
+  async openStageEpisodes(): Promise<{ type: "stage_unserved" | "fault_called"; stage: string }[]> {
+    const r = await this.pool.query(`SELECT DISTINCT kind, stage FROM stage_unserved_episodes WHERE cleared_at IS NULL`);
+    return r.rows
+      .filter((x: any) => x.kind === "stage_unserved" || x.kind === "fault_called")
+      .map((x: any) => ({ type: x.kind, stage: String(x.stage) }));
+  }
+
+  /** #185: episodes opened in the last 24 h, by kind (/health.unserved). */
+  async stageEpisodes24h(): Promise<Record<string, number>> {
+    const r = await this.pool.query(
+      `SELECT kind, count(*)::int AS n FROM stage_unserved_episodes WHERE started_at > now() - interval '24 hours' GROUP BY kind`);
+    return Object.fromEntries(r.rows.map((x: any) => [String(x.kind), Number(x.n)]));
+  }
+
+  /**
+   * #185: active fault CODES per pump from the mirror's pump_snapshots (the Pi attaches each pump's full snapshot every
+   * ~5 min, including active_faults [{code, message, severity, since}]). The hub's state frame carries only a COUNT.
+   * Non-info severities only. Read-only; an absent table (rehearsal DB) → {}.
+   */
+  async pumpFaultCodes(): Promise<Record<string, { codes: string[]; ts: number }>> {
+    try {
+      const r = await this.pool.query(
+        `SELECT pump_id, ts::float8 AS ts, snapshot->'active_faults' AS faults FROM pump_snapshots`);
+      const out: Record<string, { codes: string[]; ts: number }> = {};
+      for (const row of r.rows) {
+        const faults = Array.isArray(row.faults) ? row.faults : [];
+        const codes: string[] = faults.filter((f: any) => f && typeof f.code === "string" && f.severity !== "info").map((f: any) => String(f.code));
+        out[String(row.pump_id)] = { codes: [...new Set(codes)], ts: Number(row.ts) };
+      }
+      return out;
+    } catch (e) {
+      if ((e as { code?: string }).code === "42P01") return {};
+      throw e;
+    }
+  }
+
+  /**
+   * #187: the newest SPAN LOCAL sample per circuit name (the mirror's span_readings, fed by the Pi's LAN poller; Pi
+   * epoch seconds) over the last day; null when the table is absent (rehearsal DB). Index (name, ts).
+   */
+  async spanLocalLatest(nowS: number): Promise<Record<string, number> | null> {
+    try {
+      const r = await this.pool.query(
+        `SELECT name, max(ts)::float8 AS ts FROM span_readings WHERE ts >= $1 AND ts <= $2 GROUP BY name`, [nowS - 86_400, nowS + 120]);
+      return Object.fromEntries(r.rows.map((x: any) => [String(x.name), Number(x.ts)]));
+    } catch (e) {
+      if ((e as { code?: string }).code === "42P01") return null;
+      throw e;
+    }
+  }
+
+  /**
+   * #183: close EVERY open storm_events row, not just max(id). Each armed/active transition inserts a row and the
+   * state machine is in memory, so restarts while armed (17 deploys Sep 27–Oct 1) left rows open for weeks and the
+   * mirror's banner said "armed since 08:33 AM" while /health.storm was idle. A row ends at now() — or, for an orphan
+   * whose own window had already ended, at that windowEnd, so the TempIQ window classifier's storm_active lookup
+   * (pendingCurveWrites) does not stretch it over the weeks it sat open. `note` lands in detail.closed. Returns the
+   * number closed.
+   */
+  async closeStormEvents(note: string): Promise<number> {
+    const r = await this.pool.query(
+      `UPDATE storm_events SET
+         ended_at = GREATEST(started_at, LEAST(now(),
+           CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)),
+         detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('closed', $1::text)
+       WHERE ended_at IS NULL`,
+      [note],
     );
+    return r.rowCount ?? 0;
   }
 
   async activeStormEvent(): Promise<{ id: number; startedAt: Date; trigger: string; ceilingF: number | null } | null> {
