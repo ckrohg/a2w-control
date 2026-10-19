@@ -577,9 +577,17 @@ export class Store {
     return { mode: s.mode, autopilotDryRun: s.autopilotDryRun, phasebDryRun: s.phasebDryRun, autoSanitize: s.autoSanitize };
   }
 
+  /**
+   * A new boost SUPERSEDES every open one: its write replaced theirs on the device, and its own restore_at now owns
+   * the return to the as-found curve. Without this a 15-min boost tapped over a 2-h one expired while the older row
+   * still read as active, and the auto-pilot's boost hold kept the shorter boost's target in force for the longer
+   * one's whole timer. One statement, so no reader sees both or neither. `restored` is reused for "retired" (no schema
+   * change): nothing reads a superseded row's flag except dueBoosts/activeBoost, which must both skip it.
+   */
   async insertBoost(targetF: number, restoreAt: Date): Promise<void> {
     await this.pool.query(
-      `INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2)`,
+      `WITH retired AS (UPDATE hbx_boosts SET restored = true WHERE NOT restored)
+       INSERT INTO hbx_boosts (target_f, restore_at) VALUES ($1, $2)`,
       [targetF, restoreAt],
     );
   }

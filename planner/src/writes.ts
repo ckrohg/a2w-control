@@ -116,6 +116,20 @@ export function curveOverridden(
 
 export class HbxWriter {
   private lastWriteAt = 0;
+  /**
+   * Every device write (setTarget, setCurve, boost, restore, boost expiry) runs one at a time, in arrival order. The
+   * rate limit is checked before the PATCH but lastWriteAt is only set after it, so two writers that both passed the
+   * check could both land — and an auto-pilot write still in flight when the owner taps a boost could land SECOND and
+   * replace the boost (codex pass 1 on the boost hold). Serialised, the second writer sees the first's lastWriteAt
+   * and is refused 429. In-process only; a second planner instance is the writer lease's job (#36). patchDevice has
+   * its own fetch timeout, so a hung PATCH cannot wedge the chain.
+   */
+  private writeChain: Promise<unknown> = Promise.resolve();
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(fn, fn);
+    this.writeChain = run.catch(() => {});
+    return run;
+  }
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
 
   constructor(
@@ -212,6 +226,9 @@ export class HbxWriter {
   // raises the envelope ceiling — the I1 cross-check below is unchanged, so a higher target still
   // requires the pump setpoints to cover it (setpoint ≥ target + margin) or the write is rejected.
   async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+    return this.serial(() => this.setTargetSerial(targetF, source, capF));
+  }
+  private async setTargetSerial(targetF: number, source: string, capF: number): Promise<Record<string, unknown>> {
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
       throw new WriteError(status, detail, stable);
@@ -306,6 +323,9 @@ export class HbxWriter {
    * identification probes) stay setTarget writes on top; restore() puts the as-found curve back.
    */
   async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+    return this.serial(() => this.setCurveSerial(curve, source, capF));
+  }
+  private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number): Promise<Record<string, unknown>> {
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
     // validated (the guard already refused a wwsd that differs from the live one).
     const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
@@ -363,22 +383,41 @@ export class HbxWriter {
       await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "rejected", detail: "minutes must be 15–120" });
       throw new WriteError(422, "minutes must be 15–120");
     }
-    const result = await this.setTarget(targetF, source, capF); // envelope (capF) + I1 + rate limit
-    const restoreAt = new Date(Date.now() + minutes * 60_000);
-    await this.store.insertBoost(targetF, restoreAt);
-    return { ...result, boost_restore_at: restoreAt.toISOString() };
+    // The write AND its hbx_boosts row inside one serial slot: the auto-pilot's boost hold reads that row.
+    return this.serial(async () => {
+      const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
+      const restoreAt = new Date(Date.now() + minutes * 60_000);
+      await this.store.insertBoost(targetF, restoreAt);
+      return { ...result, boost_restore_at: restoreAt.toISOString() };
+    });
   }
 
-  /** Called every poll: restore any boost whose timer has passed (durable expiry). */
+  /**
+   * Called every poll: restore any boost whose timer has passed (durable expiry). A due row while a NEWER boost is
+   * active (an old row left unrestored through downtime or a failing restore, then the owner boosted again) is retired
+   * without a restore: restoring the as-found curve then would erase the live boost, and the auto-pilot's boost hold
+   * would keep the plant on that curve until the newer boost ran out (codex pass 1). The newer boost's own expiry
+   * restores the curve.
+   */
   async expireBoosts(): Promise<void> {
-    const due = await this.store.dueBoosts();
-    if (!due.length) return;
-    await this.restore("boost-expiry");
-    await this.store.markBoostsRestored(due.map((d) => d.id));
+    return this.serial(async () => {
+      const due = await this.store.dueBoosts();
+      if (!due.length) return;
+      const active = await this.store.activeBoost();
+      if (active) {
+        console.log(`[boost] retiring ${due.length} overdue boost row(s) without a restore — a newer boost to ${active.targetF}°F is active until ${active.restoreAt.toISOString()}`);
+      } else {
+        await this.restoreSerial("boost-expiry");
+      }
+      await this.store.markBoostsRestored(due.map((d) => d.id));
+    });
   }
 
   /** Re-apply the as-found curve endpoints. Never rate-limited, never envelope-checked. */
   async restore(source: string): Promise<Record<string, unknown>> {
+    return this.serial(() => this.restoreSerial(source));
+  }
+  private async restoreSerial(source: string): Promise<Record<string, unknown>> {
     const baseline = await this.store.baselineConfig();
     if (!baseline || typeof baseline.dbt !== "number" || typeof baseline.mbt !== "number") {
       await this.store.insertHbxWrite({ source, action: "restore", requested: null, result: "rejected", detail: "no baseline config version" });

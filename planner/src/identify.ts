@@ -673,6 +673,10 @@ export class IdentificationDriver {
       await this.postOpen(w);
       return;
     }
+    // A boost tapped while the arm was arming (setpoint lead, several ticks) or rate-limited is a human command the
+    // probe must not replace: the 429 retry would otherwise land the probe over it once the 15-min limit cleared. The
+    // window ends unwritten, so there is nothing to clean up. A failed lookup throws to tick()'s catch — no write.
+    if (await this.d.store.activeBoost()) { await this.end(w, "aborted:boost_active"); return; }
     const attempts = w.writeAttempts + 1;
     await this.d.store.updateIdentificationWindow(w.id, { writeAttempts: attempts });
     w.writeAttempts = attempts;
@@ -800,6 +804,15 @@ export class IdentificationDriver {
     //    fall through to overwriting a later human or auto-pilot command). If the status cannot be read,
     //    a non-urgent cleanup stays pending and retries; an urgent abort still restores the as-found
     //    curve — that write depends on no saved base and hotter is the safe direction.
+    // 0a. An active boost is a NEWER human command than this probe (no window opens while one is active, and the boost
+    //     row is written only after its write landed): there is nothing to return, and either cleanup write — the
+    //     re-command or the urgent as-found restore — would erase it. The boost's own expiry restores the curve and the
+    //     auto-pilot resumes after it (codex pass 1 on the boost hold). An unreadable boost table keeps a non-urgent
+    //     cleanup pending; an urgent abort still proceeds — hotter is the safe direction.
+    let boost: { targetF: number; restoreAt: Date } | null = null;
+    try { boost = await this.d.store.activeBoost(); }
+    catch (e) { if (!urgent) return stillPending(`boost state unreadable — not re-commanding over a possible boost: ${(e as Error).message.slice(0, 120)}`); }
+    if (boost) return done(`a boost to ${boost.targetF} °F is active until ${boost.restoreAt.toISOString()} — it replaced the probe; nothing to return`);
     const live = await this.d.liveCommandedTargetF().catch(() => null);
     const commanded = live != null && Number.isFinite(live) ? live : null;
     if (commanded != null && Math.round(commanded) !== Math.round(w.targetF)) {
