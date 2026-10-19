@@ -139,6 +139,29 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   assert.equal(h.reboots_7d, 0, "ambiguous jumps are not reboots");
 }
 
+// ── 4c. Every gap in the window is weighed; a clock step at a gap's edge makes it unresolved (codex pass 3 on #193)
+{
+  const st: StatsView = { boots: [], firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z") };
+  const base = { firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z") };
+  const run = [{ start: ms("2026-10-16T10:00:00Z"), end: ms("2026-10-16T12:00:00Z") }];
+  const g1 = { start: s("2026-10-16T10:00:00Z"), end: s("2026-10-16T11:00:00Z") };
+  const g2 = { start: s("2026-10-16T11:20:00Z"), end: s("2026-10-16T11:40:00Z") };
+  // a reboot in the SHORTER second gap still counts
+  const w = classifyWindows(run, { ...base, gaps: [g1, g2] }, { ...st, boots: [{ at: s("2026-10-16T11:35:00Z") }] }, NOW / 1000)[0];
+  assert.equal(w.verdict, "gap+reboot");
+  assert.equal(w.reboot_at, "2026-10-16T11:35:00.000Z");
+  assert.equal(w.readings_gap_min, 60, "the longest gap is reported");
+  // an ongoing window with a closed gap AND a trailing silence → the open one keeps it unknown
+  const now2 = s("2026-10-16T12:00:00Z");
+  const ongoing = [{ start: ms("2026-10-16T10:00:00Z"), end: null }];
+  assert.equal(classifyWindows(ongoing, { gaps: [g1], firstTs: base.firstTs, lastTs: s("2026-10-16T11:20:00Z") },
+    { ...st, lastTs: s("2026-10-16T11:59:00Z") }, now2)[0].verdict, "unknown", "the still-open silence forbids a no-reboot verdict");
+  // a forward clock step at the gap's edge: the 'gap' may be the clock jumping → unknown
+  const step = { start: s("2026-10-16T10:29:00Z"), end: s("2026-10-16T10:40:00Z") };
+  assert.equal(classifyWindows(run, { ...base, gaps: [step] }, { ...st, clockSteps: [s("2026-10-16T10:40:00Z")] }, NOW / 1000)[0].verdict, "unknown");
+  assert.equal(classifyWindows(run, { ...base, gaps: [step] }, st, NOW / 1000)[0].verdict, "gap_only", "the same gap without the step is resolved");
+}
+
 // ── 5. No reboot evidence possible → unknown, never a guessed gap_only (codex pass 1 on #193) ──────────────────────
 {
   const run = [{ start: ms("2026-10-14T15:00:00Z"), end: ms("2026-10-14T17:10:00Z") }];

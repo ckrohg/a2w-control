@@ -26,6 +26,8 @@ export const WINDOW_SLACK_S = 10 * 60;
  * Pi up longer than the step is neither. store.piLinkInputs applies it in SQL.
  */
 export const BOOT_JUMP_S = 5 * 60;
+/** A difference between the ts step and the uptime step larger than this between two samples is a clock step. */
+export const CLOCK_STEP_S = 2 * 60;
 
 export type PiVerdict = "gap+reboot" | "gap_only" | "socket_only" | "unknown";
 
@@ -87,6 +89,8 @@ export interface StatsView {
    * reboot, and a gap whose only evidence is one of these is `unknown`.
    */
   ambiguous?: Boot[];
+  /** Pi-clock discontinuities (epoch s): ts moved unlike uptime between consecutive samples — an NTP step */
+  clockSteps?: number[];
   firstTs: number | null;
   lastTs: number | null;
 }
@@ -125,25 +129,34 @@ export function classifyWindows(
     // the window itself (a long silence spanning a short socket outage — codex pass 2 on #193)
     const belongs = (g: ReadingGap) => inside(g) >= READING_GAP_MIN_S
       && (inside(g) >= (g.end - g.start) / 2 || core(g) >= (e - s) / 2);
-    const gap = gaps.filter(belongs).sort((x, y) => inside(y) - inside(x))[0] ?? null;
+    // EVERY gap that belongs is weighed (codex pass 3 on #193): a reboot in any of them is gap+reboot; otherwise any
+    // unresolved one (still open, not bracketed by stats, only an ambiguous boot, or a clock step at its edges — the
+    // "gap" may be the Pi's clock jumping, not a silence) makes the verdict unknown; only all-resolved is gap_only
+    const mine = gaps.filter(belongs);
     // a gap that overlaps the window itself but does not clearly belong to it: continuity is NOT established
-    const unclear = !gap && gaps.some((g) => core(g) > 0);
-    const open = gap != null && trailing && gap.end === nowS;
-    const bracketed = gap != null && !open && stats != null && stats.firstTs != null && stats.lastTs != null
-      && stats.firstTs <= gap.start && stats.lastTs >= gap.end;
-    const inGap = (b: Boot) => gap != null && b.at >= gap.start - 60 && b.at <= gap.end + 120;
-    const boot = gap && bracketed ? boots.find(inGap) ?? null : null;
-    const ambiguous = !boot && gap != null && bracketed && (stats?.ambiguous ?? []).some(inGap);
+    const unclear = !mine.length && gaps.some((g) => core(g) > 0);
+    const near = (g: ReadingGap, t: number) => t >= g.start - 120 && t <= g.end + 120;
+    let boot: Boot | null = null;
+    let unresolved = false;
+    for (const g of mine) {
+      const open = trailing && g.end === nowS;
+      const bracketed = !open && stats != null && stats.firstTs != null && stats.lastTs != null
+        && stats.firstTs <= g.start && stats.lastTs >= g.end;
+      const certain = bracketed ? boots.find((b) => near(g, b.at) && b.at >= g.start - 60) ?? null : null;
+      if (certain) { boot ??= certain; continue; }
+      if (!bracketed || (stats?.ambiguous ?? []).some((b) => near(g, b.at)) || (stats?.clockSteps ?? []).some((t) => near(g, t))) unresolved = true;
+    }
+    const longest = mine.reduce<ReadingGap | null>((a, g) => (!a || g.end - g.start > a.end - a.start ? g : a), null);
     const verdict: PiVerdict = !covered || unclear ? "unknown"
-      : !gap ? "socket_only"
-      : !bracketed || ambiguous ? "unknown"
-      : boot ? "gap+reboot" : "gap_only";
+      : !mine.length ? "socket_only"
+      : boot ? "gap+reboot"
+      : unresolved ? "unknown" : "gap_only";
     return {
       start: new Date(r.start).toISOString(),
       end: r.end == null ? null : new Date(r.end).toISOString(),
       minutes: Math.round((e - s) / 6) / 10,
       verdict,
-      readings_gap_min: gap ? Math.round((gap.end - gap.start) / 6) / 10 : null,
+      readings_gap_min: longest ? Math.round((longest.end - longest.start) / 6) / 10 : null,
       reboot_at: boot ? new Date(boot.at * 1000).toISOString() : null,
     };
   });

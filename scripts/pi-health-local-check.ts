@@ -18,9 +18,9 @@
  */
 import assert from "node:assert/strict";
 import { Store } from "../planner/src/store";
-import { piHealth, READING_GAP_MIN_S, BOOT_JUMP_S, DROPOUT_WINDOW_S, LOOKBACK_S } from "../planner/src/pilink";
+import { piHealth, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S } from "../planner/src/pilink";
 
-const OPTS = { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S };
+const OPTS = { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, clockStepS: CLOCK_STEP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S };
 
 const url = process.env.LOCAL_DATABASE_URL ?? "";
 if (!/^postgres(ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) {
@@ -36,6 +36,10 @@ const H = 3600, D = 86_400;
 const W1: [number, number] = [NOW - 4 * D + 2 * H, NOW - 4 * D + 4 * H + 600];
 const W2: [number, number] = [NOW - 3 * D + 5 * H, NOW - 3 * D + 7 * H + 300];
 const W3: [number, number] = [NOW - 2 * D + 10 * H, NOW - 2 * D + 12 * H];
+const W4: [number, number] = [NOW - D + 16 * H, NOW - D + 17 * H];           // socket outage while the Pi exports on
+const W4_FWD = NOW - D + 16 * H + 1_800;   // the Pi clock steps +600 s mid-outage (readings AND stats)…
+const W4_BACK = NOW - D + 17 * H + 1_800;  // …then −1037 s (to −437 s): samples interleave by ts, fractional stamps
+const offset = (t: number) => (t >= W4_FWD ? (t < W4_BACK ? 600 : -437.25) : 0);
 const REBOOT1 = NOW - 4 * D + 4 * H + 360;   // 04:06, inside W1's slack
 const REBOOT2 = NOW - 6 * H;                 // the power-cycle
 const silent = (t: number, w: [number, number]) => t > w[0] + 60 && t < w[1] - 60;
@@ -64,9 +68,10 @@ async function main() {
   // readings: both pumps every 60 s for 8 days, silent inside W1 and W2 (the exporter could not push either)
   await pool.query(
     `INSERT INTO readings (ts, pump_id, online, state)
-     SELECT t, p, true, 'heating' FROM generate_series($1::bigint, $2::bigint, 60) t, unnest(ARRAY['pump1','pump2']) p
+     SELECT t + CASE WHEN t >= $7 AND t < $8 THEN 600 WHEN t >= $8 THEN -437.25 ELSE 0 END, p, true, 'heating'
+     FROM generate_series($1::bigint, $2::bigint, 60) t, unnest(ARRAY['pump1','pump2']) p
      WHERE NOT (t > $3 + 60 AND t < $4 - 60) AND NOT (t > $5 + 60 AND t < $6 - 60)`,
-    [NOW - 8 * D, NOW - 30, W1[0], W1[1], W2[0], W2[1]]);
+    [NOW - 8 * D, NOW - 30 - 1_800, W1[0], W1[1], W2[0], W2[1], W4_FWD, W4_BACK]);
   // system_stats: every 60 s, silent inside W1; boot time jumps at REBOOT1 and REBOOT2 (and the Pi's own clock jitters ±2 s)
   const boot0 = NOW - 30 * D;
   const rows: string[] = [];
@@ -78,7 +83,7 @@ async function main() {
     const boot = t >= REBOOT2 ? REBOOT2 : t >= REBOOT1 ? REBOOT1 : boot0;
     const jitter = (t / 60) % 3 - 1; // −1, 0, +1 s
     // the Pi's CLOCK (ts) steps +600 s at STEP_FWD and back −600 s at STEP_BACK; uptime is unaffected
-    const clock = (t >= STEP_FWD && t < STEP_BACK ? 600 : 0) + (t >= FRESH_STEP ? 1_800 : 0);
+    const clock = (t >= STEP_FWD && t < STEP_BACK ? 600 : 0) + offset(t) + (t >= FRESH_STEP ? 1_800 : 0);
     rows.push(`(${t + clock}, ${t - boot + jitter})`);
   }
   for (let i = 0; i < rows.length; i += 2000) {
@@ -89,10 +94,10 @@ async function main() {
   await pool.query(
     `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
      SELECT to_timestamp(t), p, 'active', 55,
-            CASE WHEN (t >= $2 AND t < $3) OR (t >= $4 AND t < $5) OR (t >= $6 AND t < $7)
+            CASE WHEN (t >= $2 AND t < $3) OR (t >= $4 AND t < $5) OR (t >= $6 AND t < $7) OR (t >= $9 AND t < $10)
                  THEN 'failed: no Pi connected' ELSE 'sent' END
      FROM generate_series($1::bigint, $8::bigint, 300) t, unnest(ARRAY['pump1','pump2']) p`,
-    [NOW - 8 * D + 600, W1[0], W1[1], W2[0], W2[1], W3[0], W3[1], NOW - 300]);
+    [NOW - 8 * D + 600, W1[0], W1[1], W2[0], W2[1], W3[0], W3[1], NOW - 300, W4[0], W4[1]]);
   // a dropout that began 9 d ago (BEFORE the 8-d query range) and ended 6 d ago: its real start must be recovered
   await pool.query(
     `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
@@ -106,26 +111,27 @@ async function main() {
 
   const inputs = await store.piLinkInputs(NOW * 1000, OPTS);
   assert.deepEqual(Object.keys(inputs.lastByPump ?? {}).sort(), ["pump1", "pump2"]);
-  assert.equal(inputs.readings?.gaps.length, 2, `two readings gaps (got ${JSON.stringify(inputs.readings?.gaps)})`);
+  assert.equal(inputs.readings?.gaps.length, 3, `W1, W2 and the W4 clock-step artifact (got ${JSON.stringify(inputs.readings?.gaps)})`);
   const boots = inputs.stats?.boots ?? [];
-  assert.equal(boots.length, 2, `exactly the two reboots — jitter and both NTP steps ignored (got ${JSON.stringify(boots)})`);
-  assert.ok(Math.abs(boots[0].at - REBOOT1) <= 2 && Math.abs(boots[1].at - REBOOT2) <= 2, "at the right moments (±2 s clock jitter)");
+  assert.equal(boots.length, 2, `exactly the two reboots — jitter, the ±600 s steps and the interleaving −1037 s step ignored (got ${JSON.stringify(boots)})`);
+  assert.ok(Math.abs(boots[0].at - REBOOT1) <= 2 && Math.abs(boots[1].at - (REBOOT2 - 437.25)) <= 2, "at the right moments (±2 s clock jitter)");
   assert.ok(inputs.stats!.firstTs! <= NOW - 8 * D + 60, "stats coverage reported from the range start");
   assert.equal(inputs.stats?.ambiguous?.length, 1, `the fresh Pi's +30 min clock step is ambiguous (${JSON.stringify(inputs.stats?.ambiguous)})`);
   assert.ok(inputs.phaseB.every((r) => r.result === "sent" || /no Pi connected/.test(r.result)), "only rows that speak about the Pi");
 
   const h = piHealth(inputs, NOW * 1000);
-  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "gap+reboot", "gap_only", "socket_only"],
-    "the 9-d run predates the readings (they start 8 d ago) → unknown");
-  assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [3 * 24 * 60, 130, 125, 120]);
+  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "gap+reboot", "gap_only", "socket_only", "unknown"],
+    "the 9-d run predates the readings (they start 8 d ago) → unknown; W4's 'gap' is the clock step → unknown");
+  assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [3 * 24 * 60, 130, 125, 120, 60]);
+  assert.ok((inputs.stats?.clockSteps ?? []).some((t) => Math.abs(t - (W4_FWD + 600)) <= 120), "the +600 s step is detected");
   assert.equal(Date.parse(h.dropouts_7d[0].start) / 1000, NOW - 9 * D, "a run open at the range start keeps its real start");
   assert.ok(Math.abs(Date.parse(h.dropouts_7d[1].reboot_at ?? "") / 1000 - REBOOT1) <= 2, "W1 names its reboot");
   assert.equal(h.dropouts_7d[2].reboot_at, null);
   assert.equal(h.reboots_24h, 1);
   assert.equal(h.reboots_7d, 2);
-  assert.equal(h.last_reading_age_s, 60, "the newest 60-s sample sits at now − 60");
+  assert.ok(h.last_reading_age_s != null && Math.abs(h.last_reading_age_s - (1_860 + 437)) <= 61, `newest reading: the series ends 30 min early, stamped −437 s (${h.last_reading_age_s})`);
   assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 1_860)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
-  assert.deepEqual(h.summary, { count: 4, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 1, socket_only: 1, unknown: 1 } });
+  assert.deepEqual(h.summary, { count: 5, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 1, socket_only: 1, unknown: 2 } });
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);
   await pool.query(`INSERT INTO readings (ts, pump_id) VALUES ($1, 'pump1')`, [NOW - 20 * D]);

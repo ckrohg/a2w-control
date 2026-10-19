@@ -11,7 +11,7 @@ import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, handlePolledConfig, PendingTracker, type CurveDiagnosis } from "./drift";
-import { piHealth, withLiveAges, READING_GAP_MIN_S, BOOT_JUMP_S, DROPOUT_WINDOW_S, LOOKBACK_S, type PiHealth } from "./pilink";
+import { piHealth, withLiveAges, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S, type PiHealth } from "./pilink";
 import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
@@ -315,7 +315,7 @@ async function refreshPiLink(): Promise<void> {
   piLinkBusy = true;
   try {
     const now = Date.now();
-    piLink = piHealth(await store.piLinkInputs(now, { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S }), now);
+    piLink = piHealth(await store.piLinkInputs(now, { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, clockStepS: CLOCK_STEP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S }), now);
     piLinkError = null;
   } catch (e) {
     piLinkError = (e as Error).message;

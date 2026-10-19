@@ -944,7 +944,7 @@ export class Store {
    * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS, with uptime
    * evidence), each with its table's coverage over the range.
    */
-  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; windowS: number; lookbackS: number }): Promise<PiLinkInputs> {
+  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; clockStepS: number; windowS: number; lookbackS: number }): Promise<PiLinkInputs> {
     // the analysis range starts a day before the 7-d window (runs straddling the edge keep their real start) plus an
     // hour of context for the first gap / boot
     const fromS = nowMs / 1000 - o.windowS - o.lookbackS;
@@ -977,18 +977,31 @@ export class Store {
       // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): certain when uptime fell; ambiguous when the boot time
       // jumped while uptime kept rising but is shorter than the time since the previous sample (a fresh Pi's clock step
       // looks the same) — an NTP step on a long-running Pi is neither
+      // A NEW boot must also be later than EVERY boot time seen before it (codex pass 3 on #193): a backward clock
+      // step re-orders samples by ts so uptime seems to fall, but the "new" boot time is one already seen.
       const b = await this.pool.query(
         `SELECT boot_at::float8 AS at, (uptime_s < prev_up - 5) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
-                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up, lag(ts - uptime_s) OVER w AS prev_boot
+                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up, lag(ts - uptime_s) OVER w AS prev_boot,
+                  max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot
            FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
-         ) s WHERE prev_ts IS NOT NULL
-             AND (uptime_s < prev_up - 5 OR (boot_at - prev_boot > $2 AND uptime_s < ts - prev_ts))
+         ) s WHERE prev_ts IS NOT NULL AND boot_at > max_prev_boot + $2
+             AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
          ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS]);
+      // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
+      // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
+      const steps = await this.pool.query(
+        `SELECT ts::float8 AS ts FROM (
+           SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
+           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+         ) s WHERE prev_ts IS NOT NULL AND uptime_s >= prev_up - 5
+             AND abs((ts - prev_ts) - (uptime_s - prev_up)) > $2
+         ORDER BY ts`, [fromS - 3_600, o.clockStepS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
       stats = {
         boots: b.rows.filter((r: any) => r.certain).map((r: any) => ({ at: Number(r.at) })),
         ambiguous: b.rows.filter((r: any) => !r.certain).map((r: any) => ({ at: Number(r.at) })),
+        clockSteps: steps.rows.map((r: any) => Number(r.ts)),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };
