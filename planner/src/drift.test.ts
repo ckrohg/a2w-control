@@ -212,14 +212,14 @@ async function main(): Promise<void> {
     assert.deepEqual(h.rows[0].raw, seen, "the first read is kept whole");
     assert.equal(out.changes, null);
     // nothing pending is announced while the change is still there: the next poll re-detects it and pages it itself
-    assert.deepEqual(pendingUnconfirmedNotice(null, out), { pending: out.diagnosis, notice: null });
+    assert.deepEqual(pendingUnconfirmedNotice(null, out), { pending: out.diagnosis, notice: null, resolved: false });
     // the next poll: same device, re-read works now → the full check runs and pages
     const h2 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: seen, writes: [] });
     const out2 = await handlePolledConfig(prev, seen, h2.deps);
     assert.equal(out2.diagnosis?.verdict, "foreign");
     assert.equal(h2.pages.length, 1);
     assert.equal(h2.pages[0].priority, "high");
-    assert.deepEqual(pendingUnconfirmedNotice(out.diagnosis, out2), { pending: null, notice: null }, "re-detected → its own page, no extra notice");
+    assert.deepEqual(pendingUnconfirmedNotice(out.diagnosis, out2), { pending: null, notice: null, resolved: true }, "re-detected → its own page, no extra notice");
   }
 
   // ── 8b. Failed confirmation, then a planner write (boost expiry restore) replaces the curve before the next poll:
@@ -243,7 +243,22 @@ async function main(): Promise<void> {
     assert.match(carry.notice?.body ?? "", /dbt: 120 -> 100/, "the notice carries the evidence");
     assert.match(carry.notice?.body ?? "", /re-read failed: HTTP 503/);
     assert.doesNotMatch(carry.notice?.body ?? "", /single-writer/i);
+    assert.equal(carry.resolved, true, "settled — index.ts persists that so a restart does not repeat it");
     assert.equal(pendingUnconfirmedNotice(null, out2).notice, null, "nothing pending → nothing to say");
+    // after a RESTART the pending observation comes back from the DB (store.pendingUnconfirmed) — same outcome
+    const reloaded = JSON.parse(JSON.stringify(out1.diagnosis));
+    assert.equal(pendingUnconfirmedNotice(reloaded, out2).notice?.title, UNCONFIRMED_TITLE, "a reloaded pending observation is announced too");
+    // a DIFFERENT change that reverts on the next poll must not swallow the pending one (codex pass 4)
+    const h4 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: device(165, 140) });
+    const out4 = await handlePolledConfig(restored, device(141, 137), h4.deps);
+    assert.equal(out4.diagnosis?.verdict, "reverted");
+    const c4 = pendingUnconfirmedNotice(out1.diagnosis, out4);
+    assert.equal(c4.notice?.title, UNCONFIRMED_TITLE, "reverted does not supersede — the notice goes out");
+    assert.equal(c4.resolved, true);
+    // a fresh unconfirmed one replaces it (still pending, nothing announced yet)
+    const h5 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: new Error("HTTP 503") });
+    const out5 = await handlePolledConfig(restored, device(141, 137), h5.deps);
+    assert.deepEqual(pendingUnconfirmedNotice(out1.diagnosis, out5), { pending: out5.diagnosis, notice: null, resolved: false });
     // a re-read failure while a planner write already moved the baseline: no evidence row over our newer version
     const h3 = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: restored });
     await handlePolledConfig(prev, seen, h3.deps);

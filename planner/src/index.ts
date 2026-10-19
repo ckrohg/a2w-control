@@ -1616,6 +1616,7 @@ async function pollOnce(): Promise<void> {
     const carry = pendingUnconfirmedNotice(pendingUnconfirmed, drift);
     pendingUnconfirmed = carry.pending;
     if (carry.notice) await ntfy(carry.notice.title, carry.notice.body, "default", { email: true });
+    if (carry.resolved) await store.resolveUnconfirmed().catch((e) => console.error("resolveUnconfirmed failed:", (e as Error).message));
   }
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
@@ -1737,6 +1738,7 @@ async function main(): Promise<void> {
   if (process.env.POLL_ONCE === "1") await store.ensureSchema();
   else await store.ensureSchemaWithRetry();
   lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
+  pendingUnconfirmed = await store.pendingUnconfirmed().catch(() => null);   // #177: so does an unsettled observation
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the

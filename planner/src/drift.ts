@@ -424,25 +424,28 @@ export async function handlePolledConfig(
 export const UNCONFIRMED_TITLE = "HBX curve change seen once, could not be confirmed";
 
 /**
- * #177 (codex pass 3): an `unconfirmed` curve change is re-checked on the next poll. If that poll handles a curve event
- * (the change is still there → it gets its own verdict and page; or it is unconfirmed again → keep waiting) the pending
- * one is superseded. If the next poll sees NO curve change — a planner write (boost expiry, auto-pilot) replaced the
- * curve, or the change vanished — the observation would otherwise be lost: say so at default priority, with the
- * evidence, and without any single-writer claim. Returns the pending diagnosis to carry forward and the notice to send.
+ * #177 (codex passes 3–4): an `unconfirmed` curve change is re-checked on the next poll. Only a CONFIRMED curve event
+ * (echo_suspected / foreign — it gets its own page) supersedes it silently; a fresh unconfirmed one replaces it. Any
+ * other outcome — no change (a planner write such as boost expiry replaced the curve, or it vanished), non-curve drift,
+ * or a different change that reverted — would otherwise lose the observation, so it is announced at default priority
+ * with the evidence and no single-writer claim. `resolved` = the pending observation is settled (persist that, so a
+ * restart does not re-announce it — index.ts reloads the newest unresolved one at boot).
  */
 export function pendingUnconfirmedNotice(
   pending: CurveDiagnosis | null,
   outcome: DriftOutcome,
-): { pending: CurveDiagnosis | null; notice: { title: string; body: string } | null } {
-  if (outcome.diagnosis?.verdict === "unconfirmed") return { pending: outcome.diagnosis, notice: null };
-  if (!pending) return { pending: null, notice: null };
-  if (outcome.kind === "curve") return { pending: null, notice: null };
+): { pending: CurveDiagnosis | null; notice: { title: string; body: string } | null; resolved: boolean } {
+  const v = outcome.diagnosis?.verdict;
+  if (v === "unconfirmed") return { pending: outcome.diagnosis, notice: null, resolved: false };
+  if (!pending) return { pending: null, notice: null, resolved: false };
+  if (v === "echo_suspected" || v === "foreign") return { pending: null, notice: null, resolved: true };
   return {
     pending: null,
+    resolved: true,
     notice: {
       title: UNCONFIRMED_TITLE,
       body: `At ${pending.first_read_at} the device showed a reset-curve change the planner did not write, but the ` +
-        `confirmation re-read failed, and by the next poll the change was no longer there to confirm (a planner write ` +
+        `confirmation re-read failed, and by the next check the change was no longer there to confirm (a planner write ` +
         `replaced the curve, or the first read was transient). Not a confirmed second writer.\n\n${diagnosisBody(pending)}`,
     },
   };

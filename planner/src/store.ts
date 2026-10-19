@@ -909,6 +909,30 @@ export class Store {
     return { last: last.rowCount ? toWrite(last.rows[0]) : null, recent: recent.rows.map(toWrite) };
   }
 
+  /**
+   * #177 (codex pass 4): the newest `unconfirmed` observation not yet settled — no resolved_at, and no confirmed curve
+   * event (echo_suspected / foreign) recorded after it. index.ts reloads it at boot so a restart between the
+   * evidence row and the next poll does not lose the follow-up notice.
+   */
+  async pendingUnconfirmed(): Promise<CurveDiagnosis | null> {
+    const r = await this.pool.query(
+      `SELECT u.diagnosis FROM hbx_config_versions u
+       WHERE u.verdict = 'unconfirmed' AND u.diagnosis IS NOT NULL AND u.diagnosis->>'resolved_at' IS NULL
+         AND NOT EXISTS (SELECT 1 FROM hbx_config_versions c
+                          WHERE c.id > u.id AND c.verdict IN ('echo_suspected', 'foreign'))
+       ORDER BY u.id DESC LIMIT 1`,
+    );
+    return r.rowCount ? (r.rows[0].diagnosis as CurveDiagnosis) : null;
+  }
+
+  /** #177: mark every open `unconfirmed` observation settled (its notice went out, or a confirmed event superseded it). */
+  async resolveUnconfirmed(): Promise<void> {
+    await this.pool.query(
+      `UPDATE hbx_config_versions SET diagnosis = diagnosis || jsonb_build_object('resolved_at', now())
+       WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL`,
+    );
+  }
+
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */
   async latestCurveDiagnosis(): Promise<CurveDiagnosis | null> {
     const r = await this.pool.query(
