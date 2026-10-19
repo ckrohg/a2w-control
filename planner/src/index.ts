@@ -43,7 +43,7 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, type StagePump } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { PhaseB } from "./phaseb";
@@ -769,10 +769,15 @@ async function restoreAlertState(): Promise<void> {
   if (alertStateRestored) return;
   try {
     const open = await store.openAlertEpisodes();
-    alerts.adopt(open);
-    stageWatch.restore(open.filter((o) => o.kind === "stage_unserved" || o.kind === "fault_called")
+    // a stage episode is re-adopted only if it is about the pump that stage maps to NOW: after STAGE_PUMP_MAP was
+    // corrected, an old episode for the wrong unit is closed, never allowed to suppress the right one (codex pass 10)
+    const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called";
+    const { keep, stale } = partitionRestore(open, STAGE_MAP.map);
+    if (stale.length) await store.closeAlertEpisodeIds(stale.map((o) => o.id)); // a failure → the whole restore retries
+    alerts.adopt(keep);
+    stageWatch.restore(keep.filter(isStage)
       .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
-    if (open.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
+    if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
     alertStateRestored = true;
   } catch (e) {
     console.error("alert state restore failed (retried next tick):", (e as Error).message);

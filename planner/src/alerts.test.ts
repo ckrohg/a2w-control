@@ -227,5 +227,23 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   assert.equal(sent.slice(n7).filter((t) => t === "⚠ heard ghost").length, 1, "heard once, sent once");
   assert.equal(rows.find((r) => r.title === "⚠ heard ghost")?.notified, true);
 
+  // codex pass 10: a STALLED insert (never settles) must not hold the page — it goes out after the bound, and the
+  // episode stays retryable by uid (a late commit is harmless)
+  const stalled: AlertStore = { ...store, openAlertEpisode: () => new Promise<number>(() => { /* never */ }) };
+  up = true;
+  const sx = new AlertOutbox(stalled, send, () => {}, 50);
+  const n8 = sent.length;
+  const t0 = Date.now();
+  assert.equal(await sx.open("fault_called", "12", "pump2", "⚠ stalled DB", "E21"), true, "paged despite the stalled insert");
+  assert.ok(Date.now() - t0 < 2_000, "within the bound");
+  assert.equal(sent[n8], "⚠ stalled DB");
+  assert.equal(sx.pending(), 1, "kept for persistence by uid");
+  // a stalled undelivered fetch does not hang retry()
+  const stalled2: AlertStore = { ...store, undeliveredAlertEpisodes: () => new Promise(() => { /* never */ }) };
+  const sy = new AlertOutbox(stalled2, send, () => {}, 50);
+  const t1 = Date.now();
+  await sy.retry();
+  assert.ok(Date.now() - t1 < 2_000);
+
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

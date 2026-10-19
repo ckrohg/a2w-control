@@ -854,10 +854,12 @@ export class Store {
     );
   }
 
+  // (all alert_episodes queries run on the BOUNDED pool — connect / statement / query timeouts — so persistence can
+  // never block paging indefinitely; codex pass 10 on the incident-fixes PR)
   /** #185 / #187: open an alert episode; returns its id (the outbox row). */
   async openAlertEpisode(uid: string, kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number> {
     // idempotent on uid (codex pass 8): a retry after a commit whose reply was lost returns the SAME row
-    const r = await this.pool.query(
+    const r = await this.locked.query(
       `INSERT INTO alert_episodes (uid, kind, key, pump_id, title, detail) VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (uid) DO UPDATE SET uid = EXCLUDED.uid RETURNING id`,
       [uid, kind, key, pumpId, title, detail]);
@@ -867,36 +869,36 @@ export class Store {
   /** Close episodes by their client uid — for an insert whose outcome was never learned. */
   async closeAlertEpisodeUids(uids: string[]): Promise<void> {
     if (!uids.length) return;
-    await this.pool.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND uid = ANY($1::text[])`, [uids]);
+    await this.locked.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND uid = ANY($1::text[])`, [uids]);
   }
 
   /** The page for this episode was acknowledged by a channel. */
   async markAlertNotified(id: number): Promise<void> {
-    await this.pool.query(`UPDATE alert_episodes SET notified_at = now() WHERE id = $1`, [id]);
+    await this.locked.query(`UPDATE alert_episodes SET notified_at = now() WHERE id = $1`, [id]);
   }
 
   /** Close exactly these episodes (alerts.ts tracks the IDs open for each kind/key — a recurrence is a new ID). */
   async closeAlertEpisodeIds(ids: number[]): Promise<void> {
     if (!ids.length) return;
-    await this.pool.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND id = ANY($1::int[])`, [ids]);
+    await this.locked.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND id = ANY($1::int[])`, [ids]);
   }
 
   /** Episodes still open (a restart re-adopts them so they close instead of re-paging). */
-  async openAlertEpisodes(): Promise<{ id: number; kind: string; key: string }[]> {
-    const r = await this.pool.query(`SELECT id, kind, key FROM alert_episodes WHERE cleared_at IS NULL ORDER BY id`);
-    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), key: String(x.key) }));
+  async openAlertEpisodes(): Promise<{ id: number; kind: string; key: string; pumpId: string | null }[]> {
+    const r = await this.locked.query(`SELECT id, kind, key, pump_id FROM alert_episodes WHERE cleared_at IS NULL ORDER BY id`);
+    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), key: String(x.key), pumpId: x.pump_id == null ? null : String(x.pump_id) }));
   }
 
   /** Open episodes whose page no channel has acknowledged yet — re-sent every poll. */
   async undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]> {
-    const r = await this.pool.query(
+    const r = await this.locked.query(
       `SELECT id, uid, kind, title, detail FROM alert_episodes WHERE cleared_at IS NULL AND notified_at IS NULL ORDER BY id LIMIT 20`);
     return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
   }
 
   /** Episodes opened in the last 24 h, by kind (/health.unserved). */
   async alertEpisodes24h(): Promise<Record<string, number>> {
-    const r = await this.pool.query(
+    const r = await this.locked.query(
       `SELECT kind, count(*)::int AS n FROM alert_episodes WHERE started_at > now() - interval '24 hours' GROUP BY kind`);
     return Object.fromEntries(r.rows.map((x: any) => [String(x.kind), Number(x.n)]));
   }

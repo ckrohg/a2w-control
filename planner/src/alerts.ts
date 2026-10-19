@@ -25,6 +25,15 @@ interface Unrecorded { uid: string; kind: string; key: string; pumpId: string | 
 const k = (kind: string, key: string) => `${kind}\u0000${key}`;
 const RESENT = "\n\n(re-sent: the first delivery was not acknowledged by any channel)";
 
+/** Every store call is bounded: a stalled DB must never hold a page (codex pass 10). The uid makes a late commit harmless. */
+export const STORE_TIMEOUT_MS = 20_000;
+function bounded<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`alert store call timed out after ${ms} ms`)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 export class AlertOutbox {
   /** open episode row IDs by kind/key — what a recovery closes */
   private openIds = new Map<string, Set<number>>();
@@ -37,7 +46,17 @@ export class AlertOutbox {
   /** episodes whose row could not be written (with whether a channel already heard the page) */
   private unrecorded: Unrecorded[] = [];
 
-  constructor(private readonly store: AlertStore, private readonly send: Send, private readonly log: (m: string) => void = (m) => console.error(m)) {}
+  private readonly store: AlertStore;
+  constructor(store: AlertStore, private readonly send: Send, private readonly log: (m: string) => void = (m) => console.error(m), timeoutMs = STORE_TIMEOUT_MS) {
+    // the same store, every call bounded
+    this.store = {
+      openAlertEpisode: (...a) => bounded(store.openAlertEpisode(...a), timeoutMs),
+      markAlertNotified: (id) => bounded(store.markAlertNotified(id), timeoutMs),
+      undeliveredAlertEpisodes: () => bounded(store.undeliveredAlertEpisodes(), timeoutMs),
+      closeAlertEpisodeIds: (ids) => bounded(store.closeAlertEpisodeIds(ids), timeoutMs),
+      closeAlertEpisodeUids: (uids) => bounded(store.closeAlertEpisodeUids(uids), timeoutMs),
+    };
+  }
 
   /** Re-adopt rows still open in the DB after a restart (restoreAlertState). */
   adopt(rows: { id: number; kind: string; key: string }[]): void {
@@ -125,7 +144,8 @@ export class AlertOutbox {
     // a row whose uid is still held in memory (unrecorded — sent from memory, or already heard) or whose uid-close is
     // pending (cancelled after a lost reply) is never sent from the DB as well (codex pass 9)
     const heldUids = new Set<string>([...this.unclosedUids, ...this.unrecorded.map((u) => u.uid)]);
-    for (const a of await this.store.undeliveredAlertEpisodes()) {
+    const rows = await this.store.undeliveredAlertEpisodes().catch((e) => { this.log(`undelivered fetch failed: ${(e as Error).message}`); return []; });
+    for (const a of rows) {
       if (this.unclosed.has(a.id) || this.unmarked.has(a.id)) continue; // resolved, or already heard
       if (a.uid != null && heldUids.has(a.uid)) continue;
       if (!canResend(a.kind)) continue; // its watch has not re-evaluated the condition since a restore (index.ts)

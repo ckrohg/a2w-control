@@ -197,3 +197,16 @@ export class StageWatch {
     return out;
   }
 }
+
+/**
+ * Restore (codex pass 10): an open stage episode is re-adopted only if it is about the pump that stage maps to NOW. After
+ * STAGE_PUMP_MAP was corrected, an episode for the old unit would otherwise suppress the right one's page — it is closed
+ * instead. SPAN and other kinds pass through untouched.
+ */
+export function partitionRestore<T extends { kind: string; key: string; pumpId: string | null }>(
+  open: T[], map: Record<string, string>,
+): { keep: T[]; stale: T[] } {
+  const isStage = (o: T) => o.kind === "stage_unserved" || o.kind === "fault_called";
+  const stale = open.filter((o) => isStage(o) && map[o.key] !== o.pumpId);
+  return { keep: open.filter((o) => !stale.includes(o)), stale };
+}

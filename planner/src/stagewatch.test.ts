@@ -6,7 +6,7 @@
  * hub state moves nothing; restore() closes instead of re-paging. Run with: npx tsx planner/src/stagewatch.test.ts
  */
 import assert from "node:assert/strict";
-import { StageWatch, parseStagePumpMap, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, type StagePump, type StageEvent } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, type StagePump, type StageEvent } from "./stagewatch";
 
 const t0 = Date.parse("2026-10-16T04:30:00Z");
 const min = (m: number) => t0 + m * 60_000;
@@ -154,6 +154,19 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   late.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
   late.step({ nowMs: min(6), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
   assert.equal(late.status()["1"].called_not_heating_min, 6);
+}
+
+// ── 10. codex pass 10: after STAGE_PUMP_MAP is corrected, an open episode for the OLD unit is closed, not re-adopted
+{
+  const open = [
+    { id: 1, kind: "fault_called", key: "1", pumpId: "pump1" },   // stage 1 now maps to pump2 → stale
+    { id: 2, kind: "stage_unserved", key: "2", pumpId: "pump1" }, // stage 2 now maps to pump1 → keep
+    { id: 3, kind: "span_local_stale", key: "span", pumpId: null }, // not a stage episode → keep
+  ];
+  const r = partitionRestore(open, { "1": "pump2", "2": "pump1" });
+  assert.deepEqual(r.stale.map((o) => o.id), [1]);
+  assert.deepEqual(r.keep.map((o) => o.id), [2, 3]);
+  assert.deepEqual(partitionRestore(open, { "1": "pump1", "2": "pump2" }).stale.map((o) => o.id), [2]);
 }
 
 console.log("stagewatch.test.ts: all assertions passed");
