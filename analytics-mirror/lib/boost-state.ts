@@ -16,6 +16,12 @@ export const READBACK_TIMEOUT_MS = 90_000;
 export const READBACK_STALE_MS = 90_000;
 /** writes.ts status(): adoption_pending = |commanded − operative| > 3. Same tolerance here. */
 const ADOPT_TOL_F = 3;
+/**
+ * setTarget solves dbt/mbt so the curve OUTPUT at the live outdoor equals the target; rounding the two
+ * endpoints moves it ≤ 0.5 °F and outdoor drift over a ≤ 2 h boost a few tenths (4 °F spread over the
+ * 5–125 °F range). Wider than this, the curve is not the boost's.
+ */
+const CURVE_TOL_F = 1;
 
 /** The subset of the planner's writer status (writes.ts status()) this module reads. */
 export type WriterStatus = {
@@ -26,6 +32,10 @@ export type WriterStatus = {
   band?: { lo: number; hi: number } | null; // I4 envelope at the live outdoor
   i1_margin_f?: number;
   active_boost?: { target_f: number; restore_at: string } | null;
+  /** in-memory time of the writer's last accepted HBX write (null after a planner restart) */
+  last_write_at?: string | null;
+  /** the curve on the device; output_at_live_outdoor_f is what setTarget solved to equal the target */
+  curve_in_force?: { output_at_live_outdoor_f: number | null } | null;
 };
 
 /** The subset of the hub's /api/state this module reads (planner hub.ts HubState). */
@@ -163,8 +173,10 @@ export type BoostPhase =
   | { phase: "idle" }
   | { phase: "sending"; req: BoostRequest }
   | { phase: "rejected"; req: BoostRequest; status: number; error: string }
-  // seen = the read-back has shown this boost at least once (set by the caller from boostView)
-  | { phase: "accepted"; req: BoostRequest; atMs: number; restoreAt: string | null; seen?: boolean };
+  // seen = the read-back has shown this boost at least once (set by the caller from boostView);
+  // writeAt = the writer's last_write_at in that first matching read-back — our write's own stamp, so
+  // any later stamp is another write (planner clock vs planner clock: no browser-skew problem)
+  | { phase: "accepted"; req: BoostRequest; atMs: number; restoreAt: string | null; seen?: boolean; writeAt?: string | null };
 
 export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale"; tone: Tone; text: string };
 
@@ -194,7 +206,7 @@ export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number,
 
 function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): BoostView {
   if (p.phase === "idle") {
-    if (st?.active_boost) return activeView(st.active_boost, st, nowMs);
+    if (st?.active_boost) return activeView(st.active_boost, st, nowMs, null);
     return { key: "idle", tone: "neutral", text: "no boost active" };
   }
   if (p.phase === "sending") return { key: "sending", tone: "pending", text: `sending boost to ${p.req.target_f} °F…` };
@@ -225,10 +237,10 @@ function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): 
     }
     return { key: "verifying", tone: "pending", text: "planner accepted the request — reading back the writer status…" };
   }
-  return activeView(ab, st!, nowMs);
+  return activeView(ab, st!, nowMs, p.writeAt ?? null);
 }
 
-function activeView(ab: { target_f: number; restore_at: string }, st: WriterStatus, nowMs: number): BoostView {
+function activeView(ab: { target_f: number; restore_at: string }, st: WriterStatus, nowMs: number, ourWriteAt: string | null): BoostView {
   const until = fmtClock(ab.restore_at);
   // The timer has run out since this read-back: whatever it said is no longer the state (Codex pass 3).
   const endMs = Date.parse(ab.restore_at);
@@ -236,10 +248,16 @@ function activeView(ab: { target_f: number; restore_at: string }, st: WriterStat
     return { key: "expired_unrestored", tone: "pending", text: `boost timer for ${ab.target_f} °F ended at ${until} — waiting for the writer status to show the restore` };
   }
   const cmd = st.commanded_target_f;
-  // The boost row exists but the curve no longer centres on it: something wrote over it (an armed
-  // auto-pilot tick, a manual write) — say so rather than claim the boost is running.
-  if (cmd != null && Math.abs(cmd - ab.target_f) > ADOPT_TOL_F) {
-    return { key: "superseded", tone: "bad", text: `boost to ${ab.target_f} °F is on record until ${until}, but the commanded target is now ${cmd} °F — another write replaced it` };
+  const out = st.curve_in_force?.output_at_live_outdoor_f ?? null;
+  // The boost row exists but the curve is no longer its curve: something wrote over it (an armed
+  // auto-pilot tick, a manual write) — say so rather than claim the boost is running. Three tests, any
+  // one is enough: a later write stamp than ours; the curve's output at the live outdoor off the boost
+  // target; or (no curve block) the commanded midpoint off it.
+  const laterWrite = ourWriteAt != null && st.last_write_at != null && st.last_write_at !== ourWriteAt;
+  const curveOff = out != null ? Math.abs(out - ab.target_f) > CURVE_TOL_F : cmd != null && Math.abs(cmd - ab.target_f) > ADOPT_TOL_F;
+  if (laterWrite || curveOff) {
+    const now = out != null ? `${Math.round(out)} °F` : `${cmd ?? "?"} °F`;
+    return { key: "superseded", tone: "bad", text: `boost to ${ab.target_f} °F is on record until ${until}, but the HBX curve now targets ${now}${laterWrite ? ` (written again at ${fmtClock(st.last_write_at!)})` : ""} — another write replaced it` };
   }
   const op = st.target_f;
   const inForce = st.adoption_pending === false && op != null && Math.abs(op - ab.target_f) <= ADOPT_TOL_F;

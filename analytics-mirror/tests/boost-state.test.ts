@@ -82,7 +82,29 @@ t("commanded curve moved off the boost (auto-pilot wrote over it) → superseded
   const v = boostView(accepted, { ...commanded, commanded_target_f: 121 }, NOW + 20 * 60_000);
   assert.equal(v.key, "superseded");
   assert.equal(v.tone, "bad");
-  assert.match(v.text, /commanded target is now 121 °F/);
+  assert.match(v.text, /HBX curve now targets 121 °F/);
+});
+
+t("a NEARBY replacement write (132 → 135) is caught by the curve output (Codex pass 6)", () => {
+  // operative already at 135 and adoption done: the old midpoint rule (±3) would have said "in force"
+  const st: WriterStatus = { ...inForce, target_f: 135, commanded_target_f: 135, curve_in_force: { output_at_live_outdoor_f: 135 } };
+  const v = boostView(accepted, st, NOW + 20 * 60_000);
+  assert.equal(v.key, "superseded");
+  assert.match(v.text, /now targets 135 °F/);
+  // and the boost's own curve (output 132.4 after endpoint rounding) still confirms
+  const own: WriterStatus = { ...inForce, curve_in_force: { output_at_live_outdoor_f: 132.4 } };
+  assert.equal(boostView(accepted, own, NOW + 20 * 60_000).key, "in_force");
+});
+
+t("a later write stamp than ours is superseded even at the same target", () => {
+  const ours = "2026-10-16T04:43:01.000Z";
+  const p: BoostPhase = { ...accepted, seen: true, writeAt: ours } as BoostPhase;
+  assert.equal(boostView(p, { ...inForce, last_write_at: ours }, NOW + 60_000).key, "in_force");
+  const v = boostView(p, { ...inForce, last_write_at: "2026-10-16T05:01:00.000Z" }, NOW + 20 * 60_000);
+  assert.equal(v.key, "superseded");
+  assert.match(v.text, /written again at 1:01 AM/);
+  // a planner restart nulls last_write_at — not evidence either way
+  assert.equal(boostView(p, { ...inForce, last_write_at: null }, NOW + 60_000).key, "in_force");
 });
 
 t("seen, then the row disappears and the curve moved off → ended, quoting the new commanded target", () => {
