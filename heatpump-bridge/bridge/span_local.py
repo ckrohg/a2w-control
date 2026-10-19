@@ -34,6 +34,19 @@ _CLIENT_PREFIX = "a2w-bridge"
 _REREGISTER_COOLDOWN_S = 600.0
 
 
+def _detail(payload) -> str:
+    """The panel's error text for a log line: ErrorOut is {"detail": "<message>"}; FastAPI's own
+    request-validation 422 is {"detail": [{"loc": …, "msg": …}, …]}. Bounded, never raises."""
+    detail = payload.get("detail") if isinstance(payload, dict) else payload
+    if not detail:
+        return ""
+    if isinstance(detail, list):
+        detail = "; ".join(
+            f"{'.'.join(str(x) for x in d.get('loc', []))}: {d.get('msg')}" if isinstance(d, dict)
+            else str(d) for d in detail)
+    return f" — {str(detail)[:300]}"
+
+
 class SpanAuthError(Exception):
     """Register failed for a reason a retry won't fix (bad passphrase, proximity required)."""
 
@@ -188,7 +201,10 @@ class SpanClient:
             raise ValueError(f"set_relay: unknown relay state {want!r}")
         if not self._token:
             self._token = self._register_sync()
-        body = {"relayStateIn": want}
+        # The panel's schema (OpenAPI Body_set_circuit_state…: relayStateIn → RelayStateIn) nests
+        # the state: {"relayStateIn": {"relayState": "OPEN"}}. A flat {"relayStateIn": "OPEN"}
+        # fails validation with HTTP 422 — the 2026-10-19 Air-Water 2 power-cycle test.
+        body = {"relayStateIn": {"relayState": want}}
         last_err = "no reachable base"
         for base in self._candidates():
             for attempt in (1, 2):  # one transparent re-auth on an auth failure
@@ -202,7 +218,7 @@ class SpanClient:
                     return (payload or {}).get("relayState", want)
                 if status in (401, 403, 412) and attempt == 1:
                     self._token = self._register_sync(); continue
-                last_err = f"{base}: HTTP {status}"; break
+                last_err = f"{base}: HTTP {status}{_detail(payload)}"; break
         raise ConnectionError(f"set_relay: {last_err}")
 
     async def set_relay(self, circuit_id: str, want: str = "CLOSED", *,

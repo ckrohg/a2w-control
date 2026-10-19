@@ -1,6 +1,9 @@
 # @purpose: In-process fake of the SPAN panel's LOCAL API for tests — the three endpoints the
 # bridge uses (POST /api/v1/auth/register, GET /api/v1/circuits, POST /api/v1/circuits/{id}
-# with relayStateIn) on a real HTTP socket, so SpanClient runs unmodified. Knobs simulate the
+# with relayStateIn) on a real HTTP socket, so SpanClient runs unmodified. Relay writes are
+# validated against the panel's OWN published schema (span_set_circuit_state.openapi.json, cut
+# from the real panel's /api/openapi.json) and refused with 422 exactly as the panel does — the
+# fake once accepted a flat {"relayStateIn": "OPEN"} the real panel rejects. Knobs simulate the
 # failure modes breaker control must survive: writes the panel ignores (read-back mismatch),
 # CLOSE requests that fail N times, a panel that stops answering, non-controllable circuits.
 from __future__ import annotations
@@ -8,6 +11,33 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+SPEC = json.loads((Path(__file__).with_name("span_set_circuit_state.openapi.json")).read_text())
+_BODY_REF = SPEC["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+
+
+def schema_errors(value, schema: dict, loc: str = "body") -> list[str]:
+    """Just enough JSON Schema for the panel's request models: $ref, object properties +
+    required, string/boolean, enum. Unknown keys are ignored, as the panel's pydantic does."""
+    if "$ref" in schema:
+        return schema_errors(value, SPEC["schemas"][schema["$ref"].rsplit("/", 1)[1]], loc)
+    if "enum" in schema:
+        return [] if value in schema["enum"] else [f"{loc}: {value!r} not one of {schema['enum']}"]
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return [f"{loc}: value is not a valid dict"]
+        errs = [f"{loc}.{k}: field required" for k in schema.get("required", []) if k not in value]
+        for k, sub in schema.get("properties", {}).items():
+            if k in value:
+                errs += schema_errors(value[k], sub, f"{loc}.{k}")
+        return errs
+    if kind == "string" and not isinstance(value, str):
+        return [f"{loc}: str type expected"]
+    if kind == "boolean" and not isinstance(value, bool):
+        return [f"{loc}: value could not be parsed to a boolean"]
+    return []
 
 
 class FakeSpan:
@@ -25,7 +55,8 @@ class FakeSpan:
             "Kitchen": {"id": "c-k", "relayState": "CLOSED", "isUserControllable": True,
                         "instantPowerW": 50.0},
         }
-        self.writes: list[tuple[str, str]] = []     # (circuit name, relayStateIn) in order
+        self.writes: list[tuple[str, str]] = []     # (circuit name, relayState) in order
+        self.rejected: list[dict] = []                # bodies refused with 422 (schema-invalid)
         self.fail_closes = 0          # next N CLOSE writes answer 500 and change nothing
         self.ignore_writes = False    # 200 to every write, relay never changes (mismatch)
         self.down = False             # every request answers 503
@@ -77,7 +108,12 @@ class FakeSpan:
                 if not self._authed():
                     return self._send(401, {"detail": "auth"})
                 cid = self.path.rsplit("/", 1)[1]
-                want = body.get("relayStateIn")
+                errs = schema_errors(body, {"$ref": _BODY_REF})
+                if errs:
+                    with fake.lock:
+                        fake.rejected.append(body)
+                    return self._send(422, {"detail": "; ".join(errs)})   # ErrorOut
+                want = (body.get("relayStateIn") or {}).get("relayState")
                 with fake.lock:
                     name = next((n for n, c in fake.circuits.items() if c["id"] == cid), None)
                     if name is None:
