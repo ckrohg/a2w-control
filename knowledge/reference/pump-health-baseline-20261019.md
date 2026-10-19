@@ -121,8 +121,8 @@ evidence of a sick pump by itself.
 Physics: C_eff = 110 gal × 8.34 = 917 BTU/°F. One pump at ~5.3 kW electric and COP ~2.5–3 delivers ~45–55 kBTU/h,
 about +50–60 °F/h with no load. Standby loss is `tank_ua` × (T − 65) °F/h, ≈ 0.6 °F/h at 100 °F.
 
-The threshold for `called_tank_flat` is **provisional**: net rise ≤ +0.5 °F over 45 min of called + heating, after
-adding back standby loss. The check also records the pump's own ΔT and draw, so a reader can tell a load problem
+The threshold for `called_tank_flat` is **provisional**: net rise ≤ +2 °F over 45 min of called + heating, after
+adding back standby loss (≈ 0.75 °F at 118 °F). That is ~5 % of one pump's no-load rise (~40 °F in 45 min). The check also records the pump's own ΔT and draw, so a reader can tell a load problem
 (pump healthy) from a pump problem. It stays shadow until the slx distribution has been measured with the query in
 the appendix.
 
@@ -159,7 +159,7 @@ A **20 %** flag sits ~1.6× above the worst week-over-baseline swing seen.
 | `heating_no_draw` | reported heating ≥ 7 min, trailing 5-min SPAN mean **< 1 000 W** | observed min 2 851 W |
 | `idle_draw` | reported idle/off ≥ 10 min, trailing 9-min SPAN mean **> 1 000 W** | observed max 672 W; isolated > 1 kW samples last ≤ 0.8 min |
 | `defrost_overlong` | continuous `defrost` **> 20 min** (the unit's own max defrost setting caps at 20) | normal 4–9.4 min; the two real anomalies were 31 and 83 min |
-| `called_tank_flat` | stage called + mapped pump heating ≥ 90 % of 45 min; tank net rise + standby loss **≤ 0.5 °F** | **provisional** (§5) |
+| `called_tank_flat` | stage called + mapped pump heating ≥ 90 % of 45 min; tank net rise + standby loss **≤ 2 °F** | **provisional** (§5): ~5 % of one pump's no-load capacity |
 | daily `lift_drift` | 7-d pooled lift index vs own prior 14 d, same 5 °C bin (≥ 2 run-h each), **≤ −20 %** | noise max 12.7 % |
 | daily `twin_drift` | p1/p2 index ratio vs its own 14-d baseline, same bin, **≥ 20 %** change | 1 comparison so far |
 | daily `short_cycling` | **> 6** starts in any trailing 60 min | observed max 4 |
