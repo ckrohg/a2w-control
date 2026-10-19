@@ -891,20 +891,23 @@ export class Store {
   }
 
   /**
-   * #177: the planner's accepted writes for the foreign-curve verdict — the newest one (whenever it was) and every
-   * one since `since`, newest first. `requested` is exactly what patch() sent the device.
+   * #177: the planner's device writes for the foreign-curve verdict — accepted ones and acknowledged verify_mismatch
+   * ones — the newest (whenever it was) and every one since `since`, newest first. `requested` is exactly what patch()
+   * sent the device.
    */
   async plannerWrites(since: Date): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> {
     const toWrite = (r: any): PlannerWrite => ({
       at: new Date(r.ts).toISOString(), source: String(r.source), action: String(r.action),
       requested: r.requested && typeof r.requested === "object" ? r.requested : null,
       echo: r.response && typeof r.response === "object" ? r.response : null,
+      result: String(r.result),
     });
+    // verify_mismatch = the PATCH reached the device and was acknowledged with a different echo — still our write
     const [last, recent] = await Promise.all([
-      this.locked.query(`SELECT ts, source, action, requested, response FROM hbx_writes WHERE result = 'accepted' ORDER BY id DESC LIMIT 1`),
+      this.locked.query(`SELECT ts, source, action, requested, response, result FROM hbx_writes WHERE result IN ('accepted', 'verify_mismatch') ORDER BY id DESC LIMIT 1`),
       this.locked.query(
-        `SELECT ts, source, action, requested, response FROM hbx_writes
-         WHERE result = 'accepted' AND ts >= $1 ORDER BY id DESC LIMIT 50`, [since]),
+        `SELECT ts, source, action, requested, response, result FROM hbx_writes
+         WHERE result IN ('accepted', 'verify_mismatch') AND ts >= $1 ORDER BY id DESC LIMIT 50`, [since]),
     ]);
     return { last: last.rowCount ? toWrite(last.rows[0]) : null, recent: recent.rows.map(toWrite) };
   }

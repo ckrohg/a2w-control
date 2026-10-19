@@ -100,6 +100,11 @@ export interface PlannerWrite {
   requested: Record<string, unknown> | null;
   /** PATCH response echo (hbx_writes.response, #177); null on rows written before the column existed. */
   echo: Record<string, unknown> | null;
+  /**
+   * accepted | verify_mismatch — a PATCH the API acknowledged with a DIFFERENT echo (asked 142, told 141) is still our
+   * write as far as the device is concerned, and the most telling one for the echo test (codex pass 7).
+   */
+  result?: string;
 }
 
 export type CurveVerdict = "echo_suspected" | "foreign";
@@ -218,7 +223,7 @@ const fmtWrite = (w: PlannerWrite | null): string => {
   if (!w) return "none on record";
   const req = w.requested ? Object.entries(w.requested).map(([k, v]) => `${k} ${v}`).join(" / ") : "—";
   const echo = w.echo ? Object.entries(w.echo).map(([k, v]) => `${k} ${v}`).join(" / ") : "not recorded";
-  return `${w.at} ${w.source}:${w.action} requested ${req}; PATCH echo ${echo}`;
+  return `${w.at} ${w.source}:${w.action}${w.result && w.result !== "accepted" ? ` (${w.result})` : ""} requested ${req}; PATCH echo ${echo}`;
 };
 
 /** The evidence block both curve pages carry — enough to tell an echo from a writer without opening the DB. */
@@ -296,9 +301,13 @@ export async function handlePolledConfig(
   }
 
   const firstAtMs = now();
-  const lookupWrites = async (atMs: number): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> => {
+  type Writes = { last: PlannerWrite | null; recent: PlannerWrite[] };
+  const NO_WRITES: Writes = { last: null, recent: [] };
+  // null = the history could not be read — distinct from "no planner writes": an unavailable history must never
+  // turn into a foreign-writer claim (codex pass 7)
+  const lookupWrites = async (atMs: number): Promise<Writes | null> => {
     try { return await deps.plannerWrites(atMs - ECHO_WINDOW_MS); }
-    catch (e) { log(`planner-write lookup failed (verdict defaults to foreign): ${(e as Error).message}`); return { last: null, recent: [] }; }
+    catch (e) { log(`planner-write lookup failed: ${(e as Error).message}`); return null; }
   };
   const diagnose = (
     o: { fields: Record<string, FieldChange>; verdict: CurveDiagnosis["verdict"]; confirmed: boolean | null; rereadAt: string | null;
@@ -326,11 +335,13 @@ export async function handlePolledConfig(
   // the next poll (or the successor's first poll) sees the same diff and runs the whole check again. A failed re-read
   // (not a shutdown) still leaves an evidence row, and if the next poll no longer sees the change — our own write
   // superseded it, or it vanished — pendingUnconfirmedNotice() says so at default priority (codex pass 3).
-  const unconfirmedDiagnosis = async (why: string, baselineMoved = false): Promise<CurveDiagnosis> => {
-    const writes = await lookupWrites(firstAtMs);
+  const unconfirmedDiagnosis = async (
+    why: string, baselineMoved = false, o: { writes?: Writes | null; rereadAt?: string | null; after?: Record<string, any> } = {},
+  ): Promise<CurveDiagnosis> => {
+    const writes = (o.writes === undefined ? await lookupWrites(firstAtMs) : o.writes) ?? NO_WRITES;
     return diagnose({
-      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved, writes,
-      matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: dev,
+      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: o.rereadAt ?? null, rereadError: why, baselineMoved, writes,
+      matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: o.after ?? dev,
     });
   };
   const unconfirmed = async (why: string, recorded?: CurveDiagnosis): Promise<DriftOutcome> => {
@@ -378,12 +389,24 @@ export async function handlePolledConfig(
     // during the wait counts as ours (codex pass 2 — anchored at the first read, a 1 °F transform of a write made
     // during the 30 s would have paged high as foreign).
     const writes = await lookupWrites(rereadAtMs);
+    // Not yet a verdict (codex pass 7) — keep both reads as evidence on a row whose config is the CURRENT baseline,
+    // page nobody, and let the next poll re-check: (a) the re-read shows a DIFFERENT curve from the first read — it
+    // too has been seen only once (a planner write during the wait included); (b) the planner-write history could not
+    // be read — classifying without it would turn a transform of our own write into a foreign-writer page.
+    const sameCurve = CURVE_FIELDS.every((f) => JSON.stringify(config[f]) === JSON.stringify(finalConfig[f]));
+    if (confirmed && (!sameCurve || writes === null)) {
+      const why = !sameCurve ? "the re-read showed a different curve from the first read — a new candidate, re-checked next poll"
+        : "the planner-write history could not be read — classification retried next poll";
+      const d = await unconfirmedDiagnosis(why, moved, { writes, rereadAt, after: reread });
+      await deps.record({ config: base.config, changes: null, raw: dev, rereadRaw: reread, verdict: "unconfirmed", diagnosis: d });
+      return { unconfirmed: why, diagnosis: d };
+    }
     // A reverted curve keeps the first read's change in the diagnosis but is not a curve event.
     const fields = confirmed ? (finalChanges as Record<string, FieldChange>) : changes;
-    const v = curveVerdict(fields, writes.recent, confirmed ? rereadAtMs : firstAtMs);
+    const v = curveVerdict(fields, (writes ?? NO_WRITES).recent, confirmed ? rereadAtMs : firstAtMs);
     const verdict: CurveDiagnosis["verdict"] = confirmed ? (v?.verdict ?? "foreign") : "reverted";
     const diagnosis = diagnose({
-      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved: moved, writes, matches: v?.matches ?? [],
+      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved: moved, writes: writes ?? NO_WRITES, matches: v?.matches ?? [],
       before: base.raw, after: reread,
     });
     await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict, diagnosis });
@@ -450,9 +473,39 @@ export function pendingUnconfirmedNotice(
     resolved: true,
     notice: {
       title: UNCONFIRMED_TITLE,
-      body: `At ${pending.first_read_at} the device showed a reset-curve change the planner did not write, but the ` +
-        `confirmation re-read failed, and by the next check the change was no longer there to confirm (a planner write ` +
-        `replaced the curve, or the first read was transient). Not a confirmed second writer.\n\n${diagnosisBody(pending)}`,
+      body: `At ${pending.first_read_at} the device showed a reset-curve change the planner did not write, but it could ` +
+        `not be confirmed (${pending.reread_error ?? "no confirmation"}), and by the next check the change was no longer ` +
+        `there to confirm (a planner write replaced the curve, or the read was transient). Not a confirmed second ` +
+        `writer.\n\n${diagnosisBody(pending)}`,
     },
   };
+}
+
+/**
+ * #177 (codex pass 7): owns the pending `unconfirmed` observation for index.ts. The boot-time reload from the DB
+ * (store.pendingUnconfirmed) is retried on every step until it succeeds once — a transient failure at startup must
+ * not drop a persisted observation for the process's lifetime. A resolve that fails is logged; the worst case is the
+ * same notice once more after a restart, never a lost one.
+ */
+export class PendingTracker {
+  private loaded = false;
+  pending: CurveDiagnosis | null = null;
+  constructor(
+    private readonly load: () => Promise<CurveDiagnosis | null>,
+    private readonly resolve: () => Promise<void>,
+    private readonly log: (m: string) => void = (m) => console.error(m),
+  ) {}
+  async ensureLoaded(): Promise<void> {
+    if (this.loaded) return;
+    try { const p = await this.load(); this.pending ??= p; this.loaded = true; }
+    catch (e) { this.log(`pending unconfirmed reload failed (retried next poll): ${(e as Error).message}`); }
+  }
+  /** Fold this poll's outcome in; returns the notice to send, if any. */
+  async step(outcome: DriftOutcome): Promise<{ title: string; body: string } | null> {
+    await this.ensureLoaded();
+    const c = pendingUnconfirmedNotice(this.pending, outcome);
+    this.pending = c.pending;
+    if (c.resolved) await this.resolve().catch((e) => this.log(`resolveUnconfirmed failed: ${(e as Error).message}`));
+    return c.notice;
+  }
 }

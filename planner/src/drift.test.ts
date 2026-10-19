@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import {
   curveVerdict, handlePolledConfig, diffConfig, extractConfig, deviceMeta, patchEcho,
-  ECHO_TITLE, FOREIGN_TITLE, UNCONFIRMED_TITLE, REREAD_DELAY_MS, ECHO_WINDOW_MS, pendingUnconfirmedNotice,
+  ECHO_TITLE, FOREIGN_TITLE, UNCONFIRMED_TITLE, REREAD_DELAY_MS, ECHO_WINDOW_MS, pendingUnconfirmedNotice, PendingTracker,
   type PlannerWrite, type ConfigVersionRecord, type DriftDeps, type HbxConfig,
 } from "./drift";
 import { withDeviceLock } from "./writes";
@@ -397,20 +397,97 @@ async function main(): Promise<void> {
     assert.equal(locks, 2, "seed and non-curve records run under the device lock");
   }
 
-  // ── 10d. Moved baseline + a 1 °F transform of the write made DURING the wait → echo, not a high foreign page:
-  // the echo window ends at the re-read (codex pass 2) ──────────────────────────────────────────────────────────
+  // ── 10d. A planner write made DURING the wait counts as ours: the echo window ends at the re-read (codex pass 2).
+  // The device held 141/137 at both reads; the planner wrote 142/138 at 21:06:06 (between them) ─────────────────
   {
     const prev = prevOf(device(120, 118));
-    const ours = device(134, 130);                                    // dashboard write at 21:06:06, inside the 30 s
+    const ours = prevOf(device(142, 138));
     const h = harness({
-      nowIso: "2026-10-18T21:05:56.000Z", reread: device(133, 129), latest: prevOf(ours),
-      writes: [write("2026-10-18T21:06:06.000Z", "set_target", { dbt: 134, mbt: 130 })],
+      nowIso: "2026-10-18T21:05:56.000Z", reread: device(141, 137), latest: ours,
+      writes: [write("2026-10-18T21:06:06.000Z", "set_target", { dbt: 142, mbt: 138 })],
     });
     const out = await handlePolledConfig(prev, device(141, 137), h.deps);
     assert.equal(out.diagnosis?.baseline_moved, true);
     assert.equal(out.diagnosis?.verdict, "echo_suspected", "our own write made during the wait counts");
-    assert.deepEqual(h.rows[0].changes, diffConfig(extractConfig(ours), extractConfig(device(133, 129))), "judged against the moved baseline");
+    assert.deepEqual(h.rows[0].changes, diffConfig(ours.config, extractConfig(device(141, 137))), "judged against the moved baseline");
     assert.equal(h.pages[0].priority, "default");
+  }
+
+  // ── 10e. Three distinct curves (baseline, first read, re-read): the re-read's curve has been seen only once — an
+  // evidence row, no page, baseline unchanged; the next poll confirms it and gives the verdict (codex pass 7) ──────
+  {
+    const prev = prevOf(device(120, 118));
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: device(100, 96), latest: prev });
+    const out = await handlePolledConfig(prev, device(141, 137), h.deps);
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
+    assert.match(out.diagnosis?.reread_error ?? "", /different curve/);
+    assert.equal(h.pages.length, 0, "a value seen once is not paged");
+    assert.equal(h.rows.length, 1);
+    assert.deepEqual(h.rows[0].config, prev.config, "the baseline does not advance");
+    assert.equal(h.rows[0].changes, null);
+    assert.deepEqual(h.rows[0].rereadRaw, device(100, 96), "both reads kept");
+    assert.equal(out.unsettled, false, "evidence is durable — controllers may run");
+    const h2 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: device(100, 96) });
+    const out2 = await handlePolledConfig(prev, device(100, 96), h2.deps);
+    assert.equal(out2.diagnosis?.verdict, "foreign", "seen twice → confirmed");
+    assert.equal(h2.pages[0].priority, "high");
+    // and a moved baseline with a re-read that differs from the first read is a new candidate too
+    const ours = prevOf(device(134, 130));
+    const h3 = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: device(133, 129), latest: ours,
+      writes: [write("2026-10-18T21:06:06.000Z", "set_target", { dbt: 134, mbt: 130 })] });
+    const out3 = await handlePolledConfig(prev, device(141, 137), h3.deps);
+    assert.equal(out3.diagnosis?.verdict, "unconfirmed");
+    assert.deepEqual(h3.rows[0].config, ours.config, "the evidence row carries the moved baseline");
+    const h4 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: device(133, 129),
+      writes: [write("2026-10-18T21:06:06.000Z", "set_target", { dbt: 134, mbt: 130 })] });
+    const out4 = await handlePolledConfig(ours, device(133, 129), h4.deps);
+    assert.equal(out4.diagnosis?.verdict, "echo_suspected", "next poll: 133/129 is a 1 °F transform of our 134/130");
+  }
+
+  // ── 10f. The planner-write history cannot be read → never a foreign verdict: evidence row, retried (codex pass 7)
+  {
+    const prev = prevOf(device(120, 118));
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: device(141, 137), latest: prev });
+    h.deps.plannerWrites = async () => { throw new Error("query timeout"); };
+    const out = await handlePolledConfig(prev, device(141, 137), h.deps);
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
+    assert.match(out.diagnosis?.reread_error ?? "", /history could not be read/);
+    assert.equal(h.pages.length, 0, "no foreign-writer claim without the history");
+    assert.equal(h.rows[0].changes, null);
+    assert.deepEqual(h.rows[0].config, prev.config);
+  }
+
+  // ── 10g. A verify_mismatch PATCH (asked 142/138, the API echoed 141/137) is our write for the echo test ──────────
+  {
+    const prev = prevOf(device(120, 118));
+    const mismatch: PlannerWrite = { at: "2026-10-18T20:41:05.000Z", source: "autopilot", action: "set_target",
+      requested: { dbt: 142, mbt: 138 }, echo: { dbt: 141, mbt: 137 }, result: "verify_mismatch" };
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: device(141, 137), writes: [mismatch] });
+    const out = await handlePolledConfig(prev, device(141, 137), h.deps);
+    assert.equal(out.diagnosis?.verdict, "echo_suspected");
+    assert.match(h.pages[0].body, /set_target \(verify_mismatch\) requested dbt 142 \/ mbt 138; PATCH echo dbt 141 \/ mbt 137/,
+      "the page names the acknowledged mismatch and its echo");
+  }
+
+  // ── 10h. PendingTracker retries a failed boot-time reload, then announces the recovered observation ──────────────
+  {
+    const pendingDiag = (await handlePolledConfig(prevOf(device(120, 118)), device(100, 96),
+      harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: prevOf(device(120, 118)) }).deps)).diagnosis!;
+    let loads = 0, resolves = 0;
+    const t = new PendingTracker(
+      async () => { loads++; if (loads === 1) throw new Error("db blip"); return pendingDiag; },
+      async () => { resolves++; },
+      () => {},
+    );
+    await t.ensureLoaded();                       // boot: fails
+    assert.equal(t.pending, null);
+    const unchanged = await handlePolledConfig(prevOf(device(142, 138)), device(142, 138), harness({ nowIso: "2026-10-18T21:10:56.000Z" }).deps);
+    const notice = await t.step(unchanged);       // first poll: reload retried, succeeds, the change is gone → notice
+    assert.equal(loads, 2, "reload retried on the next step");
+    assert.equal(notice?.title, UNCONFIRMED_TITLE);
+    assert.equal(resolves, 1);
+    assert.equal(await t.step(unchanged), null, "announced once");
+    assert.equal(loads, 2, "loaded once; never re-loaded after success");
   }
 
   // ── 11. Seed, unchanged, and non-curve drift keep today's behaviour — and every row carries raw ─────────────────
