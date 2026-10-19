@@ -147,12 +147,17 @@ async def test_shadow_is_the_default_and_switches_nothing(rig):
     assert r.panel.writes == []
     assert await codes(r.store) == ["would_cycle"]
     assert any("would cycle" in a[1] for a in r.alerts if a[0] == "push")
+    for _ in range(31):                        # the shadow verification window ends
+        await r.step(heal)
+    await settle()
+    assert "shadow_verify" in await codes(r.store)
+    assert any("(shadow)" in a[1] and "still active" in a[1] for a in r.alerts if a[0] == "push")
+    assert any("(shadow)" in a[1] and "still active" in a[1] for a in r.alerts if a[0] == "email")
     assert any(a[0] == "email" for a in r.alerts)
     st = heal.status()["pumps"]["pump2"]
-    assert st["attempts_in_window"] == 1 and "SHADOW" in st["status"]
+    assert st["attempts_in_window"] == 2 and "SHADOW" in st["status"]   # the second "would cycle"
+    assert (await codes(r.store)).count("would_cycle") == 2
     assert heal.status()["trigger"]["stage_call"].startswith("unavailable")
-    await r.step(heal)                                     # it does not re-log every tick
-    assert await codes(r.store) == ["would_cycle"]
 
 
 async def test_grace_needs_both_clocks(rig):
@@ -432,6 +437,32 @@ async def test_both_down_pages_even_during_verification(rig):
     assert (await all_codes(r.store)).count("both_down") == 1
     assert len([a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]) == 1
     assert len([a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1]]) == 1
+
+
+async def test_disagreeing_states_page_exactly_once(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    r.p1.fault(code="E18", severity="high")
+    r.p1.snapshot["running"] = True            # pump1 faulted but still heating: NOT down
+    await heal.tick()
+    for _ in range(20):
+        await r.step(heal)
+    await settle()
+    assert (await all_codes(r.store)).count("both_down") == 0
+    assert ("Air-Water 2", "OPEN") in r.panel.writes          # so pump2 may be cycled
+    # now the peer's panel relay reads OPEN while its telemetry looks fine: down, paged ONCE
+    r.panel.set("Air-Water 1", relayState="OPEN")
+    r.p1.snapshot.update(running=False, active_faults=[], state="idle")
+    heal2 = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await heal2.tick()
+    for _ in range(40):
+        await r.step(heal2)
+    await settle()
+    pushes = [a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]
+    mails = [a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1]]
+    assert len(pushes) == 1 and len(mails) == 1
 
 
 async def test_a_bridge_restart_does_not_page_both_down(rig):
