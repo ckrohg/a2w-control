@@ -92,6 +92,12 @@ export interface ReadingsView {
    * (start, end] — rows there were stamped twice, so timestamps cannot order events in it (codex passes 8–9 on #193).
    */
   clockIntervals?: { start: number; end: number }[];
+  /**
+   * Spans the Pi clock was KNOWN (or cannot be shown not) to be misaligned against the planner's (piHealth: now, past,
+   * or unanchored). Unlike a contamination span this voids even a certain reboot: uptime proves a reboot happened, not
+   * that it lines up with the planner's window (codex pass 16 on #193).
+   */
+  misaligned?: { start: number; end: number }[];
 }
 export interface StatsView {
   /** certain reboots: uptime FELL between consecutive samples */
@@ -168,7 +174,8 @@ export function classifyWindows(
       if (!bracketed || (stats?.ambiguous ?? []).some((b) => near(g, b.at)) || (stats?.clockSteps ?? []).some((t) => near(g, t))) unresolved = true;
     }
     const longest = mine.reduce<ReadingGap | null>((a, g) => (!a || g.end - g.start > a.end - a.start ? g : a), null);
-    const verdict: PiVerdict = !covered ? "unknown"
+    const misaligned = (readings?.misaligned ?? []).some((c) => c.start <= hi && c.end >= lo);
+    const verdict: PiVerdict = !covered || misaligned ? "unknown"
       : boot ? "gap+reboot"
       : unclear || stepNear || unresolved ? "unknown"
       : !mine.length ? "socket_only" : "gap_only";
@@ -230,7 +237,7 @@ export interface PiHealth {
   reboots_7d: number | null;
   last_reboot_at: string | null;
   /** the Pi clock vs the planner's: misaligned_since non-null = every window since then is unknown */
-  pi_clock: { live_offset_s: number | null; future_rows: boolean; misaligned_since: string | null; past_misaligned: { start: string; end: string }[] };
+  pi_clock: { live_offset_s: number | null; future_rows: boolean; misaligned_since: string | null; past_misaligned: { start: string; end: string }[]; unanchored: boolean };
   dropouts_7d: DropoutWindow[];
   summary: { count: number; longest_min: number | null; verdicts: Record<PiVerdict, number> };
 }
@@ -257,13 +264,18 @@ export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number
   const nowS = nowMs / 1000;
   const fromS = nowS - DROPOUT_WINDOW_S - LOOKBACK_S;
   const since = misalignedSince(input, nowS, liveOffsetS, fromS);
-  // the clock is aligned now → reconstruct any PAST misaligned span from the signed steps; misaligned now → the span
-  // since the last step (the history before it cannot be anchored to a known-good present)
-  const past = since == null ? historicMisalignment(input.stats?.clockStepDeltas ?? [], fromS, nowS) : [];
-  const spans = [...past, ...(since == null ? [] : [{ start: since, end: nowS }])];
-  // misaligned spans void verdicts through BOTH evidence paths: readings' contamination spans and stats' steps
+  // The clock is shown aligned NOW only by a fresh live offset within CLOCK_STEP_S (codex pass 16 on #193: no hub
+  // frame ≠ aligned). Aligned → reconstruct PAST misaligned spans from the signed steps. Misaligned now → the span
+  // since the last step. Unanchored (no fresh frame, no future rows) with clock steps in range → which segment was
+  // right cannot be told → the whole range is uncertain. No steps at all → no evidence of any clock change.
+  const anchored = liveOffsetS != null && Math.abs(liveOffsetS) <= CLOCK_STEP_S;
+  const deltas = (input.stats?.clockStepDeltas ?? []).filter((d) => d.ts < nowS);
+  const past = since == null && anchored ? historicMisalignment(deltas, fromS, nowS) : [];
+  const unanchored = since == null && !anchored && deltas.some((d) => Math.abs(d.delta) > CLOCK_STEP_S);
+  const spans = [...past, ...(since == null ? [] : [{ start: since, end: nowS }]), ...(unanchored ? [{ start: fromS, end: nowS }] : [])];
+  // misaligned spans void verdicts through every evidence path, a certain reboot included
   const readingsView = !spans.length || !input.readings ? input.readings
-    : { ...input.readings, clockIntervals: [...(input.readings.clockIntervals ?? []), ...spans] };
+    : { ...input.readings, clockIntervals: [...(input.readings.clockIntervals ?? []), ...spans], misaligned: spans };
   const statsView = !spans.length || !input.stats ? input.stats
     : { ...input.stats, clockSteps: [...(input.stats.clockSteps ?? []), ...spans.flatMap((x) => [x.start, x.end])] };
   const by: PiHealth["last_reading_by_pump"] = {};
@@ -292,6 +304,8 @@ export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number
       future_rows: !!input.futureRows,
       misaligned_since: since == null ? null : new Date(since * 1000).toISOString(),
       past_misaligned: past.map((x) => ({ start: new Date(x.start * 1000).toISOString(), end: new Date(x.end * 1000).toISOString() })),
+      /** no fresh hub frame to anchor the present, and clock steps in range: every window is unknown */
+      unanchored,
     },
     dropouts_7d: windows,
     summary: {

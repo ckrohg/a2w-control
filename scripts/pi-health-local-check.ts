@@ -130,24 +130,29 @@ async function main() {
   assert.ok((inputs.stats?.ambiguous ?? []).some((b) => Math.abs(b.at - (REBOOT2 - 437.25 + 1_800)) <= 5), `the fresh Pi's +30 min clock step is ambiguous (${JSON.stringify(inputs.stats?.ambiguous)})`);
   assert.ok(inputs.phaseB.every((r) => r.result === "sent" || /no Pi connected/.test(r.result)), "only rows that speak about the Pi");
 
-  const h = piHealth(inputs, NOW * 1000);
-  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "gap+reboot", "unknown", "unknown", "unknown"],
-    "9-d run predates the readings → unknown; W5's silence was refilled by a slow clock → unknown; W2 holds the clock flick → unknown; " +
-    "W3: the steps AFTER it leave a net offset this synthetic clock never takes back (W4 ends −437 s, the fresh-boot +1800 s) — " +
-    "relative to the aligned present its stamps were off → unknown (codex pass 15); W4's 'gap' is a clock step → unknown");
+  // the hub measures the Pi clock aligned now (offset 0) — without that anchor, clock steps in range void every window:
+  const unanch = piHealth(inputs, NOW * 1000, null);
+  assert.equal(unanch.pi_clock.unanchored, true, "no fresh hub frame + clock steps in range → unanchored (codex pass 16)");
+  assert.ok(unanch.dropouts_7d.every((w) => w.verdict === "unknown"), "…and every window is unknown, a certain reboot's included");
+  const h = piHealth(inputs, NOW * 1000, 0);
+  assert.equal(h.pi_clock.unanchored, false);
+  // This synthetic week is a clock-CHAOS fixture: its stats clock ends ~23 min off its own past (W4 ends −437 s, the
+  // fresh-boot +1800 s, never taken back), so relative to the aligned present every window's stamps were off — all
+  // unknown (codex passes 15–16), a certain reboot (W1) included. The clean three-verdict proof is the next block.
+  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "unknown", "unknown", "unknown", "unknown", "unknown"],
+    "every window of the clock-chaos week is unknown");
   assert.ok((inputs.stats?.ambiguous ?? []).some((b) => Math.abs(b.at - (REBOOT1 + 3_600)) <= 5),
     `the flick's displaced samples imply REBOOT1 (its track then) + 1 h — an ambiguous jump, not a reboot (${JSON.stringify(inputs.stats?.ambiguous)})`);
   assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [3 * 24 * 60, 120, 130, 125, 120, 60]);
   assert.equal(inputs.readings?.gaps.some((g) => g.start < W5[1] && g.end > W5[0]), false, "no readings gap survives inside W5 (the trap)");
   assert.ok((inputs.stats?.clockSteps ?? []).some((t) => Math.abs(t - (W4_FWD + 600)) <= 120), "the +600 s step is detected");
   assert.equal(Date.parse(h.dropouts_7d[0].start) / 1000, NOW - 9 * D, "a run open at the range start keeps its real start");
-  assert.ok(Math.abs(Date.parse(h.dropouts_7d[2].reboot_at ?? "") / 1000 - REBOOT1) <= 2, "W1 names its reboot");
   assert.equal(h.dropouts_7d[3].reboot_at, null, "no reboot invented from the flick");
   assert.equal(h.reboots_24h, 1);
   assert.equal(h.reboots_7d, 2);
   assert.ok(h.last_reading_age_s != null && Math.abs(h.last_reading_age_s - (1_860 + 437)) <= 61, `newest reading: the series ends 30 min early, stamped −437 s (${h.last_reading_age_s})`);
   assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 1_860)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
-  assert.deepEqual(h.summary, { count: 6, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 0, socket_only: 0, unknown: 5 } });
+  assert.deepEqual(h.summary, { count: 6, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 0, gap_only: 0, socket_only: 0, unknown: 6 } });
   // codex pass 7 on #193 — (a) a forward flick still in its catch-up: samples stamped 40 min AHEAD of now (uptime still
   // rising on the current track) are quarantined: no reboot, but a clock step marked at now; (b) a real reboot 5 min
   // ago has too little history to be certain yet → ambiguous until SETTLE_S of samples stay on its track
@@ -175,6 +180,39 @@ async function main() {
   assert.ok(settled.stats?.boots.some((b) => Math.abs(b.at - (NOW - 360)) <= 2), "after 15 min on its track it is certain");
   await pool.query(`DELETE FROM system_stats WHERE ts > $1`, [NOW - 360]);
   await pool.query(`DELETE FROM readings WHERE ts >= $1 AND ts > $2`, [NOW - 2_400, NOW - 1_830 - 437]);
+
+  // ── the CLEAN proof of all three verdicts on the real SQL: no clock steps, the hub says aligned (offset 0) ─────────
+  {
+    const C0 = NOW - 2 * D, Bc = C0 - 10 * D, RB = C0 + 6 * H + 2 * H - 4 * 60; // reboot ends the first outage's silence
+    const A: [number, number] = [C0 + 6 * H, C0 + 8 * H];        // gap+reboot: both paths silent, the Pi reboots at RB
+    const G: [number, number] = [C0 + 12 * H, C0 + 14 * H];      // gap_only: both silent, no reboot
+    const K: [number, number] = [C0 + 18 * H, C0 + 20 * H];      // socket_only: readings never stop
+    await pool.query(`TRUNCATE readings, system_stats, phase_b_log RESTART IDENTITY`);
+    const r: string[] = [], st: string[] = [];
+    for (let t = C0; t <= C0 + 22 * H; t += 60) {
+      const quiet = (t > A[0] + 60 && t < A[1] - 60) || (t > G[0] + 60 && t < G[1] - 60);
+      if (quiet) continue;
+      r.push(`(${t}, 'pump1', true, 'heating')`);
+      st.push(`(${t}, ${t >= RB ? t - RB : t - Bc})`);
+    }
+    for (let i = 0; i < r.length; i += 500) {
+      await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${r.slice(i, i + 500).join(",")}`);
+      await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ${st.slice(i, i + 500).join(",")}`);
+    }
+    await pool.query(
+      `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+       SELECT to_timestamp(t), 'pump1', 'active', 55,
+              CASE WHEN (t >= $2 AND t < $3) OR (t >= $4 AND t < $5) OR (t >= $6 AND t < $7) THEN 'failed: no Pi connected' ELSE 'sent' END
+       FROM generate_series($1::bigint, $8::bigint, 300) t`, [C0, A[0], A[1], G[0], G[1], K[0], K[1], C0 + 22 * H]);
+    const at = (C0 + 22 * H) * 1000;
+    const ci = await store.piLinkInputs(at, OPTS);
+    assert.equal(ci.stats?.clockSteps?.length ?? 0, 0, "a clean clock");
+    const ch = piHealth(ci, at, 0);
+    assert.deepEqual(ch.dropouts_7d.map((w) => w.verdict), ["gap+reboot", "gap_only", "socket_only"], "all three verdicts, on the real SQL");
+    assert.ok(Math.abs(Date.parse(ch.dropouts_7d[0].reboot_at ?? "") / 1000 - RB) <= 2, "the reboot that ended the silence is named");
+    assert.equal(ch.reboots_24h, 1);
+    assert.deepEqual(ch.pi_clock, { live_offset_s: 0, future_rows: false, misaligned_since: null, past_misaligned: [], unanchored: false });
+  }
 
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);

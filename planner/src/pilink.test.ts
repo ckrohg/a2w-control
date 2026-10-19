@@ -292,4 +292,29 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
     ["socket_only", "socket_only", "socket_only", "socket_only", "socket_only"], "without the steps every window would read socket_only");
 }
 
+// ── 10. codex pass 16 on #193: a KNOWN misaligned span voids even a certain reboot; an unanchored present voids all ─
+{
+  const run = [{ start: ms("2026-10-16T10:00:00Z"), end: ms("2026-10-16T11:00:00Z") }];
+  const base = { firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z") };
+  const shifted = { start: s("2026-10-16T10:00:00Z"), end: s("2026-10-16T11:00:00Z") };      // really 09:00–10:00
+  const st: StatsView = { boots: [{ at: s("2026-10-16T10:50:00Z") }], firstTs: base.firstTs, lastTs: base.lastTs };
+  assert.equal(classifyWindows(run, { ...base, gaps: [shifted] }, st, NOW / 1000)[0].verdict, "gap+reboot", "at face value");
+  assert.equal(classifyWindows(run, { ...base, gaps: [shifted], misaligned: [{ start: s("2026-10-16T00:00:00Z"), end: NOW / 1000 }] }, st, NOW / 1000)[0].verdict,
+    "unknown", "inside a known misaligned span the reboot proves nothing about THIS window");
+  // a lone clock-step marker near a reboot does NOT void it (a rebooted Pi's NTP step is normal)
+  assert.equal(classifyWindows(run, { ...base, gaps: [shifted] }, { ...st, clockSteps: [s("2026-10-16T10:52:00Z")] }, NOW / 1000)[0].verdict, "gap+reboot");
+  // unanchored: steps in range, no fresh frame, no future rows
+  const inp: PiLinkInputs = {
+    lastByPump: { pump1: NOW / 1000 - 30 }, readings: { ...readings }, latestStat: null,
+    stats: { ...stats, clockSteps: [s("2026-10-17T12:00:00Z")], clockStepDeltas: [{ ts: s("2026-10-17T12:00:00Z"), delta: -3_600 }] }, phaseB: rows,
+  };
+  const un = piHealth(inp, NOW, null);
+  assert.equal(un.pi_clock.unanchored, true);
+  assert.ok(un.dropouts_7d.every((w) => w.verdict === "unknown"));
+  const an = piHealth(inp, NOW, 3);
+  assert.equal(an.pi_clock.unanchored, false, "a fresh frame anchors the present");
+  assert.equal(an.dropouts_7d[0].verdict, "unknown", "…and the past BEFORE the −1 h step was off by +1 h → unknown");
+  assert.equal(an.dropouts_7d.at(-1)?.verdict, "socket_only", "…after it the clock was right");
+}
+
 console.log("pilink.test.ts: all assertions passed");
