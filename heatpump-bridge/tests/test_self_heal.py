@@ -46,11 +46,12 @@ class FakePoller:
     def __init__(self, pid, name, ft):
         self.cfg = SimpleNamespace(id=pid, name=name)
         self.ft = ft
-        self.snapshot = {"online": True, "last_poll_ts": ft.clock(), "running": False,
+        self.snapshot = {"online": True, "last_poll_ts": ft.clock(), "last_poll_mono": ft.mono(),
+                         "running": False,
                          "defrosting": False, "state": "idle", "active_faults": [], "identity_ok": True}
 
     def fresh(self, **kw):
-        self.snapshot.update(last_poll_ts=self.ft.clock(), **kw)
+        self.snapshot.update(last_poll_ts=self.ft.clock(), last_poll_mono=self.ft.mono(), **kw)
 
     def fault(self, code="E21", age_min=11.0, severity="warning"):
         self.snapshot["active_faults"] = [{"key": "2111.13", "code": code, "severity": severity,
@@ -177,6 +178,7 @@ async def test_heating_defrost_stale_and_identity_all_hold_off(rig):
     await r.prime()
     r.p1.fresh()
     r.p2.snapshot["last_poll_ts"] = r.ft.clock() - 300      # stale
+    r.p2.snapshot["last_poll_mono"] = r.ft.mono() - 300
     await heal.tick()
     r.p2.fresh(identity_ok=False)                           # identity check failed
     await heal.tick()
@@ -211,6 +213,7 @@ async def test_a_telemetry_gap_restarts_the_clear_hold(rig):
     await r.step(heal)                                      # one fresh clear observation
     r.ft.t += 200                                           # then 200 s with no fresh data
     r.p2.snapshot["last_poll_ts"] = r.ft.clock() - 150
+    r.p2.snapshot["last_poll_mono"] = r.ft.mono() - 150
     await heal.tick()
     await r.step(heal)                                      # fresh again: hold restarts here
     assert "recovered" not in await codes(r.store)
@@ -240,6 +243,37 @@ async def test_whitespace_cannot_map_two_pumps_to_one_circuit(rig):
     r.p2.fault(age_min=12)
     await r.eligible(heal)
     assert r.panel.writes == []
+
+
+async def test_an_unobserved_stretch_restarts_the_clear_hold(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    await r.step(heal)                                      # hold starts
+    r.ft.t += 170                                           # loop busy elsewhere: no verify tick...
+    await r.step(heal, 30)                                  # ...data fresh again at the next one
+    assert "recovered" not in await codes(r.store)          # 200 s elapsed, but not observed
+    for _ in range(7):
+        await r.step(heal)
+    assert "recovered" in await codes(r.store)
+
+
+async def test_a_backward_clock_step_cannot_revive_frozen_telemetry(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await heal.tick()
+    r.ft.t += 601
+    await r.prime()
+    r.p1.fresh()
+    r.p2.snapshot["last_poll_mono"] = r.ft.mono() - 300     # pump2's poller stalled 5 min ago...
+    r.p2.snapshot["last_poll_ts"] = r.ft.clock() - 300
+    r.ft.wall_offset = -300                                 # ...and the wall clock steps back 5 min
+    await heal.tick()
+    assert r.panel.writes == []
+    assert "stale" in heal.status()["pumps"]["pump2"]["status"]
 
 
 async def test_a_replacement_fault_is_not_recovery(rig):
