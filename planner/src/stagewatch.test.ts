@@ -142,6 +142,18 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   assert.deepEqual(g.step({ nowMs: min(60), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), [], "an hour-long gap credits nothing");
   assert.deepEqual(g.step({ nowMs: min(65), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), []);
   assert.equal(g.step({ nowMs: min(70), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }).length, 1, "10 min of OBSERVED call after the gap → page");
+  // codex pass 6: a 10- or 15-min gap (one or two skipped polls) credits nothing either — it may hide a heating spell
+  for (const skip of [10, 15]) {
+    const q = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+    q.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
+    assert.deepEqual(q.step({ nowMs: min(skip), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), [], `${skip}-min gap credits nothing`);
+    assert.equal(q.status()["1"].called_not_heating_min, 0);
+  }
+  // a slightly late poll (6 min) still counts
+  const late = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  late.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
+  late.step({ nowMs: min(6), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
+  assert.equal(late.status()["1"].called_not_heating_min, 6);
 }
 
 console.log("stagewatch.test.ts: all assertions passed");

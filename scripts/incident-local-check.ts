@@ -58,6 +58,14 @@ async function main() {
   assert.equal(await store.closeStormEvents("planner restart while idle", boot), 1);
   const live = (await pool.query(`SELECT trigger, ended_at FROM storm_events WHERE trigger IN ('orphan', 'armed by this process') ORDER BY id`)).rows;
   assert.deepEqual(live.map((r: any) => [r.trigger, r.ended_at != null]), [["orphan", true], ["armed by this process", false]]);
+  // a stand-down at 10:00 whose close only lands at 11:00 still ends the row at 10:00 (codex pass 6)
+  await pool.query(`TRUNCATE storm_events RESTART IDENTITY`);
+  const standDown = new Date(now - 3_600_000);
+  await pool.query(`INSERT INTO storm_events (started_at, trigger, detail) VALUES ($1, 'manual', jsonb_build_object('windowEnd', $2::text))`,
+    [iso(now - 3 * 3_600_000), iso(now + 3_600_000)]);
+  assert.equal(await store.closeStormEvents("stand-down", standDown, standDown), 1);
+  const ended = (await pool.query(`SELECT ended_at FROM storm_events`)).rows[0].ended_at;
+  assert.equal(new Date(ended).toISOString(), standDown.toISOString(), "ended at the stand-down, not at the retry");
 
   // ── #185 / #187: the alert-episode outbox ─────────────────────────────────────────────────────────────────────
   await pool.query(`TRUNCATE alert_episodes RESTART IDENTITY`);

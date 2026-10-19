@@ -738,7 +738,7 @@ const PROCESS_START = new Date();
 let pendingStandDownBefore: Date | null = null;
 async function retryStormStandDown(): Promise<void> {
   if (!pendingStandDownBefore) return;
-  try { await store.closeStormEvents("stand-down", pendingStandDownBefore); pendingStandDownBefore = null; }
+  try { await store.closeStormEvents("stand-down", pendingStandDownBefore, pendingStandDownBefore); pendingStandDownBefore = null; }
   catch (e) { console.error("storm stand-down close failed (retried next tick):", (e as Error).message); }
 }
 let stormSweepDone = false;

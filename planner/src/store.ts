@@ -944,16 +944,17 @@ export class Store {
    * (pendingCurveWrites) does not stretch it over the weeks it sat open. `note` lands in detail.closed. Returns the
    * number closed.
    */
-  async closeStormEvents(note: string, startedBefore?: Date): Promise<number> {
-    // startedBefore scopes the STARTUP sweep to orphans of earlier processes: a retried sweep must never close a storm
-    // this process armed meanwhile (codex pass 4 on the incident-fixes PR)
+  async closeStormEvents(note: string, startedBefore?: Date, endedAt?: Date): Promise<number> {
+    // startedBefore scopes the STARTUP sweep / a retried stand-down to rows that existed then: a retry must never close
+    // a storm armed meanwhile (codex pass 4). endedAt is the real moment of the stand-down — a close retried later
+    // still ends the row then, so the idle gap is not classified storm-active (codex pass 6). Default now().
     const r = await this.pool.query(
       `UPDATE storm_events SET
-         ended_at = GREATEST(started_at, LEAST(now(),
+         ended_at = GREATEST(started_at, LEAST(COALESCE($3::timestamptz, now()),
            CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)),
          detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('closed', $1::text)
        WHERE ended_at IS NULL AND ($2::timestamptz IS NULL OR started_at < $2::timestamptz)`,
-      [note, startedBefore ?? null],
+      [note, startedBefore ?? null, endedAt ?? null],
     );
     return r.rowCount ?? 0;
   }

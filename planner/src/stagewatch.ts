@@ -13,8 +13,11 @@
  */
 
 export const STAGE_START_GRACE_MS = 10 * 60 * 1000;
-/** A gap between steps longer than this credits no called time at all (a planner pause or skipped polls). */
-export const MAX_STEP_MS = 15 * 60 * 1000;
+/**
+ * A gap between steps longer than this credits no called time at all: the normal 5-min poll cadence plus jitter. A
+ * skipped poll (10 min) may hide a heating or defrost spell, so it is never counted as unserved (codex pass 6).
+ */
+export const MAX_STEP_MS = 7.5 * 60 * 1000;
 export const DEFAULT_STAGE_PUMP_MAP: Readonly<Record<string, string>> = { "1": "pump1", "2": "pump2" };
 
 /**
