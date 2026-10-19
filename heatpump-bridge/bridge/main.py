@@ -86,8 +86,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         app.state.span_breakers = span_breakers
         hub_client.span = span_breakers   # before start(): the first state frame advertises it
         hub_client.start()
+        from .self_heal import SelfHealer
+        self_healer = None
+        try:  # a self-heal bug must never stop the bridge (the setpoint path) from booting
+            self_healer = SelfHealer(cfg.self_heal, pollers, span_breakers, store,
+                                     notify_cfg=cfg.notifications, span_cfg=cfg.span,
+                                     state_dir=str(Path(cfg.db_path).resolve().parent))
+            self_healer.start()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("self-heal failed to start")
+        app.state.self_heal = self_healer
 
         yield
+        if self_healer is not None:
+            await self_healer.stop()     # no new self-heal decisions during shutdown
         await hub_client.stop()          # stop command intake first...
         if span_breakers is not None:
             await span_breakers.stop()   # ...then let a running power cycle finish its hold + CLOSE

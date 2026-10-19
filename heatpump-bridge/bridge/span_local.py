@@ -206,18 +206,33 @@ class SpanClient:
         # fails validation with HTTP 422 — the 2026-10-19 Air-Water 2 power-cycle test.
         body = {"relayStateIn": {"relayState": want}}
         last_err = "no reachable base"
+        maybe_sent = False   # an OPEN POST went out and was not definitively rejected
         for base in self._candidates():
             for attempt in (1, 2):  # one transparent re-auth on an auth failure
+                if want == "OPEN":
+                    # The guard + expiry hold for EVERY OPEN POST, retries included. If a
+                    # previous POST may have landed, a refusal now is NOT "nothing sent".
+                    try:
+                        open_permit.recheck()
+                    except OpenAborted as exc:
+                        if maybe_sent:
+                            raise ConnectionError(f"OPEN retry aborted after a possibly-delivered "
+                                                  f"OPEN: {exc}") from exc
+                        raise
                 try:
                     status, payload = self._request(
                         base, f"/api/v1/circuits/{circuit_id}", method="POST", body=body, token=self._token)
                 except (urllib.error.URLError, OSError, TimeoutError) as e:
+                    maybe_sent = maybe_sent or want == "OPEN"   # may have reached the panel
                     last_err = f"{base}: {e}"; break
                 if status == 200:
                     self._base = base
                     return (payload or {}).get("relayState", want)
                 if status in (401, 403, 412) and attempt == 1:
+                    # a definitive auth rejection: THIS post was not applied (earlier ones keep
+                    # whatever maybe_sent already says)
                     self._token = self._register_sync(); continue
+                maybe_sent = maybe_sent or want == "OPEN"       # any other answer: unknown
                 last_err = f"{base}: HTTP {status}{_detail(payload)}"; break
         raise ConnectionError(f"set_relay: {last_err}")
 
@@ -229,17 +244,24 @@ class SpanClient:
         return await asyncio.to_thread(_locked)
 
 
+class OpenAborted(Exception):
+    """The permit's guard refused at the dispatch boundary: NOTHING was sent to the panel."""
+
+
 class OpenPermit:
     """Capability to OPEN one SPAN circuit, once, within a few seconds. Minted only by
     span_control.BreakerController after its guards pass; SpanClient refuses OPEN without one.
-    Single-use so a stray reference can never be replayed into a second OFF."""
+    Single-use so a stray reference can never be replayed into a second OFF. An optional
+    `guard()` runs LAST — in the worker, under the client lock, immediately before the POST — and
+    aborts with OpenAborted if it returns a reason (callers' last-moment re-validation)."""
 
     TTL_S = 30.0
 
-    def __init__(self, circuit_id: str, name: str, reason: str):
+    def __init__(self, circuit_id: str, name: str, reason: str, guard=None):
         self.circuit_id = circuit_id
         self.name = name
         self.reason = reason
+        self.guard = guard
         self._expires = time.monotonic() + self.TTL_S
         self._used = False
 
@@ -250,7 +272,16 @@ class OpenPermit:
             raise ValueError(f"open permit is for '{self.name}', not circuit {circuit_id!r}")
         if time.monotonic() > self._expires:
             raise ValueError(f"open permit for '{self.name}' expired")
-        self._used = True
+        self._used = True   # the guard runs before each POST (recheck), not here
+
+    def recheck(self) -> None:
+        """Expiry + guard, run before each OPEN POST (check() has already consumed the permit)."""
+        if time.monotonic() > self._expires:
+            raise OpenAborted(f"open permit for '{self.name}' expired")
+        if self.guard is not None:
+            why = self.guard()
+            if why:
+                raise OpenAborted(why)
 
 
 def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
@@ -319,6 +350,7 @@ class SpanLocalPoller:
         # + the hub state frame). Refreshed every poll and after every breaker read-back.
         self.latest_circuits: dict[str, dict | None] = {}
         self.latest_circuits_ts: float | None = None
+        self.latest_circuits_mono: float | None = None   # same read, monotonic (freshness checks)
 
     def start(self) -> None:
         if self.cfg and self.cfg.host and self.cfg.passphrase:
@@ -347,11 +379,12 @@ class SpanLocalPoller:
                 await self.notify("SPAN local recovered", "Instant circuit power logging is back.")
         return rows
 
-    def note_circuits(self, circuits: dict, ts: float) -> None:
+    def note_circuits(self, circuits: dict, ts: float, mono: float | None = None) -> None:
         """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""
         self.latest_circuits = {b.name: extract_relay(circuits, b.name)
                                 for b in getattr(self.cfg, "breakers", [])}
         self.latest_circuits_ts = ts
+        self.latest_circuits_mono = time.monotonic() if mono is None else mono
 
     async def _evaluate_arm(self, circuits: dict, ts: float) -> None:
         """Backup-element ARM decision. Phase 1 = SHADOW (logs would-arm, toggles NOTHING).
