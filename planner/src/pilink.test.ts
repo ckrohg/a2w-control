@@ -290,6 +290,13 @@ function observations(off = 3, dropouts: [string, string][] = [
   // certain reboot (W1)
   const encl = piHealth({ ...clean, readings: { ...readings, clockIntervals: [{ start: s("2026-10-14T13:00:00Z"), end: s("2026-10-14T19:00:00Z") }] } }, NOW, 4);
   assert.equal(encl.dropouts_7d[0].verdict, "unknown", "W1's gap+reboot inside an enclosing re-stamped span → unknown");
+  // codex pass 20: a gradual slew of 10 min across the bracket (no single step) → unknown; a few seconds → stands
+  const slewed = (amount: number) => piHealth({ ...clean, stats: { ...stats, clockSteps: [], drift: [
+    { track: 3, start: s("2026-10-16T09:00:00Z"), end: s("2026-10-16T09:59:00Z"), cmin: 0, cmax: amount / 2 },
+    { track: 3, start: s("2026-10-16T10:00:00Z"), end: s("2026-10-16T12:30:00Z"), cmin: amount / 2, cmax: amount },
+  ] } }, NOW, 4).dropouts_7d[2].verdict;
+  assert.equal(slewed(600), "unknown");
+  assert.equal(slewed(4), "socket_only");
   // a missing bracket (the planner was down the half hour before a window) → unknown
   const gapObs = observations().filter((o) => !(o.at > s("2026-10-16T09:20:00Z") && o.at <= s("2026-10-16T10:00:00Z")));
   assert.equal(piHealth({ ...clean, clockObs: gapObs }, NOW, 4).dropouts_7d[2].verdict, "unknown");

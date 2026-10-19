@@ -1040,6 +1040,26 @@ export class Store {
              AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
          ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS, nowS + o.futureS, o.settleS]);
       const future = await this.pool.query(`SELECT count(*)::int AS n FROM system_stats WHERE ts > $1`, [nowS + o.futureS]);
+      // gradual clock movement (codex pass 20): within each boot track (a new track starts where uptime falls), the
+      // running sum of SUB-threshold ts-vs-uptime increments is the clock's slew; hourly min/max of it per track let
+      // pilink.ts see a bracket the clock moved through by more than CLOCK_STEP_S without any single step. Expanding
+      // frames only (incremental).
+      const drift = await this.pool.query(
+        `WITH s AS (
+           SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
+           FROM system_stats WHERE ts >= $1 AND ts <= $2 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+         ), d AS (
+           SELECT ts,
+                  CASE WHEN prev_ts IS NULL OR uptime_s < prev_up - 5 THEN 1 ELSE 0 END AS newtrack,
+                  CASE WHEN prev_ts IS NULL OR uptime_s < prev_up - 5 THEN 0
+                       WHEN abs((ts - prev_ts) - (uptime_s - prev_up)) > $3 THEN 0
+                       ELSE (ts - prev_ts) - (uptime_s - prev_up) END AS inc
+           FROM s
+         ), c AS (
+           SELECT ts, sum(newtrack) OVER (ORDER BY ts) AS track, sum(inc) OVER (ORDER BY ts) AS cum FROM d
+         )
+         SELECT track::int AS track, min(ts)::float8 AS start, max(ts)::float8 AS "end", min(cum)::float8 AS cmin, max(cum)::float8 AS cmax
+         FROM c GROUP BY track, floor(ts / 3600) ORDER BY 2`, [fromS - 3_600, nowS + o.futureS, o.clockStepS]);
       futureRows ||= Number(future.rows[0]?.n ?? 0) > 0;
       // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
       // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
@@ -1075,6 +1095,7 @@ export class Store {
         // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
         // window cannot read as resolved while they exist
         clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
+        drift: drift.rows.map((r: any) => ({ track: Number(r.track), start: Number(r.start), end: Number(r.end), cmin: Number(r.cmin), cmax: Number(r.cmax) })),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };

@@ -222,6 +222,39 @@ async function main() {
     assert.ok(piHealth(await store.piLinkInputs(at, OPTS), at, 0).dropouts_7d.every((w) => w.verdict === "unknown"));
   }
 
+  // ── codex pass 20 on #193: a 10-min blackout, a reboot with the clock 10 min SLOW, then a GRADUAL catch-up (5 s per
+  // minute) while the hub socket stays down — no readings gap, no single step, aligned observations either side.
+  // Must read unknown, never socket_only.
+  {
+    const T = NOW - D, Bt = T - 20 * D, RBt = T + 9 * 60;
+    const off = (t: number) => (t < RBt ? 0 : Math.max(0, 600 - 5 * Math.floor((t - RBt) / 60)));   // Pi − true, negative
+    const up = (t: number) => (t < RBt ? t - Bt : t - RBt);
+    await pool.query(`TRUNCATE readings, system_stats, phase_b_log, pi_clock_observations RESTART IDENTITY`);
+    const r: string[] = [], st: string[] = [];
+    for (let t = T - 3 * H; t <= T + 4 * H; t += 60) {
+      if (t >= T && t < T + 10 * 60) continue;                     // the blackout
+      r.push(`(${t - off(t)}, 'pump1', true, 'heating')`);
+      st.push(`(${t - off(t)}, ${up(t)})`);
+    }
+    for (let i = 0; i < r.length; i += 500) {
+      await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${r.slice(i, i + 500).join(",")}`);
+      await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ${st.slice(i, i + 500).join(",")} ON CONFLICT (ts) DO NOTHING`);
+    }
+    await pool.query(
+      `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+       SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+       FROM generate_series($1::bigint, $4::bigint, 300) t`, [T - 3 * H, T, T + 130 * 60, T + 4 * H]);
+    await pool.query(
+      `INSERT INTO pi_clock_observations (at, offset_s) SELECT to_timestamp(t), 2 FROM generate_series($1::bigint, $2::bigint, 300) t
+       WHERE NOT (t > $3 AND t < $4)`, [T - 3 * H, T + 4 * H, T, T + 130 * 60]);
+    const at = (T + 4 * H) * 1000;
+    const si = await store.piLinkInputs(at, OPTS);
+    assert.equal(si.readings?.gaps.filter((g) => g.start < T + 2 * H && g.end > T).length, 0, "the trap: no readings gap survives");
+    assert.equal((si.stats?.clockSteps ?? []).filter((x) => x > T - 60 && x < T + 3 * H).length, 0, "…and no single step");
+    const wS = piHealth(si, at, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T) <= 60);
+    assert.equal(wS?.verdict, "unknown", `a gradual slew through the window voids it (got ${wS?.verdict})`);
+  }
+
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);
   await pool.query(`INSERT INTO readings (ts, pump_id) VALUES ($1, 'pump1')`, [NOW - 20 * D]);

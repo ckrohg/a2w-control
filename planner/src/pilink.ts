@@ -104,6 +104,8 @@ export interface StatsView {
   ambiguous?: Boot[];
   /** Pi-clock discontinuities (epoch s): ts moved unlike uptime between consecutive samples — an NTP step */
   clockSteps?: number[];
+  /** hourly buckets of the clock's cumulative sub-threshold slew per boot track (store.piLinkInputs) */
+  drift?: { track: number; start: number; end: number; cmin: number; cmax: number }[];
   firstTs: number | null;
   lastTs: number | null;
 }
@@ -260,6 +262,14 @@ export function windowClockTrusted(
   // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to];
   // a re-stamped span is checked for OVERLAP, not by its endpoints (codex pass 19: one enclosing the bracket counts)
   const lo = from - WINDOW_SLACK_S, hi = to + WINDOW_SLACK_S;
+  // gradual movement: within one boot track, the slew across the bracket must stay within CLOCK_STEP_S (codex pass 20)
+  const byTrack = new Map<number, { cmin: number; cmax: number }>();
+  for (const b of input.stats?.drift ?? []) {
+    if (b.end < lo || b.start > hi) continue;
+    const t = byTrack.get(b.track) ?? { cmin: Infinity, cmax: -Infinity };
+    byTrack.set(b.track, { cmin: Math.min(t.cmin, b.cmin), cmax: Math.max(t.cmax, b.cmax) });
+  }
+  if ([...byTrack.values()].some((t) => t.cmax - t.cmin > CLOCK_STEP_S)) return false;
   return !(input.stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi)
     && !(input.readings?.clockIntervals ?? []).some((c) => c.start <= hi && c.end >= lo)
     && !(input.futureRows && to >= nowS - OBS_BRACKET_S);
