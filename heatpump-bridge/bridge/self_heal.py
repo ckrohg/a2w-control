@@ -83,6 +83,13 @@ class SelfHealer:
                 "span_wait": None,          # monotonic: since when live waits for a panel read
                 "last_outcome": p.get("last_outcome"),
             }
+            pending = p.get("verify")
+            if isinstance(pending, dict) and isinstance(pending.get("code"), str):
+                # A cycle (or shadow decision) was in flight when the bridge stopped: verify
+                # again from now, with a full window — never silently forget it.
+                self._begin_verify(self._pumps[pid], pending["code"], shadow=bool(pending.get("shadow")))
+                self._pumps[pid]["verify"]["restored"] = True
+                self._pumps[pid]["status"] = "verifying (restored after a restart)"
         self._startup_paged = False
 
     # --- lifecycle ------------------------------------------------------------
@@ -195,6 +202,8 @@ class SelfHealer:
                 return f"{name} is offline"
             if s.get("identity_ok") is False:
                 return f"{name}'s gateway identity check failed"
+            if s.get("on") is False or s.get("state") == "off":
+                return f"{name} is switched off"
             bad = [f for f in s.get("active_faults", []) if _is_blocking(f)]
             if bad:
                 return f"{name} is faulted ({', '.join(str(f.get('code')) for f in bad)})"
@@ -250,8 +259,9 @@ class SelfHealer:
                 st["span_wait"] = None
                 st["status"] = "no target fault"
                 continue
-            if st["fault_seen"] is None or st["fault_seen"][0] != fault.get("code"):
-                st["fault_seen"] = (fault.get("code"), self._mono())
+            key = (fault.get("code"), fault.get("since"))
+            if st["fault_seen"] is None or st["fault_seen"][0] != key:
+                st["fault_seen"] = (key, self._mono())   # a new onset restarts the in-process grace
             await self._consider(pid, poller, st, fault, fresh)
 
     async def _startup_notes(self) -> None:
@@ -365,13 +375,16 @@ class SelfHealer:
                              f"'{circuit}' ({self.cfg.off_s:g} s off). Shadow mode: nothing switched.",
                              detail, title=f"A2W self-heal (shadow): would cycle {name}")
             self._begin_verify(st, code, shadow=True)
+            self._save()
             return
         if self.breakers.snapshot()["busy"]:
             st["status"] = "waiting: another breaker action is running"
             return
         st["attempts"].append(self._stamp())
+        self._begin_verify(st, code, shadow=False)   # persisted with the attempt: a restart
         if not self._save():   # counted durably BEFORE acting, or not at all
             st["attempts"].pop()
+            st["phase"], st["verify"] = "idle", None
             st["status"] = "refusing: cannot persist the attempt budget"
             if "persist" not in st["paged"]:
                 st["paged"].add("persist")
@@ -394,6 +407,7 @@ class SelfHealer:
                 # Conditions changed at the last moment (or a human is switching): nothing was
                 # switched, so it is not an attempt. The next tick re-evaluates from scratch.
                 st["attempts"].pop()
+                st["phase"], st["verify"] = "idle", None
                 self._save()
                 st["status"] = f"aborted before switching: {text}"
                 await self._step(pid, "cycle_aborted", "info",
@@ -402,6 +416,7 @@ class SelfHealer:
                                  title=f"A2W self-heal: {name} cycle aborted", priority="default")
                 return
             st["status"] = f"cycle refused: {text}"
+            st["phase"], st["verify"] = "idle", None
             self._record_outcome(st, "refused", text)
             if "refused" not in st["paged"]:
                 st["paged"].add("refused")
@@ -410,6 +425,7 @@ class SelfHealer:
         if not result.get("ok"):
             # The controller already paged a failed CLOSE (urgent, with the manual step).
             st["status"] = f"cycle failed: {result.get('detail')}"
+            st["phase"], st["verify"] = "idle", None
             self._record_outcome(st, "cycle_failed", result.get("detail", ""))
             await self._step(pid, "cycle_failed", "critical",
                              f"{name}: power cycle of '{circuit}' did not complete cleanly: "
@@ -417,7 +433,7 @@ class SelfHealer:
                              title=f"A2W self-heal: {name} power cycle failed", priority="high")
             return
         st["status"] = f"cycled; verifying recovery (≤ {self.cfg.verify_min:g} min)"
-        self._begin_verify(st, code, shadow=False)
+        self._begin_verify(st, code, shadow=False)   # the window starts after the cycle
 
     def _precheck(self, pid: str, episode: tuple, circ: dict) -> str | None:
         """Re-run the pump guards on the CURRENT snapshots and the controller's FRESH panel read.
@@ -478,10 +494,10 @@ class SelfHealer:
         if v["shadow"]:
             if recovered or now >= v["until"]:
                 outcome = "cleared on its own" if recovered else "still active (nothing was switched)"
+                st["phase"], st["verify"] = "idle", None
                 self._record_outcome(st, "shadow_" + ("cleared" if recovered else "active"), outcome)
                 await self._audit(pid, "shadow_verify", "info",
                                   f"{name}: shadow verification — {code} {outcome}", facts)
-                st["phase"], st["verify"] = "idle", None
             else:
                 st["status"] = "SHADOW: watching what a cycle would have had to fix"
             return
@@ -560,15 +576,20 @@ class SelfHealer:
         except (OSError, ValueError) as exc:
             return {}, f"{type(exc).__name__}: {exc}"
         try:
+            if not isinstance(data, dict) or data.get("v") != 2:
+                raise ValueError("unknown version")
             pumps = data["pumps"]
             if not isinstance(pumps, dict):
                 raise ValueError("pumps is not an object")
+            missing = [pid for pid in self.cfg.circuits if pid not in pumps]
+            if missing:   # an existing file that lacks a pump's budget is not "zero attempts"
+                raise ValueError(f"no history for {', '.join(missing)}")
             out: dict = {}
             for pid, p in pumps.items():
-                if not isinstance(p, dict) or not isinstance(p.get("attempts", []), list):
+                if not isinstance(p, dict) or not isinstance(p.get("attempts"), list):
                     raise ValueError(f"{pid}: bad entry")
                 attempts = []
-                for a in p.get("attempts", []):
+                for a in p["attempts"]:
                     wall, mono = a["wall"], a.get("mono")
                     if isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(wall):
                         raise ValueError(f"{pid}: bad attempt time {wall!r}")
@@ -579,8 +600,9 @@ class SelfHealer:
                         a = {"wall": wall, "mono": self._mono(), "boot": self._boot_id, "rebased": True}
                     attempts.append({"wall": wall, "mono": a["mono"], "boot": a["boot"],
                                      **({"rebased": True} if a.get("rebased") else {})})
-                lo = p.get("last_outcome")
-                out[pid] = {"attempts": attempts, "last_outcome": lo if isinstance(lo, dict) else None}
+                lo, vf = p.get("last_outcome"), p.get("verify")
+                out[pid] = {"attempts": attempts, "last_outcome": lo if isinstance(lo, dict) else None,
+                            "verify": vf if isinstance(vf, dict) else None}
             return out, None
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             return {}, f"malformed history: {exc}"
@@ -588,8 +610,11 @@ class SelfHealer:
     def _save(self) -> bool:
         if not self._path:
             return False
-        data = {"v": 2, "pumps": {pid: {"attempts": st["attempts"], "last_outcome": st["last_outcome"]}
-                                  for pid, st in self._pumps.items()}}
+        data = {"v": 2, "pumps": {
+            pid: {"attempts": st["attempts"], "last_outcome": st["last_outcome"],
+                  "verify": ({"code": st["verify"]["code"], "shadow": st["verify"]["shadow"]}
+                             if st["phase"] == "verifying" and st["verify"] else None)}
+            for pid, st in self._pumps.items()}}
         tmp = self._path.with_suffix(".tmp")
         try:  # durable: the attempt budget must survive a power blip
             with open(tmp, "w") as f:

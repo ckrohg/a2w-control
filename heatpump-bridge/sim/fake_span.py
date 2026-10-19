@@ -27,6 +27,8 @@ class FakeSpan:
         }
         self.writes: list[tuple[str, str]] = []     # (circuit name, relayStateIn) in order
         self.fail_closes = 0          # next N CLOSE writes answer 500 and change nothing
+        self.fail_opens = 0           # next N OPEN writes answer 500 and change nothing
+        self.auth_fail_writes = 0     # next N writes answer 401 (token rejected) and change nothing
         self.ignore_writes = False    # 200 to every write, relay never changes (mismatch)
         self.down = False             # every request answers 503
         self.dupes: dict[str, tuple[str, dict]] = {}   # extra circuits {id: (name, fields)} on the wire
@@ -76,6 +78,10 @@ class FakeSpan:
                     return self._send(404, {"detail": "nope"})
                 if not self._authed():
                     return self._send(401, {"detail": "auth"})
+                with fake.lock:
+                    if fake.auth_fail_writes > 0:
+                        fake.auth_fail_writes -= 1
+                        return self._send(401, {"detail": "token expired"})
                 cid = self.path.rsplit("/", 1)[1]
                 want = body.get("relayStateIn")
                 with fake.lock:
@@ -85,6 +91,9 @@ class FakeSpan:
                     fake.writes.append((name, want))
                     if want == "CLOSED" and fake.fail_closes > 0:
                         fake.fail_closes -= 1
+                        return self._send(500, {"detail": "relay busy"})
+                    if want == "OPEN" and fake.fail_opens > 0:
+                        fake.fail_opens -= 1
                         return self._send(500, {"detail": "relay busy"})
                     if not fake.ignore_writes:
                         fake.circuits[name]["relayState"] = want

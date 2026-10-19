@@ -376,6 +376,61 @@ async def test_budget_survives_a_reboot_with_a_clock_step(rig):
     assert rebooted.status()["pumps"]["pump2"]["attempts_in_window"] == 1
 
 
+async def test_a_switched_off_peer_counts_as_down(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    r.p1.snapshot.update(on=False, state="off")
+    await r.eligible(heal)
+    await settle()
+    assert r.panel.writes == []
+    assert "both_down" in await codes(r.store)
+
+
+async def test_same_code_recurrence_restarts_the_in_process_grace(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await heal.tick()
+    await r.step(heal, 500)
+    r.p2.fault(age_min=12)                       # cleared and back between ticks: new onset
+    r.ft.wall_offset = 3600                      # plus a forward wall step
+    await r.step(heal, 200)                      # old episode would be past 10 min; new one isn't
+    assert opens(r.panel) == []
+    await r.step(heal, 601)                      # 10 min after the new onset was first seen
+    assert len(opens(r.panel)) == 1, heal.status()["pumps"]["pump2"]["status"]
+
+
+async def test_a_restart_mid_verification_resumes_it(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)                       # cycled; verifying
+    data = json.loads((r.tmp_path / sh_mod.STATE_FILE).read_text())
+    assert data["pumps"]["pump2"]["verify"]["code"] == "E21"
+    heal2 = r.make(live=True)                    # restart
+    assert heal2.status()["pumps"]["pump2"]["phase"] == "verifying"
+    for _ in range(32):                          # E21 never clears
+        await r.step(heal2)
+    assert "not_recovered" in await codes(r.store)
+    for _ in range(22):                          # the new process's own 10 min grace, then attempt 2
+        await r.step(heal2)
+    assert len(opens(r.panel)) == 2              # the budget (1 used) survived the restart
+
+
+async def test_incomplete_history_is_a_spent_budget(rig):
+    r = rig
+    for bad in ({"v": 2, "pumps": {"pump1": {"attempts": []}}},          # pump2 missing
+                {"v": 2, "pumps": {"pump1": {}, "pump2": {}}},          # attempts missing
+                {"pumps": {"pump1": {"attempts": []}, "pump2": {"attempts": []}}}):   # no version
+        (r.tmp_path / sh_mod.STATE_FILE).write_text(json.dumps(bad))
+        heal = r.make(live=True)
+        assert heal.history_problem, bad
+    (r.tmp_path / sh_mod.STATE_FILE).write_text(json.dumps(
+        {"v": 2, "pumps": {"pump1": {"attempts": []}, "pump2": {"attempts": []}}}))
+    assert not r.make(live=True).history_problem
+
+
 async def test_cold_or_stale_span_waits_then_pages_manual(rig):
     r = rig
     r.poller.latest_circuits = {}                           # just booted: no panel read yet

@@ -377,6 +377,40 @@ async def test_precheck_runs_on_the_fresh_read_and_can_refuse(rig):
     assert (await ctl.execute("Air-Water 2", "power_cycle", precheck=lambda c: None))["ok"]
 
 
+def late_guard(refuse_from_call: int):
+    calls = {"n": 0}
+
+    def guard(circ):
+        calls["n"] += 1
+        return "pump started heating" if calls["n"] >= refuse_from_call else None
+    return guard, calls
+
+
+async def test_guard_rechecks_before_an_auth_retry_post(rig, monkeypatch):
+    from bridge import span_local
+    panel, ctl, ft, *_ = rig
+    panel.auth_fail_writes = 1                  # first OPEN POST: 401 (definitively not applied)
+    monkeypatch.setattr(span_local, "_REREGISTER_COOLDOWN_S", 0.0)   # allow the re-registration
+    guard, calls = late_guard(3)                # precheck ok, 1st POST ok, re-auth POST refused
+    with pytest.raises(BreakerRefused, match="precheck: pump started heating"):
+        await ctl.execute("Air-Water 2", "power_cycle", precheck=guard)
+    assert calls["n"] == 3
+    assert panel.relay("Air-Water 2") == "CLOSED"
+    assert [w for w in panel.writes if w[1] == "CLOSED"] == []   # nothing sent: no hold, no CLOSE
+
+
+async def test_guard_refusal_after_a_maybe_delivered_open_still_holds_and_closes(rig):
+    panel, ctl, ft, *_ = rig
+    ctl.client.ip_fallback = ctl.client.host    # two bases -> a second OPEN POST
+    panel.fail_opens = 1                        # first POST: 500 (maybe applied)
+    guard, calls = late_guard(3)                # refused before the second POST
+    t0 = ft.t
+    r = await ctl.execute("Air-Water 2", "power_cycle", precheck=guard)
+    assert ft.t - t0 >= 60                      # treated as possibly delivered: full hold
+    assert panel.writes[-1] == ("Air-Water 2", "CLOSED")
+    assert r["relay_state"] == "CLOSED"
+
+
 # --- read-back --------------------------------------------------------------------------
 async def test_readback_mismatch_is_reported_not_confirmed(rig):
     panel, ctl, ft, store, _, _ = rig
