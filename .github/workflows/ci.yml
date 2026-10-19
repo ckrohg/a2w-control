@@ -74,9 +74,10 @@ jobs:
       - name: Run hub assertion suites
         run: npm test
 
-  # #186/#184/#183: the mirror's state mappings (boost read-back confirmation, backup-element card,
-  # storm banner) are pure functions in analytics-mirror/lib with node:assert suites under tests/,
-  # the same shape as hub-tests. `npm run build` never executes them, so they gate here.
+  # The mirror's pure state mappings (boost read-back #186, backup card #184, storm banner #183,
+  # SPAN breaker control #195, Pi tile #165) have node:assert suites under analytics-mirror/tests/
+  # and lib/*.test.ts, run by `npm test` — the same shape as hub-tests. `npm run build` never
+  # executes them, so they gate here.
   mirror-tests:
     runs-on: ubuntu-latest
     defaults:
