@@ -88,6 +88,18 @@ export function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/**
+ * Per-write boost semantics, evaluated INSIDE the serial slot so no check-then-write gap remains.
+ * yieldToBoost: an automatic writer (auto-pilot, identification) refuses to write while a boost is active — the
+ * refusal is a WriteError whose `stable` is BOOST_YIELD (isBoostYield), which callers record as a hold, not a fault.
+ * It matters most for restore(), which the rate limit never blocks (codex pass 2 on the boost hold).
+ * endsBoost: a human write (dashboard restore / set target) replaces the boost, so it retires the open boost row —
+ * otherwise the auto-pilot would keep holding a boost the owner already cancelled.
+ */
+export type WriteOpts = { yieldToBoost?: boolean; endsBoost?: boolean };
+export const BOOST_YIELD = "yielded to an active boost";
+export function isBoostYield(e: unknown): boolean { return e instanceof WriteError && e.stable === BOOST_YIELD; }
+
 export class WriteError extends Error {
   /**
    * `stable` is the message with its moving parts (ages, counts) removed — the key the auto-pilot dedups its ledger
@@ -129,6 +141,27 @@ export class HbxWriter {
     const run = this.writeChain.then(fn, fn);
     this.writeChain = run.catch(() => {});
     return run;
+  }
+  /** One serial slot with the WriteOpts boost semantics around the write. */
+  private guarded(source: string, action: string, requested: unknown, opts: WriteOpts, write: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+    return this.serial(async () => {
+      if (opts.yieldToBoost) {
+        const b = await this.store.activeBoost();
+        if (b) {
+          const detail = `${BOOST_YIELD} (${b.targetF}°F until ${b.restoreAt.toISOString()})`;
+          await this.store.insertHbxWrite({ source, action, requested, result: "rejected", detail });
+          throw new WriteError(409, detail, BOOST_YIELD);
+        }
+      }
+      const result = await write();
+      if (opts.endsBoost) {
+        // The write has landed; a failed retire must not turn it into an error response. Logged loudly instead: the
+        // auto-pilot would hold for the stale row until its restore_at, and expireBoosts would then restore.
+        try { await this.store.retireOpenBoosts(); }
+        catch (e) { console.error(`[boost] ${source} ${action} landed but the open boost row was not retired: ${(e as Error).message}`); return { ...result, boost_retire_failed: true }; }
+      }
+      return result;
+    });
   }
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
 
@@ -225,8 +258,8 @@ export class HbxWriter {
   // sanitize passes DEFAULT_OPTS.sanitizeCapF so its 140°F soak isn't clamped to 135. This only
   // raises the envelope ceiling — the I1 cross-check below is unchanged, so a higher target still
   // requires the pump setpoints to cover it (setpoint ≥ target + margin) or the write is rejected.
-  async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
-    return this.serial(() => this.setTargetSerial(targetF, source, capF));
+  async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "set_target", { target_f: targetF }, opts, () => this.setTargetSerial(targetF, source, capF));
   }
   private async setTargetSerial(targetF: number, source: string, capF: number): Promise<Record<string, unknown>> {
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
@@ -322,8 +355,8 @@ export class HbxWriter {
    * every attempt, and the config-echo verify inside patch(). Excursions (bank, soak, storm, boost,
    * identification probes) stay setTarget writes on top; restore() puts the as-found curve back.
    */
-  async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
-    return this.serial(() => this.setCurveSerial(curve, source, capF));
+  async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "set_curve", { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd }, opts, () => this.setCurveSerial(curve, source, capF));
   }
   private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number): Promise<Record<string, unknown>> {
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
@@ -414,8 +447,8 @@ export class HbxWriter {
   }
 
   /** Re-apply the as-found curve endpoints. Never rate-limited, never envelope-checked. */
-  async restore(source: string): Promise<Record<string, unknown>> {
-    return this.serial(() => this.restoreSerial(source));
+  async restore(source: string, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source));
   }
   private async restoreSerial(source: string): Promise<Record<string, unknown>> {
     const baseline = await this.store.baselineConfig();

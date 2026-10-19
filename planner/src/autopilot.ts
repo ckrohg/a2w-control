@@ -12,7 +12,7 @@
  */
 
 import { Store } from "./store";
-import { HbxWriter, WriteError } from "./writes";
+import { HbxWriter, WriteError, isBoostYield } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
 import { APPLY_TOLERANCE_F, curveAlreadyInForce, type ShapedCurve } from "./curve";
 // #173: curveAlreadyInForce + APPLY_TOLERANCE_F live in curve.ts now (shared with writes.ts status() and /health);
@@ -171,7 +171,7 @@ export class AutoPilot {
           return;
         }
         try {
-          await this.writer.setCurve(d.curve, "autopilot");
+          await this.writer.setCurve(d.curve, "autopilot", undefined, { yieldToBoost: true });
           await this.record(target, reason, "set-curve", `commanded ${label} — ${reason}`);
           console.log(`[autopilot] ${this.lastResult}`);
         } catch (e) {
@@ -179,6 +179,7 @@ export class AutoPilot {
             await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${label} (${reason})`);
             return;
           }
+          if (isBoostYield(e)) { await this.record(target, reason, "held", `held: a boost started while this write was queued — ${label} not applied`, null, "boost-yield"); return; }
           // #167: a disconnected / stale Pi is refused 503 exactly like an unreachable hub — filed as a rejection
           // (the ledger key is the age-free `stable` form, so a 3-h dropout is ONE row), warned, never paged.
           const msg = e instanceof WriteError ? e.message : (e as Error).message;
@@ -219,7 +220,7 @@ export class AutoPilot {
     }
 
     try {
-      await this.writer.setTarget(target, "autopilot", capF);
+      await this.writer.setTarget(target, "autopilot", capF, { yieldToBoost: true });
       await this.record(target, reason, "set", `set ${target}°F — ${reason}`, block);
       console.log(`[autopilot] ${this.lastResult}`);
     } catch (e) {
@@ -228,6 +229,8 @@ export class AutoPilot {
         await this.record(target, reason, "rate-limited", `rate-limited, retry next cycle → ${target}°F (${reason})`, block);
         return;
       }
+      // the writer re-checks the boost inside its serial slot: one that landed after the check above is still a hold
+      if (isBoostYield(e)) { await this.record(target, reason, "held", `held: a boost started while this write was queued — ${target}°F not applied`, block, "boost-yield"); return; }
       const msg = e instanceof WriteError ? e.message : (e as Error).message;
       // I4/I1 rejections are the guardrails doing their job — log, don't page. Sustained failure is
       // caught by the standing I1 monitor + the adoption monitor. #167: "cannot verify I1" (hub unreachable,

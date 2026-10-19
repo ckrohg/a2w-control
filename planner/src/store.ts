@@ -592,6 +592,11 @@ export class Store {
     );
   }
 
+  /** A human write replaced the boost (dashboard restore / set target): retire every open row — nothing is left to restore. */
+  async retireOpenBoosts(): Promise<void> {
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE NOT restored`);
+  }
+
   /** Boosts whose restore is due (survives planner restarts — durability is the point). */
   async dueBoosts(): Promise<{ id: number; targetF: number }[]> {
     const res = await this.pool.query(

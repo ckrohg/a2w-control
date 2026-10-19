@@ -6,10 +6,11 @@
  * (c) A rejected write does not poison the chain. Plain node:assert under tsx: npx tsx planner/src/writes-boost.test.ts
  */
 import assert from "node:assert/strict";
-import { HbxWriter, WriteError } from "./writes";
+import { HbxWriter, WriteError, isBoostYield } from "./writes";
+import { AutoPilot } from "./autopilot";
 
 type Boost = { targetF: number; restoreAt: Date };
-function harness() {
+function harness(planTargetF = 126) {
   const patches: Array<Record<string, number>> = [];
   const audits: Array<{ source: string; action: string; result: string }> = [];
   const cfg = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 };
@@ -27,6 +28,10 @@ function harness() {
     activeBoost: async (): Promise<Boost | null> => { const b = boosts.filter((x) => !x.restored && x.restoreAt.getTime() > Date.now()).at(-1); return b ? { targetF: b.targetF, restoreAt: b.restoreAt } : null; },
     dueBoosts: async () => boosts.filter((x) => !x.restored && x.restoreAt.getTime() <= Date.now()).map((x) => ({ id: x.id, targetF: x.targetF })),
     markBoostsRestored: async (ids: number[]) => { for (const b of boosts) if (ids.includes(b.id)) b.restored = true; },
+    retireOpenBoosts: async () => { for (const b of boosts) b.restored = true; },
+    // for an AutoPilot over this REAL writer
+    recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), tank_target_f: planTargetF, reason: "DHW window floor" }] }],
+    insertAutopilotLog: async () => {},
   } as any;
   const slx = { patchDevice: async (_b: string, _s: string, fields: Record<string, number>) => {
     if (gate) await gate;
@@ -36,7 +41,8 @@ function harness() {
   const hub = { getState: async () => ({ pi_connected: true, ts: Math.floor(Date.now() / 1000) - 10, pumps: [{ id: "pump1", name: "P1", online: true, setpoint_c: 60 }] }) } as any;
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
-  return { writer, patches, audits, boosts, hold, live: () => live };
+  const autopilot = new AutoPilot(store, writer, false, async () => {});
+  return { writer, autopilot, patches, audits, boosts, hold, live: () => live };
 }
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
@@ -124,6 +130,68 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     await h.writer.expireBoosts();
     assert.equal(h.patches.length, 3, "two boosts + the restore");
     assert.deepEqual(h.patches[2], { dbt: 130, mbt: 126, dot: 10 });
+  }
+  // (d1) yieldToBoost (codex pass 2): an automatic restore — exempt from the rate limit — refuses while a boost is active
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 60, "dashboard")), "ok");
+    let err: unknown = null;
+    try { await h.writer.restore("identification-abort#1", { yieldToBoost: true }); } catch (e) { err = e; }
+    assert.ok(isBoostYield(err), `expected a boost yield, got ${String(err)}`);
+    assert.equal(h.patches.length, 1, "the restore did not erase the boost");
+    assert.equal(h.audits.at(-1)?.result, "rejected"); assert.equal(h.audits.at(-1)?.action, "restore");
+    assert.equal(await status(h.writer.restore("dashboard")), "ok", "without the option a restore still always runs");
+  }
+  // (d2) a write QUEUED behind a boost's in-flight PATCH sees the boost row inside its own slot and yields (not 429)
+  {
+    const h = harness();
+    const release = h.hold();
+    const bo = status(h.writer.boost(129, 60, "dashboard"));
+    await settle();
+    const rs = h.writer.restore("identification-end#1", { yieldToBoost: true }).then(() => "ok", (e) => e);
+    await settle(); release();
+    assert.equal(await bo, "ok");
+    assert.ok(isBoostYield(await rs), "the queued restore yields to the boost that landed ahead of it");
+    assert.equal(h.patches.length, 1);
+  }
+  // (e1) REAL writer + auto-pilot: a boost holds the auto-pilot; the owner's dashboard restore (endsBoost) cancels the
+  //      boost, so the auto-pilot is no longer held for a boost that is gone
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 120, "dashboard")), "ok");
+    (h.writer as any).lastWriteAt = 0; // past the 15-min window
+    await h.autopilot.applyLatestPlan();
+    assert.match(h.autopilot.lastResult, /^held for boost to 129°F/); assert.equal(h.patches.length, 1);
+    assert.equal(await status(h.writer.restore("dashboard", { endsBoost: true })), "ok");
+    assert.ok(h.boosts.every((b) => b.restored), "the dashboard restore retired the boost row");
+    (h.writer as any).lastWriteAt = 0;
+    await h.autopilot.applyLatestPlan();
+    assert.doesNotMatch(h.autopilot.lastResult, /boost/, "no phantom boost hold");
+    assert.match(h.autopilot.lastResult, /already commanded/, "back on its own decision (the restored curve's 128 °F is within tolerance of 126)");
+  }
+  // (e2) a dashboard set-target (endsBoost) replaces the boost too; a REJECTED one leaves the boost standing
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 120, "dashboard")), "ok");
+    assert.equal(await status(h.writer.setTarget(127, "dashboard", undefined, { endsBoost: true })), 429, "inside 15 min: refused");
+    assert.ok(h.boosts.every((b) => !b.restored), "a refused human write does not cancel the boost");
+    (h.writer as any).lastWriteAt = 0;
+    assert.equal(await status(h.writer.setTarget(127, "dashboard", undefined, { endsBoost: true })), "ok");
+    assert.ok(h.boosts.every((b) => b.restored), "an accepted one does");
+  }
+  // (e3) REAL writer + auto-pilot: the auto-pilot passed its boost check, then a boost landed ahead of its write in the
+  //      queue → the in-slot re-check yields and the decision is a HOLD, not a rejection. (Plan 120 °F: far enough
+  //      from the commanded 128 that the auto-pilot does try to write; the yield is checked before the envelope.)
+  {
+    const h = harness(120);
+    const release = h.hold();
+    const bo = status(h.writer.boost(129, 60, "dashboard"));
+    await settle();
+    const ap = h.autopilot.applyLatestPlan();
+    await settle(); await settle(); release();
+    assert.equal(await bo, "ok"); await ap;
+    assert.match(h.autopilot.lastResult, /^held: a boost started while this write was queued — 120°F not applied$/, `got: ${h.autopilot.lastResult}`);
+    assert.equal(h.patches.length, 1, "only the boost reached the device");
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

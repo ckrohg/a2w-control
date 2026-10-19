@@ -2305,13 +2305,13 @@ async function main(): Promise<void> {
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
           if (req.url === "/api/hbx/restore") {
-            return json(res, 200, await writer.restore("dashboard"));
+            return json(res, 200, await writer.restore("dashboard", { endsBoost: true })); // the owner cancelled any boost
           }
           const body = JSON.parse((await readBody(req)) || "{}");
           if (req.url === "/api/hbx/boost") {
             return json(res, 200, await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard"));
           }
-          return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard"));
+          return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard", undefined, { endsBoost: true }));
         }
         if (req.url === "/api/storm/arm" || req.url === "/api/storm/disarm") {
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });

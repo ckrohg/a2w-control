@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
-import { WriteError } from "./writes";
+import { WriteError, BOOST_YIELD } from "./writes";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
 const cell = (over: Partial<PlanCell> & { band: [number, number] }, sug: Partial<NonNullable<PlanCell["suggest"]>> = {}): PlanCell => ({
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error } }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -151,12 +151,16 @@ async function main(): Promise<void> {
     const deps: IdentDeps = {
       store,
       writer: {
-        async setTarget(targetF: number, source: string, capF?: number) {
+        async setTarget(targetF: number, source: string, capF?: number, opts?: { yieldToBoost?: boolean }) {
+          over.onSetTarget?.(source);
+          // the real writer checks the boost first inside its serial slot (writes.ts guarded), then the rate limit
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) throw new WriteError(409, `${BOOST_YIELD} (fake)`, BOOST_YIELD);
           const f = writeFails.shift();
           if (f != null) throw new WriteError(f, f === 429 ? "rate limited" : "rejected");
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
-        async restore(source: string) {
+        async restore(source: string, opts?: { yieldToBoost?: boolean }) {
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new WriteError(409, `${BOOST_YIELD} (fake)`, BOOST_YIELD); }
           if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
           restores.push(source); return { ok: true };
         },
@@ -696,6 +700,44 @@ async function main(): Promise<void> {
     await u.driver.tick();
     assert.equal(u.rows[0].cleanupState, "pending"); assert.match(u.rows[0].cleanupDetail ?? "", /boost state unreadable/);
     assert.equal(u.writes.length, 0); assert.equal(u.restores.length, 0);
+  }
+  // 5g. Interleaving (codex pass 2 on the boost hold): the boost lands AFTER cleanup's step-0a check. (i) It lands
+  //     before the re-command's slot → the writer yields → done, no write. (ii) It lands after the re-command was
+  //     refused 429 → the fallback restore, which the rate limit never blocks, yields too → done, no restore.
+  {
+    const ended = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 300 * 60_000), state: "ended", arm: "probe", direction: "up", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 8, baseF: 135, targetF: 143, capF: 145, drawProbability: 0.5, drawSeed: "0.2", startedAt: new Date(T0.getTime() - 200 * 60_000),
+      endedAt: new Date(T0.getTime() - 80 * 60_000), endReason: "completed", durationMin: 120, writeId: 40, writeAccepted: true, dryRun: false,
+      postedOpen: true, postedClosed: true, cell: null, safeToProbe: null, armingTicks: 0, writeAttempts: 1, cleanupState: "pending", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    const tapped = { targetF: 140, restoreAt: new Date(T0.getTime() + 3600_000) };
+    const b1 = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const i = harness({ plan: upPlan, commanded: 143, seedRows: [ended()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: b1,
+      liveCommanded: async () => { b1.v = tapped; return 143; } }); // the owner taps a boost while cleanup reads the device
+    await i.driver.tick();
+    assert.equal(i.rows[0].cleanupState, "done"); assert.match(i.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
+    assert.equal(i.writes.length, 0); assert.deepEqual(i.restores, []);
+    const b2 = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const ii = harness({ plan: upPlan, commanded: 143, seedRows: [ended()], lastEnd: new Date(T0.getTime() - 80 * 60_000), boost: b2, writeFails: [429],
+      onSetTarget: () => { /* the boost's write is ahead in the queue: 429 for us, and its row is visible by the restore */ queueMicrotask(() => { b2.v = tapped; }); } });
+    await ii.driver.tick();
+    assert.equal(ii.rows[0].cleanupState, "done"); assert.match(ii.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
+    assert.deepEqual(ii.restores, ["YIELD"], "the restore was attempted and YIELDED — it did not erase the boost");
+  }
+  // 5h. a probe write queued behind a boost yields → the window ends unwritten (no 429 retry loop)
+  {
+    const pw = (): IdentWindow => ({
+      id: 1, createdAt: new Date(T0.getTime() - 5 * 60_000), state: "pending_write", arm: "probe", direction: "down", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
+      magnitudeF: 6, baseF: 130, targetF: 124, capF: 135, drawProbability: 0.5, drawSeed: "0.2", startedAt: null, endedAt: null, endReason: null,
+      durationMin: 120, writeId: null, writeAccepted: false, dryRun: false, postedOpen: false, postedClosed: false, cell: cell({ band: [30, 45] }), safeToProbe: null,
+      armingTicks: 0, writeAttempts: 1, cleanupState: "none", cleanupDetail: null, cleanupAttempts: 0,
+    });
+    const b = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const h = harness({ plan: downPlan, commanded: 130, seedRows: [pw()], boost: b, onSetTarget: () => { b.v = { targetF: 132, restoreAt: new Date(T0.getTime() + 3600_000) }; } });
+    await h.driver.tick();
+    assert.equal(h.rows[0].state, "ended"); assert.equal(h.rows[0].endReason, "aborted:boost_active");
+    assert.equal(h.writes.length, 0); assert.equal(h.rows[0].cleanupState, "none");
   }
   // 4d. Cleanup is a NO-OP when the device no longer commands the probe target (a legacy/backfilled row, or
   //     something else already moved the plant) — codex pass 4.

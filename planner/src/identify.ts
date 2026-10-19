@@ -39,7 +39,7 @@ import { randomBytes } from "node:crypto";
 import type { HubClient } from "./hub";
 import type { Store } from "./store";
 import type { HbxWriter } from "./writes";
-import { WriteError, piStateUnverifiable } from "./writes";
+import { WriteError, piStateUnverifiable, isBoostYield } from "./writes";
 import type { AutoPilot } from "./autopilot";
 import type { PhaseB } from "./phaseb";
 import type { DemandFeed, InsightZone } from "./demand";
@@ -681,8 +681,9 @@ export class IdentificationDriver {
     await this.d.store.updateIdentificationWindow(w.id, { writeAttempts: attempts });
     w.writeAttempts = attempts;
     try {
-      await this.d.writer.setTarget(w.targetF, probeSource(w.id), w.capF);
+      await this.d.writer.setTarget(w.targetF, probeSource(w.id), w.capF, { yieldToBoost: true });
     } catch (e) {
+      if (isBoostYield(e)) { await this.end(w, "aborted:boost_active"); return; }
       if (e instanceof WriteError && e.status === 429 && attempts < WRITE_RETRY_MAX) {
         // Stays pending_write: the next poll retries. Nothing is posted — an unwritten arm is not evidence.
         this.lastResult = `rate-limited writing ${w.targetF} °F for #${w.id} — retry next poll (${attempts}/${WRITE_RETRY_MAX})`;
@@ -829,9 +830,12 @@ export class IdentificationDriver {
     let permanent = urgent;
     if (commanded != null) {
       try {
-        await this.d.writer.setTarget(returnF, cleanupSource(w.id, false), returnCapF);
+        await this.d.writer.setTarget(returnF, cleanupSource(w.id, false), returnCapF, { yieldToBoost: true });
         return await done(`re-commanded ${returnLabel}`);
       } catch (e) {
+        // a boost that landed after step 0a (it was queued behind this write) owns the plant now — and must not fall
+        // through to the rate-limit-exempt restore below (codex pass 2 on the boost hold)
+        if (isBoostYield(e)) return done(`a boost took over during cleanup — ${(e as Error).message}; nothing to return`);
         const status = e instanceof WriteError ? e.status : 0;
         permanent = permanent || (status >= 400 && status < 500) || attempts >= CLEANUP_TRANSIENT_MAX;
         if (!permanent) return stillPending(`re-command failed (transient): ${(e as Error).message.slice(0, 120)}`);
@@ -839,9 +843,10 @@ export class IdentificationDriver {
     }
     // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
     try {
-      await this.d.writer.restore(cleanupSource(w.id, urgent));
+      await this.d.writer.restore(cleanupSource(w.id, urgent), { yieldToBoost: true });
       return await done(`as-found curve restored (base re-command refused${urgent ? "; abort" : ""})`);
     } catch (e) {
+      if (isBoostYield(e)) return done(`a boost took over during cleanup — ${(e as Error).message}; nothing to return`);
       return stillPending(`restore failed: ${(e as Error).message.slice(0, 120)}`);
     }
   }
