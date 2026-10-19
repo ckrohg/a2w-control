@@ -335,6 +335,7 @@ export class HbxWriter {
     return this.guarded(source, "set_target", { target_f: targetF }, opts, () => this.setTargetSerial(targetF, source, capF));
   }
   private async setTargetSerial(targetF: number, source: string, capF: number): Promise<Record<string, unknown>> {
+    const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
       throw new WriteError(status, detail, stable);
@@ -415,6 +416,7 @@ export class HbxWriter {
       source,
       "set_target",
       `target ${targetF}°F commanded (curve ${dbt}/${mbt} → ${targetF}°F output at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      epoch,
     );
   }
 
@@ -432,6 +434,7 @@ export class HbxWriter {
     return this.guarded(source, "set_curve", { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd }, opts, () => this.setCurveSerial(curve, source, capF));
   }
   private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number): Promise<Record<string, unknown>> {
+    const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
     // validated (the guard already refused a wwsd that differs from the live one).
     const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
@@ -474,6 +477,7 @@ export class HbxWriter {
       source,
       "set_curve",
       `curve commanded: ${curve.dbt}°F at ${curve.dot}°F → ${curve.mbt}°F at ${curve.wwsd}°F (output ${outputNow.toFixed(1)}°F at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      epoch,
     );
   }
 
@@ -544,6 +548,12 @@ export class HbxWriter {
     source: string,
     action: string,
     summary: string,
+    /**
+     * deviceWrites when the caller evaluated its guards (rate limit, I1, envelope). A device write landing since then
+     * can only be a restore that overtook this write's stuck slot (serial(maxWaitMs)); this write's guards are then
+     * stale and it must not land over the restore (codex pass 9). Omitted for restore itself: it is the last word.
+     */
+    epoch?: number,
   ): Promise<Record<string, unknown>> {
     // Graceful handover (2026-10-01): once SIGTERM has landed no NEW device write may start — the lease is about to
     // be handed to the successor and a PATCH that began after the barrier could land after the successor's own
@@ -577,6 +587,10 @@ export class HbxWriter {
         if (writeBarrier) {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "planner shutting down — write barrier went up during the lease check" });
           throw new WriteError(503, "refused: planner is shutting down (lease handover in progress)");
+        }
+        if (epoch != null && this.deviceWrites !== epoch) {
+          await this.store.insertHbxWrite({ source, action, requested: fields, result: "rejected", detail: "superseded: another device write (a restore) landed while this write was being evaluated" });
+          throw new WriteError(429, "superseded: a restore landed while this write was being evaluated — retry next cycle");
         }
         let dev: Record<string, any>;
         try {

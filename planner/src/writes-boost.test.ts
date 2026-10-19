@@ -312,5 +312,24 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(await later, 429);
     assert.equal(h.patches.length, 1);
   }
+  // (k) codex pass 9: the overtaken write had ALREADY passed its rate-limit check and stalls in the writer-lease query
+  //     inside patch(). When it resumes it must not PATCH over the restore that overtook it (re-checked in the lock).
+  {
+    const h = harness();
+    let unstick!: () => void; const stuck = new Promise<void>((r) => { unstick = r; });
+    let leaseCalls = 0;
+    h.store.holdsWriterLease = async () => { leaseCalls++; if (leaseCalls === 1) await stuck; return true; };
+    const w = new HbxWriter(h.slx, h.store, h.hub, "b", "s", async () => {}, false, { instanceId: "a", staleMs: 60_000 });
+    (w as any).restoreQueueWaitMs = 30;
+    const ap = status(w.setTarget(126, "autopilot"));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(leaseCalls, 1, "the auto-pilot write is past its guards, stuck in the lease query");
+    assert.equal(await status(w.restore("dashboard")), "ok");
+    assert.deepEqual(h.patches, [{ dbt: 130, mbt: 126, dot: 10 }], "the restore landed");
+    unstick();
+    assert.equal(await ap, 429, "the stale write is refused inside the device lock");
+    assert.equal(h.patches.length, 1, "it never reached the device — the owner's restore stands");
+    assert.match(h.audits.at(-1)?.detail ?? "", /^superseded: /);
+  }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
