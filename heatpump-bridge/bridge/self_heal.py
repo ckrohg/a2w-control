@@ -198,6 +198,9 @@ class SelfHealer:
         return min(hits, key=lambda f: f.get("since") or 0) if hits else None
 
     def _other_down(self, pid: str, *, span: dict | None) -> str | None:
+        for oid in self.cfg.circuits:     # every pump self-heal knows about must be visible
+            if oid != pid and oid not in self.pollers:
+                return f"{oid} has no telemetry on this bridge"
         for oid, other in self.pollers.items():
             if oid == pid:
                 continue
