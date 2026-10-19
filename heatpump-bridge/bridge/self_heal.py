@@ -38,6 +38,8 @@ SPAN_WAIT_PAGE_S = 600.0     # live, eligible, but no usable panel read for this
 RUNNING_QUIET_S = 120.0      # "not heating" = no compressor seen for this long (anti-short-cycle)
 DEFROST_QUIET_S = 300.0      # and no defrost for this long
 CLEAR_HOLD_S = 180.0         # recovered = no blocking fault, observed fresh, continuously this long
+ABORT_COOLDOWN_S = 300.0     # after a last-moment abort, wait this long before trying again
+ABORTS_BEFORE_MANUAL = 3     # consecutive aborts in one episode -> page the manual step
 ALL_DOWN_PAGE_S = 300.0      # every pump down this long (debounces a bridge restart) -> page
 OBS_GAP_S = 90.0             # verification ticks further apart than this break the continuity
 STATE_FILE = "self-heal.json"
@@ -86,6 +88,7 @@ class SelfHealer:
                 "last_running": None, "last_defrost": None,   # monotonic
                 "fault_seen": None,         # (code, monotonic first seen) for the grace
                 "span_wait": None,          # monotonic: since when live waits for a panel read
+                "aborts": 0, "abort_until": None,   # consecutive last-moment aborts + cooldown
                 "last_outcome": p.get("last_outcome"),
             }
             pending = p.get("verify")
@@ -286,6 +289,7 @@ class SelfHealer:
             if fault is None:
                 st["paged"].clear()     # episode over: the next one pages afresh
                 st["fault_seen"] = None
+                st["aborts"], st["abort_until"] = 0, None
                 st["span_wait"] = None
                 st["status"] = "no target fault"
                 continue
@@ -470,6 +474,9 @@ class SelfHealer:
         if self.breakers.snapshot()["busy"]:
             st["status"] = "waiting: another breaker action is running"
             return
+        if st["abort_until"] is not None and self._mono() < st["abort_until"]:
+            st["status"] = f"waiting {st['abort_until'] - self._mono():.0f} s after an aborted attempt"
+            return
         st["attempts"].append(self._stamp())
         self._begin_verify(st, code, shadow=False)   # persisted with the attempt: a restart
         if not self._save():   # counted durably BEFORE acting, or not at all
@@ -481,11 +488,14 @@ class SelfHealer:
                 await self._manual(pid, name, code, circuit, "the bridge cannot persist its attempt budget")
             return
         st["status"] = f"power-cycling '{circuit}'"
-        await self._step(pid, "cycle_start", "warning",
-                         f"{name}: {code} active {age_min:.0f} min, not heating — power-cycling "
-                         f"'{circuit}' ({self.cfg.off_s:g} s off), attempt {len(self._recent(st))}/"
-                         f"{self.cfg.max_attempts}.", detail,
-                         title=f"A2W self-heal: power-cycling {name}")
+        start_msg = (f"{name}: {code} active {age_min:.0f} min, not heating — power-cycling "
+                     f"'{circuit}' ({self.cfg.off_s:g} s off), attempt {len(self._recent(st))}/"
+                     f"{self.cfg.max_attempts}.")
+        if st["aborts"] == 0:
+            await self._step(pid, "cycle_start", "warning", start_msg, detail,
+                             title=f"A2W self-heal: power-cycling {name}")
+        else:   # a retry after an abort: audited, not re-announced
+            await self._audit(pid, "cycle_start", "warning", start_msg, detail)
         try:
             episode = (code, fault.get("since"), st["fault_seen"])
             result = await self.breakers.execute(
@@ -499,11 +509,21 @@ class SelfHealer:
                 st["attempts"].pop()
                 st["phase"], st["verify"] = "idle", None
                 self._save()
+                st["aborts"] += 1
+                st["abort_until"] = self._mono() + ABORT_COOLDOWN_S
                 st["status"] = f"aborted before switching: {text}"
-                await self._step(pid, "cycle_aborted", "info",
-                                 f"{name}: power cycle aborted before anything was switched — {text}.",
-                                 {**detail, "reason": text},
-                                 title=f"A2W self-heal: {name} cycle aborted", priority="default")
+                msg = f"{name}: power cycle aborted before anything was switched — {text}."
+                if "aborted" not in st["paged"]:
+                    st["paged"].add("aborted")
+                    await self._step(pid, "cycle_aborted", "info", msg, {**detail, "reason": text},
+                                     title=f"A2W self-heal: {name} cycle aborted", priority="default")
+                else:
+                    await self._audit(pid, "cycle_aborted", "info", msg, {**detail, "reason": text})
+                if st["aborts"] >= ABORTS_BEFORE_MANUAL and "abort_manual" not in st["paged"]:
+                    st["paged"].add("abort_manual")
+                    await self._manual(pid, name, code, circuit,
+                                       f"{st['aborts']} attempts in a row were aborted at the last "
+                                       f"moment (latest: {text})")
                 return
             st["status"] = f"cycle refused: {text}"
             st["phase"], st["verify"] = "idle", None
@@ -512,6 +532,7 @@ class SelfHealer:
                 st["paged"].add("refused")
                 await self._manual(pid, name, code, circuit, text)
             return
+        st["aborts"], st["abort_until"] = 0, None
         if not result.get("ok"):
             # The controller already paged a failed CLOSE (urgent, with the manual step).
             st["status"] = f"cycle failed: {result.get('detail')}"
