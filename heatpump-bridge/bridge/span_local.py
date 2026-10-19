@@ -350,6 +350,7 @@ class SpanLocalPoller:
         # + the hub state frame). Refreshed every poll and after every breaker read-back.
         self.latest_circuits: dict[str, dict | None] = {}
         self.latest_circuits_ts: float | None = None
+        self.latest_circuits_mono: float | None = None   # same read, monotonic (freshness checks)
 
     def start(self) -> None:
         if self.cfg and self.cfg.host and self.cfg.passphrase:
@@ -378,11 +379,12 @@ class SpanLocalPoller:
                 await self.notify("SPAN local recovered", "Instant circuit power logging is back.")
         return rows
 
-    def note_circuits(self, circuits: dict, ts: float) -> None:
+    def note_circuits(self, circuits: dict, ts: float, mono: float | None = None) -> None:
         """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""
         self.latest_circuits = {b.name: extract_relay(circuits, b.name)
                                 for b in getattr(self.cfg, "breakers", [])}
         self.latest_circuits_ts = ts
+        self.latest_circuits_mono = time.monotonic() if mono is None else mono
 
     async def _evaluate_arm(self, circuits: dict, ts: float) -> None:
         """Backup-element ARM decision. Phase 1 = SHADOW (logs would-arm, toggles NOTHING).

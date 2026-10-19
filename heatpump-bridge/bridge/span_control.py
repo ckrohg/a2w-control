@@ -119,6 +119,7 @@ class BreakerController:
             })
         return {
             "ts": getattr(self.cache, "latest_circuits_ts", None),
+            "mono": getattr(self.cache, "latest_circuits_mono", None),
             "circuits": circuits,
             "busy": dict(self._busy) if self._busy else None,
             "pending_close": sorted(self._pending_close),
@@ -293,7 +294,7 @@ class BreakerController:
     async def _read_panel(self) -> dict:
         circuits = await self.client.fetch_circuits()
         if self.cache is not None and hasattr(self.cache, "note_circuits"):
-            self.cache.note_circuits(circuits, self._clock())
+            self.cache.note_circuits(circuits, self._clock(), self._mono())
         return circuits
 
     # --- the run --------------------------------------------------------------

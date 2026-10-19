@@ -190,8 +190,14 @@ class SelfHealer:
         if self.breakers is None:
             return None
         snap = self.breakers.snapshot()
-        ts = snap.get("ts")
-        if ts is None or not (0 <= self._clock() - ts < SPAN_FRESH_S):
+        mono, ts = snap.get("mono"), snap.get("ts")
+        if isinstance(mono, (int, float)):
+            age = self._mono() - mono               # immune to wall-clock steps
+        elif ts is not None:
+            age = self._clock() - ts
+        else:
+            return None
+        if not (0 <= age < SPAN_FRESH_S):
             return None
         if any(c["heat_pump"] and c["relay_state"] is None for c in snap["circuits"]):
             return None
