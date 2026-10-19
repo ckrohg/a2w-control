@@ -290,6 +290,39 @@ async function main(): Promise<void> {
     assert.equal(out.diagnosis?.matches[0]?.written, 142, "the diagnosis still names the nearest planner write");
   }
 
+  // ── 9a. `unsettled` marks exactly the outcomes with no durable evidence: index.ts fails the poll on it so no
+  // controller supersedes the observation (codex pass 6) ──────────────────────────────────────────────────────────
+  {
+    const prev = prevOf(device(120, 118));
+    const seen = device(141, 137);
+    // re-read OK, but the latest-version lookup fails → nothing recorded → unsettled
+    let h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: seen });
+    h.deps.latest = async () => { throw new Error("query timeout"); };
+    let out = await handlePolledConfig(prev, seen, h.deps);
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
+    assert.equal(h.rows.length, 0, "no baseline known → never write a row that might be stale");
+    assert.equal(out.unsettled, true, "→ index.ts skips this poll's actuation");
+    // re-read failed but the evidence row landed → settled enough: controllers may run
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: prev });
+    out = await handlePolledConfig(prev, seen, h.deps);
+    assert.equal(h.rows.length, 1);
+    assert.equal(out.unsettled, false);
+    // re-read failed AND the evidence row could not be written → unsettled
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: prev });
+    h.deps.record = async () => { throw new Error("db down"); };
+    out = await handlePolledConfig(prev, seen, h.deps);
+    assert.equal(out.unsettled, true);
+    // shutdown: unsettled too (index.ts ignores it while shutting down — the write barrier is already up)
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", waitOk: false });
+    out = await handlePolledConfig(prev, seen, h.deps);
+    assert.equal(out.unsettled, true);
+    // confirmed / reverted / no-change outcomes are never unsettled
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: seen });
+    assert.ok(!(await handlePolledConfig(prev, seen, h.deps)).unsettled);
+    h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: device(120, 118) });
+    assert.ok(!(await handlePolledConfig(prev, seen, h.deps)).unsettled);
+  }
+
   // ── 9b. A re-read abandoned mid-request (index.ts abandonOnShutdown rejects) is unconfirmed too ─────────────────
   {
     const prev = prevOf(device(120, 118));

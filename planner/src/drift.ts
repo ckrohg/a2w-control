@@ -201,6 +201,12 @@ export interface DriftOutcome {
   /** Changes recorded (null when nothing changed for good). */
   changes: Record<string, FieldChange> | null;
   diagnosis: CurveDiagnosis | null;
+  /**
+   * true = a curve change was seen but is neither confirmed nor durably recorded (no evidence row: the DB failed, or
+   * SIGTERM). index.ts then fails this poll — no controller may overwrite the curve before the observation is kept
+   * (codex pass 6) — exactly as a failed device read already does; the next poll sees the same diff again.
+   */
+  unsettled?: boolean;
 }
 
 const curveChanged = (c: Record<string, FieldChange> | null): boolean => !!c && ("dbt" in c || "mbt" in c);
@@ -329,8 +335,9 @@ export async function handlePolledConfig(
   };
   const unconfirmed = async (why: string, recorded?: CurveDiagnosis): Promise<DriftOutcome> => {
     const diagnosis = recorded ?? await unconfirmedDiagnosis(why);
+    const unsettled = !recorded;
     log(`HBX curve change seen but not confirmed (${why}) — not recorded, not paged; the next poll re-checks:\n${fmtChanges(changes)}`);
-    return { kind: "curve", config, device: dev, changes: null, diagnosis };
+    return { kind: "curve", config, device: dev, changes: null, diagnosis, unsettled };
   };
   if (!(await deps.wait(REREAD_DELAY_MS))) return unconfirmed("re-read skipped: planner shutting down");
 

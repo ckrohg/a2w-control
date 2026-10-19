@@ -1607,6 +1607,11 @@ async function pollOnce(): Promise<void> {
     record: (r) => store.insertConfigVersion(r.config, r.changes, r),
     notify: (title, body, priority, opts) => ntfy(title, body, priority, opts),
   });
+  if (drift.unsettled && !shuttingDown) {
+    lastCurveDiagnosis = drift.diagnosis ?? lastCurveDiagnosis;
+    // a curve change neither confirmed nor durably recorded: no controller may overwrite it this cycle (#177)
+    throw new Error("HBX curve change seen but neither confirmed nor recorded — skipping this poll's actuation; the next poll re-checks");
+  }
   const config = drift.config;
   if (drift.kind === "seeded") console.log("seeded initial hbx_config_versions row");
   if (drift.changes) lastDriftAt = new Date().toISOString();
