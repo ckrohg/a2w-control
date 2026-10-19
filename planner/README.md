@@ -112,6 +112,20 @@ the planner records its *own* writes with a `_source` tag and therefore never se
   before this cycle's own writes*; a foreign change to the curve (`dbt`/`mbt`) pages
   **"⚠ Foreign HBX curve write — single-writer invariant"** (high); other foreign edits page
   "HBX config changed (outside the planner)".
+- **Self-diagnosing curve alert (#177).** A `dbt`/`mbt` diff is re-read after ~30 s and pages only
+  if it persists (a revert records both reads with `verdict = reverted`, `changed_fields` NULL, no
+  page). It is then compared with the planner's own accepted writes (`hbx_writes.requested`) in the
+  previous 60 min: when **every** changed curve field is within **2 °F** of a value the planner
+  wrote to that field, the verdict is `echo_suspected` and it pages at **default** priority (with
+  email) as **"HBX curve differs from our write (possible device/cloud transform)"** — no
+  single-writer claim. Otherwise the verdict is `foreign` and today's high page stands. Both pages
+  carry the evidence: before/after values, the re-read, the nearest planner-written values, the
+  planner's last write with its PATCH echo (`hbx_writes.response`), and the device's own provenance
+  (`changeSource`, `updatedAt`, …). Every `hbx_config_versions` row stores the full device object in
+  `raw` (and `reread_raw`, `verdict`, `diagnosis` for curve events). `/health.drift.last_foreign`
+  gives `{at, fields, planner_last_write, reread_confirmed, verdict}`. Prompted by the two
+  2026-10-18 pages (120/118 → 141/137 and → 129/125), each 1 °F under the planner's own preceding
+  flat band.
 - **48-hour surface** — the dashboard chip runs the acceptance query
   `changed_fields IS NOT NULL AND changed_fields->>'_source' IS NULL` over the last 48 h.
 

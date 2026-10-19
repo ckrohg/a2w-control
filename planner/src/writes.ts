@@ -19,7 +19,7 @@ import { SensorLinxClient } from "./sensorlinx";
 import { Store } from "./store";
 import { HubClient, type HubState } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
-import { extractConfig, diffConfig } from "./drift";
+import { extractConfig, diffConfig, patchEcho } from "./drift";
 import { curveAlreadyInForce, curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
@@ -427,7 +427,7 @@ export class HbxWriter {
     const mismatches = Object.entries(fields).filter(([k, v]) => dev[k] !== v);
     if (mismatches.length) {
       const detail = `read-back mismatch: ${mismatches.map(([k, v]) => `${k} wanted ${v} got ${dev[k]}`).join("; ")}`;
-      await this.store.insertHbxWrite({ source, action, requested: fields, result: "verify_mismatch", detail });
+      await this.store.insertHbxWrite({ source, action, requested: fields, result: "verify_mismatch", detail, response: patchEcho(dev, fields) });
       throw new WriteError(502, detail);
     }
 
@@ -438,11 +438,13 @@ export class HbxWriter {
     const changes = prev ? diffConfig(prev, newCfg) : null;
     if (changes) {
       (changes as Record<string, unknown>)["_source"] = `${source}:${action}`;
-      await this.store.insertConfigVersion(newCfg, changes);
+      // #177: the PATCH response IS the device object — keep it whole, so a later "foreign" diff can be read
+      // against exactly what the cloud said it held right after our write.
+      await this.store.insertConfigVersion(newCfg, changes, { raw: dev });
     }
 
     this.lastWriteAt = Date.now();
-    await this.store.insertHbxWrite({ source, action, requested: fields, result: "accepted", detail: summary });
+    await this.store.insertHbxWrite({ source, action, requested: fields, result: "accepted", detail: summary, response: patchEcho(dev, fields) });
     await this.notify(`HBX ${action} (${source})`, summary);
     return { ok: true, ...fields, detail: summary };
   }

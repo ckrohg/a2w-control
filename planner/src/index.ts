@@ -10,7 +10,7 @@
 import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
-import { extractConfig, diffConfig } from "./drift";
+import { extractConfig, handlePolledConfig, type CurveDiagnosis } from "./drift";
 import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
@@ -300,6 +300,9 @@ const cToF = (c: number) => (c * 9) / 5 + 32;
 
 let lastPollAt: string | null = null;
 let lastDriftAt: string | null = null;
+// #177: the newest curve diagnosis (echo_suspected | foreign | reverted) → /health.drift.last_foreign. Seeded from the
+// DB at boot so a redeploy does not blank it.
+let lastCurveDiagnosis: CurveDiagnosis | null = null;
 let lastShadowAt: string | null = null;
 let consecutiveFailures = 0;
 let offlineAlerted = false;
@@ -760,6 +763,17 @@ const WRITER_LEASE_ENABLED = process.env.WRITER_LEASE_ENABLED === "1";
 let writerLeaseState: { held: boolean; holder: string | null } | null = null;
 // Graceful handover (2026-10-01): set on SIGTERM/SIGINT so no renew races the release and no timer fires again.
 let shuttingDown = false;
+// #177: the drift detector's 30 s re-read wait must never hold a poll past SIGTERM (shutdown settles loops for 9 s,
+// then refuses to release the lease over a still-running poll) — cleanup() aborts this and the wait returns false.
+const shutdownAbort = new AbortController();
+function shutdownAwareWait(ms: number): Promise<boolean> {
+  if (shuttingDown || shutdownAbort.signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { shutdownAbort.signal.removeEventListener("abort", onAbort); resolve(true); }, ms);
+    const onAbort = () => { clearTimeout(t); resolve(false); };
+    shutdownAbort.signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 // EVERY loop() still running (not just the latest — a slow poll can outlive the 5-min interval), so shutdown can wait
 // for all actuation to settle before it releases the lease; and every lease renew/claim still awaiting the DB, so a
 // renew that started before SIGTERM cannot re-claim the row after the release (codex pass 1 on #162).
@@ -1566,49 +1580,29 @@ async function pollOnce(): Promise<void> {
   // FOREIGN writer moved the curve — one that bypassed I4/I1/rate-limit/audit. (Reading the
   // baseline AFTER autopilot writes — the old placement — would false-flag autopilot's OWN
   // curve move as foreign the instant it goes live.) See README §Single-writer invariant, #36.
-  const config = extractConfig(dev);
-  const prevConfig = await store.latestConfig();
+  // #177: the whole decision — seed / non-curve drift / curve diff → 30 s re-read → verdict (echo of our own write
+  // vs foreign writer) → page only if it persists — lives in drift.ts handlePolledConfig, so it is testable without
+  // a DB (drift.test.ts replays the two 2026-10-18 events). Every row now stores the raw device object.
+  // It still records the change NOW — before any controller acts this poll — so store.latestConfig() (which
+  // writer.status() and the auto-pilot's "already commanded there" check read) is current (codex pass 7 on the
+  // identification driver: one cycle behind, cleanup could re-command a base over a human's newer curve).
+  const prevVersion = await store.latestConfigVersion();
+  const drift = await handlePolledConfig(prevVersion, dev, {
+    reread: () => slx.getDevice(BUILDING_ID, SYNC_CODE),
+    wait: shutdownAwareWait,
+    latest: () => store.latestConfigVersion(),
+    plannerWrites: (sinceMs) => store.plannerWrites(new Date(sinceMs)),
+    record: (r) => store.insertConfigVersion(r.config, r.changes, r),
+    notify: (title, body, priority, opts) => ntfy(title, body, priority, opts),
+  });
+  const config = drift.config;
+  if (drift.kind === "seeded") console.log("seeded initial hbx_config_versions row");
+  if (drift.changes) lastDriftAt = new Date().toISOString();
+  if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
     lastDeviceCurve = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number")
       ? { dot: c.dot as number, wwsd: c.wwsd as number, dbt: c.dbt as number, mbt: c.mbt as number } : null;
-  }
-  // Record a FOREIGN curve change NOW — before any controller acts this poll — so store.latestConfig()
-  // (which writer.status() and the auto-pilot's "already commanded there" check read) is current.
-  // Previously this ran at the end of the poll, one full cycle behind the device (codex pass 7 on
-  // the identification driver: cleanup could re-command a base over a human's newer curve).
-  if (prevConfig === null) {
-    await store.insertConfigVersion(config, null);
-    console.log("seeded initial hbx_config_versions row");
-  } else {
-    // prevConfig was read just above, before this poll's own writes — so any diff is a FOREIGN
-    // writer (the planner records its own writes separately, via writes.ts patch()).
-    const changes = diffConfig(prevConfig, config);
-    if (changes) {
-      await store.insertConfigVersion(config, changes);
-      lastDriftAt = new Date().toISOString();
-      const summary = Object.entries(changes)
-        .map(([k, c]) => `${k}: ${c.old} -> ${c.new}`)
-        .join("\n");
-      // A foreign change to the reset curve (dbt/mbt) — the exact target the autopilot manages
-      // — is a single-writer-invariant VIOLATION: someone wrote the HBX outside the guarded
-      // path (a direct-to-SensorLinx script or a second planner instance). Name it loudly so
-      // it's actioned, not mistaken for a benign schedule tweak. See README §Single-writer, #36.
-      const curveViolation = "dbt" in changes || "mbt" in changes;
-      if (curveViolation) {
-        console.warn(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${summary}`);
-        await ntfy(
-          "⚠ Foreign HBX curve write — single-writer invariant",
-          `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${summary}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).`,
-          "high",
-        );
-      } else {
-        console.warn(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
-        // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
-        // history and the /hbx page, not in a daily email that would dilute the warn tier.
-        await ntfy("HBX config changed (outside the planner)", summary, "high", { email: false });
-      }
-    }
   }
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
@@ -1724,6 +1718,7 @@ async function main(): Promise<void> {
   // ensureSchemaWithRetry() for why that distinction cost us four days in August.
   if (process.env.POLL_ONCE === "1") await store.ensureSchema();
   else await store.ensureSchemaWithRetry();
+  lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the
@@ -1752,6 +1747,7 @@ async function main(): Promise<void> {
     if (cleanupDone) return;
     cleanupDone = true;
     shuttingDown = true;
+    shutdownAbort.abort();
     raiseWriteBarrier();
     const hardExit = setTimeout(() => { console.error(`[shutdown] ${reason}: forced exit (in-flight work did not finish in time)`); process.exit(0); }, 12_000);
     hardExit.unref?.();
@@ -1832,6 +1828,16 @@ async function main(): Promise<void> {
           const ok = consecutiveFailures < OFFLINE_AFTER_FAILURES;
           return json(res, ok ? 200 : 503, {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
+            // #177: the newest curve event, self-diagnosed — verdict echo_suspected (within 2 °F of a value the planner
+            // wrote in the previous 60 min; default page) | foreign (high page) | reverted (re-read showed it gone; no page).
+            drift: {
+              last_at: lastDriftAt,
+              last_foreign: lastCurveDiagnosis
+                ? { at: lastCurveDiagnosis.at, fields: lastCurveDiagnosis.fields, planner_last_write: lastCurveDiagnosis.planner_last_write,
+                    reread_confirmed: lastCurveDiagnosis.reread_confirmed, verdict: lastCurveDiagnosis.verdict,
+                    device_before: lastCurveDiagnosis.device_before, device_after: lastCurveDiagnosis.device_after }
+                : null,
+            },
             // Which forecast the latest plan was built from — "cached" means open-meteo failed this hour
             // and the last good forecast (≤ 6 h old) stood in, so the plan + demand floor still refreshed.
             forecast: lastForecast,

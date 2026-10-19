@@ -59,9 +59,23 @@ type SlxRow = {
   connected: boolean | null;
 };
 type PumpRow = { ts: number; pump_id: string; setpoint_c: number | null };
-type VersionRow = { id: number; t: number; changed_fields: Record<string, { old: unknown; new: unknown }> | null };
+type VersionRow = {
+  id: number; t: number; changed_fields: Record<string, { old: unknown; new: unknown }> | null;
+  // #177 (planner): verdict + the raw device object's curve/provenance. Read through to_jsonb(v) so this query works
+  // whether or not the planner's additive migration has run yet — the columns simply read null before it.
+  verdict: string | null; reread_confirmed: boolean | null;
+  raw_curve: Record<string, unknown> | null; reread_curve: Record<string, unknown> | null;
+  first_read_fields: Record<string, { old: unknown; new: unknown }> | null;
+};
 type ShadowBlock = { ts: string; outdoor_f: number; tank_target_f: number; hp1_setpoint_f: number; reason: string };
 type ShadowMeta = { dhw_windows?: [number, number][]; windows_learned?: boolean; learn_days?: number; draw_events?: number };
+
+// "dbt 141 / mbt 137 / dot 26 (changeSource device, updatedAt …)" from the raw device object's curve subset (#177).
+const fmtRaw = (r: Record<string, unknown>): string => {
+  const curve = ["dbt", "mbt", "dot"].filter((k) => r[k] != null).map((k) => `${k} ${r[k]}`).join(" / ");
+  const meta = ["changeSource", "updatedAt"].filter((k) => r[k] != null).map((k) => `${k} ${r[k]}`).join(", ");
+  return meta ? `${curve} (${meta})` : curve;
+};
 
 export default async function HbxPage({ searchParams }: { searchParams: { hours?: string } }) {
   const hours = searchParams.hours === "168" ? 168 : 24;
@@ -96,8 +110,17 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
     const c = await sql`SELECT config FROM hbx_config_versions ORDER BY id DESC LIMIT 1`;
     cfg = c.rowCount ? (c.rows[0].config as Record<string, any>) : null;
     versions = (await sql<VersionRow>`
-      SELECT id, EXTRACT(EPOCH FROM observed_at)::float8 AS t, changed_fields
-      FROM hbx_config_versions ORDER BY id DESC LIMIT 12`).rows;
+      SELECT id, EXTRACT(EPOCH FROM observed_at)::float8 AS t, changed_fields,
+             to_jsonb(v)->>'verdict' AS verdict,
+             (to_jsonb(v)->'diagnosis'->'reread_confirmed') AS reread_confirmed,
+             CASE WHEN jsonb_typeof(to_jsonb(v)->'raw') = 'object' THEN jsonb_build_object(
+               'dbt', to_jsonb(v)->'raw'->'dbt', 'mbt', to_jsonb(v)->'raw'->'mbt', 'dot', to_jsonb(v)->'raw'->'dot',
+               'changeSource', to_jsonb(v)->'raw'->'changeSource', 'updatedAt', to_jsonb(v)->'raw'->'updatedAt') END AS raw_curve,
+             CASE WHEN jsonb_typeof(to_jsonb(v)->'reread_raw') = 'object' THEN jsonb_build_object(
+               'dbt', to_jsonb(v)->'reread_raw'->'dbt', 'mbt', to_jsonb(v)->'reread_raw'->'mbt', 'dot', to_jsonb(v)->'reread_raw'->'dot',
+               'changeSource', to_jsonb(v)->'reread_raw'->'changeSource', 'updatedAt', to_jsonb(v)->'reread_raw'->'updatedAt') END AS reread_curve,
+             (to_jsonb(v)->'diagnosis'->'fields') AS first_read_fields
+      FROM hbx_config_versions v ORDER BY id DESC LIMIT 12`).rows;
     try {
       scored = (await sql`
         SELECT EXTRACT(EPOCH FROM hour_ts)::float8 AS t, shadow_target_f::float8 AS s
@@ -399,7 +422,15 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                 #{v.id} · {fmtDateTime(v.t)} ·
                 {" "}{v.changed_fields
                   ? Object.entries(v.changed_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")
-                  : "initial snapshot (as-found baseline)"}
+                  : v.verdict === "reverted" && v.first_read_fields
+                    ? `transient read, reverted on re-read: ${Object.entries(v.first_read_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")}`
+                    : v.verdict ? "no lasting change" : "initial snapshot (as-found baseline)"}
+                {v.verdict && (
+                  <> · <b>{v.verdict === "echo_suspected" ? "echo of our write (suspected)" : v.verdict}</b>
+                    {v.reread_confirmed === true ? " · re-read ✓" : v.reread_confirmed === false ? " · re-read reverted" : " · no re-read"}</>
+                )}
+                {v.raw_curve && <span className="dim"> · raw {fmtRaw(v.raw_curve)}</span>}
+                {v.reread_curve && <span className="dim"> · re-read {fmtRaw(v.reread_curve)}</span>}
               </div>
             ))}
           </div>

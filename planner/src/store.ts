@@ -11,7 +11,7 @@
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { IdentWindow } from "./identify";
-import type { HbxConfig, FieldChange } from "./drift";
+import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 
 export interface SlxReading {
   ts: Date;
@@ -57,6 +57,14 @@ export class Store {
         changed_fields jsonb,
         config         jsonb NOT NULL
       );
+      -- #177: the drift row must explain itself. raw = the full SensorLinx device object the row was read from
+      -- (changeSource / updatedAt / connectedAt kept whole); on a curve diff, reread_raw = the confirmation read
+      -- ~30 s later, verdict = echo_suspected | foreign | reverted, diagnosis = the planner's last write, the
+      -- writes the echo test used, both read times. Additive; rows before this migration have them NULL.
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS raw        jsonb;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS reread_raw jsonb;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS verdict    text;
+      ALTER TABLE hbx_config_versions ADD COLUMN IF NOT EXISTS diagnosis  jsonb;
       CREATE TABLE IF NOT EXISTS shadow_plans (
         id          serial PRIMARY KEY,
         computed_at timestamptz NOT NULL DEFAULT now(),
@@ -88,6 +96,9 @@ export class Store {
         result     text NOT NULL,
         detail     text
       );
+      -- #177: the PATCH response echo (written fields + curve + device provenance) — what the device/cloud SAID it
+      -- now holds, beside what we asked for. NULL on rejected attempts and on rows before this migration.
+      ALTER TABLE hbx_writes ADD COLUMN IF NOT EXISTS response jsonb;
       CREATE TABLE IF NOT EXISTS autopilot_log (
         id        serial PRIMARY KEY,
         ts        timestamptz NOT NULL DEFAULT now(),
@@ -852,11 +863,40 @@ export class Store {
   /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */
   async insertHbxWrite(w: {
     source: string; action: string; requested: unknown; result: string; detail: string;
+    /** #177: the PATCH response echo (drift.ts patchEcho) — accepted / verify_mismatch only. */
+    response?: Record<string, unknown> | null;
   }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO hbx_writes (source, action, requested, result, detail) VALUES ($1,$2,$3,$4,$5)`,
-      [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail],
+      `INSERT INTO hbx_writes (source, action, requested, result, detail, response) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [w.source, w.action, JSON.stringify(w.requested), w.result, w.detail, w.response == null ? null : JSON.stringify(w.response)],
     );
+  }
+
+  /**
+   * #177: the planner's accepted writes for the foreign-curve verdict — the newest one (whenever it was) and every
+   * one since `since`, newest first. `requested` is exactly what patch() sent the device.
+   */
+  async plannerWrites(since: Date): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> {
+    const toWrite = (r: any): PlannerWrite => ({
+      at: new Date(r.ts).toISOString(), source: String(r.source), action: String(r.action),
+      requested: r.requested && typeof r.requested === "object" ? r.requested : null,
+      echo: r.response && typeof r.response === "object" ? r.response : null,
+    });
+    const [last, recent] = await Promise.all([
+      this.pool.query(`SELECT ts, source, action, requested, response FROM hbx_writes WHERE result = 'accepted' ORDER BY id DESC LIMIT 1`),
+      this.pool.query(
+        `SELECT ts, source, action, requested, response FROM hbx_writes
+         WHERE result = 'accepted' AND ts >= $1 ORDER BY id DESC LIMIT 50`, [since]),
+    ]);
+    return { last: last.rowCount ? toWrite(last.rows[0]) : null, recent: recent.rows.map(toWrite) };
+  }
+
+  /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */
+  async latestCurveDiagnosis(): Promise<CurveDiagnosis | null> {
+    const r = await this.pool.query(
+      `SELECT diagnosis FROM hbx_config_versions WHERE verdict IS NOT NULL AND diagnosis IS NOT NULL ORDER BY id DESC LIMIT 1`,
+    );
+    return r.rowCount ? (r.rows[0].diagnosis as CurveDiagnosis) : null;
   }
 
   /**
@@ -1284,13 +1324,24 @@ export class Store {
     return res.rowCount ? (res.rows[0].config as HbxConfig) : null;
   }
 
+  /** The newest version row's config AND raw device object (#177: the "before" provenance for a curve page). */
+  async latestConfigVersion(): Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null> {
+    const res = await this.pool.query(
+      `SELECT config, raw FROM hbx_config_versions ORDER BY id DESC LIMIT 1`,
+    );
+    return res.rowCount ? { config: res.rows[0].config as HbxConfig, raw: (res.rows[0].raw ?? null) as Record<string, any> | null } : null;
+  }
+
   async insertConfigVersion(
     config: HbxConfig,
     changedFields: Record<string, FieldChange> | null,
+    // #177: the raw device object(s) and the curve verdict. Optional so every older call shape still works.
+    extra: Pick<ConfigVersionRecord, "raw" | "rereadRaw" | "verdict" | "diagnosis"> = { raw: null },
   ): Promise<void> {
+    const j = (v: unknown) => (v == null ? null : JSON.stringify(v));
     await this.pool.query(
-      `INSERT INTO hbx_config_versions (changed_fields, config) VALUES ($1, $2)`,
-      [changedFields === null ? null : JSON.stringify(changedFields), JSON.stringify(config)],
+      `INSERT INTO hbx_config_versions (changed_fields, config, raw, reread_raw, verdict, diagnosis) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [j(changedFields), JSON.stringify(config), j(extra.raw), j(extra.rereadRaw), extra.verdict ?? null, j(extra.diagnosis)],
     );
   }
 
