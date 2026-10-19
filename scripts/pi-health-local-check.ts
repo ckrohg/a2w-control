@@ -132,10 +132,10 @@ async function main() {
 
   // the hub measures the Pi clock aligned now (offset 0) — without that anchor, clock steps in range void every window:
   const unanch = piHealth(inputs, NOW * 1000, null);
-  assert.equal(unanch.pi_clock.unanchored, true, "no fresh hub frame + clock steps in range → unanchored (codex pass 16)");
+  assert.equal(unanch.pi_clock.anchored, false, "no fresh hub frame and the newest reading is old → not anchored (codex passes 16–17)");
   assert.ok(unanch.dropouts_7d.every((w) => w.verdict === "unknown"), "…and every window is unknown, a certain reboot's included");
   const h = piHealth(inputs, NOW * 1000, 0);
-  assert.equal(h.pi_clock.unanchored, false);
+  assert.equal(h.pi_clock.anchored, true);
   // This synthetic week is a clock-CHAOS fixture: its stats clock ends ~23 min off its own past (W4 ends −437 s, the
   // fresh-boot +1800 s, never taken back), so relative to the aligned present every window's stamps were off — all
   // unknown (codex passes 15–16), a certain reboot (W1) included. The clean three-verdict proof is the next block.
@@ -211,7 +211,7 @@ async function main() {
     assert.deepEqual(ch.dropouts_7d.map((w) => w.verdict), ["gap+reboot", "gap_only", "socket_only"], "all three verdicts, on the real SQL");
     assert.ok(Math.abs(Date.parse(ch.dropouts_7d[0].reboot_at ?? "") / 1000 - RB) <= 2, "the reboot that ended the silence is named");
     assert.equal(ch.reboots_24h, 1);
-    assert.deepEqual(ch.pi_clock, { live_offset_s: 0, future_rows: false, misaligned_since: null, past_misaligned: [], unanchored: false });
+    assert.deepEqual(ch.pi_clock, { live_offset_s: 0, future_rows: false, anchored: true, anchor: "hub", last_clock_event_at: null });
   }
 
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
@@ -356,14 +356,14 @@ async function main() {
   const hP = piHealth(inP, atP);
   const wP = hP.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60);
   assert.equal(wP?.verdict, "unknown", `a persistently fast clock voids the verdict (got ${wP?.verdict})`);
-  assert.ok(hP.pi_clock.misaligned_since && Math.abs(Date.parse(hP.pi_clock.misaligned_since) / 1000 - (P + H)) <= 120,
-    `misaligned since the step (${hP.pi_clock.misaligned_since})`);
+  assert.equal(hP.pi_clock.anchored, false, "future rows: the present is not anchored");
+  assert.equal(hP.pi_clock.future_rows, true);
   // the live offset alone (the future rows gone, e.g. evaluated once the data has caught up) does the same
   const late = (P + 15 * H) * 1000;
   const inL = await store.piLinkInputs(late, OPTS);
   assert.equal(inL.futureRows, false);
   assert.equal(piHealth(inL, late, 0).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict,
-    "socket_only", "with NO evidence of misalignment (offset 0, no future rows) the hour-late gap misses the window — the false verdict the rule prevents");
+    "socket_only", "if the hub CLAIMED alignment (offset 0) after the step, the stamps are taken at face value — so an honest offset matters:");
   const hL = piHealth(inL, late, -3_600);
   assert.equal(hL.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - (P + 10 * H)) <= 60)?.verdict, "unknown",
     "the hub measures the Pi an hour fast → unknown");
@@ -396,9 +396,8 @@ async function main() {
   const hQ = piHealth(inQ, atQ, 0);
   const wQ = hQ.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - out0) <= 60);
   assert.equal(wQ?.verdict, "unknown", `an outage inside a corrected slow span stays unknown (got ${wQ?.verdict})`);
-  // (the first slow hour re-stamps [Q0−1 h, Q0) and loses its ts conflicts to the real rows, so the step is seen at ~Q0)
-  assert.ok(hQ.pi_clock.past_misaligned.some((x) => { const a = Date.parse(x.start) / 1000; return a >= Q0 - H - 180 && a <= Q0 + 180 && Math.abs(Date.parse(x.end) / 1000 - Q1) <= 180; }),
-    `the slow span is reconstructed (${JSON.stringify(hQ.pi_clock.past_misaligned)})`);
+  assert.ok(hQ.pi_clock.last_clock_event_at && Math.abs(Date.parse(hQ.pi_clock.last_clock_event_at) / 1000 - Q1) <= 180,
+    `the correcting step is the last clock event (${hQ.pi_clock.last_clock_event_at}) — every window before it is unknown`);
 
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }

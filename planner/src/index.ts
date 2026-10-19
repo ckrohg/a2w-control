@@ -311,13 +311,15 @@ let piLink: PiHealth | null = null;
 let piLinkError: string | null = null;
 let piLinkBusy = false;
 let piClockOffsetS: number | null = null; // checkI1 measures it from the hub frame each poll
+let piClockOffsetAt = 0;                   // …when; an observation older than 15 min anchors nothing (codex pass 17)
 async function refreshPiLink(): Promise<void> {
   if (piLinkBusy) return; // a slow DB must not stack refreshes
   piLinkBusy = true;
   try {
     const now = Date.now();
     // a connected frame is ≤ ~15 s old plus latency: anything beyond 30 s is the Pi clock, not the frame's age
-    const off = piClockOffsetS == null ? null : Math.abs(piClockOffsetS) > 30 ? piClockOffsetS : 0;
+    const fresh = piClockOffsetS != null && now - piClockOffsetAt <= 15 * 60_000;
+    const off = !fresh ? null : Math.abs(piClockOffsetS as number) > 30 ? piClockOffsetS : 0;
     piLink = piHealth(await store.piLinkInputs(now, { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, clockStepS: CLOCK_STEP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S, futureS: FUTURE_S, settleS: SETTLE_S }), now, off);
     piLinkError = null;
   } catch (e) {
@@ -499,6 +501,7 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     state = await hub.getState();
   } catch (e) {
     console.warn("I1 check skipped — hub unreachable:", (e as Error).message);
+    piClockOffsetS = null; piClockOffsetAt = Date.now(); // a failed observation invalidates the last one
     return;
   }
   // #122 Wave 1: free ride — this state is already fetched every poll for the I1 check.
@@ -508,6 +511,7 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
   // connected, fresh frame measures its clock to within ~15 s + latency; piHealth voids windows while it is off.
   piClockOffsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
     ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
+  piClockOffsetAt = Date.now();
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );

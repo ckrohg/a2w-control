@@ -76,6 +76,15 @@ result with its ages advanced) `pilink.ts` turns the last 7 days into:
 - `last_reading_age_s` (+ per pump), `uptime_s`, `reboots_24h` / `reboots_7d` / `last_reboot_at`
   (a reboot = the boot time `ts − uptime_s` jumping forward by > 5 min), and a `summary`.
 
+**The clock rule.** Windows are planner-clock; the evidence is Pi-clock. A verdict stands only if
+the present is *anchored* — a hub-frame offset measured ≤ 15 min ago within 2 min, or the newest
+reading stamped within the last 3 min — and *no clock event* (a clock step seen in system_stats, a
+re-stamped span seen in readings' ingestion order, future-stamped rows) lies at or after the
+window's start; otherwise it is `unknown`. A reboot is counted only when uptime fell, the new boot
+track persists for 15 min, readings were flowing at its would-be origin, and it is outside any
+re-stamped span. `/health.pi.pi_clock {live_offset_s, future_rows, anchored, anchor,
+last_clock_event_at}` says why a window reads unknown.
+
 The two SQL reductions (readings gaps > 5 min, uptime resets) run in `store.piLinkInputs`; the
 weekly digest shows a tile with this beside the hub's own counters (`pi_dropouts_*`, #178), which
 reset on a hub redeploy — the two sources should corroborate. Proven on a synthetic week by
