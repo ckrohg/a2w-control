@@ -244,6 +244,34 @@ if [ -n "$HEALTH" ]; then
   fi
 fi
 
+echo "[8] SPAN local stream — the path every SPAN safety action depends on (#187, incident 2026-10-16 F5)"
+# The Pi's LAN poller (span_local.py) lands span_readings in the mirror every ~25 s; the planner reports the newest
+# sample's age at /health.span. The cloud path failing alone is reported there but is not drift.
+if [ -n "$HEALTH" ]; then
+  # the CURRENT age: /health.span is computed each loop tick and served from memory — add the time since computed_at,
+  # and refuse a failed or stale computation outright (a frozen healthy result must not pass forever)
+  SPANAGE="$(jq -r 'if .span.local_last_reading_age_s == null or .span.computed_at == null then empty
+                    else (.span.local_last_reading_age_s + (now - (.span.computed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601))) | floor end' <<<"$HEALTH")"
+  SPANCOMPUTED_AGO="$(jq -r 'if .span.computed_at == null then empty else (now - (.span.computed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) | floor end' <<<"$HEALTH")"
+  SPANERR="$(jq -r '.span.refresh_error // empty' <<<"$HEALTH")"
+  SPANTABLE="$(jq -r 'if .span.local_table == null then "absent" else (.span.local_table|tostring) end' <<<"$HEALTH")"
+  CLOUDSTREAK="$(jq -r '.span.cloud.fail_streak // 0' <<<"$HEALTH")"
+  # the error first: a check that has never succeeded is pending AND failing — that is drift, not "just started"
+  if [ -n "$SPANERR" ] || { [ -n "$SPANCOMPUTED_AGO" ] && [ "$SPANCOMPUTED_AGO" -gt 900 ]; }; then
+    fail "/health.span is not being refreshed (last computed: $([ -n "$SPANCOMPUTED_AGO" ] && echo "${SPANCOMPUTED_AGO}s ago" || echo never)${SPANERR:+; error: $SPANERR}) — the SPAN-local check itself is failing"
+  elif [ "$(jq -r '.span.pending // false' <<<"$HEALTH")" = "true" ]; then
+    skip "planner just started — /health.span not computed yet"
+  elif [ "$SPANTABLE" = "absent" ] || [ "$SPANTABLE" = "false" ]; then
+    skip "planner predates /health.span (#187), or span_readings is absent — redeploy the planner to assert it"
+  elif [ -z "$SPANAGE" ]; then
+    fail "no SPAN local samples in span_readings (table=${SPANTABLE}) — the local path is not reporting"
+  elif [ "${SPANAGE%.*}" -le 900 ]; then
+    pass "SPAN local stream ${SPANAGE}s old (≤ 900 s)$([ "$CLOUDSTREAK" -gt 0 ] && echo "; cloud path failing ${CLOUDSTREAK}× (reported, not drift)")"
+  else
+    fail "SPAN local stream ${SPANAGE}s old (> 900 s) — the Pi's LAN poller is not landing span_readings (#187)"
+  fi
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
   if [ "$ACKED" -gt 0 ]; then echo "no NEW drift ($ACKED acknowledged: $ACKED_BY)"; else echo "no drift detected"; fi

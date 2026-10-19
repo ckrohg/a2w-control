@@ -15,8 +15,9 @@ export const CONFIG_FIELDS = [
   "numStg", "hpStg", "rotTi", "rotCy", "lagT", "lagOff", "stgSeq", "loLo", "twoS", "prior",
   // backup triggers (the 16.5 kW element — plan §5.5)
   "bkLag", "bkDif", "bkTemp", "bkOd", "bkTk",
-  // demand + DHW modes
-  "permHD", "permCD", "dhwOn", "dhwT", "dmd",
+  // demand + DHW modes. NOT `dmd` (#182): it is a live demand bitmask (1 ↔ 9 ↔ 41, nine flips Oct 14–16 — the
+  // "HBX config changed 12:00 AM" banner of the 2026-10-16 incident was one), not a setting. It stays in `raw`.
+  "permHD", "permCD", "dhwOn", "dhwT",
   // ECO clock / schedule
   "ecoCl", "pgm", "autoTm", "wwTime",
   "wkd1B", "wkd1T", "wkd2B", "wkd2T", "wkd3B", "wkd3T", "wkd4B", "wkd4T",
@@ -41,10 +42,15 @@ export interface FieldChange {
   new: unknown;
 }
 
-/** null when identical; otherwise {field: {old, new}} for every differing field. */
+/**
+ * null when identical; otherwise {field: {old, new}} for every differing CONFIG_FIELDS field. Only CONFIG_FIELDS are
+ * compared (#182): a field dropped from the list (dmd) still sits in every stored version, and must not surface as a
+ * one-off "dmd: 9 -> null" change the first poll after the deploy.
+ */
 export function diffConfig(prev: HbxConfig, next: HbxConfig): Record<string, FieldChange> | null {
   const changes: Record<string, FieldChange> = {};
-  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  const fields = new Set<string>(CONFIG_FIELDS);
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)].filter((k) => fields.has(k)));
   for (const k of keys) {
     if (JSON.stringify(prev[k]) !== JSON.stringify(next[k])) {
       changes[k] = { old: prev[k] ?? null, new: next[k] ?? null };

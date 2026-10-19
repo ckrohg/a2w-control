@@ -18,7 +18,7 @@ import { TempiqPusher } from "./tempiq";
 import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
-import { HubClient } from "./hub";
+import { HubClient, type HubState } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
@@ -42,7 +42,10 @@ import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
-import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock } from "./writes";
+import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
+import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
+import { AlertOutbox } from "./alerts";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -686,9 +689,138 @@ async function checkI8(): Promise<void> {
  */
 let unservedStreak = 0;
 let unservedAlerted = false;
+// #185: the per-stage alarm (stagewatch.ts). STAGE_PUMP_MAP is the PHYSICAL stage-relay → heat-pump wiring
+// (README §Per-stage unserved alarm says how to verify it at the panel); default {"1":"pump1","2":"pump2"}.
+const STAGE_MAP = parseStagePumpMap(process.env.STAGE_PUMP_MAP);
+if (STAGE_MAP.error) console.warn(STAGE_MAP.error);
+const stageWatch = new StageWatch(STAGE_MAP.map);
+let stageEpisodes24h: Record<string, number> | null = null;
+let lastLagTMin: number | null = null; // the HBX's lag-stage timer, from this poll's config (named in the page)
+
+/**
+ * #185: step the per-stage watch on this poll's HBX stages and the hub state the all-idle check already fetched (no
+ * extra hub traffic). `state` null = unknown (hub unreachable); a disconnected / stale Pi frame is unverifiable too
+ * (#167 piStateUnverifiable) — then nothing moves. Fault codes come from the mirror's pump_snapshots.
+ */
+async function checkStages(reading: SlxReading, state: HubState | null, anyStageCall: boolean): Promise<void> {
+  const live = !anyStageCall ? [] : state && !piStateUnverifiable(state) ? state.pumps : null;
+  let pumps: StagePump[] | null = live;
+  if (live && live.some((p) => p.state === "fault")) {
+    // codes only ANNOTATE a live fault, and only from a snapshot ≤ 15 min old (the Pi attaches one every ~5 min)
+    // an annotation only — bounded (store's bounded pool), and a failure or timeout simply means no codes
+    const codes = await store.pumpFaultCodes().catch(() => ({} as Record<string, { codes: string[]; ts: number }>));
+    const nowS = Date.now() / 1000;
+    pumps = live.map((p) => {
+      const c = codes[p.id];
+      return p.state === "fault" && c && Math.abs(nowS - c.ts) <= 15 * 60 ? { ...p, fault_codes: c.codes } : p;
+    });
+  }
+  const events = stageWatch.step({ nowMs: Date.now(), stagesCalled: reading.stagesCalled, pumps, lagTMin: lastLagTMin });
+  if (alertStateRestored && pumps != null && reading.stagesCalled != null) stageEvaluatedSinceRestore = true;
+  for (const e of events) {
+    if (e.kind === "open") {
+      console.warn(`[stagewatch] ${e.title}: ${e.body}`);
+      await openAlert(e.type, e.stage, e.pumpId, e.title, e.body);
+    } else {
+      await alerts.close(e.type, e.stage);
+      await ntfy(e.title, e.body, "default", { resolved: true });
+    }
+  }
+  stageEpisodes24h = await store.alertEpisodes24h().catch(() => stageEpisodes24h);
+}
+
+/**
+ * #183: the storm machine always starts idle (its state is in memory), so any storm_events row still open from BEFORE
+ * this process started is an orphan — close it, or the mirror banner shows "armed" while /health.storm is idle. A storm
+ * still live re-arms on the next trigger poll and opens a fresh row. A failed sweep is retried every tick (codex pass
+ * 4), scoped to rows started before boot, so it can never close a storm this process armed meanwhile.
+ */
+const PROCESS_START = new Date();
+const pendingStandDowns: Date[] = [];
+async function retryStormStandDown(): Promise<void> {
+  while (pendingStandDowns.length) {
+    const at = pendingStandDowns[0];
+    try { await store.closeStormEvents("stand-down", at, at); pendingStandDowns.shift(); }
+    catch (e) { console.error("storm stand-down close failed (retried next tick):", (e as Error).message); return; }
+  }
+}
+let stormSweepDone = false;
+async function sweepStormOrphans(): Promise<void> {
+  if (stormSweepDone) return;
+  try {
+    const closed = await store.closeStormEvents("planner restart while idle", PROCESS_START, PROCESS_START, true);
+    stormSweepDone = true;
+    if (closed) console.log(`[storm] closed ${closed} orphaned storm_events row(s) — planner restart while idle`);
+  } catch (e) {
+    console.error("storm orphan sweep failed (retried next tick):", (e as Error).message);
+  }
+}
+
+/**
+ * #185 / #187: open alert episodes are re-adopted at boot — they close on clear instead of re-paging; undelivered ones
+ * are re-sent by alerts.retry(). A FAILED load is not "nothing open" (codex pass 3): it is retried every tick until it
+ * succeeds. Until then the watches run anyway — a page must never wait on the DB — and a late restore reconciles
+ * itself: an adopted episode whose condition has cleared is closed by the next step, and closeAlertEpisodes closes
+ * every row of that kind/key, so a duplicate opened meanwhile closes with it.
+ */
+let alertStateRestored = false;
+let stageEvaluatedSinceRestore = false; // set by checkStages after a successful restore
+let spanEvaluatedSinceRestore = false;  // set by checkSpanLocal after a successful restore
+async function restoreAlertState(): Promise<void> {
+  if (alertStateRestored) return;
+  try {
+    const open = await store.openAlertEpisodes();
+    // a stage episode is re-adopted only if it is about the pump that stage maps to NOW: after STAGE_PUMP_MAP was
+    // corrected, an old episode for the wrong unit is closed, never allowed to suppress the right one (codex pass 10)
+    const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called";
+    // an episode the outbox is already closing (opened and recovered while restore was failing) is never re-adopted —
+    // re-adopting it would latch the watch "open" over rows being closed and silence a recurrence (codex pass 11)
+    const { keep, stale } = partitionRestore(open.filter((o) => !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length) await store.closeAlertEpisodeIds(stale.map((o) => o.id)); // a failure → the whole restore retries
+    alerts.adopt(keep);
+    stageWatch.restore(keep.filter(isStage)
+      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
+    if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
+    alertStateRestored = true;
+  } catch (e) {
+    console.error("alert state restore failed (retried next tick):", (e as Error).message);
+  }
+}
+
+// #185 / #187: the alert outbox (alerts.ts) — pages resolved only on acknowledged delivery, re-sent every poll.
+const alerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "high"));
+async function openAlert(kind: string, key: string, pumpId: string | null, title: string, body: string): Promise<void> {
+  await alerts.open(kind, key, pumpId, title, body);
+}
+
+// #187: the SPAN-local heartbeat (spanlocal.ts) — refreshed every poll, served from here on /health.span.
+const spanLocalAlarm = new SpanLocalAlarm();
+let spanLocal: SpanHealth | null = null;
+let spanLocalError: string | null = null;
+async function checkSpanLocal(): Promise<void> {
+  const nowS = Date.now() / 1000;
+  const cloud = {
+    enabled: !!spanWatch, last_ok_at: spanWatch?.lastOkAt ?? null,
+    fail_streak: spanWatch?.failStreak ?? 0, last_error: spanWatch?.lastError ?? null,
+  };
+  spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
+  spanLocalError = null;
+  const n = spanLocalAlarm.step(spanLocal);
+  if (alertStateRestored && spanLocal.local_stale !== null) spanEvaluatedSinceRestore = true;
+  if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
+  else if (n) {
+    await alerts.close("span_local_stale", "span");
+    await ntfy(n.title, n.body, n.priority, { resolved: true });
+  }
+}
+
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
   if (!hub) return;
   const anyStageCall = reading.stagesCalled?.some(Boolean) === true;
+  // one hub read serves both alarms; the stage watch runs first and never changes the all-idle logic below
+  let st: HubState | null = null;
+  if (anyStageCall) { try { st = await hub.getState(); } catch { st = null; } }
+  await checkStages(reading, st, anyStageCall).catch((e) => console.error("stage check failed:", (e as Error).message));
   if (!anyStageCall) {
     unservedStreak = 0;
     if (unservedAlerted) {
@@ -698,13 +830,8 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
     }
     return;
   }
-  let running = false;
-  try {
-    const st = await hub.getState();
-    running = st.pumps.some((p) => p.online && p.state === "heating");
-  } catch {
-    return; // hub unreachable — can't judge; don't false-alarm
-  }
+  if (!st) return; // hub unreachable — can't judge; don't false-alarm
+  const running = st.pumps.some((p) => p.online && p.state === "heating");
   if (running) {
     unservedStreak = 0;
     if (unservedAlerted) {
@@ -1046,7 +1173,10 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
       "high",
     );
   } else {
-    await store.closeStormEvent().catch((e) => console.error("storm event close failed:", (e as Error).message));
+    // a failed close is retried every tick, scoped to rows started before this stand-down (codex pass 5); several
+    // stand-downs during one DB outage queue up and apply oldest first (codex pass 7)
+    pendingStandDowns.push(new Date());
+    await retryStormStandDown();
     await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { resolved: true });
   }
 }
@@ -1673,6 +1803,7 @@ async function pollOnce(): Promise<void> {
     throw new Error("HBX curve change seen but neither confirmed nor recorded — skipping this poll's actuation; the next poll re-checks");
   }
   const config = drift.config;
+  lastLagTMin = typeof (config as { lagT?: unknown }).lagT === "number" ? (config as { lagT: number }).lagT : lastLagTMin;
   if (drift.kind === "seeded") console.log("seeded initial hbx_config_versions row");
   if (drift.changes) lastDriftAt = new Date().toISOString();
   if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
@@ -1688,6 +1819,7 @@ async function pollOnce(): Promise<void> {
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
+
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
@@ -1763,6 +1895,8 @@ async function loop(): Promise<void> {
 }
 
 async function loopBody(): Promise<void> {
+  // restore FIRST, so this tick's stage / SPAN evaluation reconciles adopted episodes before any re-send (codex pass 5)
+  await restoreAlertState();
   try {
     await pollOnce();
     lastPollAt = new Date().toISOString();
@@ -1784,6 +1918,16 @@ async function loopBody(): Promise<void> {
     }
   }
 
+  // #187 / #185: the SPAN-local check and the alert outbox depend on neither SensorLinx nor the poll's success —
+  // they run every tick on their own, so a SensorLinx outage cannot hide a SPAN outage or stall a re-send (codex pass 2)
+  await sweepStormOrphans();
+  await retryStormStandDown();
+  await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
+  // a DB row is re-sent only once its watch has evaluated the condition since the restore that adopted it — a resolved
+  // incident is closed by that evaluation instead of paged (codex pass 5)
+  await alerts.retry((kind) => (kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
+    .catch((e) => console.error("alert re-send failed:", (e as Error).message));
+
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
   try {
@@ -1801,6 +1945,8 @@ async function main(): Promise<void> {
   else await store.ensureSchemaWithRetry();
   lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
+  await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
+  await sweepStormOrphans(); // #183 — retried every tick until it succeeds
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the
@@ -1876,6 +2022,8 @@ async function main(): Promise<void> {
     await once("decay scan", () => decayScanOnce(store));
     await once("realized-savings", () => realized.computeAndStore());
     await once("pi-link", refreshPiLink);
+    await once("span-local", checkSpanLocal);
+    await once("alert re-send", () => alerts.retry());
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-ua-push", () => pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (tempiq) await once("tempiq-push", () => tempiq.tick());
@@ -1916,6 +2064,16 @@ async function main(): Promise<void> {
             // #165: Pi uptime, reboots and the 7-d dropout windows (phase_b_log `no Pi connected` runs), each with a
             // gap-vs-reboot verdict from the mirror's readings + system_stats. Corroborates the hub's own counters
             // (hub /health pi_dropouts_24h / _7d, #178), which reset on a hub redeploy; these come from the DB.
+            // #185: the all-idle alarm beside the per-stage watch (stage → mapped pump, called-not-heating minutes,
+            // open episodes) and episodes opened in 24 h. STAGE_PUMP_MAP is the physical wiring (README).
+            unserved: {
+              all_idle: { alerted: unservedAlerted, streak: unservedStreak },
+              stage_pump_map: STAGE_MAP.map, stage_pump_map_error: STAGE_MAP.error,
+              stages: stageWatch.status(), episodes_24h: stageEpisodes24h, lag_t_min: lastLagTMin,
+            },
+            // #187: the SPAN LOCAL stream (the Pi's LAN poller → span_readings) beside spanwatch's cloud state. Pages
+            // when local is older than 15 min; the cloud failing alone only shows here.
+            span: spanLocal ? { ...spanLocal, refresh_error: spanLocalError } : { pending: true, refresh_error: spanLocalError },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
               : { pending: true, refresh_error: piLinkError },

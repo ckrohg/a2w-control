@@ -1,0 +1,175 @@
+/**
+ * @purpose #185 / #187: the delivery OUTBOX for edge-triggered alert episodes (alert_episodes). The row is written
+ * first, the page goes out through a delivery-aware sender (index.ts ntfyDelivered: true only when a channel
+ * ACKNOWLEDGED it), and notified_at is set only then. retry() re-sends open, unnotified episodes — every loop tick and
+ * after a restart — so a page that failed to deliver is never silently "already alerted".
+ *
+ * Every episode is tracked by its row ID (codex passes 1–4 on the incident-fixes PR): a recovery closes exactly the
+ * episodes that were open at that moment — never a recurrence opened afterwards — and a close the DB refused is
+ * retried by ID, while those IDs are never re-sent in the meantime. An episode whose row could not be written is held
+ * in memory with its delivery status until it can be persisted (then marked notified if it was already heard) or, if
+ * still unheard, delivered directly; a recovery cancels it outright.
+ */
+import { randomUUID } from "node:crypto";
+
+export interface AlertStore {
+  openAlertEpisode(uid: string, kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number>;
+  closeAlertEpisodeUids(uids: string[]): Promise<void>;
+  markAlertNotified(id: number): Promise<void>;
+  undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]>;
+  closeAlertEpisodeIds(ids: number[]): Promise<void>;
+}
+export type Send = (title: string, body: string) => Promise<boolean>;
+
+interface Unrecorded { uid: string; kind: string; key: string; pumpId: string | null; title: string; body: string; delivered: boolean }
+const k = (kind: string, key: string) => `${kind}\u0000${key}`;
+const RESENT = "\n\n(re-sent: the first delivery was not acknowledged by any channel)";
+
+/** Every store call is bounded: a stalled DB must never hold a page (codex pass 10). The uid makes a late commit harmless. */
+export const STORE_TIMEOUT_MS = 20_000;
+function bounded<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`alert store call timed out after ${ms} ms`)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+export class AlertOutbox {
+  /** open episode row IDs by kind/key — what a recovery closes */
+  private openIds = new Map<string, Set<number>>();
+  /** IDs whose close the DB refused: retried every retry(), never re-sent meanwhile */
+  private unclosed = new Set<number>();
+  /** IDs a channel acknowledged but whose notified_at write failed: the MARK is retried, the page never re-sent */
+  private unmarked = new Set<number>();
+  /** uids of cancelled unrecorded episodes: the insert may have committed with its reply lost — close them by uid */
+  private unclosedUids = new Set<string>();
+  /** episodes whose row could not be written (with whether a channel already heard the page) */
+  private unrecorded: Unrecorded[] = [];
+
+  private readonly store: AlertStore;
+  /**
+   * uids whose INSERT is still outstanding (a bounded call timed out but the statement may yet commit): a uid tombstone
+   * is dropped only once its insert has SETTLED and a close ran after that (codex pass 11 on the incident-fixes PR)
+   */
+  private inflight = new Set<string>();
+  constructor(store: AlertStore, private readonly send: Send, private readonly log: (m: string) => void = (m) => console.error(m), timeoutMs = STORE_TIMEOUT_MS) {
+    // the same store, every call bounded
+    this.store = {
+      openAlertEpisode: (uid, ...a) => {
+        this.inflight.add(uid);
+        const raw = store.openAlertEpisode(uid, ...a);
+        raw.then(() => this.inflight.delete(uid), () => this.inflight.delete(uid));
+        return bounded(raw, timeoutMs);
+      },
+      markAlertNotified: (id) => bounded(store.markAlertNotified(id), timeoutMs),
+      undeliveredAlertEpisodes: () => bounded(store.undeliveredAlertEpisodes(), timeoutMs),
+      closeAlertEpisodeIds: (ids) => bounded(store.closeAlertEpisodeIds(ids), timeoutMs),
+      closeAlertEpisodeUids: (uids) => bounded(store.closeAlertEpisodeUids(uids), timeoutMs),
+    };
+  }
+
+  /** Re-adopt rows still open in the DB after a restart (restoreAlertState). */
+  adopt(rows: { id: number; kind: string; key: string }[]): void {
+    for (const r of rows) this.track(r.kind, r.key, r.id);
+  }
+
+  private track(kind: string, key: string, id: number): void {
+    const s = this.openIds.get(k(kind, key)) ?? new Set<number>();
+    s.add(id);
+    this.openIds.set(k(kind, key), s);
+  }
+
+  async open(kind: string, key: string, pumpId: string | null, title: string, body: string): Promise<boolean> {
+    const uid = randomUUID(); // the episode's identity before any write: retries are idempotent (codex pass 8)
+    const id = await this.store.openAlertEpisode(uid, kind, key, pumpId, title, body).catch((e) => {
+      this.log(`alert episode open failed: ${(e as Error).message}`); return null;
+    });
+    if (id != null) this.track(kind, key, id);
+    const delivered = await this.send(title, body);
+    if (delivered && id != null) await this.mark(id);
+    if (id == null) this.unrecorded.push({ uid, kind, key, pumpId, title, body, delivered });
+    return delivered;
+  }
+
+  /**
+   * The condition cleared: cancel any unrecorded episode for it, and close exactly the rows open for it NOW (by ID) —
+   * a failed close is retried by ID, so an episode opened later for the same kind/key is never closed by it.
+   */
+  async close(kind: string, key: string): Promise<void> {
+    // a cancelled unrecorded episode may in fact be committed (reply lost): close it by uid as well
+    for (const u of this.unrecorded) if (u.kind === kind && u.key === key) this.unclosedUids.add(u.uid);
+    this.unrecorded = this.unrecorded.filter((u) => !(u.kind === kind && u.key === key));
+    const ids = [...(this.openIds.get(k(kind, key)) ?? [])];
+    this.openIds.delete(k(kind, key));
+    for (const id of ids) this.unclosed.add(id);
+    await this.flushCloses();
+  }
+
+  /** notified_at — on failure the ID is remembered and only the write is retried (codex pass 5) */
+  private async mark(id: number): Promise<void> {
+    try { await this.store.markAlertNotified(id); this.unmarked.delete(id); }
+    catch (e) { this.unmarked.add(id); this.log(`alert notified mark failed (retried, not re-sent): ${(e as Error).message}`); }
+  }
+
+  private async flushCloses(): Promise<void> {
+    if (this.unclosed.size) {
+      const ids = [...this.unclosed];
+      try { await this.store.closeAlertEpisodeIds(ids); for (const id of ids) this.unclosed.delete(id); }
+      catch (e) { this.log(`alert episode close failed (retried): ${(e as Error).message}`); }
+    }
+    if (this.unclosedUids.size) {
+      const uids = [...this.unclosedUids];
+      // only uids whose insert had already settled when this close started may be dropped after it succeeds
+      const settled = uids.filter((u) => !this.inflight.has(u));
+      try { await this.store.closeAlertEpisodeUids(uids); for (const u of settled) this.unclosedUids.delete(u); }
+      catch (e) { this.log(`alert episode close by uid failed (retried): ${(e as Error).message}`); }
+    }
+  }
+
+  /** True when the outbox is closing this episode (by ID or uid) — a late restore must not re-adopt it (codex pass 11). */
+  isClosing(id: number, uid: string | null): boolean {
+    return this.unclosed.has(id) || (uid != null && this.unclosedUids.has(uid));
+  }
+
+  /** Unrecorded episodes (in memory only). */
+  pending(): number { return this.unrecorded.length; }
+  /** Closes still owed to the DB. */
+  pendingCloses(): number { return this.unclosed.size; }
+
+  /**
+   * Closes and notified-marks owed first; then unrecorded episodes (persisted if the DB is back — marked notified if
+   * already heard — else sent directly if still unheard); then open, unacknowledged rows oldest first, excluding any
+   * whose close is pending or that a channel already heard, and any whose kind `canResend` holds back (index.ts: a watch
+   * that has not re-evaluated its condition since a restore); stops sending at the first failure. Returns pages sent.
+   */
+  async retry(canResend: (kind: string) => boolean = () => true): Promise<number> {
+    await this.flushCloses();
+    for (const id of [...this.unmarked]) await this.mark(id);
+    let sent = 0;
+    const queue = this.unrecorded;
+    this.unrecorded = [];
+    for (const u of queue) {
+      const id = await this.store.openAlertEpisode(u.uid, u.kind, u.key, u.pumpId, u.title, u.body).catch(() => null);
+      if (id != null) {
+        this.track(u.kind, u.key, id);
+        if (u.delivered) await this.mark(id);
+        continue; // an unheard one is now an outbox row: the loop below delivers it
+      }
+      if (!u.delivered && (await this.send(u.title, u.body + RESENT))) { sent++; u.delivered = true; }
+      this.unrecorded.push(u); // still not durable — keep trying to persist it
+    }
+    // a row whose uid is still held in memory (unrecorded — sent from memory, or already heard) or whose uid-close is
+    // pending (cancelled after a lost reply) is never sent from the DB as well (codex pass 9)
+    const heldUids = new Set<string>([...this.unclosedUids, ...this.unrecorded.map((u) => u.uid)]);
+    const rows = await this.store.undeliveredAlertEpisodes().catch((e) => { this.log(`undelivered fetch failed: ${(e as Error).message}`); return []; });
+    for (const a of rows) {
+      if (this.unclosed.has(a.id) || this.unmarked.has(a.id)) continue; // resolved, or already heard
+      if (a.uid != null && heldUids.has(a.uid)) continue;
+      if (!canResend(a.kind)) continue; // its watch has not re-evaluated the condition since a restore (index.ts)
+      if (!(await this.send(a.title, `${a.detail ?? ""}${RESENT}`))) break;
+      await this.mark(a.id);
+      sent++;
+    }
+    return sent;
+  }
+}
