@@ -535,6 +535,22 @@ async def test_a_bridge_restart_does_not_page_both_down(rig):
     assert "both_down" not in await codes(r.store, "pump1")
 
 
+async def test_a_peer_that_just_stopped_with_a_fault_is_down(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    r.p1.snapshot["running"] = True
+    await heal.tick()                                    # pump1 seen running
+    r.ft.t += 590
+    r.p1.fresh(); r.p2.fresh(); await r.prime(); await heal.tick()
+    r.p1.fault(code="E18", severity="high")              # pump1 faults and stops...
+    r.p1.snapshot["running"] = False
+    await r.step(heal, 20)                               # ...right as pump2 becomes eligible
+    await settle()
+    assert r.panel.writes == []
+    assert "both_down" in await all_codes(r.store)
+
+
 async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch):
     r = rig
     heal = r.make(live=True)

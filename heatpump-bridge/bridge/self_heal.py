@@ -303,11 +303,10 @@ class SelfHealer:
             return "failed its gateway identity check"
         if s.get("on") is False or s.get("state") == "off":
             return "is switched off"
-        st = self._pumps.get(pid)
-        recently_running = s.get("running") or (st is not None and st["last_running"] is not None
-                                                and self._mono() - st["last_running"] < RUNNING_QUIET_S)
+        # Faulted AND not running NOW = down. (The 120 s quiet period protects the pump we would
+        # cycle; for judging a peer, only a compressor running right now counts as "heating".)
         bad = [str(f.get("code")) for f in s.get("active_faults", []) if _is_blocking(f)]
-        if bad and not recently_running:
+        if bad and not s.get("running"):
             return f"is faulted ({', '.join(bad)})"
         circuit = self.cfg.circuits.get(pid)
         if span is not None and circuit:
