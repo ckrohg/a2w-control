@@ -320,10 +320,10 @@ export async function handlePolledConfig(
   // the next poll (or the successor's first poll) sees the same diff and runs the whole check again. A failed re-read
   // (not a shutdown) still leaves an evidence row, and if the next poll no longer sees the change — our own write
   // superseded it, or it vanished — pendingUnconfirmedNotice() says so at default priority (codex pass 3).
-  const unconfirmedDiagnosis = async (why: string): Promise<CurveDiagnosis> => {
+  const unconfirmedDiagnosis = async (why: string, baselineMoved = false): Promise<CurveDiagnosis> => {
     const writes = await lookupWrites(firstAtMs);
     return diagnose({
-      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved: false, writes,
+      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved, writes,
       matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: dev,
     });
   };
@@ -343,16 +343,15 @@ export async function handlePolledConfig(
     catch (e) {
       const why = `re-read failed: ${(e as Error).message}`;
       if (/shutting down/.test(why)) return { unconfirmed: why };
-      // Keep the evidence (codex pass 3): an evidence row whose config is the UNCHANGED baseline — so it can never
-      // advance the baseline or close a TempIQ window (changed_fields NULL) — carrying the first read whole. Skipped
-      // if a planner write moved the baseline meanwhile (that write's own row is newer evidence of the curve).
+      // Keep the evidence durably (codex passes 3 + 5): an evidence row whose config is the CURRENT baseline (the
+      // newest recorded version, re-read under the lock — a planner write during the wait included), so it can never
+      // move the baseline or close a TempIQ window (changed_fields NULL), carrying the first read whole. A restart
+      // before the next poll reloads it (store.pendingUnconfirmed).
       try {
-        const cur = deps.latest ? await deps.latest() : prev;
-        if (cur && JSON.stringify(cur.config) === JSON.stringify(prev.config)) {
-          const d = await unconfirmedDiagnosis(why);
-          await deps.record({ config: prev.config, changes: null, raw: dev, rereadRaw: null, verdict: "unconfirmed", diagnosis: d });
-          return { unconfirmed: why, diagnosis: d };
-        }
+        const cur = (deps.latest ? await deps.latest() : null) ?? prev;
+        const d = await unconfirmedDiagnosis(why, JSON.stringify(cur.config) !== JSON.stringify(prev.config));
+        await deps.record({ config: cur.config, changes: null, raw: dev, rereadRaw: null, verdict: "unconfirmed", diagnosis: d });
+        return { unconfirmed: why, diagnosis: d };
       } catch (e2) { log(`unconfirmed evidence row not written: ${(e2 as Error).message}`); }
       return { unconfirmed: why };
     }

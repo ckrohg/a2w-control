@@ -259,10 +259,17 @@ async function main(): Promise<void> {
     const h5 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: new Error("HTTP 503") });
     const out5 = await handlePolledConfig(restored, device(141, 137), h5.deps);
     assert.deepEqual(pendingUnconfirmedNotice(out1.diagnosis, out5), { pending: out5.diagnosis, notice: null, resolved: false });
-    // a re-read failure while a planner write already moved the baseline: no evidence row over our newer version
+    // a re-read failure while a planner write already moved the baseline: the evidence is STILL kept (codex pass 5),
+    // on a row whose config is the NEW baseline — so it cannot undo our write, and a restart reloads it
     const h3 = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: restored });
-    await handlePolledConfig(prev, seen, h3.deps);
-    assert.equal(h3.rows.length, 0);
+    const out3 = await handlePolledConfig(prev, seen, h3.deps);
+    assert.equal(h3.rows.length, 1);
+    assert.deepEqual(h3.rows[0].config, restored.config, "the evidence row carries the current baseline, never the stale one");
+    assert.equal(h3.rows[0].changes, null);
+    assert.equal(h3.rows[0].verdict, "unconfirmed");
+    assert.deepEqual(h3.rows[0].raw, seen);
+    assert.equal(out3.diagnosis?.baseline_moved, true);
+    assert.equal(h3.rows[0].diagnosis, out3.diagnosis, "the persisted diagnosis is the pending one (what store.pendingUnconfirmed reloads)");
   }
 
   // ── 9. Shutdown during the wait → the re-read is skipped (never holds the poll past SIGTERM), nothing recorded ──
