@@ -18,13 +18,14 @@
  */
 import assert from "node:assert/strict";
 import { Store } from "../planner/src/store";
-import { piHealth, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S } from "../planner/src/pilink";
+import { assertLocalDatabaseUrl } from "../planner/src/local-db";
+import { piHealth, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S, FUTURE_S, SETTLE_S } from "../planner/src/pilink";
 
-const OPTS = { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, clockStepS: CLOCK_STEP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S };
+const OPTS = { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S, clockStepS: CLOCK_STEP_S, windowS: DROPOUT_WINDOW_S, lookbackS: LOOKBACK_S, futureS: FUTURE_S, settleS: SETTLE_S };
 
 const url = process.env.LOCAL_DATABASE_URL ?? "";
-if (!/^postgres(ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) {
-  console.error("refusing: LOCAL_DATABASE_URL must point at localhost (this check is for a local database only)");
+try { assertLocalDatabaseUrl(url); } catch (e) {
+  console.error(`refusing: LOCAL_DATABASE_URL must point at a loopback host (this check is for a local database only): ${(e as Error).message}`);
   process.exit(2);
 }
 const store = new Store(url);
@@ -145,6 +146,30 @@ async function main() {
   assert.ok(h.last_reading_age_s != null && Math.abs(h.last_reading_age_s - (1_860 + 437)) <= 61, `newest reading: the series ends 30 min early, stamped −437 s (${h.last_reading_age_s})`);
   assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 1_860)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
   assert.deepEqual(h.summary, { count: 6, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 0, socket_only: 1, unknown: 4 } });
+  // codex pass 7 on #193 — (a) a forward flick still in its catch-up: samples stamped 40 min AHEAD of now (uptime still
+  // rising on the current track) are quarantined: no reboot, but a clock step marked at now; (b) a real reboot 5 min
+  // ago has too little history to be certain yet → ambiguous until SETTLE_S of samples stay on its track
+  const lastStat = (await pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS up FROM system_stats WHERE ts <= $1 ORDER BY ts DESC LIMIT 1`, [NOW])).rows[0];
+  // the displaced samples were taken EARLIER in real time than the resumed ones (lower uptime) and span 20 min — sorted
+  // by ts they follow the resumed samples, so without the quarantine they look like a settled reboot
+  await pool.query(
+    `INSERT INTO system_stats (ts, uptime_s) SELECT $1::float8 + k * 60, $2::float8 - 3000 + k * 60 FROM generate_series(0, 20) k
+     ON CONFLICT (ts) DO NOTHING`, [NOW + 2_400, Number(lastStat.up)]);
+  const flick = await store.piLinkInputs(NOW * 1000, OPTS);
+  assert.equal(flick.stats?.boots.length, 2, "future-stamped samples never make a reboot");
+  assert.ok(flick.stats?.clockSteps?.includes(NOW), "…but mark a clock discontinuity at now");
+  assert.ok(flick.latestStat && flick.latestStat.ts <= NOW + FUTURE_S, "latest uptime comes from a sample not in the future");
+  await pool.query(`DELETE FROM system_stats WHERE ts > $1`, [NOW]);
+  await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ($1, 60), ($2, 120), ($3, 180)`, [NOW - 300, NOW - 240, NOW - 180]);
+  const fresh = await store.piLinkInputs(NOW * 1000, OPTS);
+  assert.equal(fresh.stats?.boots.length, 2, "a reboot 5 min ago is not yet certain");
+  assert.ok((fresh.stats?.ambiguous ?? []).some((b) => Math.abs(b.at - (NOW - 360)) <= 2), "…it is ambiguous until it settles");
+  await pool.query(`INSERT INTO system_stats (ts, uptime_s) SELECT t, t - $1 FROM generate_series($2::bigint, $3::bigint, 60) t`,
+    [NOW - 360, NOW - 120, NOW + 15 * 60]);
+  const settled = await store.piLinkInputs((NOW + 15 * 60 + 30) * 1000, OPTS);
+  assert.ok(settled.stats?.boots.some((b) => Math.abs(b.at - (NOW - 360)) <= 2), "after 15 min on its track it is certain");
+  await pool.query(`DELETE FROM system_stats WHERE ts > $1`, [NOW - 360]);
+
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);
   await pool.query(`INSERT INTO readings (ts, pump_id) VALUES ($1, 'pump1')`, [NOW - 20 * D]);

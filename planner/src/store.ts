@@ -944,23 +944,25 @@ export class Store {
    * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS, with uptime
    * evidence), each with its table's coverage over the range.
    */
-  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; clockStepS: number; windowS: number; lookbackS: number }): Promise<PiLinkInputs> {
+  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; clockStepS: number; windowS: number; lookbackS: number; futureS: number; settleS: number }): Promise<PiLinkInputs> {
     // the analysis range starts a day before the 7-d window (runs straddling the edge keep their real start) plus an
     // hour of context for the first gap / boot
-    const fromS = nowMs / 1000 - o.windowS - o.lookbackS;
+    const nowS = nowMs / 1000;
+    const fromS = nowS - o.windowS - o.lookbackS;
     const absent = (e: unknown) => (e as { code?: string }).code === "42P01"; // undefined_table
     let lastByPump: PiLinkInputs["lastByPump"] = null;
     let readings: PiLinkInputs["readings"] = null;
     try {
       // the newest reading per pump over the WHOLE table: a silence longer than the analysis range must keep an
       // honest, growing age rather than drop to null (codex pass 1 on #193); index (pump_id, ts)
-      const last = await this.pool.query(`SELECT pump_id, max(ts)::float8 AS ts FROM readings GROUP BY pump_id`);
+      // (future-dated rows — a Pi clock ahead of ours — are left out here too; they are flagged via system_stats)
+      const last = await this.pool.query(`SELECT pump_id, max(ts)::float8 AS ts FROM readings WHERE ts <= $1 GROUP BY pump_id`, [nowS + o.futureS]);
       const span = await this.pool.query(
-        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1`, [fromS - 3_600]);
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1 AND ts <= $2`, [fromS - 3_600, nowS + o.futureS]);
       const gaps = await this.pool.query(
         `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
-           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1) d
-         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS]);
+           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1 AND ts <= $3) d
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS, nowS + o.futureS]);
       lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
       readings = {
         gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
@@ -971,9 +973,9 @@ export class Store {
     let latestStat: PiLinkInputs["latestStat"] = null;
     let stats: PiLinkInputs["stats"] = null;
     try {
-      const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats ORDER BY ts DESC LIMIT 1`);
+      const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats WHERE ts <= $1 ORDER BY ts DESC LIMIT 1`, [nowS + o.futureS]);
       const span = await this.pool.query(
-        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL`, [fromS - 3_600]);
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM system_stats WHERE ts >= $1 AND ts <= $2 AND uptime_s IS NOT NULL`, [fromS - 3_600, nowS + o.futureS]);
       // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): certain when uptime fell; ambiguous when the boot time
       // jumped while uptime kept rising but is shorter than the time since the previous sample (a fresh Pi's clock step
       // looks the same) — an NTP step on a long-running Pi is neither
@@ -982,31 +984,39 @@ export class Store {
       // …and no LATER sample may return to a boot track seen BEFORE it (codex pass 5 on #193): a brief forward clock flick
       // displaces a few samples onto a "new" track whose uptime seems to fall, then the old track resumes — that is
       // a clock artefact, kept as ambiguous, never a certain reboot.
+      // Samples stamped AHEAD of our clock are quarantined (codex pass 7 on #193): during a forward flick's catch-up
+      // they sort after the resumed samples and fake a reboot; and a reboot is certain only once SETTLE_S of later
+      // history has stayed on its track — until then it is ambiguous (the window reads unknown, the count lags).
       const b = await this.pool.query(
         `SELECT boot_at::float8 AS at,
-                (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)) AS certain FROM (
+                (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)
+                 AND max_next_ts >= ts + $4) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
                   lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up,
                   max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot,
-                  min(ts - uptime_s) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS min_next_boot
-           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+                  min(ts - uptime_s) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS min_next_boot,
+                  max(ts) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS max_next_ts
+           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
          ) s WHERE prev_ts IS NOT NULL AND boot_at > max_prev_boot + $2
              AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
-         ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS]);
+         ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS, nowS + o.futureS, o.settleS]);
+      const future = await this.pool.query(`SELECT count(*)::int AS n FROM system_stats WHERE ts > $1`, [nowS + o.futureS]);
       // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
       // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
       const steps = await this.pool.query(
         `SELECT ts::float8 AS ts FROM (
            SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
-           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
          ) s WHERE prev_ts IS NOT NULL AND uptime_s >= prev_up - 5
              AND abs((ts - prev_ts) - (uptime_s - prev_up)) > $2
-         ORDER BY ts`, [fromS - 3_600, o.clockStepS]);
+         ORDER BY ts`, [fromS - 3_600, o.clockStepS, nowS + o.futureS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
       stats = {
         boots: b.rows.filter((r: any) => r.certain).map((r: any) => ({ at: Number(r.at) })),
         ambiguous: b.rows.filter((r: any) => !r.certain).map((r: any) => ({ at: Number(r.at) })),
-        clockSteps: steps.rows.map((r: any) => Number(r.ts)),
+        // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
+        // window cannot read as resolved while they exist
+        clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };

@@ -28,6 +28,10 @@ export const WINDOW_SLACK_S = 10 * 60;
 export const BOOT_JUMP_S = 5 * 60;
 /** A difference between the ts step and the uptime step larger than this between two samples is a clock step. */
 export const CLOCK_STEP_S = 2 * 60;
+/** Mirror samples stamped further than this AHEAD of the planner's clock are quarantined (a Pi clock running fast). */
+export const FUTURE_S = 2 * 60;
+/** A reboot is certain only after this much later history stayed on its new boot track (codex pass 7 on #193). */
+export const SETTLE_S = 15 * 60;
 
 export type PiVerdict = "gap+reboot" | "gap_only" | "socket_only" | "unknown";
 
