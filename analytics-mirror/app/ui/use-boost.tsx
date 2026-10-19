@@ -86,12 +86,12 @@ export function useBoost() {
   // Remember that the read-back showed this boost, so its later disappearance reads as "ended",
   // never as "unconfirmed".
   useEffect(() => {
-    if (phase.phase === "accepted" && !phase.seen && ["commanded", "in_force", "superseded"].includes(view.key)) {
+    if (phase.phase === "accepted" && !phase.seen && ["commanded", "in_force", "superseded", "unverified"].includes(view.key)) {
       setPhase({ ...phase, seen: true, writeAt: st?.last_write_at ?? null });
     }
   }, [phase, view.key, st]);
 
-  const waiting = ["verifying", "commanded", "sending", "expired_unrestored", "stale"].includes(view.key);
+  const waiting = ["verifying", "commanded", "sending", "expired_unrestored", "stale", "unverified"].includes(view.key);
   useEffect(() => {
     loadStatus();
     loadHub();

@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useBoost } from "../ui/use-boost";
-import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes, overlayBoost } from "@/lib/boost-state";
+import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes, overlayBoost, chartShowsBoost } from "@/lib/boost-state";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
 
@@ -546,7 +546,7 @@ export default function OptimizeClient({
   const ab = bst.st?.active_boost ?? null;
   // Drawn only for a FRESH read-back that still centres on the boost (commanded / in force) — not for
   // a superseded or stale one (Codex pass 2).
-  const boostDrawn = ab && (bst.view.key === "commanded" || bst.view.key === "in_force");
+  const boostDrawn = ab && chartShowsBoost(bst.view);
   const span = boostDrawn ? boostChartSpan(bst.nowMs, ab.restore_at) : null;
   const boost: Boost | null = boostDrawn && span
     ? {

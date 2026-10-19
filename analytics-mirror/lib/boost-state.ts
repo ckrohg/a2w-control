@@ -180,7 +180,12 @@ export type BoostPhase =
   // any later stamp is another write (planner clock vs planner clock: no browser-skew problem)
   | { phase: "accepted"; req: BoostRequest; atMs: number; restoreAt: string | null; seen?: boolean; writeAt?: string | null };
 
-export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale"; tone: Tone; text: string };
+export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale" | "unverified"; tone: Tone; text: string };
+
+/** Only a read-back that positively identifies the boost may be drawn on the plan chart. */
+export function chartShowsBoost(v: BoostView): boolean {
+  return v.key === "commanded" || v.key === "in_force";
+}
 
 function sameRestore(a: string, b: string): boolean {
   const ta = Date.parse(a), tb = Date.parse(b);
@@ -271,7 +276,7 @@ function activeView(ab: { target_f: number; restore_at: string }, st: WriterStat
   // Without the DB answer, identity is a best guess from the curve — never shown as confirmed green.
   if (st.boost_superseded_by === undefined) {
     const opNow = st.target_f;
-    return { key: "commanded", tone: "pending", text: `boost to ${ab.target_f} °F on record until ${until} (HBX on ${opNow != null ? `${r0(opNow)} °F` : "?"}) — could not check for later writes, so not confirmed in force` };
+    return { key: "unverified", tone: "pending", text: `boost to ${ab.target_f} °F on record until ${until} (HBX on ${opNow != null ? `${r0(opNow)} °F` : "?"}) — could not check for later writes, so not confirmed` };
   }
   const inForce = st.adoption_pending === false && op != null && Math.abs(op - ab.target_f) <= ADOPT_TOL_F;
   if (inForce) return { key: "in_force", tone: "ok", text: `in force: tank target ${r0(op!)} °F until ${until}, then the curve restores` };

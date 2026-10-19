@@ -4,7 +4,7 @@
 // Run: npx tsx tests/boost-state.test.ts
 import assert from "node:assert/strict";
 import {
-  boostView, boostChartSpan, etHour, overlayBoost, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
+  boostView, boostChartSpan, chartShowsBoost, etHour, overlayBoost, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
   type WriterStatus, type BoostPhase, type HubState,
 } from "../lib/boost-state";
 
@@ -240,9 +240,18 @@ t("DB says the curve was written after the boost → superseded, even a 1 °F ne
 t("DB answer unavailable → never green, says it could not check", () => {
   const { boost_superseded_by: _drop, ...noDb } = inForce;
   const v = boostView(accepted, noDb, NOW + 60_000);
-  assert.equal(v.key, "commanded");
+  assert.equal(v.key, "unverified");
   assert.equal(v.tone, "pending");
-  assert.match(v.text, /could not check for later writes, so not confirmed in force/);
+  assert.match(v.text, /could not check for later writes, so not confirmed/);
+  assert.equal(chartShowsBoost(v), false); // Codex pass 8: not drawn either
+});
+
+t("chart eligibility: only commanded / in force", () => {
+  assert.equal(chartShowsBoost(boostView(accepted, commanded, NOW + 10_000)), true);
+  assert.equal(chartShowsBoost(boostView(accepted, inForce, NOW + 600_000)), true);
+  assert.equal(chartShowsBoost(boostView(accepted, { ...commanded, commanded_target_f: 121 }, NOW + 10_000)), false); // superseded
+  assert.equal(chartShowsBoost(boostView(accepted, inForce, NOW + 600_000, NOW)), false); // stale
+  assert.equal(chartShowsBoost(boostView(accepted, before, NOW + 5_000)), false); // verifying
 });
 
 console.log(`boost-state: ${n} passed`);
