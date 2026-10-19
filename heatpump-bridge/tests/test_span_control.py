@@ -434,6 +434,68 @@ async def test_untimed_bare_open_restarts_the_hold_after_a_restart(rig, monkeypa
         await fresh.execute("Kitchen", "close")
 
 
+async def test_unreadable_opens_history_fails_closed(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    for bad in ("{not json", None):
+        path = tmp_path / span_control.OPENS_FILE
+        if path.is_dir():
+            path.rmdir()
+        if bad is None:
+            path.unlink(missing_ok=True)
+            path.mkdir()                       # reading it raises an OSError
+        else:
+            path.write_text(bad)
+        fresh = BreakerController(ctl.cfg, ctl.client, store, cache=ctl.cache, state_dir=str(tmp_path),
+                                  sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+        await fresh.recover()
+        panel.set("Kitchen", relayState="OPEN")
+        with pytest.raises(BreakerRefused, match="minimum off time"):
+            await fresh.execute("Kitchen", "close")
+        await fresh.stop()
+
+
+async def test_transient_cycle_record_read_error_keeps_the_record_and_recovers(rig, monkeypatch):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    panel.set("Air-Water 2", relayState="OPEN")
+    cycle_file(tmp_path).write_text(json.dumps(
+        {"name": "Air-Water 2", "circuit_id": "c-aw2", "opened_at": None, "off_s": 60}))
+    real = ctl._read_cycle_file
+    fails = {"n": 2}
+
+    def flaky():
+        if fails["n"] > 0:
+            fails["n"] -= 1
+            raise OSError("EIO")
+        return real()
+    monkeypatch.setattr(ctl, "_read_cycle_file", flaky)
+    await ctl.recover()
+    assert cycle_file(tmp_path).exists()                     # not deleted
+    assert ctl._record_blocked
+    for _ in range(500):
+        if panel.relay("Air-Water 2") == "CLOSED" and not cycle_file(tmp_path).exists():
+            break
+        await asyncio.sleep(0.01)
+    assert panel.relay("Air-Water 2") == "CLOSED"
+    assert not cycle_file(tmp_path).exists()
+    assert any(a[2] == "urgent" for a in alerts if a[0] == "push")
+
+
+async def test_blocked_record_refuses_off_actions(rig, monkeypatch):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    cycle_file(tmp_path).write_text("{}")
+
+    def broken():
+        raise OSError("EIO")
+    monkeypatch.setattr(ctl, "_read_cycle_file", broken)
+    monkeypatch.setattr(span_control, "RECORD_RETRY_S", 10_000.0)
+    ft.block = 10_000.0
+    await ctl.recover()
+    with pytest.raises(BreakerRefused, match="can't be read yet"):
+        await ctl.execute("Air-Water 1", "power_cycle")
+    assert (await ctl.execute("Buffer Tank", "close"))["ok"]   # ON stays possible
+    ft.release.set()
+
+
 async def test_min_off_after_a_reboot_restarts_the_hold(rig):
     panel, ctl, ft, store, alerts, tmp_path = rig
     ctl._boot_id = "boot-A"

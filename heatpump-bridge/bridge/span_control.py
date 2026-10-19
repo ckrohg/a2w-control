@@ -41,6 +41,7 @@ EVENT_TYPE = "span_breaker"
 READBACK_TRIES = 3           # the panel can lag a write by a beat; re-read before calling it a mismatch
 READBACK_GAP_S = 1.0
 CYCLE_FILE = "span-breaker-cycle.json"
+RECORD_RETRY_S = 30.0                    # re-read an unreadable (I/O error) cycle record this often
 OPENS_FILE = "span-breaker-opens.json"   # bare OPENs: when, so the min-off survives a restart
 
 
@@ -92,6 +93,8 @@ class BreakerController:
         self._busy: dict | None = None  # the ONE action in flight (global lock)
         self._task: asyncio.Task | None = None
         self._stopping = False
+        self._record_blocked = False   # a cycle record exists but can't be read yet: no OFF actions
+        self._record_task: asyncio.Task | None = None
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
         self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
         self._open_untimed: set[str] = set()                # bare OPEN dispatched, landing time unknown
@@ -135,6 +138,9 @@ class BreakerController:
             if self._stopping:
                 raise BreakerRefused("the bridge is shutting down — try again in a minute", 503)
             spec, hold = self._validate(name, action, off_s)
+            if self._record_blocked and action != "close":
+                raise BreakerRefused("an interrupted power cycle's record can't be read yet — only "
+                                     "'close' is allowed until it is", 503)
             if self._pending_close and action != "close":
                 raise BreakerRefused(
                     f"'{', '.join(sorted(self._pending_close))}' has not been verified back ON yet — "
@@ -160,7 +166,38 @@ class BreakerController:
         out the rest of the hold — all of it when the OPEN's timing was never recorded — then
         CLOSE with the same retries and paging."""
         self._restore_opens()
-        rec = self._read_cycle_file()
+        try:
+            rec = self._read_cycle_file()
+        except OSError as exc:
+            # A storage hiccup is not a malformed record: keep the file, block OFF actions, page,
+            # and keep re-reading until the interrupted cycle can be finished.
+            self._record_blocked = True
+            await self._audit_raw("cycle_record_unreadable", "critical",
+                                  f"an interrupted power cycle's record can't be read ({exc}) — "
+                                  "retrying; check that every Air-Water circuit is ON", {"error": str(exc)})
+            self._alert("URGENT: check the Air-Water breakers",
+                        "A bridge restart found an interrupted power cycle but can't read its record "
+                        f"({exc}). A2W keeps retrying; check that the Air-Water 1 and Air-Water 2 "
+                        "circuits are ON at the SPAN panel.", "urgent")
+            self._record_task = asyncio.create_task(self._retry_record(), name="span-breaker-record")
+            return
+        await self._recover_from(rec)
+
+    async def _retry_record(self) -> None:
+        while True:
+            await self._sleep(RECORD_RETRY_S)
+            try:
+                rec = self._read_cycle_file()
+            except OSError as exc:
+                log.warning("span breaker: cycle record still unreadable: %s", exc)
+                continue
+            while self._busy is not None:       # a human 'close' may be running
+                await self._sleep(1.0)
+            self._record_blocked = False
+            await self._recover_from(rec)
+            return
+
+    async def _recover_from(self, rec: dict | None) -> None:
         if rec is None:
             return
         name, cid = rec.get("name"), rec.get("circuit_id")
@@ -198,6 +235,10 @@ class BreakerController:
         """Shutdown: refuse new actions, then let any in-flight hold + CLOSE run to completion —
         never cut a hold short. (A SIGKILL mid-cycle is covered by the cycle record.)"""
         self._stopping = True
+        if self._record_task is not None:
+            self._record_task.cancel()   # the record stays on disk for the next start
+            with contextlib.suppress(BaseException):
+                await self._record_task
         task = self._task
         if task and not task.done():
             with contextlib.suppress(BaseException):
@@ -647,16 +688,22 @@ class BreakerController:
     def _restore_opens(self) -> None:
         if not self._opens_path:
             return
+        now = self._mono()
         try:
             recs = json.loads(self._opens_path.read_text())
+            if not isinstance(recs, dict):
+                raise ValueError("not an object")
         except FileNotFoundError:
             return
         except (OSError, ValueError) as exc:
-            log.warning("span breaker: opens record unreadable (%s) — ignoring", exc)
+            # History unknown: fail closed — every circuit A2W may switch off starts a fresh
+            # minimum off time, so nothing it opened can be closed early.
+            log.warning("span breaker: opens record unreadable (%s) — restarting min-off holds", exc)
+            for b in self.cfg.breakers:
+                if b.allow_open:
+                    self._opened_at[b.name] = now
+                    self._open_untimed.add(b.name)
             return
-        if not isinstance(recs, dict):
-            return
-        now = self._mono()
         for n, r in recs.items():
             t = r.get("opened_mono") if isinstance(r, dict) else None
             same_boot = bool(self._boot_id) and isinstance(r, dict) and r.get("boot_id") == self._boot_id
@@ -665,14 +712,18 @@ class BreakerController:
                 and t <= now else now
 
     def _read_cycle_file(self) -> dict | None:
+        """None = no record; {} = a malformed record; raises OSError on an I/O failure (which
+        may be transient — the caller must not treat it as 'no record')."""
         if not self._cycle_path:
             return None
         try:
-            rec = json.loads(self._cycle_path.read_text())
+            text = self._cycle_path.read_text()
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as exc:
-            log.warning("span breaker: cycle record unreadable: %s", exc)
+        try:
+            rec = json.loads(text)
+        except ValueError as exc:
+            log.warning("span breaker: cycle record malformed: %s", exc)
             return {}
         return rec if isinstance(rec, dict) else {}
 
