@@ -482,12 +482,20 @@ async function main(): Promise<void> {
     await t.ensureLoaded();                       // boot: fails
     assert.equal(t.pending, null);
     const unchanged = await handlePolledConfig(prevOf(device(142, 138)), device(142, 138), harness({ nowIso: "2026-10-18T21:10:56.000Z" }).deps);
-    const notice = await t.step(unchanged);       // first poll: reload retried, succeeds, the change is gone → notice
+    const sent: string[] = [];
+    const send = async (n: { title: string }) => { assert.equal(resolves, 0, "sent BEFORE it is marked resolved (codex pass 8)"); sent.push(n.title); };
+    const notice = await t.step(unchanged, send); // first poll: reload retried, succeeds, the change is gone → notice
     assert.equal(loads, 2, "reload retried on the next step");
     assert.equal(notice?.title, UNCONFIRMED_TITLE);
+    assert.deepEqual(sent, [UNCONFIRMED_TITLE]);
     assert.equal(resolves, 1);
-    assert.equal(await t.step(unchanged), null, "announced once");
+    assert.equal(await t.step(unchanged, send), null, "announced once");
     assert.equal(loads, 2, "loaded once; never re-loaded after success");
+    // interrupted delivery: the send dies (process killed mid-ntfy) → NOT resolved, so the successor's reload sees it
+    let r2 = 0;
+    const t2 = new PendingTracker(async () => pendingDiag, async () => { r2++; }, () => {});
+    await assert.rejects(t2.step(unchanged, async () => { throw new Error("SIGKILL mid-send"); }));
+    assert.equal(r2, 0, "an undelivered notice is never marked resolved");
   }
 
   // ── 11. Seed, unchanged, and non-curve drift keep today's behaviour — and every row carries raw ─────────────────

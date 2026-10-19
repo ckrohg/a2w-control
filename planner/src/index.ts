@@ -1619,8 +1619,7 @@ async function pollOnce(): Promise<void> {
   if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
   {
     // an unconfirmed curve change is re-checked by the next poll; if that poll no longer sees it, say so (#177)
-    const notice = await pendingUnconfirmed.step(drift);
-    if (notice) await ntfy(notice.title, notice.body, "default", { email: true });
+    await pendingUnconfirmed.step(drift, (n) => ntfy(n.title, n.body, "default", { email: true }));
   }
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };

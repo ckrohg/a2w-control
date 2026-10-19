@@ -500,10 +500,15 @@ export class PendingTracker {
     try { const p = await this.load(); this.pending ??= p; this.loaded = true; }
     catch (e) { this.log(`pending unconfirmed reload failed (retried next poll): ${(e as Error).message}`); }
   }
-  /** Fold this poll's outcome in; returns the notice to send, if any. */
-  async step(outcome: DriftOutcome): Promise<{ title: string; body: string } | null> {
+  /**
+   * Fold this poll's outcome in. A due notice is SENT before the observation is marked resolved (codex pass 8): a crash
+   * or SIGTERM between the two leaves it pending in the DB, so the successor announces it — at worst twice, never
+   * lost. Returns the notice that was sent, if any.
+   */
+  async step(outcome: DriftOutcome, send: (n: { title: string; body: string }) => Promise<void>): Promise<{ title: string; body: string } | null> {
     await this.ensureLoaded();
     const c = pendingUnconfirmedNotice(this.pending, outcome);
+    if (c.notice) await send(c.notice);
     this.pending = c.pending;
     if (c.resolved) await this.resolve().catch((e) => this.log(`resolveUnconfirmed failed: ${(e as Error).message}`));
     return c.notice;
