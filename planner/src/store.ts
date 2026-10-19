@@ -1001,13 +1001,16 @@ export class Store {
       const b = await this.pool.query(
         `SELECT boot_at::float8 AS at, ts::float8 AS sample_ts, (max_prev_boot + uptime_s)::float8 AS origin,
                 (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)
-                 AND max_next_ts >= ts + $4) AS certain FROM (
+                 AND last_ts >= ts + $4) AS certain FROM (
+           -- every frame is EXPANDING (incremental in Postgres — codex pass 11 on #193: a suffix frame
+           -- ROWS 1 FOLLOWING..UNBOUNDED re-scans the rest of the series per row, quadratic): the suffix minimum is an
+           -- expanding frame over DESCENDING ts, and the latest ts is one value for the whole set
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
                   lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up,
                   max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot,
-                  min(ts - uptime_s) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS min_next_boot,
-                  max(ts) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS max_next_ts
-           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+                  min(ts - uptime_s) OVER (ORDER BY ts DESC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS min_next_boot,
+                  max(ts) OVER () AS last_ts
+           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts ASC)
          ) s WHERE prev_ts IS NOT NULL AND boot_at > max_prev_boot + $2
              AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
          ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS, nowS + o.futureS, o.settleS]);
