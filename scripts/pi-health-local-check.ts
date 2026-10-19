@@ -166,9 +166,13 @@ async function main() {
   assert.ok((fresh.stats?.ambiguous ?? []).some((b) => Math.abs(b.at - (NOW - 360)) <= 2), "…it is ambiguous until it settles");
   await pool.query(`INSERT INTO system_stats (ts, uptime_s) SELECT t, t - $1 FROM generate_series($2::bigint, $3::bigint, 60) t`,
     [NOW - 360, NOW - 120, NOW + 15 * 60]);
+  // the same pushes carry readings (arrival-order evidence must cover a reboot before it is certain)
+  await pool.query(`INSERT INTO readings (ts, pump_id) SELECT t, 'pump1' FROM generate_series($1::bigint, $2::bigint, 60) t`,
+    [NOW - 2_400, NOW + 15 * 60]);
   const settled = await store.piLinkInputs((NOW + 15 * 60 + 30) * 1000, OPTS);
   assert.ok(settled.stats?.boots.some((b) => Math.abs(b.at - (NOW - 360)) <= 2), "after 15 min on its track it is certain");
   await pool.query(`DELETE FROM system_stats WHERE ts > $1`, [NOW - 360]);
+  await pool.query(`DELETE FROM readings WHERE ts >= $1 AND ts > $2`, [NOW - 2_400, NOW - 1_830 - 437]);
 
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);
@@ -206,8 +210,26 @@ async function main() {
     assert.equal(fin.stats?.boots.length, 0, `${at}: the flick never makes a certain reboot (${JSON.stringify(fin.stats?.boots)})`);
     assert.equal(fh.reboots_24h, 0, `${at}: and is never counted`);
     assert.equal(w6?.verdict, "unknown", `${at}: the outage during the flick is unknown (got ${w6?.verdict})`);
-    assert.ok((fin.stats?.clockIntervals ?? []).some((c) => c.start <= F1 + 60 && c.end >= F1 + H - 120), `${at}: the re-stamped span is known from readings' ingestion order`);
+    assert.ok((fin.readings?.clockIntervals ?? []).some((c) => c.start <= F1 + 60 && c.end >= F1 + H - 120), `${at}: the re-stamped span is known from readings' ingestion order`);
   }
+  // codex pass 9 on #193 — the same flick with ONE mirror table missing at a time:
+  // (a) readings absent: no arrival-order evidence → no reboot is ever certain during the catch-up
+  await pool.query(`ALTER TABLE readings RENAME TO readings_hidden`);
+  for (const evalS of [T0 + H + 15 * 60, T0 + H + 19 * 60, T0 + 3 * H]) {
+    const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+    assert.equal(fin.readings, null);
+    assert.equal(fin.stats?.boots.length, 0, `readings absent, at T0+${Math.round((evalS - T0) / 60)} min: nothing certain`);
+  }
+  await pool.query(`ALTER TABLE readings_hidden RENAME TO readings`);
+  // (b) system_stats absent: the readings-derived contamination still keeps the outage unknown, never socket_only
+  await pool.query(`ALTER TABLE system_stats RENAME TO system_stats_hidden`);
+  for (const evalS of [T0 + H + 15 * 60, T0 + 3 * H]) {
+    const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+    assert.equal(fin.stats, null);
+    const w6 = piHealth(fin, evalS * 1000).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T0) <= 60);
+    assert.equal(w6?.verdict, "unknown", `stats absent, at T0+${Math.round((evalS - T0) / 60)} min: unknown (got ${w6?.verdict})`);
+  }
+  await pool.query(`ALTER TABLE system_stats_hidden RENAME TO system_stats`);
 
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }

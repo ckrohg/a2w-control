@@ -977,6 +977,8 @@ export class Store {
         gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
+        // carried with READINGS, so the evidence holds even when system_stats is absent (codex pass 9 on #193)
+        clockIntervals: contaminated,
       };
     } catch (e) { if (!absent(e)) throw e; }
     let latestStat: PiLinkInputs["latestStat"] = null;
@@ -1023,11 +1025,14 @@ export class Store {
       // a candidate sampled inside a clock-contaminated span is never certain: its "settled" history may be the
       // displaced samples themselves (codex pass 8 on #193)
       const dirty = (t: number) => contaminated.some((c) => t >= c.start - 60 && t <= c.end + 60);
-      const certain = (r: any) => r.certain && !dirty(Number(r.sample_ts));
+      // …and only where readings' arrival order COVERS the candidate: without it (table absent, or no readings yet at
+      // that time) displaced history cannot be excluded, so nothing is certain (codex pass 9 on #193)
+      const arrivalCovers = (t: number) => readings != null && readings.firstTs != null && readings.firstTs <= t - 600
+        && readings.lastTs != null && readings.lastTs >= t;
+      const certain = (r: any) => r.certain && arrivalCovers(Number(r.sample_ts)) && !dirty(Number(r.sample_ts));
       stats = {
         boots: b.rows.filter(certain).map((r: any) => ({ at: Number(r.at) })),
         ambiguous: b.rows.filter((r: any) => !certain(r)).map((r: any) => ({ at: Number(r.at) })),
-        clockIntervals: contaminated,
         // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
         // window cannot read as resolved while they exist
         clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
