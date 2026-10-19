@@ -10,7 +10,7 @@
 import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
-import { extractConfig, handlePolledConfig, type CurveDiagnosis } from "./drift";
+import { extractConfig, handlePolledConfig, pendingUnconfirmedNotice, type CurveDiagnosis } from "./drift";
 import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
@@ -303,6 +303,8 @@ let lastDriftAt: string | null = null;
 // #177: the newest curve diagnosis (echo_suspected | foreign | reverted) → /health.drift.last_foreign. Seeded from the
 // DB at boot so a redeploy does not blank it.
 let lastCurveDiagnosis: CurveDiagnosis | null = null;
+// #177: an `unconfirmed` curve change awaiting the next poll's re-check (drift.ts pendingUnconfirmedNotice).
+let pendingUnconfirmed: CurveDiagnosis | null = null;
 let lastShadowAt: string | null = null;
 let consecutiveFailures = 0;
 let offlineAlerted = false;
@@ -1609,6 +1611,12 @@ async function pollOnce(): Promise<void> {
   if (drift.kind === "seeded") console.log("seeded initial hbx_config_versions row");
   if (drift.changes) lastDriftAt = new Date().toISOString();
   if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
+  {
+    // an unconfirmed curve change is re-checked by the next poll; if that poll no longer sees it, say so (#177)
+    const carry = pendingUnconfirmedNotice(pendingUnconfirmed, drift);
+    pendingUnconfirmed = carry.pending;
+    if (carry.notice) await ntfy(carry.notice.title, carry.notice.body, "default", { email: true });
+  }
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
     lastDeviceCurve = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number")

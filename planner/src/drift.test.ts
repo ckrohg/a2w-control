@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import {
   curveVerdict, handlePolledConfig, diffConfig, extractConfig, deviceMeta, patchEcho,
-  ECHO_TITLE, FOREIGN_TITLE, REREAD_DELAY_MS, ECHO_WINDOW_MS,
+  ECHO_TITLE, FOREIGN_TITLE, UNCONFIRMED_TITLE, REREAD_DELAY_MS, ECHO_WINDOW_MS, pendingUnconfirmedNotice,
   type PlannerWrite, type ConfigVersionRecord, type DriftDeps, type HbxConfig,
 } from "./drift";
 import { withDeviceLock } from "./writes";
@@ -205,14 +205,49 @@ async function main(): Promise<void> {
     assert.equal(out.diagnosis?.reread_confirmed, null);
     assert.match(out.diagnosis?.reread_error ?? "", /re-read failed: HTTP 503/);
     assert.equal(h.pages.length, 0, "a change not shown to persist pages nobody (#177: page only if it persists)");
-    assert.equal(h.rows.length, 0, "and is not recorded — the baseline must not advance on one unconfirmed read");
+    assert.equal(h.rows.length, 1, "an evidence row is kept (codex pass 3)…");
+    assert.deepEqual(h.rows[0].config, prev.config, "…whose config is the UNCHANGED baseline — the baseline must not advance on one unconfirmed read");
+    assert.equal(h.rows[0].changes, null, "changed_fields NULL: never a drift-chip hit or a TempIQ window closer");
+    assert.equal(h.rows[0].verdict, "unconfirmed");
+    assert.deepEqual(h.rows[0].raw, seen, "the first read is kept whole");
     assert.equal(out.changes, null);
+    // nothing pending is announced while the change is still there: the next poll re-detects it and pages it itself
+    assert.deepEqual(pendingUnconfirmedNotice(null, out), { pending: out.diagnosis, notice: null });
     // the next poll: same device, re-read works now → the full check runs and pages
     const h2 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: seen, writes: [] });
     const out2 = await handlePolledConfig(prev, seen, h2.deps);
     assert.equal(out2.diagnosis?.verdict, "foreign");
     assert.equal(h2.pages.length, 1);
     assert.equal(h2.pages[0].priority, "high");
+    assert.deepEqual(pendingUnconfirmedNotice(out.diagnosis, out2), { pending: null, notice: null }, "re-detected → its own page, no extra notice");
+  }
+
+  // ── 8b. Failed confirmation, then a planner write (boost expiry restore) replaces the curve before the next poll:
+  // the observation is not lost — the next poll sends a default "could not be confirmed" notice (codex pass 3) ─────
+  {
+    const prev = prevOf(device(120, 118));
+    const seen = device(100, 96);
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: prev });
+    const out1 = await handlePolledConfig(prev, seen, h.deps);
+    let carry = pendingUnconfirmedNotice(null, out1);
+    assert.equal(carry.pending?.verdict, "unconfirmed");
+    // …same poll: boost expiry restores the as-found 165/140 and self-records it (the device now shows it)…
+    const restored = prevOf(device(165, 140));
+    // …next poll: the device and the latest version agree → no diff
+    const h2 = harness({ nowIso: "2026-10-18T21:10:56.000Z" });
+    const out2 = await handlePolledConfig(restored, device(165, 140), h2.deps);
+    assert.equal(out2.kind, "unchanged");
+    carry = pendingUnconfirmedNotice(carry.pending, out2);
+    assert.equal(carry.pending, null);
+    assert.equal(carry.notice?.title, UNCONFIRMED_TITLE);
+    assert.match(carry.notice?.body ?? "", /dbt: 120 -> 100/, "the notice carries the evidence");
+    assert.match(carry.notice?.body ?? "", /re-read failed: HTTP 503/);
+    assert.doesNotMatch(carry.notice?.body ?? "", /single-writer/i);
+    assert.equal(pendingUnconfirmedNotice(null, out2).notice, null, "nothing pending → nothing to say");
+    // a re-read failure while a planner write already moved the baseline: no evidence row over our newer version
+    const h3 = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), latest: restored });
+    await handlePolledConfig(prev, seen, h3.deps);
+    assert.equal(h3.rows.length, 0);
   }
 
   // ── 9. Shutdown during the wait → the re-read is skipped (never holds the poll past SIGTERM), nothing recorded ──

@@ -422,8 +422,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
                 #{v.id} · {fmtDateTime(v.t)} ·
                 {" "}{v.changed_fields
                   ? Object.entries(v.changed_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")
-                  : v.verdict === "reverted" && v.first_read_fields
-                    ? `transient read, reverted on re-read: ${Object.entries(v.first_read_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")}`
+                  : (v.verdict === "reverted" || v.verdict === "unconfirmed") && v.first_read_fields
+                    ? `${v.verdict === "reverted" ? "transient read, reverted on re-read" : "seen once, re-read failed (baseline unchanged)"}: ${Object.entries(v.first_read_fields).map(([k, c]) => `${k}: ${c.old} → ${c.new}`).join(" · ")}`
                     : v.verdict ? "no lasting change" : "initial snapshot (as-found baseline)"}
                 {v.verdict && (
                   <> · <b>{v.verdict === "echo_suspected" ? "echo of our write (suspected)" : v.verdict}</b>

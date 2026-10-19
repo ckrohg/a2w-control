@@ -27,25 +27,30 @@ export interface SlxReading {
 }
 
 /** Bounds for queries run under the device lock (see Store.locked). */
-export const LOCKED_STATEMENT_TIMEOUT_MS = 10_000;
-export const LOCKED_QUERY_TIMEOUT_MS = 15_000;
+export const LOCKED_TIMEOUTS_MS = { connect: 10_000, statement: 10_000, query: 15_000 };
 
 export class Store {
   private pool: Pool;
   /**
    * #177 (codex pass 2): the queries that run while the device lock is held (writes.ts withDeviceLock — the writer's
    * self-record, the drift detector's confirmation record) go through this small pool with a SERVER-side
-   * statement_timeout below a CLIENT-side query_timeout: a stalled connection fails in bounded time and releases the
+   * statement_timeout below a CLIENT-side query_timeout, and a bounded connect/checkout: a stalled connection fails in bounded time and releases the
    * lock instead of queueing every later PATCH (a restore included) behind it, and any statement the server did
    * run has finished or been cancelled before the client gives up — so a timed-out insert cannot land after a later
    * write's. All of them are single-row reads/inserts; the main pool keeps no timeout, as before.
    */
   private locked: Pool;
 
-  constructor(databaseUrl: string) {
+  constructor(databaseUrl: string, lockedTimeoutsMs: typeof LOCKED_TIMEOUTS_MS = LOCKED_TIMEOUTS_MS) {
     const ssl = /localhost|127\.0\.0\.1/.test(databaseUrl) ? undefined : { rejectUnauthorized: false };
     this.pool = new Pool({ connectionString: databaseUrl, max: 3, ssl });
-    this.locked = new Pool({ connectionString: databaseUrl, max: 2, ssl, statement_timeout: LOCKED_STATEMENT_TIMEOUT_MS, query_timeout: LOCKED_QUERY_TIMEOUT_MS });
+    // connectionTimeoutMillis bounds checkout + connection startup (TLS/auth) too (codex pass 3)
+    this.locked = new Pool({
+      connectionString: databaseUrl, max: 2, ssl,
+      connectionTimeoutMillis: lockedTimeoutsMs.connect,
+      statement_timeout: lockedTimeoutsMs.statement,
+      query_timeout: lockedTimeoutsMs.query,
+    });
     // an idle client dropped by the server must not crash the process (the query path already reports its own errors)
     this.locked.on("error", (e) => console.error("store (locked pool) idle client error:", e.message));
   }

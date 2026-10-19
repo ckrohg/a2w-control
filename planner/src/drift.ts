@@ -145,7 +145,7 @@ export interface ConfigVersionRecord {
   changes: Record<string, FieldChange> | null;
   raw: Record<string, any> | null;
   rereadRaw?: Record<string, any> | null;
-  verdict?: CurveVerdict | "reverted" | null;
+  verdict?: CurveDiagnosis["verdict"] | null;
   diagnosis?: CurveDiagnosis | null;
 }
 
@@ -314,16 +314,21 @@ export async function handlePolledConfig(
     device_after: deviceMeta(o.after),
     paged: o.verdict === "foreign" ? "high" : o.verdict === "echo_suspected" ? "default" : null,
   });
-  // No confirmation read (it failed, or SIGTERM cut the wait / the read short): NOTHING is recorded and nobody is
-  // paged — the change has not been shown to persist (#177), and recording the first read would advance the
-  // baseline over whatever a planner write may have put there meanwhile (codex pass 1). latestConfig() stays put, so
-  // the next poll (or the successor's first poll) sees the same diff and runs the whole check again.
-  const unconfirmed = async (why: string): Promise<DriftOutcome> => {
+  // No confirmation read (it failed, or SIGTERM cut the wait / the read short): the baseline does NOT advance and
+  // nobody is paged — the change has not been shown to persist (#177), and recording the first read as the config
+  // would overwrite whatever a planner write may have put there meanwhile (codex pass 1). latestConfig() stays put, so
+  // the next poll (or the successor's first poll) sees the same diff and runs the whole check again. A failed re-read
+  // (not a shutdown) still leaves an evidence row, and if the next poll no longer sees the change — our own write
+  // superseded it, or it vanished — pendingUnconfirmedNotice() says so at default priority (codex pass 3).
+  const unconfirmedDiagnosis = async (why: string): Promise<CurveDiagnosis> => {
     const writes = await lookupWrites(firstAtMs);
-    const diagnosis = diagnose({
+    return diagnose({
       fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved: false, writes,
       matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: dev,
     });
+  };
+  const unconfirmed = async (why: string, recorded?: CurveDiagnosis): Promise<DriftOutcome> => {
+    const diagnosis = recorded ?? await unconfirmedDiagnosis(why);
     log(`HBX curve change seen but not confirmed (${why}) — not recorded, not paged; the next poll re-checks:\n${fmtChanges(changes)}`);
     return { kind: "curve", config, device: dev, changes: null, diagnosis };
   };
@@ -331,11 +336,26 @@ export async function handlePolledConfig(
 
   // Re-read → baseline → verdict → record, all under the device lock (writes.ts withDeviceLock): no planner write can
   // land between the confirmation read and the row, so the read is judged against every write that has completed.
-  type Locked = { unconfirmed: string } | { diagnosis: CurveDiagnosis; finalDev: Record<string, any>; finalConfig: HbxConfig; finalChanges: Record<string, FieldChange> | null };
+  type Locked = { unconfirmed: string; diagnosis?: CurveDiagnosis } | { diagnosis: CurveDiagnosis; finalDev: Record<string, any>; finalConfig: HbxConfig; finalChanges: Record<string, FieldChange> | null };
   const locked: Locked = await lock(async (): Promise<Locked> => {
     let reread: Record<string, any>;
     try { reread = await deps.reread(); }
-    catch (e) { return { unconfirmed: `re-read failed: ${(e as Error).message}` }; }
+    catch (e) {
+      const why = `re-read failed: ${(e as Error).message}`;
+      if (/shutting down/.test(why)) return { unconfirmed: why };
+      // Keep the evidence (codex pass 3): an evidence row whose config is the UNCHANGED baseline — so it can never
+      // advance the baseline or close a TempIQ window (changed_fields NULL) — carrying the first read whole. Skipped
+      // if a planner write moved the baseline meanwhile (that write's own row is newer evidence of the curve).
+      try {
+        const cur = deps.latest ? await deps.latest() : prev;
+        if (cur && JSON.stringify(cur.config) === JSON.stringify(prev.config)) {
+          const d = await unconfirmedDiagnosis(why);
+          await deps.record({ config: prev.config, changes: null, raw: dev, rereadRaw: null, verdict: "unconfirmed", diagnosis: d });
+          return { unconfirmed: why, diagnosis: d };
+        }
+      } catch (e2) { log(`unconfirmed evidence row not written: ${(e2 as Error).message}`); }
+      return { unconfirmed: why };
+    }
     const rereadAtMs = now();
     const rereadAt = new Date(rereadAtMs).toISOString();
     // A planner write may have self-recorded a version during the wait: judge the re-read against THAT.
@@ -360,10 +380,10 @@ export async function handlePolledConfig(
       fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved: moved, writes, matches: v?.matches ?? [],
       before: base.raw, after: reread,
     });
-    await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict: verdict as ConfigVersionRecord["verdict"], diagnosis });
+    await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict, diagnosis });
     return { diagnosis, finalDev: reread, finalConfig, finalChanges };
   });
-  if ("unconfirmed" in locked) return unconfirmed(locked.unconfirmed);
+  if ("unconfirmed" in locked) return unconfirmed(locked.unconfirmed, locked.diagnosis);
   const { diagnosis, finalDev, finalConfig, finalChanges } = locked;
   const verdict = diagnosis.verdict;
 
@@ -399,4 +419,31 @@ export async function handlePolledConfig(
     );
   }
   return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis };
+}
+
+export const UNCONFIRMED_TITLE = "HBX curve change seen once, could not be confirmed";
+
+/**
+ * #177 (codex pass 3): an `unconfirmed` curve change is re-checked on the next poll. If that poll handles a curve event
+ * (the change is still there → it gets its own verdict and page; or it is unconfirmed again → keep waiting) the pending
+ * one is superseded. If the next poll sees NO curve change — a planner write (boost expiry, auto-pilot) replaced the
+ * curve, or the change vanished — the observation would otherwise be lost: say so at default priority, with the
+ * evidence, and without any single-writer claim. Returns the pending diagnosis to carry forward and the notice to send.
+ */
+export function pendingUnconfirmedNotice(
+  pending: CurveDiagnosis | null,
+  outcome: DriftOutcome,
+): { pending: CurveDiagnosis | null; notice: { title: string; body: string } | null } {
+  if (outcome.diagnosis?.verdict === "unconfirmed") return { pending: outcome.diagnosis, notice: null };
+  if (!pending) return { pending: null, notice: null };
+  if (outcome.kind === "curve") return { pending: null, notice: null };
+  return {
+    pending: null,
+    notice: {
+      title: UNCONFIRMED_TITLE,
+      body: `At ${pending.first_read_at} the device showed a reset-curve change the planner did not write, but the ` +
+        `confirmation re-read failed, and by the next poll the change was no longer there to confirm (a planner write ` +
+        `replaced the curve, or the first read was transient). Not a confirmed second writer.\n\n${diagnosisBody(pending)}`,
+    },
+  };
 }

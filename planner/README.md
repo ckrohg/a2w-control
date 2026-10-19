@@ -114,8 +114,12 @@ the planner records its *own* writes with a `_source` tag and therefore never se
   "HBX config changed (outside the planner)".
 - **Self-diagnosing curve alert (#177).** A `dbt`/`mbt` diff is re-read after ~30 s and pages only
   if it persists (a revert records both reads with `verdict = reverted`, `changed_fields` NULL, no
-  page; a re-read that fails or is cut short by SIGTERM records nothing and pages nobody — the
-  next poll, or the successor's first, sees the same diff and re-checks). The re-read → record runs
+  page; a re-read that fails or is cut short by SIGTERM pages nobody and never advances the
+  baseline — the next poll, or the successor's first, sees the same diff and re-checks. A failed
+  re-read leaves an `unconfirmed` evidence row whose config is the unchanged baseline, and if the
+  next poll no longer sees the change, a default-priority "HBX curve change seen once, could not be
+  confirmed" notice carries the evidence). Every query run under the device lock uses a small pool
+  with connect, statement and query timeouts, so a stalled database releases the lock. The re-read → record runs
   under the same in-process device lock as the writer's PATCH → self-record, so a dashboard write
   can never land between them. It is then compared with the planner's own accepted writes (`hbx_writes.requested`) in the
   previous 60 min: when **every** changed curve field is within **2 °F** of a value the planner
