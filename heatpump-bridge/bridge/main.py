@@ -88,7 +88,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         hub_client.start()
         from .self_heal import SelfHealer
         self_healer = SelfHealer(cfg.self_heal, pollers, span_breakers, store,
-                                 notify_cfg=cfg.notifications,
+                                 notify_cfg=cfg.notifications, span_cfg=cfg.span,
                                  state_dir=str(Path(cfg.db_path).resolve().parent))
         self_healer.start()
         app.state.self_heal = self_healer

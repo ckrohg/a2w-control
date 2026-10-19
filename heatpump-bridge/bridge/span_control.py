@@ -127,11 +127,15 @@ class BreakerController:
             "max_off_s": self.cfg.max_off_s,
         }
 
-    async def execute(self, circuit, action, *, off_s=None, source: str = "ui") -> dict:
+    async def execute(self, circuit, action, *, off_s=None, source: str = "ui",
+                      precheck=None) -> dict:
         """Run one breaker action. Raises BreakerRefused when a guard says no (nothing was
         switched); otherwise returns the outcome with the READ-BACK relay state. The work runs in
         a controller-owned task behind a shield, so a caller that goes away (a closed browser
-        tab, a dropped hub link) can never abandon a circuit half-way through a cycle."""
+        tab, a dropped hub link) can never abandon a circuit half-way through a cycle.
+        `precheck(circ)` (optional, sync) runs on the FRESH panel read immediately before an OPEN
+        is dispatched — no await in between — and refuses the action by returning a reason. The
+        self-heal uses it to re-validate pump state at the last possible moment."""
         name = circuit.strip() if isinstance(circuit, str) else ""
         label = name or repr(circuit)
         try:
@@ -156,7 +160,7 @@ class BreakerController:
         # check-and-set with no await in between: atomic on the event loop
         self._busy = {"circuit": spec.name, "action": action, "source": source,
                       "started": self._clock(), "off_s": hold}
-        self._task = asyncio.create_task(self._run(spec, action, hold, source),
+        self._task = asyncio.create_task(self._run(spec, action, hold, source, precheck),
                                          name=f"span-breaker-{action}")
         return await asyncio.shield(self._task)
 
@@ -293,7 +297,7 @@ class BreakerController:
         return circuits
 
     # --- the run --------------------------------------------------------------
-    async def _run(self, spec, action: str, hold: float, source: str) -> dict:
+    async def _run(self, spec, action: str, hold: float, source: str, precheck=None) -> dict:
         try:
             try:
                 circuits = await self._read_panel()
@@ -322,6 +326,10 @@ class BreakerController:
                 raise BreakerRefused(
                     f"'{spec.name}' is already {circ['relay_state'] or 'in an unknown state'} — "
                     "use On to restore it", 409)
+            if precheck is not None:
+                why = precheck(circ)
+                if why:
+                    raise BreakerRefused(f"precheck: {why}", 409)
             if action == "open":
                 return await self._do_open(spec, circ, source)
             return await self._do_cycle(spec, circ, hold, source)
