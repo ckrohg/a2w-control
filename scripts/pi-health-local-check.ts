@@ -212,6 +212,25 @@ async function main() {
     assert.equal(w6?.verdict, "unknown", `${at}: the outage during the flick is unknown (got ${w6?.verdict})`);
     assert.ok((fin.readings?.clockIntervals ?? []).some((c) => c.start <= F1 + 60 && c.end >= F1 + H - 120), `${at}: the re-stamped span is known from readings' ingestion order`);
   }
+  // codex pass 12 on #193 — a SHORT socket outage at the flick's start, ending > 10 min before the correction: the
+  // forward jump's skipped stretch is contaminated too, so it stays unknown (exports continued throughout)
+  await pool.query(`TRUNCATE phase_b_log RESTART IDENTITY`);
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $4::bigint, 60) t`, [T0 - 3 * H, T0, T0 + 5 * 60, T0 + 3 * H]);
+  for (const evalS of [T0 + H + 25 * 60, T0 + 3 * H]) {
+    const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+    const w7 = piHealth(fin, evalS * 1000).dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T0) <= 60);
+    assert.equal(w7?.minutes, 5);
+    assert.equal(w7?.verdict, "unknown", `T0..T0+5 outage, at T0+${Math.round((evalS - T0) / 60)} min: unknown, never gap_only (got ${w7?.verdict})`);
+    assert.ok((fin.readings?.clockIntervals ?? []).some((c) => c.start <= T0 && c.end >= F1 + H - 120), "the span runs from the forward jump to the end of the displaced rows");
+  }
+  await pool.query(`TRUNCATE phase_b_log RESTART IDENTITY`);
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $4::bigint, 300) t`, [T0 - 3 * H, T0, T0 + 25 * 60, T0 + 3 * H]);
   // codex pass 9 on #193 — the same flick with ONE mirror table missing at a time:
   // (a) readings absent: no arrival-order evidence → no reboot is ever certain during the catch-up
   await pool.query(`ALTER TABLE readings RENAME TO readings_hidden`);

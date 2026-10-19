@@ -967,10 +967,15 @@ export class Store {
       // readings.id is the mirror's INGESTION order — real arrival time — which system_stats lacks (codex pass 8 on
       // #193). A backward Pi-clock step shows here unambiguously: ts FALLS between consecutive rows of a pump in id
       // order. The span it re-stamps, (new ts, old ts], is clock-contaminated: rows there were stamped twice.
+      // The span starts where the clock LEFT real time, not where it returned (codex pass 12 on #193): for a flick
+      // (forward jump, then this backward step) that is the last row stamped before the return time — the row just
+      // before the forward jump — so the skipped stretch between the two is contaminated too.
       const back = await this.pool.query(
-        `SELECT ts::float8 AS start, prev_ts::float8 AS "end" FROM (
-           SELECT ts, lag(ts) OVER (PARTITION BY pump_id ORDER BY id) AS prev_ts FROM readings WHERE ts >= $1
-         ) x WHERE prev_ts - ts > $2 ORDER BY ts`, [fromS - 3_600, o.clockStepS]);
+        `SELECT COALESCE((SELECT max(r2.ts) FROM readings r2
+                          WHERE r2.pump_id = x.pump_id AND r2.id < x.id AND r2.ts < x.ts), x.ts)::float8 AS start,
+                x.prev_ts::float8 AS "end"
+         FROM (SELECT id, pump_id, ts, lag(ts) OVER (PARTITION BY pump_id ORDER BY id) AS prev_ts FROM readings WHERE ts >= $1) x
+         WHERE x.prev_ts - x.ts > $2 ORDER BY x.ts`, [fromS - 3_600, o.clockStepS]);
       contaminated = back.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) }));
       lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
       readings = {
