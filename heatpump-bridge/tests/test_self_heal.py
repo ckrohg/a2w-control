@@ -219,6 +219,29 @@ async def test_a_telemetry_gap_restarts_the_clear_hold(rig):
     assert "recovered" in await codes(r.store)
 
 
+async def test_a_switched_off_pump_is_not_recovery(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    r.p2.snapshot.update(on=False, state="off")              # fresh, fault-free, but OFF
+    for _ in range(32):
+        await r.step(heal)
+    c = await codes(r.store)
+    assert "recovered" not in c and "not_recovered" in c
+    assert heal.status()["pumps"]["pump2"]["last_outcome"]["detail"] == "switched off"
+
+
+async def test_whitespace_cannot_map_two_pumps_to_one_circuit(rig):
+    r = rig
+    heal = r.make(live=True, circuits={"pump1": "Air-Water 1", "pump2": " Air-Water 1 "})
+    assert set(heal.config_errors) == {"pump1", "pump2"}
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    assert r.panel.writes == []
+
+
 async def test_a_replacement_fault_is_not_recovery(rig):
     r = rig
     heal = r.make(live=True)
@@ -352,17 +375,24 @@ async def test_a_new_fault_episode_does_not_inherit_the_grace(rig, monkeypatch):
 
 async def test_nested_history_corruption_is_a_spent_budget_not_a_crash(rig):
     r = rig
-    for bad in ({"pumps": {"pump2": {"attempts": None}}},
-                {"pumps": {"pump2": {"attempts": [{"wall": "yesterday"}]}}},
-                {"pumps": {"pump2": {"attempts": [{"mono": 5}]}}},
-                {"pumps": []}):
+    def doc(pump2):   # a valid document except for pump2's entry
+        return {"v": 2, "pumps": {"pump1": {"attempts": []}, "pump2": pump2}}
+    for bad in (doc({"attempts": None}),
+                doc({"attempts": [{"wall": "yesterday"}]}),
+                doc({"attempts": [{"mono": 5}]}),
+                doc({"attempts": [{"wall": 1.0, "mono": "x", "boot": "boot-A"}]}),
+                doc([]),
+                {"v": 2, "pumps": []}):
         (r.tmp_path / sh_mod.STATE_FILE).write_text(json.dumps(bad))
         heal = r.make(live=True)
         assert heal.history_problem, bad
         assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 2
     (r.tmp_path / sh_mod.STATE_FILE).write_text(
-        '{"pumps": {"pump2": {"attempts": [{"wall": NaN, "mono": 1, "boot": "boot-A"}]}}}')
+        '{"v": 2, "pumps": {"pump1": {"attempts": []}, '
+        '"pump2": {"attempts": [{"wall": NaN, "mono": 1, "boot": "boot-A"}]}}}')
     assert r.make(live=True).history_problem
+    (r.tmp_path / sh_mod.STATE_FILE).write_text(json.dumps(doc({"attempts": []})))
+    assert not r.make(live=True).history_problem       # the control: the same shape, valid
 
 
 async def test_budget_survives_a_reboot_with_a_clock_step(rig):
