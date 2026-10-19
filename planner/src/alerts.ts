@@ -16,7 +16,7 @@ export interface AlertStore {
   openAlertEpisode(uid: string, kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number>;
   closeAlertEpisodeUids(uids: string[]): Promise<void>;
   markAlertNotified(id: number): Promise<void>;
-  undeliveredAlertEpisodes(): Promise<{ id: number; kind: string; title: string; detail: string | null }[]>;
+  undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]>;
   closeAlertEpisodeIds(ids: number[]): Promise<void>;
 }
 export type Send = (title: string, body: string) => Promise<boolean>;
@@ -122,8 +122,12 @@ export class AlertOutbox {
       if (!u.delivered && (await this.send(u.title, u.body + RESENT))) { sent++; u.delivered = true; }
       this.unrecorded.push(u); // still not durable — keep trying to persist it
     }
+    // a row whose uid is still held in memory (unrecorded — sent from memory, or already heard) or whose uid-close is
+    // pending (cancelled after a lost reply) is never sent from the DB as well (codex pass 9)
+    const heldUids = new Set<string>([...this.unclosedUids, ...this.unrecorded.map((u) => u.uid)]);
     for (const a of await this.store.undeliveredAlertEpisodes()) {
       if (this.unclosed.has(a.id) || this.unmarked.has(a.id)) continue; // resolved, or already heard
+      if (a.uid != null && heldUids.has(a.uid)) continue;
       if (!canResend(a.kind)) continue; // its watch has not re-evaluated the condition since a restore (index.ts)
       if (!(await this.send(a.title, `${a.detail ?? ""}${RESENT}`))) break;
       await this.mark(a.id);

@@ -18,7 +18,7 @@ import { AlertOutbox, type AlertStore } from "./alerts";
     },
     closeAlertEpisodeUids: async (uids) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (uids.includes(r.uid)) r.cleared = true; },
     markAlertNotified: async (id) => { rows[id - 1].notified = true; },
-    undeliveredAlertEpisodes: async () => rows.filter((r) => !r.cleared && !r.notified).map((r) => ({ id: r.id, kind: r.kind, title: r.title, detail: r.detail })),
+    undeliveredAlertEpisodes: async () => rows.filter((r) => !r.cleared && !r.notified).map((r) => ({ id: r.id, uid: r.uid, kind: r.kind, title: r.title, detail: r.detail })),
   };
   let up = false;
   const sent: string[] = [];
@@ -201,6 +201,31 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   const before2 = rows.length;
   await gx.open("stage_unserved", "8", "pump1", "⚠ one row", "b");
   assert.equal(rows.length, before2 + 1);
+
+  // codex pass 9: (a) a lost-reply insert cancelled on recovery whose uid-close FAILS → never paged meanwhile
+  up = false;
+  lostReply = true;
+  const gy = new AlertOutbox(ghost, send, () => {});
+  await gy.open("fault_called", "11", "pump2", "⚠ ghost 2", "E21");
+  closeUp = false;
+  await gy.close("fault_called", "11");                          // recovery; the close by uid fails
+  lostReply = false; up = true;
+  const n6 = sent.length;
+  await gy.retry();
+  assert.ok(!sent.slice(n6).includes("⚠ ghost 2"), "a resolved ghost is never paged while its uid-close is pending");
+  closeUp = true;
+  await gy.retry();
+  assert.equal(rows.find((r) => r.title === "⚠ ghost 2")?.cleared, true, "…and is closed once the DB takes it");
+  // (b) a lost-reply insert that WAS heard → persisted later and never sent a second time from the DB
+  lostReply = true;
+  const gz = new AlertOutbox(ghost, send, () => {});
+  const n7 = sent.length;
+  await gz.open("span_local_stale", "span2", null, "⚠ heard ghost", "x");
+  lostReply = false;
+  await gz.retry();
+  await gz.retry();
+  assert.equal(sent.slice(n7).filter((t) => t === "⚠ heard ghost").length, 1, "heard once, sent once");
+  assert.equal(rows.find((r) => r.title === "⚠ heard ghost")?.notified, true);
 
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

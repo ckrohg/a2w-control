@@ -888,10 +888,10 @@ export class Store {
   }
 
   /** Open episodes whose page no channel has acknowledged yet — re-sent every poll. */
-  async undeliveredAlertEpisodes(): Promise<{ id: number; kind: string; title: string; detail: string | null }[]> {
+  async undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]> {
     const r = await this.pool.query(
-      `SELECT id, kind, title, detail FROM alert_episodes WHERE cleared_at IS NULL AND notified_at IS NULL ORDER BY id LIMIT 20`);
-    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
+      `SELECT id, uid, kind, title, detail FROM alert_episodes WHERE cleared_at IS NULL AND notified_at IS NULL ORDER BY id LIMIT 20`);
+    return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
   }
 
   /** Episodes opened in the last 24 h, by kind (/health.unserved). */
