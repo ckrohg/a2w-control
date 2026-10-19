@@ -256,11 +256,12 @@ if [ -n "$HEALTH" ]; then
   SPANERR="$(jq -r '.span.refresh_error // empty' <<<"$HEALTH")"
   SPANTABLE="$(jq -r 'if .span.local_table == null then "absent" else (.span.local_table|tostring) end' <<<"$HEALTH")"
   CLOUDSTREAK="$(jq -r '.span.cloud.fail_streak // 0' <<<"$HEALTH")"
-  if [ "$(jq -r '.span.pending // false' <<<"$HEALTH")" = "true" ]; then
+  # the error first: a check that has never succeeded is pending AND failing — that is drift, not "just started"
+  if [ -n "$SPANERR" ] || { [ -n "$SPANCOMPUTED_AGO" ] && [ "$SPANCOMPUTED_AGO" -gt 900 ]; }; then
+    fail "/health.span is not being refreshed (last computed: $([ -n "$SPANCOMPUTED_AGO" ] && echo "${SPANCOMPUTED_AGO}s ago" || echo never)${SPANERR:+; error: $SPANERR}) — the SPAN-local check itself is failing"
+  elif [ "$(jq -r '.span.pending // false' <<<"$HEALTH")" = "true" ]; then
     skip "planner just started — /health.span not computed yet"
-  elif [ -n "$SPANERR" ] || { [ -n "$SPANCOMPUTED_AGO" ] && [ "$SPANCOMPUTED_AGO" -gt 900 ]; }; then
-    fail "/health.span is not being refreshed (computed ${SPANCOMPUTED_AGO:-?}s ago${SPANERR:+; error: $SPANERR}) — the SPAN-local check itself is failing"
-  elif [ "$SPANTABLE" = "absent" ]; then
+  elif [ "$SPANTABLE" = "absent" ] || [ "$SPANTABLE" = "false" ]; then
     skip "planner predates /health.span (#187), or span_readings is absent — redeploy the planner to assert it"
   elif [ -z "$SPANAGE" ]; then
     fail "no SPAN local samples in span_readings (table=${SPANTABLE}) — the local path is not reporting"

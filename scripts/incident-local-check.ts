@@ -66,6 +66,14 @@ async function main() {
   assert.equal(await store.closeStormEvents("stand-down", standDown, standDown), 1);
   const ended = (await pool.query(`SELECT ended_at FROM storm_events`)).rows[0].ended_at;
   assert.equal(new Date(ended).toISOString(), standDown.toISOString(), "ended at the stand-down, not at the retry");
+  // two stand-downs queued during one DB outage, applied oldest first (codex pass 7): each storm ends at ITS stand-down
+  await pool.query(`TRUNCATE storm_events RESTART IDENTITY`);
+  const sd1 = new Date(now - 2 * 3_600_000), sd2 = new Date(now - 3_600_000);
+  await pool.query(`INSERT INTO storm_events (started_at, trigger) VALUES ($1, 'first'), ($2, 'second')`,
+    [iso(now - 3 * 3_600_000), iso(now - 1.5 * 3_600_000)]);
+  for (const at of [sd1, sd2]) await store.closeStormEvents("stand-down", at, at);
+  const two = (await pool.query(`SELECT trigger, ended_at FROM storm_events ORDER BY id`)).rows;
+  assert.deepEqual(two.map((r: any) => [r.trigger, new Date(r.ended_at).toISOString()]), [["first", sd1.toISOString()], ["second", sd2.toISOString()]]);
 
   // ── #185 / #187: the alert-episode outbox ─────────────────────────────────────────────────────────────────────
   await pool.query(`TRUNCATE alert_episodes RESTART IDENTITY`);

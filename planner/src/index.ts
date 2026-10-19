@@ -735,11 +735,13 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
  * 4), scoped to rows started before boot, so it can never close a storm this process armed meanwhile.
  */
 const PROCESS_START = new Date();
-let pendingStandDownBefore: Date | null = null;
+const pendingStandDowns: Date[] = [];
 async function retryStormStandDown(): Promise<void> {
-  if (!pendingStandDownBefore) return;
-  try { await store.closeStormEvents("stand-down", pendingStandDownBefore, pendingStandDownBefore); pendingStandDownBefore = null; }
-  catch (e) { console.error("storm stand-down close failed (retried next tick):", (e as Error).message); }
+  while (pendingStandDowns.length) {
+    const at = pendingStandDowns[0];
+    try { await store.closeStormEvents("stand-down", at, at); pendingStandDowns.shift(); }
+    catch (e) { console.error("storm stand-down close failed (retried next tick):", (e as Error).message); return; }
+  }
 }
 let stormSweepDone = false;
 async function sweepStormOrphans(): Promise<void> {
@@ -1163,8 +1165,9 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
       "high",
     );
   } else {
-    // a failed close is retried every tick, scoped to rows started before this stand-down (codex pass 5)
-    pendingStandDownBefore = new Date();
+    // a failed close is retried every tick, scoped to rows started before this stand-down (codex pass 5); several
+    // stand-downs during one DB outage queue up and apply oldest first (codex pass 7)
+    pendingStandDowns.push(new Date());
     await retryStormStandDown();
     await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { resolved: true });
   }
