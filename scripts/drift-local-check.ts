@@ -72,15 +72,30 @@ async function main() {
   assert.equal(await b.pendingUnconfirmed(), null, "settled");
   await b.close();
 
-  // ── process C: nothing to repeat ──────────────────────────────────────────────────────────────────────────────
+  // ── process C: nothing to repeat; then unconfirmed → confirmed page that reached NOBODY → restart ──────────────
   const c = new Store(url);
   assert.equal(await c.pendingUnconfirmed(), null, "a later restart does not re-announce it");
-  // a confirmed foreign change records the verdict + diagnosis and becomes the newest curve diagnosis
-  const conf = await handlePolledConfig(await c.latestConfigVersion(), device(100, 96), deps(c, async () => device(100, 96), pages));
+  const again = await handlePolledConfig(await c.latestConfigVersion(), device(90, 86), deps(c, async () => { throw new Error("HTTP 503"); }, pages));
+  assert.equal(again.diagnosis?.verdict, "unconfirmed");
+  const dead = deps(c, async () => device(90, 86), pages);
+  dead.notify = async () => false;                                     // every channel down
+  const conf = await handlePolledConfig(await c.latestConfigVersion(), device(90, 86), dead);
   assert.equal(conf.diagnosis?.verdict, "foreign");
-  assert.equal((await c.latestCurveDiagnosis())?.verdict, "foreign");
-  assert.deepEqual(pages, ["⚠ Foreign HBX curve write — single-writer invariant"]);
-  await c.close();
+  assert.equal(conf.delivered, false);
+  assert.equal((await c.latestCurveDiagnosis())?.verdict, "foreign", "the confirmed row is recorded and is the newest diagnosis");
+  const kept = pendingUnconfirmedNotice(again.diagnosis, conf);
+  assert.equal(kept.resolved, false, "an undelivered confirmed page settles nothing");
+  await c.close(); // ← restart before anyone heard
+  const d = new Store(url);
+  const back = await d.pendingUnconfirmed();
+  assert.equal(back?.verdict, "unconfirmed", "the restart still reloads it — a later confirmed row does not hide it (codex pass 11)");
+  const quiet = await handlePolledConfig(await d.latestConfigVersion(), device(90, 86), deps(d, async () => device(90, 86), pages));
+  assert.equal(quiet.kind, "unchanged");
+  assert.equal(pendingUnconfirmedNotice(back, quiet).notice?.title, UNCONFIRMED_TITLE, "…and announces it");
+  await d.resolveUnconfirmed();
+  assert.equal(await d.pendingUnconfirmed(), null);
+  assert.deepEqual(pages, [], "the only page in this run was the undelivered one (counted by `dead`, not `pages`)");
+  await d.close();
   console.log("drift-local-check: all assertions passed");
 }
 

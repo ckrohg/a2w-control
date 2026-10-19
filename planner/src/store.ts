@@ -913,17 +913,16 @@ export class Store {
   }
 
   /**
-   * #177 (codex pass 4): the newest `unconfirmed` observation not yet settled — no resolved_at, and no confirmed curve
-   * event (echo_suspected / foreign) recorded after it. index.ts reloads it at boot so a restart between the
-   * evidence row and the next poll does not lose the follow-up notice.
+   * #177 (codex passes 4, 11): the newest `unconfirmed` observation not yet settled (no resolved_at). resolved_at is the
+   * ONLY settlement signal — PendingTracker stamps it after an acknowledged notice or a DELIVERED confirmed page; a
+   * later confirmed row whose page reached nobody must not hide it. index.ts reloads it at boot so a restart between
+   * the evidence row and the next poll does not lose the follow-up notice.
    */
   async pendingUnconfirmed(): Promise<CurveDiagnosis | null> {
     const r = await this.pool.query(
-      `SELECT u.diagnosis FROM hbx_config_versions u
-       WHERE u.verdict = 'unconfirmed' AND u.diagnosis IS NOT NULL AND u.diagnosis->>'resolved_at' IS NULL
-         AND NOT EXISTS (SELECT 1 FROM hbx_config_versions c
-                          WHERE c.id > u.id AND c.verdict IN ('echo_suspected', 'foreign'))
-       ORDER BY u.id DESC LIMIT 1`,
+      `SELECT diagnosis FROM hbx_config_versions
+       WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL
+       ORDER BY id DESC LIMIT 1`,
     );
     return r.rowCount ? (r.rows[0].diagnosis as CurveDiagnosis) : null;
   }
