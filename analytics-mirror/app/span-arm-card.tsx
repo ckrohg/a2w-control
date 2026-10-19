@@ -19,7 +19,8 @@ export function SpanArmCard({ state, events, nowS: serverNowS }: { state: ArmSta
   const [pending, setPending] = useState(false);
   const [desired, setDesired] = useState<boolean | null>(state?.desired_armed ?? state?.armed ?? false);
   const armed = desired ?? false;
-  const relayOpen = state?.relay_state === "OPEN";
+  const relayOpen = state?.relay_state?.toUpperCase() === "OPEN";
+  const relayClosed = state?.relay_state?.toUpperCase() === "CLOSED"; // anything else is unknown, never "available"
   // #184: a relay reading older than 15 min is not a state — say how old it is instead.
   const relayAgeS = state?.ts != null ? nowS - (state.ts > 1e12 ? state.ts / 1000 : state.ts) : null;
   const relayAgeMin = relayAgeS != null ? Math.round(relayAgeS / 60) : null;
@@ -45,10 +46,12 @@ export function SpanArmCard({ state, events, nowS: serverNowS }: { state: ArmSta
         </span>
       </h3>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", margin: "8px 0" }}>
-        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale ? "#888" : relayOpen ? "var(--crit)" : "#e0b24d" }}>
+        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale || !(relayOpen || relayClosed) ? "#888" : relayOpen ? "var(--crit)" : "#e0b24d" }}>
           {state?.relay_state == null ? "—"
             : relayStale ? `unknown (SPAN data ${relayAgeMin == null ? "undated" : `${relayAgeMin} min old`})`
-            : relayOpen ? "OPEN — unavailable" : "CLOSED — available"}</b></span>
+            : relayOpen ? "OPEN — unavailable"
+            : relayClosed ? "CLOSED — available"
+            : `unknown (relay state "${state.relay_state}")`}</b></span>
         <span>A2W: <b style={{ color: armed ? "#4dabf7" : "#888" }}>{armed ? "ARMED" : "DISARMED"}</b></span>
         <button
           disabled={pending}
