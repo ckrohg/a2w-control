@@ -142,6 +142,11 @@ class SelfHealer:
     def _check_config(self) -> dict[str, str]:
         """Problems that make a pump ineligible — reported, never a boot failure."""
         errs: dict[str, str] = {}
+        if self.cfg.live and not self.cfg.circuits_verified:
+            # A guessed map could power-cycle the HEALTHY pump (the power backstop only catches
+            # a swap while that pump draws running-level power).
+            return {pid: "the pump↔circuit map is not verified (self_heal.circuits_verified: false)"
+                    for pid in self.cfg.circuits}
         span = self.span_cfg
         if span is None:
             return errs

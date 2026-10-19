@@ -302,6 +302,10 @@ class SelfHealConfig(BaseModel):
     # "idle" pump's circuit draws running-level power, but that is a backstop, not the check).
     circuits: dict[str, str] = Field(default_factory=lambda: {"pump1": "Air-Water 1",
                                                               "pump2": "Air-Water 2"})
+    # LIVE switching needs the owner to confirm the map above on the house (e.g. watch each
+    # circuit's watts while one pump runs). Until then live=true is reported unavailable and
+    # pages; shadow runs either way.
+    circuits_verified: bool = False
 
     @field_validator("circuits", mode="after")
     @classmethod
