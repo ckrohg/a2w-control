@@ -146,15 +146,20 @@ export class Store {
         cleared_at timestamptz,
         detail     text
       );
-      -- #185: per-stage unserved-call episodes (stagewatch.ts): kind stage_unserved | fault_called, one row per edge.
-      CREATE TABLE IF NOT EXISTS stage_unserved_episodes (
-        id         serial PRIMARY KEY,
-        kind       text NOT NULL,
-        stage      text NOT NULL,
-        pump_id    text NOT NULL,
-        started_at timestamptz NOT NULL DEFAULT now(),
-        cleared_at timestamptz,
-        detail     text
+      -- #185 / #187: edge-triggered alert episodes with a delivery OUTBOX. kind = stage_unserved | fault_called (key =
+      -- the HBX stage) | span_local_stale (key = 'span'). notified_at stays NULL until a channel ACKNOWLEDGED the page
+      -- (index.ts ntfyDelivered); every poll re-sends the open, unnotified ones — so a page that failed to deliver is
+      -- never silently "already alerted", and a restart re-adopts open episodes instead of re-paging them.
+      CREATE TABLE IF NOT EXISTS alert_episodes (
+        id          serial PRIMARY KEY,
+        kind        text NOT NULL,
+        key         text NOT NULL,
+        pump_id     text,
+        started_at  timestamptz NOT NULL DEFAULT now(),
+        cleared_at  timestamptz,
+        title       text NOT NULL,
+        detail      text,
+        notified_at timestamptz
       );
       CREATE TABLE IF NOT EXISTS hbx_boosts (
         id         serial PRIMARY KEY,
@@ -847,30 +852,42 @@ export class Store {
     );
   }
 
-  /** #185: open a per-stage episode (stagewatch.ts edge). */
-  async openStageEpisode(kind: string, stage: string, pumpId: string, detail: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO stage_unserved_episodes (kind, stage, pump_id, detail) VALUES ($1, $2, $3, $4)`, [kind, stage, pumpId, detail]);
-  }
-
-  /** #185: close every open episode of this kind on this stage. */
-  async closeStageEpisodes(kind: string, stage: string): Promise<void> {
-    await this.pool.query(
-      `UPDATE stage_unserved_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND kind = $1 AND stage = $2`, [kind, stage]);
-  }
-
-  /** #185: episodes still open (a restart re-adopts them so they close instead of re-paging). */
-  async openStageEpisodes(): Promise<{ type: "stage_unserved" | "fault_called"; stage: string }[]> {
-    const r = await this.pool.query(`SELECT DISTINCT kind, stage FROM stage_unserved_episodes WHERE cleared_at IS NULL`);
-    return r.rows
-      .filter((x: any) => x.kind === "stage_unserved" || x.kind === "fault_called")
-      .map((x: any) => ({ type: x.kind, stage: String(x.stage) }));
-  }
-
-  /** #185: episodes opened in the last 24 h, by kind (/health.unserved). */
-  async stageEpisodes24h(): Promise<Record<string, number>> {
+  /** #185 / #187: open an alert episode; returns its id (the outbox row). */
+  async openAlertEpisode(kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number> {
     const r = await this.pool.query(
-      `SELECT kind, count(*)::int AS n FROM stage_unserved_episodes WHERE started_at > now() - interval '24 hours' GROUP BY kind`);
+      `INSERT INTO alert_episodes (kind, key, pump_id, title, detail) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [kind, key, pumpId, title, detail]);
+    return Number(r.rows[0].id);
+  }
+
+  /** The page for this episode was acknowledged by a channel. */
+  async markAlertNotified(id: number): Promise<void> {
+    await this.pool.query(`UPDATE alert_episodes SET notified_at = now() WHERE id = $1`, [id]);
+  }
+
+  /** Close every open episode of this kind and key. */
+  async closeAlertEpisodes(kind: string, key: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND kind = $1 AND key = $2`, [kind, key]);
+  }
+
+  /** Episodes still open (a restart re-adopts them so they close instead of re-paging). */
+  async openAlertEpisodes(): Promise<{ id: number; kind: string; key: string }[]> {
+    const r = await this.pool.query(`SELECT id, kind, key FROM alert_episodes WHERE cleared_at IS NULL ORDER BY id`);
+    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), key: String(x.key) }));
+  }
+
+  /** Open episodes whose page no channel has acknowledged yet — re-sent every poll. */
+  async undeliveredAlertEpisodes(): Promise<{ id: number; kind: string; title: string; detail: string | null }[]> {
+    const r = await this.pool.query(
+      `SELECT id, kind, title, detail FROM alert_episodes WHERE cleared_at IS NULL AND notified_at IS NULL ORDER BY id LIMIT 20`);
+    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
+  }
+
+  /** Episodes opened in the last 24 h, by kind (/health.unserved). */
+  async alertEpisodes24h(): Promise<Record<string, number>> {
+    const r = await this.pool.query(
+      `SELECT kind, count(*)::int AS n FROM alert_episodes WHERE started_at > now() - interval '24 hours' GROUP BY kind`);
     return Object.fromEntries(r.rows.map((x: any) => [String(x.kind), Number(x.n)]));
   }
 
@@ -898,13 +915,21 @@ export class Store {
 
   /**
    * #187: the newest SPAN LOCAL sample per circuit name (the mirror's span_readings, fed by the Pi's LAN poller; Pi
-   * epoch seconds) over the last day; null when the table is absent (rehearsal DB). Index (name, ts).
+   * epoch seconds) at ANY age — a planner started during a multi-day outage must still see that reporting stopped
+   * (codex pass 1). A loose index scan over (name, ts): one index probe per distinct name, never a table scan. Samples
+   * stamped > 2 min ahead of our clock are ignored. null when the table is absent (rehearsal DB).
    */
   async spanLocalLatest(nowS: number): Promise<Record<string, number> | null> {
     try {
       const r = await this.pool.query(
-        `SELECT name, max(ts)::float8 AS ts FROM span_readings WHERE ts >= $1 AND ts <= $2 GROUP BY name`, [nowS - 86_400, nowS + 120]);
-      return Object.fromEntries(r.rows.map((x: any) => [String(x.name), Number(x.ts)]));
+        `WITH RECURSIVE n AS (
+           (SELECT name FROM span_readings ORDER BY name LIMIT 1)
+           UNION ALL
+           SELECT (SELECT s.name FROM span_readings s WHERE s.name > n.name ORDER BY s.name LIMIT 1) FROM n WHERE n.name IS NOT NULL
+         )
+         SELECT n.name, (SELECT max(s.ts) FROM span_readings s WHERE s.name = n.name AND s.ts <= $1)::float8 AS ts
+         FROM n WHERE n.name IS NOT NULL`, [nowS + 120]);
+      return Object.fromEntries(r.rows.filter((x: any) => x.ts != null).map((x: any) => [String(x.name), Number(x.ts)]));
     } catch (e) {
       if ((e as { code?: string }).code === "42P01") return null;
       throw e;

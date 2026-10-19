@@ -13,7 +13,7 @@
  */
 
 export const STAGE_START_GRACE_MS = 10 * 60 * 1000;
-/** A gap between steps longer than this never counts as called time (a planner pause or a skipped poll). */
+/** A gap between steps longer than this credits no called time at all (a planner pause or skipped polls). */
 export const MAX_STEP_MS = 15 * 60 * 1000;
 export const DEFAULT_STAGE_PUMP_MAP: Readonly<Record<string, string>> = { "1": "pump1", "2": "pump2" };
 
@@ -70,10 +70,13 @@ interface StageState {
 }
 
 const label = (p: StagePump | undefined, id: string) => p?.name?.trim() || id;
-const faulted = (p: StagePump | undefined) => !!p && (p.state === "fault" || (p.active_faults ?? 0) > 0);
+// The bridge's derived `fault` state already excludes info-level protections (P17 anti-freeze is NORMAL — poller.py
+// _derive_state), while the hub's raw active_faults COUNT includes them: never page on the count (codex pass 1).
+// A non-info code from the mirror's pump_snapshots counts too.
+const faulted = (p: StagePump | undefined) => !!p && (p.state === "fault" || (p.fault_codes?.length ?? 0) > 0);
 const describe = (p: StagePump | undefined, id: string): string => {
   if (!p) return `${id} is not in the hub's state (no data)`;
-  const codes = p.fault_codes?.length ? `, ${p.fault_codes.join("/")}` : (p.active_faults ?? 0) > 0 ? `, ${p.active_faults} active fault(s)` : "";
+  const codes = p.fault_codes?.length ? `, ${p.fault_codes.join("/")}` : "";
   return `${label(p, id)} is ${p.online ? (p.state ?? "unknown") : "offline"}${codes}`;
 };
 
@@ -146,7 +149,9 @@ export class StageWatch {
         continue;
       }
       const defrost = !!pump && pump.online && pump.state === "defrost";
-      const dt = s.lastStepMs == null ? 0 : Math.min(Math.max(0, i.nowMs - s.lastStepMs), MAX_STEP_MS);
+      // a gap longer than MAX_STEP_MS (skipped polls) credits NOTHING — the call may have just begun (codex pass 1)
+      const gap = s.lastStepMs == null ? 0 : Math.max(0, i.nowMs - s.lastStepMs);
+      const dt = gap > MAX_STEP_MS ? 0 : gap;
       if (!defrost) s.calledMs += dt; // defrost suspends the start-grace clock (it neither runs nor resets)
       s.lastStepMs = i.nowMs;
       if (!s.unservedOpen && s.calledMs >= this.graceMs) {

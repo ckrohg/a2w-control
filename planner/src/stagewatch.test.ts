@@ -113,4 +113,23 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   assert.equal(STAGE_START_GRACE_MS, 600_000);
 }
 
+// ── 9. codex pass 1 — P17 anti-freeze (info) counts in the hub's active_faults but is NOT a fault; a skipped-poll gap
+// credits no called time ─────────────────────────────────────────────────────────────────────────────────────────
+{
+  const w = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  for (let m = 0; m <= 30; m += 5) {
+    assert.deepEqual(w.step({ nowMs: min(m), stagesCalled: [true, false], pumps: [hp1("heating", { active_faults: 1, fault_codes: [] }), hp2("idle")], lagTMin: 180 }), [],
+      "heating with P17 active: no page");
+  }
+  // a non-info code with a non-fault state still pages (state lags the code by a poll)
+  const c = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  assert.equal(c.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle", { active_faults: 1, fault_codes: ["E21"] }), hp2("idle")], lagTMin: 180 })[0]?.type, "fault_called");
+  // skipped polls: called at 0, then nothing until 60 min, then 65 → only 5 min credited, no page
+  const g = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  g.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
+  assert.deepEqual(g.step({ nowMs: min(60), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), [], "an hour-long gap credits nothing");
+  assert.deepEqual(g.step({ nowMs: min(65), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), []);
+  assert.equal(g.step({ nowMs: min(70), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }).length, 1, "10 min of OBSERVED call after the gap → page");
+}
+
 console.log("stagewatch.test.ts: all assertions passed");

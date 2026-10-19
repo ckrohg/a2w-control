@@ -45,6 +45,7 @@ import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, type StagePump } from "./stagewatch";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
+import { AlertOutbox } from "./alerts";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -711,15 +712,20 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
   const events = stageWatch.step({ nowMs: Date.now(), stagesCalled: reading.stagesCalled, pumps, lagTMin: lastLagTMin });
   for (const e of events) {
     if (e.kind === "open") {
-      await store.openStageEpisode(e.type, e.stage, e.pumpId, e.body).catch((err) => console.error("stage episode open failed:", (err as Error).message));
       console.warn(`[stagewatch] ${e.title}: ${e.body}`);
-      await ntfy(e.title, e.body, "high");
+      await openAlert(e.type, e.stage, e.pumpId, e.title, e.body);
     } else {
-      await store.closeStageEpisodes(e.type, e.stage).catch((err) => console.error("stage episode close failed:", (err as Error).message));
+      await store.closeAlertEpisodes(e.type, e.stage).catch((err) => console.error("alert episode close failed:", (err as Error).message));
       await ntfy(e.title, e.body, "default", { resolved: true });
     }
   }
-  stageEpisodes24h = await store.stageEpisodes24h().catch(() => stageEpisodes24h);
+  stageEpisodes24h = await store.alertEpisodes24h().catch(() => stageEpisodes24h);
+}
+
+// #185 / #187: the alert outbox (alerts.ts) — pages resolved only on acknowledged delivery, re-sent every poll.
+const alerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "high"));
+async function openAlert(kind: string, key: string, pumpId: string | null, title: string, body: string): Promise<void> {
+  await alerts.open(kind, key, pumpId, title, body);
 }
 
 // #187: the SPAN-local heartbeat (spanlocal.ts) — refreshed every poll, served from here on /health.span.
@@ -733,7 +739,11 @@ async function checkSpanLocal(): Promise<void> {
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   const n = spanLocalAlarm.step(spanLocal);
-  if (n) await ntfy(n.title, n.body, n.priority, n.resolved ? { resolved: true } : {});
+  if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
+  else if (n) {
+    await store.closeAlertEpisodes("span_local_stale", "span").catch((err) => console.error("alert episode close failed:", (err as Error).message));
+    await ntfy(n.title, n.body, n.priority, { resolved: true });
+  }
 }
 
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
@@ -1739,6 +1749,7 @@ async function pollOnce(): Promise<void> {
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   await checkSpanLocal().catch((e) => console.error("span-local check failed:", (e as Error).message));
+  await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
@@ -1852,7 +1863,14 @@ async function main(): Promise<void> {
   else await store.ensureSchemaWithRetry();
   lastCurveDiagnosis = await store.latestCurveDiagnosis().catch(() => null); // #177: /health survives a redeploy
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
-  stageWatch.restore(await store.openStageEpisodes().catch(() => []));       // #185: open episodes close, never re-page
+  {
+    // #185 / #187: open alert episodes are re-adopted — they close on clear instead of re-paging; undelivered ones are
+    // re-sent by alerts.retry() on the first poll
+    const open = await store.openAlertEpisodes().catch(() => []);
+    stageWatch.restore(open.filter((o) => o.kind === "stage_unserved" || o.kind === "fault_called")
+      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
+    if (open.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
+  }
   // #183: the storm machine always starts idle (its state is in memory), so any storm_events row still open is an
   // orphan of an earlier process — close it, or the mirror banner shows "armed" while /health.storm is idle. A storm
   // that is still live re-arms on the next trigger poll and opens a fresh row.

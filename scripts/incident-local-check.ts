@@ -1,12 +1,12 @@
 /**
  * @purpose Incident fixes 2026-10-16 (#183, #185, #187): exercise the new store SQL against a LOCAL Postgres with the
- * real table shapes — the storm_events sweep (every open row closes; orphans at their own windowEnd), the per-stage
- * episode table, fault codes from the mirror's pump_snapshots, and the SPAN-local latest-per-circuit read from
+ * real table shapes — the storm_events sweep (every open row closes; orphans at their own windowEnd), the alert-
+ * episode outbox, fault codes from the mirror's pump_snapshots, and the SPAN-local latest-per-circuit read from
  * span_readings (absent tables → the documented empty answers). Never touches production: refuses any URL whose
  * effective host is not loopback (planner/src/local-db.ts).
  *
  * Run from planner/:  LOCAL_DATABASE_URL=postgres://localhost:5432/a2w_local npx tsx ../scripts/incident-local-check.ts
- * (createdb a2w_local first if needed; the check TRUNCATEs storm_events / stage_unserved_episodes and drops/recreates
+ * (createdb a2w_local first if needed; the check TRUNCATEs storm_events / alert_episodes and drops/recreates
  * pump_snapshots + span_readings.) Exits non-zero on any failed assertion.
  */
 import assert from "node:assert/strict";
@@ -53,15 +53,19 @@ async function main() {
   assert.equal(rows[4].detail, null, "an already-closed row is untouched");
   assert.equal(await store.closeStormEvents("stand-down"), 0, "idempotent");
 
-  // ── #185: per-stage episodes ───────────────────────────────────────────────────────────────────────────────────
-  await pool.query(`TRUNCATE stage_unserved_episodes RESTART IDENTITY`);
-  await store.openStageEpisode("fault_called", "2", "pump2", "Stage 2 called but Heat Pump 2 is FAULTED (E21)");
-  await store.openStageEpisode("stage_unserved", "2", "pump2", "Stage 2 called for 10 min …");
-  assert.deepEqual((await store.openStageEpisodes()).sort((a, b) => a.type.localeCompare(b.type)),
-    [{ type: "fault_called", stage: "2" }, { type: "stage_unserved", stage: "2" }]);
-  await store.closeStageEpisodes("fault_called", "2");
-  assert.deepEqual(await store.openStageEpisodes(), [{ type: "stage_unserved", stage: "2" }]);
-  assert.deepEqual(await store.stageEpisodes24h(), { fault_called: 1, stage_unserved: 1 });
+  // ── #185 / #187: the alert-episode outbox ─────────────────────────────────────────────────────────────────────
+  await pool.query(`TRUNCATE alert_episodes RESTART IDENTITY`);
+  const f = await store.openAlertEpisode("fault_called", "2", "pump2", "⚠ Stage 2 called but Heat Pump 2 is FAULTED", "E21");
+  const u = await store.openAlertEpisode("stage_unserved", "2", "pump2", "⚠ Stage 2 called 10 min but Heat Pump 2 is not heating", "…");
+  await store.openAlertEpisode("span_local_stale", "span", null, "⚠ SPAN local stream stale", "…");
+  assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [1, 2, 3], "nothing acknowledged yet → all in the outbox");
+  await store.markAlertNotified(f);
+  assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u, 3]);
+  await store.closeAlertEpisodes("fault_called", "2");
+  await store.closeAlertEpisodes("span_local_stale", "span");
+  assert.deepEqual((await store.openAlertEpisodes()).map((x) => [x.kind, x.key]), [["stage_unserved", "2"]], "a restart re-adopts what is still open");
+  assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u], "a cleared episode leaves the outbox");
+  assert.deepEqual(await store.alertEpisodes24h(), { fault_called: 1, stage_unserved: 1, span_local_stale: 1 });
 
   // ── #185: fault codes from pump_snapshots (the mirror's latest-only full snapshot) ────────────────────────────────
   await pool.query(`DROP TABLE IF EXISTS pump_snapshots`);
@@ -84,9 +88,13 @@ async function main() {
     (4, $4, 'Air-Water 2', 7), (5, $5, 'Old circuit', 0), (6, $6, 'Air-Water 1', 2200)`,
     [nowS - 60, nowS - 25, nowS - 40, nowS - 3_600, nowS - 2 * 86_400, nowS + 3_600]);
   const latest = await store.spanLocalLatest(nowS);
-  assert.deepEqual(Object.keys(latest ?? {}).sort(), ["Air-Water 1", "Air-Water 2", "Buffer Tank"], "older than a day is not a live circuit");
+  assert.deepEqual(Object.keys(latest ?? {}).sort(), ["Air-Water 1", "Air-Water 2", "Buffer Tank", "Old circuit"], "every circuit, at any age");
   assert.equal(latest?.["Buffer Tank"], nowS - 25);
+  assert.equal(latest?.["Old circuit"], nowS - 2 * 86_400, "a 2-day-old circuit keeps its honest age (codex pass 1)");
   assert.equal(latest?.["Air-Water 1"], nowS - 40, "a sample stamped an hour in the future is ignored");
+  // a planner started during a 2-day outage: every circuit is old → the newest sample is 2 days old
+  await pool.query(`DELETE FROM span_readings WHERE ts > $1`, [nowS - 2 * 86_400 + 1]);
+  assert.deepEqual(await store.spanLocalLatest(nowS), { "Old circuit": nowS - 2 * 86_400 });
 
   console.log("incident-local-check: all assertions passed");
 }

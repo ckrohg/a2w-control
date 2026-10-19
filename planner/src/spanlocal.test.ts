@@ -53,4 +53,17 @@ const badCloud: SpanCloudState = { enabled: true, last_ok_at: "2026-10-15T23:40:
   // a Pi clock ahead of ours never yields a negative age
   assert.equal(spanHealth({ x: NOW + 30 }, NOW, okCloud).local_last_reading_age_s, 0);
 }
+// ── 5. codex pass 1 — a planner started during a 2-day outage still sees it (any-age newest sample); a restart
+// re-adopts the open episode: no second page, and the recovery still resolves it ─────────────────────────────────
+{
+  const a = new SpanLocalAlarm();
+  const twoDays = spanHealth({ "Buffer Tank": NOW - 2 * 86_400 }, NOW, okCloud);
+  assert.equal(twoDays.local_stale, true);
+  assert.equal(a.step(twoDays)?.priority, "high");
+  const restarted = new SpanLocalAlarm();
+  restarted.restore(true);
+  assert.equal(restarted.step(twoDays), null, "restart during the outage: no second page");
+  assert.equal(restarted.step(spanHealth({ "Buffer Tank": NOW - 10 }, NOW, okCloud))?.resolved, true, "…and recovery still resolves it");
+}
+
 console.log("spanlocal.test.ts: all assertions passed");

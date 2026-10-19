@@ -44,6 +44,8 @@ export function spanHealth(byName: Record<string, number> | null, nowS: number, 
 /** Edge-triggered: one high page when the local stream goes stale, one resolved notice when it returns. */
 export class SpanLocalAlarm {
   private alerted = false;
+  /** A restart re-adopts an open span_local_stale episode (alert_episodes): no second page, and recovery still closes it. */
+  restore(open: boolean): void { this.alerted = open; }
   step(h: SpanHealth): { title: string; body: string; priority: "high" | "default"; resolved: boolean } | null {
     if (h.local_stale === null) return null; // absent / empty table: no evidence either way — never page on it
     if (h.local_stale && !this.alerted) {
