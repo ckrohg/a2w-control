@@ -41,6 +41,7 @@ EVENT_TYPE = "span_breaker"
 READBACK_TRIES = 3           # the panel can lag a write by a beat; re-read before calling it a mismatch
 READBACK_GAP_S = 1.0
 CYCLE_FILE = "span-breaker-cycle.json"
+OPENS_FILE = "span-breaker-opens.json"   # bare OPENs: when, so the min-off survives a restart
 
 
 def read_boot_id() -> str | None:
@@ -84,6 +85,7 @@ class BreakerController:
         self.notify_cfg = notify_cfg
         self.cache = cache              # SpanLocalPoller: latest_circuits shared with the poll loop
         self._cycle_path = Path(state_dir) / CYCLE_FILE if state_dir else None
+        self._opens_path = Path(state_dir) / OPENS_FILE if state_dir else None
         self._sleep = sleep             # injectable: tests hold 60 s without waiting 60 s
         self._clock = clock             # wall clock: persisted timestamps, reports
         self._mono = mono               # in-process hold timing (immune to clock steps)
@@ -156,6 +158,7 @@ class BreakerController:
         circuit and may not have closed it (crash, power loss, SIGKILL). Finish that cycle: wait
         out the rest of the hold — all of it when the OPEN's timing was never recorded — then
         CLOSE with the same retries and paging."""
+        self._restore_opens()
         rec = self._read_cycle_file()
         if rec is None:
             return
@@ -294,7 +297,8 @@ class BreakerController:
         state, err = await self._close_once(cid, name)
         ok = state == "CLOSED"
         if ok:
-            self._opened_at.pop(name, None)
+            if self._opened_at.pop(name, None) is not None:
+                self._persist_opens()
             self._finish_pending(name)
         result = self._result(name, "close", ok, state, "CLOSED", source,
                               "ON (verified)" if ok else f"read-back {state or 'unavailable'}"
@@ -309,11 +313,16 @@ class BreakerController:
         name, cid = spec.name, circ["circuit_id"]
         err = None
         self._opened_at[name] = self._mono()   # before dispatch: the min-off guard is conservative
+        if not self._persist_opens():
+            self._opened_at.pop(name, None)
+            raise BreakerRefused("could not persist the switch-off time (disk?) — refusing to "
+                                 "switch anything off", 503)
         try:
             await self.client.set_relay(cid, "OPEN", open_permit=OpenPermit(cid, name, f"open ({source})"))
         except Exception as exc:  # noqa: BLE001 — the request may still have landed; read back
             err = str(exc)
         self._opened_at[name] = self._mono()
+        self._persist_opens()
         state = await self._readback(cid, name, "OPEN")
         ok = state == "OPEN"
         detail = "OFF (verified)" if ok else f"read-back {state or 'unavailable'}" + (f" ({err})" if err else "")
@@ -595,25 +604,56 @@ class BreakerController:
 
     # --- crash-recovery record ------------------------------------------------
     def _write_cycle_file(self, rec: dict) -> bool:
-        """Durably replace the cycle record (file fsync + rename + directory fsync)."""
-        if not self._cycle_path:
+        return self._write_durable(self._cycle_path, rec)
+
+    @staticmethod
+    def _write_durable(path: Path | None, obj) -> bool:
+        """Durably replace a small JSON record (file fsync + rename + directory fsync)."""
+        if not path:
             return False
-        tmp = self._cycle_path.with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         try:
             with open(tmp, "w") as f:
-                json.dump(rec, f)
+                json.dump(obj, f)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._cycle_path)
-            dfd = os.open(str(self._cycle_path.parent), os.O_RDONLY)
+            os.replace(tmp, path)
+            dfd = os.open(str(path.parent), os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
             return True
         except OSError as exc:
-            log.warning("span breaker: cycle record write failed: %s", exc)
+            log.warning("span breaker: record write failed (%s): %s", path.name, exc)
             return False
+
+    def _persist_opens(self) -> bool:
+        """Bare-OPEN times (power cycles have their own record). Monotonic + boot id, so a restart
+        in the same boot keeps the real elapsed time and a reboot restarts the hold."""
+        recs = {n: {"opened_mono": t, "boot_id": self._boot_id} for n, t in self._opened_at.items()
+                if n not in self._pending_close}
+        return self._write_durable(self._opens_path, recs)
+
+    def _restore_opens(self) -> None:
+        if not self._opens_path:
+            return
+        try:
+            recs = json.loads(self._opens_path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("span breaker: opens record unreadable (%s) — ignoring", exc)
+            return
+        if not isinstance(recs, dict):
+            return
+        now = self._mono()
+        for n, r in recs.items():
+            t = r.get("opened_mono") if isinstance(r, dict) else None
+            same_boot = bool(self._boot_id) and isinstance(r, dict) and r.get("boot_id") == self._boot_id
+            # same boot: the real elapsed time; otherwise unknown -> the min-off restarts now
+            self._opened_at[n] = t if same_boot and isinstance(t, (int, float)) and math.isfinite(t) \
+                and t <= now else now
 
     def _read_cycle_file(self) -> dict | None:
         if not self._cycle_path:

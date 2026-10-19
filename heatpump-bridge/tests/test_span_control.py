@@ -392,6 +392,38 @@ async def test_open_then_close_respects_min_off_time(rig):
     assert (await ctl.execute("Kitchen", "close"))["relay_state"] == "CLOSED"
 
 
+async def test_min_off_after_a_bare_open_survives_a_restart(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    ctl._boot_id = "boot-A"
+    assert (await ctl.execute("Kitchen", "open"))["ok"]
+    fresh = BreakerController(ctl.cfg, ctl.client, store, cache=ctl.cache, state_dir=str(tmp_path),
+                              sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+    fresh._boot_id = "boot-A"
+    await fresh.recover()                      # a restart within the same boot
+    ft.t += 30
+    with pytest.raises(BreakerRefused, match="minimum off time"):
+        await fresh.execute("Kitchen", "close")
+    ft.t += 30
+    assert (await fresh.execute("Kitchen", "close"))["relay_state"] == "CLOSED"
+    rebooted = BreakerController(ctl.cfg, ctl.client, store, cache=ctl.cache, state_dir=str(tmp_path),
+                                 sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+    await rebooted.recover()                   # the close cleared the record
+    assert rebooted._opened_at == {}
+
+
+async def test_min_off_after_a_reboot_restarts_the_hold(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    ctl._boot_id = "boot-A"
+    assert (await ctl.execute("Kitchen", "open"))["ok"]
+    ft.t += 3600                               # long ago, but a reboot makes it unknowable
+    rebooted = BreakerController(ctl.cfg, ctl.client, store, cache=ctl.cache, state_dir=str(tmp_path),
+                                 sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+    rebooted._boot_id = "boot-B"
+    await rebooted.recover()
+    with pytest.raises(BreakerRefused, match="minimum off time"):
+        await rebooted.execute("Kitchen", "close")
+
+
 # --- crash recovery -----------------------------------------------------------------------
 async def test_recover_closes_a_circuit_a_restart_left_open(rig):
     panel, ctl, ft, store, alerts, tmp_path = rig
