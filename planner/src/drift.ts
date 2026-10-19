@@ -154,7 +154,8 @@ export interface CurveDiagnosis {
   at: string;
   /** The curve change that stands (prev → re-read); for `reverted`, the transient first-read change. */
   fields: Record<string, FieldChange>;
-  verdict: CurveVerdict | "reverted";
+  /** unconfirmed = no confirmation read (failed / shutdown): never recorded, never paged, re-checked next poll. */
+  verdict: CurveVerdict | "reverted" | "unconfirmed";
   /** true = the re-read still showed the change; false = it reverted (no page); null = no re-read (failed / shutdown). */
   reread_confirmed: boolean | null;
   reread_at: string | null;
@@ -185,6 +186,8 @@ export interface DriftDeps {
    */
   latest?: () => Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null>;
   notify: (title: string, body: string, priority: string, opts?: { email?: boolean }) => Promise<void>;
+  /** writes.ts withDeviceLock — serialises the re-read → record with the planner's own PATCH → record. */
+  lock?: <T>(fn: () => Promise<T>) => Promise<T>;
   now?: () => number;
   log?: (msg: string) => void;
 }
@@ -267,61 +270,88 @@ export async function handlePolledConfig(
   }
 
   const firstAtMs = now();
-  let reread: Record<string, any> | null = null;
-  let rereadAt: string | null = null;
-  let rereadError: string | null = null;
-  if (await deps.wait(REREAD_DELAY_MS)) {
-    try { reread = await deps.reread(); rereadAt = new Date(now()).toISOString(); }
-    catch (e) { rereadError = `re-read failed: ${(e as Error).message}`; }
-  } else {
-    rereadError = "re-read skipped: planner shutting down";
-  }
-  let base = prev;
-  if (reread && deps.latest) {
-    try { base = (await deps.latest()) ?? prev; }
-    catch (e) { log(`latest-version re-fetch failed (judging against the poll-time baseline): ${(e as Error).message}`); }
-  }
-  const baselineMoved = JSON.stringify(base.config) !== JSON.stringify(prev.config);
-  const finalDev = reread ?? dev;
-  const finalConfig = reread ? extractConfig(reread) : config;
-  const finalChanges = reread ? diffConfig(base.config, finalConfig) : changes;
-  const confirmed = reread ? curveChanged(finalChanges) : null;
-
-  let writes: { last: PlannerWrite | null; recent: PlannerWrite[] } = { last: null, recent: [] };
-  try { writes = await deps.plannerWrites(firstAtMs - ECHO_WINDOW_MS); }
-  catch (e) { log(`planner-write lookup failed (verdict defaults to foreign): ${(e as Error).message}`); }
-
-  // A reverted curve keeps the first read's verdict fields for the record but is not a curve event.
-  const curveFields = confirmed === false ? changes : (finalChanges as Record<string, FieldChange>);
-  const v = confirmed === false ? null : curveVerdict(curveFields, writes.recent, firstAtMs);
-  const verdict: CurveDiagnosis["verdict"] = confirmed === false ? "reverted" : (v?.verdict ?? "foreign");
-  const diagnosis: CurveDiagnosis = {
-    at: new Date(firstAtMs).toISOString(),
-    fields: curveFields,
-    verdict,
-    reread_confirmed: confirmed,
-    reread_at: rereadAt,
-    reread_error: rereadError,
-    baseline_moved: baselineMoved,
-    first_read_at: new Date(firstAtMs).toISOString(),
-    planner_last_write: writes.last,
-    planner_writes_60m: writes.recent,
-    matches: v?.matches ?? curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [],
-    device_before: deviceMeta(base.raw),
-    device_after: deviceMeta(finalDev),
-    paged: verdict === "foreign" ? "high" : verdict === "echo_suspected" ? "default" : null,
+  const lock = deps.lock ?? (<T>(fn: () => Promise<T>) => fn());
+  const lookupWrites = async (): Promise<{ last: PlannerWrite | null; recent: PlannerWrite[] }> => {
+    try { return await deps.plannerWrites(firstAtMs - ECHO_WINDOW_MS); }
+    catch (e) { log(`planner-write lookup failed (verdict defaults to foreign): ${(e as Error).message}`); return { last: null, recent: [] }; }
   };
+  const diagnose = (
+    o: { fields: Record<string, FieldChange>; verdict: CurveDiagnosis["verdict"]; confirmed: boolean | null; rereadAt: string | null;
+         rereadError: string | null; baselineMoved: boolean; writes: { last: PlannerWrite | null; recent: PlannerWrite[] };
+         matches: EchoMatch[]; before: Record<string, any> | null; after: Record<string, any> },
+  ): CurveDiagnosis => ({
+    at: new Date(firstAtMs).toISOString(),
+    fields: o.fields,
+    verdict: o.verdict,
+    reread_confirmed: o.confirmed,
+    reread_at: o.rereadAt,
+    reread_error: o.rereadError,
+    baseline_moved: o.baselineMoved,
+    first_read_at: new Date(firstAtMs).toISOString(),
+    planner_last_write: o.writes.last,
+    planner_writes_60m: o.writes.recent,
+    matches: o.matches,
+    device_before: deviceMeta(o.before),
+    device_after: deviceMeta(o.after),
+    paged: o.verdict === "foreign" ? "high" : o.verdict === "echo_suspected" ? "default" : null,
+  });
+  // No confirmation read (it failed, or SIGTERM cut the wait / the read short): NOTHING is recorded and nobody is
+  // paged — the change has not been shown to persist (#177), and recording the first read would advance the
+  // baseline over whatever a planner write may have put there meanwhile (codex pass 1). latestConfig() stays put, so
+  // the next poll (or the successor's first poll) sees the same diff and runs the whole check again.
+  const unconfirmed = async (why: string): Promise<DriftOutcome> => {
+    const writes = await lookupWrites();
+    const diagnosis = diagnose({
+      fields: changes, verdict: "unconfirmed", confirmed: null, rereadAt: null, rereadError: why, baselineMoved: false, writes,
+      matches: curveVerdict(changes, writes.recent, firstAtMs)?.matches ?? [], before: prev.raw, after: dev,
+    });
+    log(`HBX curve change seen but not confirmed (${why}) — not recorded, not paged; the next poll re-checks:\n${fmtChanges(changes)}`);
+    return { kind: "curve", config, device: dev, changes: null, diagnosis };
+  };
+  if (!(await deps.wait(REREAD_DELAY_MS))) return unconfirmed("re-read skipped: planner shutting down");
 
-  if (confirmed === false) {
-    // The change did not persist — a stale/transient cloud read, not a writer. Record both reads; page nobody.
-    // Any NON-curve field that did change for good is still drift and is recorded/notified as such.
-    await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict, diagnosis });
+  // Re-read → baseline → verdict → record, all under the device lock (writes.ts withDeviceLock): no planner write can
+  // land between the confirmation read and the row, so the read is judged against every write that has completed.
+  type Locked = { unconfirmed: string } | { diagnosis: CurveDiagnosis; finalDev: Record<string, any>; finalConfig: HbxConfig; finalChanges: Record<string, FieldChange> | null };
+  const locked: Locked = await lock(async (): Promise<Locked> => {
+    let reread: Record<string, any>;
+    try { reread = await deps.reread(); }
+    catch (e) { return { unconfirmed: `re-read failed: ${(e as Error).message}` }; }
+    const rereadAt = new Date(now()).toISOString();
+    // A planner write may have self-recorded a version during the wait: judge the re-read against THAT.
+    let base = prev;
+    if (deps.latest) {
+      try { base = (await deps.latest()) ?? prev; }
+      catch (e) { return { unconfirmed: `latest-version re-fetch failed: ${(e as Error).message}` }; }
+    }
+    const baselineMoved = JSON.stringify(base.config) !== JSON.stringify(prev.config);
+    const finalConfig = extractConfig(reread);
+    const finalChanges = diffConfig(base.config, finalConfig);
+    const confirmed = curveChanged(finalChanges);
+    const writes = await lookupWrites();
+    // A reverted curve keeps the first read's change in the diagnosis but is not a curve event.
+    const fields = confirmed ? (finalChanges as Record<string, FieldChange>) : changes;
+    const v = curveVerdict(fields, writes.recent, firstAtMs);
+    const verdict: CurveDiagnosis["verdict"] = confirmed ? (v?.verdict ?? "foreign") : "reverted";
+    const diagnosis = diagnose({
+      fields, verdict, confirmed, rereadAt, rereadError: null, baselineMoved, writes, matches: v?.matches ?? [],
+      before: base.raw, after: reread,
+    });
+    await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict: verdict as ConfigVersionRecord["verdict"], diagnosis });
+    return { diagnosis, finalDev: reread, finalConfig, finalChanges };
+  });
+  if ("unconfirmed" in locked) return unconfirmed(locked.unconfirmed);
+  const { diagnosis, finalDev, finalConfig, finalChanges } = locked;
+  const verdict = diagnosis.verdict;
+
+  if (verdict === "reverted") {
+    // The change did not persist — a stale/transient cloud read (or superseded by our own write), not a writer.
+    // Both reads are recorded; nobody is paged. A NON-curve field that did change for good is still drift.
     log(`HBX curve change reverted on re-read (transient, not paged):\n${fmtChanges(changes)}`);
     if (finalChanges) await deps.notify("HBX config changed (outside the planner)", fmtChanges(finalChanges), "high", { email: false });
     return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis };
   }
 
-  await deps.record({ config: finalConfig, changes: finalChanges, raw: dev, rereadRaw: reread, verdict, diagnosis });
   const evidence = diagnosisBody(diagnosis);
   if (verdict === "echo_suspected") {
     log(`HBX curve differs from our write — echo suspected (#177):\n${fmtChanges(diagnosis.fields)}`);

@@ -41,7 +41,7 @@ import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
-import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight } from "./writes";
+import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock } from "./writes";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -772,6 +772,14 @@ function shutdownAwareWait(ms: number): Promise<boolean> {
     const t = setTimeout(() => { shutdownAbort.signal.removeEventListener("abort", onAbort); resolve(true); }, ms);
     const onAbort = () => { clearTimeout(t); resolve(false); };
     shutdownAbort.signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function abandonOnShutdown<T>(p: Promise<T>): Promise<T> {
+  if (shutdownAbort.signal.aborted) return Promise.reject(new Error("planner shutting down"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("planner shutting down"));
+    shutdownAbort.signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => shutdownAbort.signal.removeEventListener("abort", onAbort));
   });
 }
 // EVERY loop() still running (not just the latest — a slow poll can outlive the 5-min interval), so shutdown can wait
@@ -1588,8 +1596,10 @@ async function pollOnce(): Promise<void> {
   // identification driver: one cycle behind, cleanup could re-command a base over a human's newer curve).
   const prevVersion = await store.latestConfigVersion();
   const drift = await handlePolledConfig(prevVersion, dev, {
-    reread: () => slx.getDevice(BUILDING_ID, SYNC_CODE),
+    // a SIGTERM mid-request abandons the confirmation (unconfirmed → nothing recorded; the successor re-checks)
+    reread: () => abandonOnShutdown(slx.getDevice(BUILDING_ID, SYNC_CODE)),
     wait: shutdownAwareWait,
+    lock: withDeviceLock,
     latest: () => store.latestConfigVersion(),
     plannerWrites: (sinceMs) => store.plannerWrites(new Date(sinceMs)),
     record: (r) => store.insertConfigVersion(r.config, r.changes, r),

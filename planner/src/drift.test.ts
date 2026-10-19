@@ -2,7 +2,8 @@
  * @purpose Assertions for the self-diagnosing foreign-curve alert (#177, drift.ts handlePolledConfig / curveVerdict).
  * Run with: npx tsx planner/src/drift.test.ts — exits non-zero on failure. Replays the two 2026-10-18 "FOREIGN HBX
  * CURVE WRITE" pages from their logged numbers and pins: echo verdict at 0/−1/−2 °F, foreign at −3, a re-read that
- * reverts → no page, a failed / shutdown-skipped re-read still pages, and the raw device object on every row.
+ * reverts → no page, a failed / shutdown-skipped re-read records nothing and pages nobody (the next poll re-checks),
+ * the device lock ordering against a concurrent planner write, and the raw device object on every row.
  */
 import assert from "node:assert/strict";
 import {
@@ -10,6 +11,7 @@ import {
   ECHO_TITLE, FOREIGN_TITLE, REREAD_DELAY_MS, ECHO_WINDOW_MS,
   type PlannerWrite, type ConfigVersionRecord, type DriftDeps, type HbxConfig,
 } from "./drift";
+import { withDeviceLock } from "./writes";
 
 // A device object shaped like the as-found SensorLinx one (knowledge/reference/hbx-config-asfound-20260713.json):
 // curve + a non-curve config field + live telemetry + the API's provenance fields.
@@ -193,34 +195,51 @@ async function main(): Promise<void> {
     assert.equal(h.pages[0].email, false);
   }
 
-  // ── 8. Re-read FAILS → still pages (fail loud), reread_confirmed null, the reason is in the page ─────────────────
+  // ── 8. Re-read FAILS → unconfirmed: nothing recorded, nobody paged; latestConfig stays, so the next poll re-checks
   {
     const prev = prevOf(device(120, 118));
     const seen = device(100, 96);
     const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("HTTP 503"), writes: [] });
     const out = await handlePolledConfig(prev, seen, h.deps);
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
     assert.equal(out.diagnosis?.reread_confirmed, null);
-    assert.equal(out.diagnosis?.verdict, "foreign");
-    assert.equal(h.pages.length, 1);
-    assert.equal(h.pages[0].priority, "high");
-    assert.match(h.pages[0].body, /re-read failed: HTTP 503/);
-    assert.deepEqual(h.rows[0].config, extractConfig(seen), "no re-read: the first read is the record");
-    assert.equal(h.rows[0].rereadRaw, null);
+    assert.match(out.diagnosis?.reread_error ?? "", /re-read failed: HTTP 503/);
+    assert.equal(h.pages.length, 0, "a change not shown to persist pages nobody (#177: page only if it persists)");
+    assert.equal(h.rows.length, 0, "and is not recorded — the baseline must not advance on one unconfirmed read");
+    assert.equal(out.changes, null);
+    // the next poll: same device, re-read works now → the full check runs and pages
+    const h2 = harness({ nowIso: "2026-10-18T21:10:56.000Z", reread: seen, writes: [] });
+    const out2 = await handlePolledConfig(prev, seen, h2.deps);
+    assert.equal(out2.diagnosis?.verdict, "foreign");
+    assert.equal(h2.pages.length, 1);
+    assert.equal(h2.pages[0].priority, "high");
   }
 
-  // ── 9. Shutdown during the wait → the re-read is skipped (never holds the poll past SIGTERM), still pages ────────
+  // ── 9. Shutdown during the wait → the re-read is skipped (never holds the poll past SIGTERM), nothing recorded ──
   {
     const prev = prevOf(device(120, 118));
     const seen = device(141, 137);
     let reread = 0;
+    let looked = 0;
     const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", waitOk: false, writes: [write("2026-10-18T20:41:05.000Z", "set_target", { dbt: 142, mbt: 138 })] });
     h.deps.reread = async () => { reread++; return seen; };
+    h.deps.lock = async (fn) => { looked++; return fn(); };
     const out = await handlePolledConfig(prev, seen, h.deps);
     assert.equal(reread, 0, "no device read after shutdown began");
-    assert.equal(out.diagnosis?.reread_confirmed, null);
+    assert.equal(looked, 0, "the device lock is never taken after shutdown began");
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
     assert.match(out.diagnosis?.reread_error ?? "", /shutting down/);
-    assert.equal(h.pages.length, 1);
-    assert.equal(out.diagnosis?.verdict, "echo_suspected");
+    assert.equal(h.pages.length + h.rows.length, 0, "the successor's first poll re-detects it");
+    assert.equal(out.diagnosis?.matches[0]?.written, 142, "the diagnosis still names the nearest planner write");
+  }
+
+  // ── 9b. A re-read abandoned mid-request (index.ts abandonOnShutdown rejects) is unconfirmed too ─────────────────
+  {
+    const prev = prevOf(device(120, 118));
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z", reread: new Error("planner shutting down") });
+    const out = await handlePolledConfig(prev, device(141, 137), h.deps);
+    assert.equal(out.diagnosis?.verdict, "unconfirmed");
+    assert.equal(h.pages.length + h.rows.length, 0);
   }
 
   // ── 10. A planner write that lands DURING the wait (dashboard boost) is the new baseline — not a curve change ────
@@ -234,6 +253,33 @@ async function main(): Promise<void> {
     assert.equal(out.diagnosis?.verdict, "reverted");
     assert.equal(out.diagnosis?.baseline_moved, true);
     assert.equal(h.rows[0].changes, null);
+  }
+
+  // ── 10b. The device lock serialises a planner write that starts DURING the re-read: it runs after the detector's
+  // record, so the detector never judges a re-read against a baseline from a later moment (codex pass 1) ──────────
+  {
+    const order: string[] = [];
+    let deviceNow = device(141, 137);
+    let latestNow = prevOf(device(120, 118));
+    const h = harness({ nowIso: "2026-10-18T21:05:56.000Z" });
+    let writer: Promise<void> | null = null;
+    h.deps.lock = withDeviceLock;
+    h.deps.latest = async () => latestNow;
+    h.deps.reread = async () => {
+      const seen = deviceNow;
+      // a dashboard boost arrives while the confirmation GET is on the wire
+      writer = withDeviceLock(async () => { order.push("writer"); deviceNow = device(134, 130); latestNow = prevOf(deviceNow); });
+      await new Promise((r) => setTimeout(r, 5));
+      return seen;
+    };
+    const rec = h.deps.record;
+    h.deps.record = async (r) => { order.push("detector"); await rec(r); };
+    const out = await handlePolledConfig(latestNow, deviceNow, h.deps);
+    await writer;
+    assert.deepEqual(order, ["detector", "writer"], "the planner write waits for the detector's re-read → record");
+    assert.deepEqual(h.rows[0].changes, diffConfig(extractConfig(device(120, 118)), extractConfig(device(141, 137))),
+      "judged against the baseline of the re-read's own moment");
+    assert.equal(out.diagnosis?.baseline_moved, false);
   }
 
   // ── 11. Seed, unchanged, and non-curve drift keep today's behaviour — and every row carries raw ─────────────────
