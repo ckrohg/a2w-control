@@ -206,18 +206,33 @@ class SpanClient:
         # fails validation with HTTP 422 — the 2026-10-19 Air-Water 2 power-cycle test.
         body = {"relayStateIn": {"relayState": want}}
         last_err = "no reachable base"
+        maybe_sent = False   # an OPEN POST went out and was not definitively rejected
         for base in self._candidates():
             for attempt in (1, 2):  # one transparent re-auth on an auth failure
+                if want == "OPEN":
+                    # The guard + expiry hold for EVERY OPEN POST, retries included. If a
+                    # previous POST may have landed, a refusal now is NOT "nothing sent".
+                    try:
+                        open_permit.recheck()
+                    except OpenAborted as exc:
+                        if maybe_sent:
+                            raise ConnectionError(f"OPEN retry aborted after a possibly-delivered "
+                                                  f"OPEN: {exc}") from exc
+                        raise
                 try:
                     status, payload = self._request(
                         base, f"/api/v1/circuits/{circuit_id}", method="POST", body=body, token=self._token)
                 except (urllib.error.URLError, OSError, TimeoutError) as e:
+                    maybe_sent = maybe_sent or want == "OPEN"   # may have reached the panel
                     last_err = f"{base}: {e}"; break
                 if status == 200:
                     self._base = base
                     return (payload or {}).get("relayState", want)
                 if status in (401, 403, 412) and attempt == 1:
+                    # a definitive auth rejection: THIS post was not applied (earlier ones keep
+                    # whatever maybe_sent already says)
                     self._token = self._register_sync(); continue
+                maybe_sent = maybe_sent or want == "OPEN"       # any other answer: unknown
                 last_err = f"{base}: HTTP {status}{_detail(payload)}"; break
         raise ConnectionError(f"set_relay: {last_err}")
 
@@ -257,7 +272,12 @@ class OpenPermit:
             raise ValueError(f"open permit is for '{self.name}', not circuit {circuit_id!r}")
         if time.monotonic() > self._expires:
             raise ValueError(f"open permit for '{self.name}' expired")
-        self._used = True
+        self._used = True   # the guard runs before each POST (recheck), not here
+
+    def recheck(self) -> None:
+        """Expiry + guard, run before each OPEN POST (check() has already consumed the permit)."""
+        if time.monotonic() > self._expires:
+            raise OpenAborted(f"open permit for '{self.name}' expired")
         if self.guard is not None:
             why = self.guard()
             if why:
