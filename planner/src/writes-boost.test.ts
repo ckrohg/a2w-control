@@ -15,7 +15,7 @@ function harness(planTargetF = 126) {
   const audits: Array<{ source: string; action: string; result: string }> = [];
   const cfg = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 };
   let live: Record<string, number> = { ...cfg };
-  const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean }> = [];
+  const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean; createdAt?: Date }> = [];
   const apLogs: Array<{ targetF: number | null; reason: string; result: string }> = [];
   const failRetire = { n: 0 }; // retireOpenBoosts throws this many more times
   const failConfig = { n: 0 }; // patch()'s post-PATCH accepted-write audit insert throws this many more times
@@ -30,11 +30,14 @@ function harness(planTargetF = 126) {
     },
     insertConfigVersion: async () => {},
     // the real insertBoost retires every open row in the same statement (store.ts; checked on PGlite)
-    insertBoost: async (targetF: number, restoreAt: Date) => { for (const b of boosts) b.restored = true; boosts.push({ id: boosts.length + 1, targetF, restoreAt, restored: false }); },
+    insertBoost: async (targetF: number, restoreAt: Date) => { for (const b of boosts) b.restored = true; boosts.push({ id: boosts.length + 1, targetF, restoreAt, restored: false, createdAt: new Date() }); },
     activeBoost: async (): Promise<Boost | null> => { const b = boosts.filter((x) => !x.restored && x.restoreAt.getTime() > Date.now()).at(-1); return b ? { targetF: b.targetF, restoreAt: b.restoreAt } : null; },
     dueBoosts: async () => boosts.filter((x) => !x.restored && x.restoreAt.getTime() <= Date.now()).map((x) => ({ id: x.id, targetF: x.targetF })),
     markBoostsRestored: async (ids: number[]) => { for (const b of boosts) if (ids.includes(b.id)) b.restored = true; },
-    retireOpenBoosts: async () => { if (failRetire.n > 0) { failRetire.n--; throw new Error("connection terminated"); } for (const b of boosts) b.restored = true; },
+    retireOpenBoosts: async (before: Date) => {
+      if (failRetire.n > 0) { failRetire.n--; throw new Error("connection terminated"); }
+      for (const b of boosts) if ((b.createdAt ?? new Date(0)).getTime() <= before.getTime()) b.restored = true;
+    },
     // for an AutoPilot over this REAL writer
     recentPlans: async () => [{ plan: [{ ts: new Date(Date.now() - 600_000).toISOString(), tank_target_f: planTargetF, reason: "DHW window floor" }] }],
     insertAutopilotLog: async (l: { targetF: number | null; reason: string; result: string }) => { apLogs.push(l); },
@@ -48,7 +51,7 @@ function harness(planTargetF = 126) {
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
   const autopilot = new AutoPilot(store, writer, false, async () => {});
-  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, live: () => live };
+  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, store, slx, hub, live: () => live };
 }
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
@@ -250,6 +253,23 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(await status(k.writer.boost(129, 60, "dashboard")), "ok");
     assert.equal(await status(k.writer.setTarget(127, "dashboard", undefined, { endsBoost: true })), 429);
     assert.ok(k.boosts.every((b) => !b.restored));
+  }
+  // (h) codex pass 5: planner A's cancel retire fails; planner B (sharing the DB) starts a NEW boost afterwards. A's
+  //     delayed retry retires only rows created before A's cancel landed — B's boost stays active.
+  {
+    const a = harness();
+    assert.equal(await status(a.writer.boost(129, 60, "dashboard")), "ok");
+    (a.writer as any).lastWriteAt = 0; a.failRetire.n = 1;
+    const r = await a.writer.restore("dashboard", { endsBoost: true });
+    assert.equal(r.boost_retire_failed, true);
+    await new Promise((res) => setTimeout(res, 5)); // B's boost is strictly later than A's cancel
+    const b = new HbxWriter(a.slx, a.store, a.hub, "b", "s", async () => {});
+    assert.equal(await status(b.boost(128, 60, "dashboard")), "ok"); // B's insertBoost retires A's stale row too
+    a.boosts.push({ id: 99, targetF: 127, restoreAt: new Date(Date.now() + 3600_000), restored: false, createdAt: new Date() }); // and another, later
+    await a.writer.expireBoosts(); // A's retry runs
+    assert.equal((await a.writer.status()).boost_cancel_pending, false);
+    assert.equal(a.boosts[0].restored, true, "A's cancelled boost is retired");
+    assert.deepEqual(a.boosts.slice(1).map((x) => x.restored), [false, false], "the boosts started after A's cancel are untouched");
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

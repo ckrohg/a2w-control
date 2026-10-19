@@ -592,9 +592,13 @@ export class Store {
     );
   }
 
-  /** A human write replaced the boost (dashboard restore / set target): retire every open row — nothing is left to restore. */
-  async retireOpenBoosts(): Promise<void> {
-    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE NOT restored`);
+  /**
+   * A human write replaced the boost (dashboard restore / set target): retire the open rows created BEFORE that write
+   * landed — nothing is left to restore for them. Scoped by time, not "every open row", so a delayed retry (the DB was
+   * down) cannot retire a newer boost started afterwards, e.g. by a successor planner instance (codex pass 5).
+   */
+  async retireOpenBoosts(createdBefore: Date): Promise<void> {
+    await this.pool.query(`UPDATE hbx_boosts SET restored = true WHERE NOT restored AND created_at <= $1`, [createdBefore]);
   }
 
   /** Boosts whose restore is due (survives planner restarts — durability is the point). */

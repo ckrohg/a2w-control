@@ -157,12 +157,13 @@ export class HbxWriter {
    * stays. Surfaced in status().boost_cancel_pending and the write response. In-memory: a restart forgets it, and the
    * stale row then behaves like an ordinary boost (hold, then the as-found restore at its restore_at).
    */
-  private retirePending = false;
+  private retirePendingBefore: Date | null = null; // the landing time of the cancel whose retire is pending
+  private get retirePending(): boolean { return this.retirePendingBefore != null; }
   private async retryPendingRetire(): Promise<boolean> {
-    if (!this.retirePending) return true;
+    if (!this.retirePendingBefore) return true;
     try {
-      await this.store.retireOpenBoosts();
-      this.retirePending = false;
+      await this.store.retireOpenBoosts(this.retirePendingBefore);
+      this.retirePendingBefore = null;
       console.log("[boost] the cancelled boost row is retired (retry succeeded)");
       return true;
     } catch (e) {
@@ -192,18 +193,19 @@ export class HbxWriter {
       const before = this.deviceWrites;
       let result: Record<string, unknown>;
       try { result = await write(); }
-      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action); throw e; }
+      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action, new Date()); throw e; }
       // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
-      return (await this.retireCancelledBoost(source, action)) ? result : { ...result, boost_retire_failed: true };
+      return (await this.retireCancelledBoost(source, action, new Date())) ? result : { ...result, boost_retire_failed: true };
     });
   }
   /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after. */
   private deviceWrites = 0;
   /** Retire the open boost row for a landed human write; on failure arm the retry. true = retired. */
-  private async retireCancelledBoost(source: string, action: string): Promise<boolean> {
-    try { await this.store.retireOpenBoosts(); return true; }
+  private async retireCancelledBoost(source: string, action: string, landedAt: Date): Promise<boolean> {
+    try { await this.store.retireOpenBoosts(landedAt); return true; }
     catch (e) {
-      this.retirePending = true;
+      // a second failed cancel widens the window to its own landing time (rows before the earlier one are inside it)
+      this.retirePendingBefore = this.retirePendingBefore && this.retirePendingBefore > landedAt ? this.retirePendingBefore : landedAt;
       const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
       console.error(`[boost] ${msg}`);
       await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
@@ -470,7 +472,7 @@ export class HbxWriter {
       const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
       const restoreAt = new Date(Date.now() + minutes * 60_000);
       await this.store.insertBoost(targetF, restoreAt);
-      this.retirePending = false; // insertBoost retired every older open row, the stale one included
+      this.retirePendingBefore = null; // insertBoost retired every older open row, the stale one included
       return { ...result, boost_restore_at: restoreAt.toISOString() };
     });
   }
