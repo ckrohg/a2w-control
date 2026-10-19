@@ -19,10 +19,11 @@ export const READING_GAP_MIN_S = 5 * 60;
 /** How far outside a window a readings gap or a boot may sit and still belong to it (phase_b_log is 5-min grained). */
 export const WINDOW_SLACK_S = 10 * 60;
 /**
- * A reboot between two system_stats samples needs uptime evidence, not just a moved boot time (codex pass 1 on #193:
- * an NTP step forward moves ts − uptime_s exactly like a reboot does): uptime fell, OR the new uptime is shorter than
- * the time since the previous sample (the Pi booted after it) — with the boot time also jumping by more than this.
- * A clock step on a Pi up longer than the step trips neither. store.piLinkInputs applies it in SQL.
+ * A reboot between two system_stats samples needs uptime evidence, not just a moved boot time (codex passes 1–2 on
+ * #193: an NTP step forward moves ts − uptime_s exactly like a reboot does). CERTAIN: uptime fell. AMBIGUOUS: the boot
+ * time jumped by more than this while uptime kept rising but is shorter than the time since the previous sample — a
+ * reboot of a Pi that had only just booted, or a clock step on one; two samples cannot tell which. A clock step on a
+ * Pi up longer than the step is neither. store.piLinkInputs applies it in SQL.
  */
 export const BOOT_JUMP_S = 5 * 60;
 
@@ -77,7 +78,18 @@ export function mergeBoots(boots: Boot[]): Boot[] {
 }
 
 export interface ReadingsView { gaps: ReadingGap[]; firstTs: number | null; lastTs: number | null }
-export interface StatsView { boots: Boot[]; firstTs: number | null; lastTs: number | null }
+export interface StatsView {
+  /** certain reboots: uptime FELL between consecutive samples */
+  boots: Boot[];
+  /**
+   * boot-time jumps that are a reboot OR a clock step on a freshly booted Pi — uptime kept rising but is shorter than
+   * the time since the previous sample. Indistinguishable from two samples (codex pass 2 on #193): never counted as a
+   * reboot, and a gap whose only evidence is one of these is `unknown`.
+   */
+  ambiguous?: Boot[];
+  firstTs: number | null;
+  lastTs: number | null;
+}
 
 /**
  * Verdict per window (codex pass 1 on #193 tightened every rule):
@@ -85,8 +97,10 @@ export interface StatsView { boots: Boot[]; firstTs: number | null; lastTs: numb
  *   unrelated gap just before/after does not turn a socket outage into a gap;
  * - the reboot must be the one that ended THAT gap — inside [gap start − 1 min, gap end + 2 min] (the Pi boots, then
  *   its first push closes the gap) — not merely somewhere in the window;
+ * - a gap overlapping the window that does NOT clearly belong to it → `unknown`: continuity is never assumed;
  * - gap+reboot vs gap_only needs system_stats samples bracketing the gap (first ≤ gap start, last ≥ gap end): absent,
- *   empty, late-starting stats, or a gap still open now → `unknown`, never a guessed gap_only;
+ *   empty, late-starting stats, a gap still open now, or only an AMBIGUOUS boot jump in it → `unknown`, never a
+ *   guessed gap_only;
  * - no readings before the window → `unknown`.
  * `readings` null = the table is absent; `stats` null likewise. A silence that has not ended (trailing) is a gap.
  */
@@ -106,15 +120,23 @@ export function classifyWindows(
     const lo = s - WINDOW_SLACK_S, hi = e + WINDOW_SLACK_S;
     const covered = readings != null && readings.firstTs != null && readings.firstTs <= s;
     const inside = (g: ReadingGap) => Math.max(0, Math.min(g.end, hi) - Math.max(g.start, lo));
-    const gap = gaps.filter((g) => inside(g) >= (g.end - g.start) / 2 && inside(g) >= READING_GAP_MIN_S)
-      .sort((x, y) => inside(y) - inside(x))[0] ?? null;
+    const core = (g: ReadingGap) => Math.max(0, Math.min(g.end, e) - Math.max(g.start, s));
+    // a gap belongs to the window when at least half of it lies inside window ± slack, OR it covers at least half of
+    // the window itself (a long silence spanning a short socket outage — codex pass 2 on #193)
+    const belongs = (g: ReadingGap) => inside(g) >= READING_GAP_MIN_S
+      && (inside(g) >= (g.end - g.start) / 2 || core(g) >= (e - s) / 2);
+    const gap = gaps.filter(belongs).sort((x, y) => inside(y) - inside(x))[0] ?? null;
+    // a gap that overlaps the window itself but does not clearly belong to it: continuity is NOT established
+    const unclear = !gap && gaps.some((g) => core(g) > 0);
     const open = gap != null && trailing && gap.end === nowS;
     const bracketed = gap != null && !open && stats != null && stats.firstTs != null && stats.lastTs != null
       && stats.firstTs <= gap.start && stats.lastTs >= gap.end;
-    const boot = gap && bracketed ? boots.find((b) => b.at >= gap.start - 60 && b.at <= gap.end + 120) ?? null : null;
-    const verdict: PiVerdict = !covered ? "unknown"
+    const inGap = (b: Boot) => gap != null && b.at >= gap.start - 60 && b.at <= gap.end + 120;
+    const boot = gap && bracketed ? boots.find(inGap) ?? null : null;
+    const ambiguous = !boot && gap != null && bracketed && (stats?.ambiguous ?? []).some(inGap);
+    const verdict: PiVerdict = !covered || unclear ? "unknown"
       : !gap ? "socket_only"
-      : !bracketed ? "unknown"
+      : !bracketed || ambiguous ? "unknown"
       : boot ? "gap+reboot" : "gap_only";
     return {
       start: new Date(r.start).toISOString(),

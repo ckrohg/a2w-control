@@ -974,18 +974,21 @@ export class Store {
       const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats ORDER BY ts DESC LIMIT 1`);
       const span = await this.pool.query(
         `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL`, [fromS - 3_600]);
-      // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): the boot time jumped AND (uptime fell OR the new uptime
-      // is shorter than the time since the previous sample) — an NTP step on a long-running Pi moves ts − uptime_s too
+      // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): certain when uptime fell; ambiguous when the boot time
+      // jumped while uptime kept rising but is shorter than the time since the previous sample (a fresh Pi's clock step
+      // looks the same) — an NTP step on a long-running Pi is neither
       const b = await this.pool.query(
-        `SELECT boot_at::float8 AS at FROM (
+        `SELECT boot_at::float8 AS at, (uptime_s < prev_up - 5) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
                   lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up, lag(ts - uptime_s) OVER w AS prev_boot
            FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
-         ) s WHERE prev_ts IS NOT NULL AND boot_at - prev_boot > $2 AND (uptime_s < prev_up OR uptime_s < ts - prev_ts)
+         ) s WHERE prev_ts IS NOT NULL
+             AND (uptime_s < prev_up - 5 OR (boot_at - prev_boot > $2 AND uptime_s < ts - prev_ts))
          ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
       stats = {
-        boots: b.rows.map((r: any) => ({ at: Number(r.at) })),
+        boots: b.rows.filter((r: any) => r.certain).map((r: any) => ({ at: Number(r.at) })),
+        ambiguous: b.rows.filter((r: any) => !r.certain).map((r: any) => ({ at: Number(r.at) })),
         firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
         lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
       };
@@ -996,7 +999,16 @@ export class Store {
       `SELECT (EXTRACT(EPOCH FROM ts) * 1000)::float8 AS ts, result FROM phase_b_log
        WHERE ts >= to_timestamp($1) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
        ORDER BY ts`, [fromS]);
-    return { lastByPump, readings, latestStat, stats, phaseB: pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) })) };
+    // a run already OPEN at the range start keeps its real start (codex pass 2 on #193): the first failure after the
+    // last `sent` before the boundary, however long ago — prepended, so dropoutRuns opens the run there
+    const open = await this.pool.query(
+      `SELECT (EXTRACT(EPOCH FROM min(ts)) * 1000)::float8 AS ts FROM phase_b_log
+       WHERE mode = 'active' AND result LIKE '%no Pi connected%' AND ts < to_timestamp($1)
+         AND ts > COALESCE((SELECT max(ts) FROM phase_b_log
+                            WHERE mode = 'active' AND result = 'sent' AND ts < to_timestamp($1)), '-infinity'::timestamptz)`, [fromS]);
+    const phaseB = pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) }));
+    if (open.rows[0]?.ts != null) phaseB.unshift({ ts: Number(open.rows[0].ts), result: "failed: no Pi connected" });
+    return { lastByPump, readings, latestStat, stats, phaseB };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

@@ -110,6 +110,35 @@ const readings = { gaps, firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-
   assert.equal(classifyWindows(run, { ...base, gaps: [blip] }, st([]), NOW / 1000)[0].verdict, "socket_only");
 }
 
+// ── 4b. A long silence that SPANS a short socket outage is that outage's gap; a partial overlap is unclear → unknown;
+// a growing trailing silence never turns into continuity (codex pass 2 on #193) ─────────────────────────────────
+{
+  const run = [{ start: ms("2026-10-16T10:00:00Z"), end: ms("2026-10-16T11:00:00Z") }];
+  const base = { firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z") };
+  const st: StatsView = { boots: [], firstTs: s("2026-10-10T00:00:00Z"), lastTs: s("2026-10-18T21:59:00Z") };
+  const spanning = { start: s("2026-10-16T09:00:00Z"), end: s("2026-10-16T14:00:00Z") };
+  assert.equal(classifyWindows(run, { ...base, gaps: [spanning] }, st, NOW / 1000)[0].verdict, "gap_only",
+    "readings were silent for the whole outage — never socket_only");
+  assert.equal(classifyWindows(run, { ...base, gaps: [spanning] }, { ...st, boots: [{ at: s("2026-10-16T13:58:00Z") }] }, NOW / 1000)[0].verdict,
+    "gap+reboot", "…and the reboot that ended the silence counts");
+  // a 6-min gap covering only the first minutes of a 2-h outage, mostly before it: neither belongs nor is absent
+  const run2 = [{ start: ms("2026-10-16T10:00:00Z"), end: ms("2026-10-16T12:00:00Z") }];
+  const partial = { start: s("2026-10-16T08:00:00Z"), end: s("2026-10-16T10:05:00Z") };
+  assert.equal(classifyWindows(run2, { ...base, gaps: [partial] }, st, NOW / 1000)[0].verdict, "unknown", "unclear overlap → unknown");
+  // an ongoing outage whose readings went silent before it began: unknown at every age, never socket_only
+  const ongoing = [{ start: ms("2026-10-18T10:00:00Z"), end: null }];
+  for (const lastIso of ["2026-10-18T09:30:00Z", "2026-10-18T03:00:00Z", "2026-10-17T12:00:00Z"]) {
+    const v = classifyWindows(ongoing, { gaps: [], firstTs: s("2026-10-10T00:00:00Z"), lastTs: s(lastIso) }, st, NOW / 1000)[0].verdict;
+    assert.equal(v, "unknown", `silent since ${lastIso}: still unknown`);
+  }
+  // an AMBIGUOUS boot jump (reboot vs a fresh Pi's clock step) inside the gap → unknown, and never counted
+  const short = { start: s("2026-10-16T10:10:00Z"), end: s("2026-10-16T10:40:00Z") };
+  const amb: StatsView = { ...st, ambiguous: [{ at: s("2026-10-16T10:30:00Z") }] };
+  assert.equal(classifyWindows(run, { ...base, gaps: [short] }, amb, NOW / 1000)[0].verdict, "unknown");
+  const h = piHealth({ lastByPump: { pump1: NOW / 1000 - 30 }, readings: { ...base, gaps: [] }, latestStat: null, stats: amb, phaseB: [] }, NOW);
+  assert.equal(h.reboots_7d, 0, "ambiguous jumps are not reboots");
+}
+
 // ── 5. No reboot evidence possible → unknown, never a guessed gap_only (codex pass 1 on #193) ──────────────────────
 {
   const run = [{ start: ms("2026-10-14T15:00:00Z"), end: ms("2026-10-14T17:10:00Z") }];

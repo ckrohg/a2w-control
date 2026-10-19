@@ -13,7 +13,8 @@
  *   W3  −2 d 10:00 → 12:00  "no Pi connected"; readings + stats continue every minute       → socket_only
  * plus a reboot −6 h with no dropout (an owner power-cycle) → reboots_24h = 1, reboots_7d = 2; an NTP step +10 min on
  * the long-running Pi (−1 d 03:00) and a step −10 min (−1 d 15:00) that must NOT count as reboots; and a dropout
- * that straddles the 7-day edge (starts 1 h before it, ends 1 h after) reported with its real start.
+ * that began 9 d ago (before the query range) and ended 6 d ago, reported with its real start; and a +30 min clock
+ * step 2 min after the power-cycle — ambiguous, never a reboot.
  */
 import assert from "node:assert/strict";
 import { Store } from "../planner/src/store";
@@ -70,12 +71,14 @@ async function main() {
   const boot0 = NOW - 30 * D;
   const rows: string[] = [];
   const STEP_FWD = NOW - D + 3 * H, STEP_BACK = NOW - D + 15 * H; // NTP corrections on the long-running Pi
-  for (let t = NOW - 8 * D; t <= NOW - 30; t += 60) {
+  // a +30 min step 2 min after the power-cycle (REBOOT2): ambiguous by construction — must not count as a reboot
+  const FRESH_STEP = REBOOT2 + 120;
+  for (let t = NOW - 8 * D; t <= NOW - 30 - 1_800; t += 60) {
     if (silent(t, W1)) continue;
     const boot = t >= REBOOT2 ? REBOOT2 : t >= REBOOT1 ? REBOOT1 : boot0;
     const jitter = (t / 60) % 3 - 1; // −1, 0, +1 s
     // the Pi's CLOCK (ts) steps +600 s at STEP_FWD and back −600 s at STEP_BACK; uptime is unaffected
-    const clock = t >= STEP_FWD && t < STEP_BACK ? 600 : 0;
+    const clock = (t >= STEP_FWD && t < STEP_BACK ? 600 : 0) + (t >= FRESH_STEP ? 1_800 : 0);
     rows.push(`(${t + clock}, ${t - boot + jitter})`);
   }
   for (let i = 0; i < rows.length; i += 2000) {
@@ -90,9 +93,13 @@ async function main() {
                  THEN 'failed: no Pi connected' ELSE 'sent' END
      FROM generate_series($1::bigint, $8::bigint, 300) t, unnest(ARRAY['pump1','pump2']) p`,
     [NOW - 8 * D + 600, W1[0], W1[1], W2[0], W2[1], W3[0], W3[1], NOW - 300]);
-  // a dropout straddling the 7-day edge: 1 h before it → 1 h after it (readings continued: socket_only)
+  // a dropout that began 9 d ago (BEFORE the 8-d query range) and ended 6 d ago: its real start must be recovered
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $3::bigint, 300) t`, [NOW - 10 * D, NOW - 9 * D, NOW - 8 * D + 300]);
   await pool.query(`UPDATE phase_b_log SET result = 'failed: no Pi connected'
-                    WHERE ts >= to_timestamp($1) AND ts < to_timestamp($2)`, [NOW - 7 * D - H, NOW - 7 * D + H]);
+                    WHERE ts >= to_timestamp($1) AND ts < to_timestamp($2)`, [NOW - 8 * D, NOW - 6 * D]);
   await pool.query(`INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result) VALUES
     (to_timestamp($1), 'pump1', 'active', 55, 'skipped: no writer lease'),
     (to_timestamp($1), 'pump1', 'dry-run', 55, 'would-send')`, [W2[0] + 900]);
@@ -104,19 +111,21 @@ async function main() {
   assert.equal(boots.length, 2, `exactly the two reboots — jitter and both NTP steps ignored (got ${JSON.stringify(boots)})`);
   assert.ok(Math.abs(boots[0].at - REBOOT1) <= 2 && Math.abs(boots[1].at - REBOOT2) <= 2, "at the right moments (±2 s clock jitter)");
   assert.ok(inputs.stats!.firstTs! <= NOW - 8 * D + 60, "stats coverage reported from the range start");
+  assert.equal(inputs.stats?.ambiguous?.length, 1, `the fresh Pi's +30 min clock step is ambiguous (${JSON.stringify(inputs.stats?.ambiguous)})`);
   assert.ok(inputs.phaseB.every((r) => r.result === "sent" || /no Pi connected/.test(r.result)), "only rows that speak about the Pi");
 
   const h = piHealth(inputs, NOW * 1000);
-  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["socket_only", "gap+reboot", "gap_only", "socket_only"]);
-  assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [120, 130, 125, 120]);
-  assert.equal(Date.parse(h.dropouts_7d[0].start) / 1000, NOW - 7 * D - H, "the straddling run keeps its real start (lookback)");
+  assert.deepEqual(h.dropouts_7d.map((w) => w.verdict), ["unknown", "gap+reboot", "gap_only", "socket_only"],
+    "the 9-d run predates the readings (they start 8 d ago) → unknown");
+  assert.deepEqual(h.dropouts_7d.map((w) => w.minutes), [3 * 24 * 60, 130, 125, 120]);
+  assert.equal(Date.parse(h.dropouts_7d[0].start) / 1000, NOW - 9 * D, "a run open at the range start keeps its real start");
   assert.ok(Math.abs(Date.parse(h.dropouts_7d[1].reboot_at ?? "") / 1000 - REBOOT1) <= 2, "W1 names its reboot");
   assert.equal(h.dropouts_7d[2].reboot_at, null);
   assert.equal(h.reboots_24h, 1);
   assert.equal(h.reboots_7d, 2);
   assert.equal(h.last_reading_age_s, 60, "the newest 60-s sample sits at now − 60");
-  assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 60)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
-  assert.deepEqual(h.summary, { count: 4, longest_min: 130, verdicts: { "gap+reboot": 1, gap_only: 1, socket_only: 2, unknown: 0 } });
+  assert.ok(h.uptime_s != null && Math.abs(h.uptime_s - (6 * H - 1_860)) <= 2, `uptime since the power-cycle (${h.uptime_s})`);
+  assert.deepEqual(h.summary, { count: 4, longest_min: 3 * 24 * 60, verdicts: { "gap+reboot": 1, gap_only: 1, socket_only: 1, unknown: 1 } });
   // the newest-reading query is not bounded by the analysis range: delete everything newer than 9 d → age still honest
   await pool.query(`DELETE FROM readings WHERE ts > $1`, [NOW - 9 * D]);
   await pool.query(`INSERT INTO readings (ts, pump_id) VALUES ($1, 'pump1')`, [NOW - 20 * D]);
