@@ -979,11 +979,16 @@ export class Store {
       // looks the same) — an NTP step on a long-running Pi is neither
       // A NEW boot must also be later than EVERY boot time seen before it (codex pass 3 on #193): a backward clock
       // step re-orders samples by ts so uptime seems to fall, but the "new" boot time is one already seen.
+      // …and no LATER sample may return to a boot track seen BEFORE it (codex pass 5 on #193): a brief forward clock flick
+      // displaces a few samples onto a "new" track whose uptime seems to fall, then the old track resumes — that is
+      // a clock artefact, kept as ambiguous, never a certain reboot.
       const b = await this.pool.query(
-        `SELECT boot_at::float8 AS at, (uptime_s < prev_up - 5) AS certain FROM (
+        `SELECT boot_at::float8 AS at,
+                (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
-                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up, lag(ts - uptime_s) OVER w AS prev_boot,
-                  max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot
+                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up,
+                  max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot,
+                  min(ts - uptime_s) OVER (w ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS min_next_boot
            FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
          ) s WHERE prev_ts IS NOT NULL AND boot_at > max_prev_boot + $2
              AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
