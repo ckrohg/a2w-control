@@ -170,8 +170,10 @@ class BreakerController:
             rec = self._read_cycle_file()
         except OSError as exc:
             # A storage hiccup is not a malformed record: keep the file, block OFF actions, page,
-            # and keep re-reading until the interrupted cycle can be finished.
+            # and keep re-reading until the interrupted cycle can be finished. Meanwhile any
+            # circuit A2W can switch off may have just been opened: restart its minimum off time.
             self._record_blocked = True
+            self._restart_min_off_all()
             await self._audit_raw("cycle_record_unreadable", "critical",
                                   f"an interrupted power cycle's record can't be read ({exc}) — "
                                   "retrying; check that every Air-Water circuit is ON", {"error": str(exc)})
@@ -202,8 +204,10 @@ class BreakerController:
             return
         name, cid = rec.get("name"), rec.get("circuit_id")
         if not isinstance(name, str) or not isinstance(cid, str):
-            # We cannot tell WHICH circuit was left off — say so loudly rather than guess.
+            # We cannot tell WHICH circuit was left off — say so loudly rather than guess, and
+            # give every circuit A2W can switch off a fresh minimum off time.
             log.warning("span breaker: unreadable cycle record — paging: %r", rec)
+            self._restart_min_off_all()
             self._clear_cycle_file()
             await self._audit_raw("cycle_record_unreadable", "critical",
                                   "an interrupted power cycle left an unreadable record — check that "
@@ -685,6 +689,16 @@ class BreakerController:
                 for n, t in self._opened_at.items() if n not in self._pending_close}
         return self._write_durable(self._opens_path, recs)
 
+    def _restart_min_off_all(self) -> None:
+        """History unknown: every circuit A2W may switch OFF (cycle or open) gets a fresh minimum
+        off time from now, so nothing it may have opened can be closed early. Persisted."""
+        now = self._mono()
+        for b in self.cfg.breakers:
+            if b.allow_open or b.allow_cycle:
+                self._opened_at[b.name] = now
+                self._open_untimed.add(b.name)
+        self._persist_opens()
+
     def _restore_opens(self) -> None:
         if not self._opens_path:
             return
@@ -699,10 +713,7 @@ class BreakerController:
             # History unknown: fail closed — every circuit A2W may switch off starts a fresh
             # minimum off time, so nothing it opened can be closed early.
             log.warning("span breaker: opens record unreadable (%s) — restarting min-off holds", exc)
-            for b in self.cfg.breakers:
-                if b.allow_open:
-                    self._opened_at[b.name] = now
-                    self._open_untimed.add(b.name)
+            self._restart_min_off_all()
             return
         for n, r in recs.items():
             t = r.get("opened_mono") if isinstance(r, dict) else None
@@ -717,11 +728,11 @@ class BreakerController:
         if not self._cycle_path:
             return None
         try:
-            text = self._cycle_path.read_text()
+            raw = self._cycle_path.read_bytes()
         except FileNotFoundError:
             return None
         try:
-            rec = json.loads(text)
+            rec = json.loads(raw)            # bad UTF-8 is a UnicodeDecodeError (a ValueError)
         except ValueError as exc:
             log.warning("span breaker: cycle record malformed: %s", exc)
             return {}

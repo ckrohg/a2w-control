@@ -480,6 +480,35 @@ async def test_transient_cycle_record_read_error_keeps_the_record_and_recovers(r
     assert any(a[2] == "urgent" for a in alerts if a[0] == "push")
 
 
+async def test_unreadable_record_imposes_min_off_before_close(rig, monkeypatch):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    panel.set("Air-Water 2", relayState="OPEN")
+    cycle_file(tmp_path).write_text("{}")
+
+    def broken():
+        raise OSError("EIO")
+    monkeypatch.setattr(ctl, "_read_cycle_file", broken)
+    monkeypatch.setattr(span_control, "RECORD_RETRY_S", 10_000.0)
+    ft.block = 10_000.0
+    await ctl.recover()
+    with pytest.raises(BreakerRefused, match="minimum off time"):
+        await ctl.execute("Air-Water 2", "close")
+    ft.t += 60
+    assert (await ctl.execute("Air-Water 2", "close"))["relay_state"] == "CLOSED"
+    ft.release.set()
+
+
+async def test_invalid_utf8_record_pages_instead_of_crashing(rig):
+    panel, ctl, ft, store, alerts, tmp_path = rig
+    cycle_file(tmp_path).write_bytes(b"\xff\xfe{\x80garbage")
+    panel.set("Air-Water 2", relayState="OPEN")
+    await ctl.recover()                          # must not raise
+    await asyncio.sleep(0.05)
+    assert any(a[2] == "urgent" for a in alerts if a[0] == "push")
+    with pytest.raises(BreakerRefused, match="minimum off time"):
+        await ctl.execute("Air-Water 2", "close")
+
+
 async def test_blocked_record_refuses_off_actions(rig, monkeypatch):
     panel, ctl, ft, store, alerts, tmp_path = rig
     cycle_file(tmp_path).write_text("{}")

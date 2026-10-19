@@ -79,7 +79,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             span_breakers = BreakerController(
                 cfg.span, span_poller.client, store, notify_cfg=cfg.notifications,
                 cache=span_poller, state_dir=str(Path(cfg.db_path).resolve().parent))
-            await span_breakers.recover()   # finish a power cycle a restart interrupted
+            try:
+                await span_breakers.recover()   # finish a power cycle a restart interrupted
+            except Exception:  # noqa: BLE001 — a recovery bug must never stop the bridge booting
+                logging.getLogger(__name__).exception("span breaker recovery failed")
         app.state.span_breakers = span_breakers
         hub_client.span = span_breakers   # before start(): the first state frame advertises it
         hub_client.start()
