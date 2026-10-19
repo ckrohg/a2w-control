@@ -715,6 +715,7 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
     });
   }
   const events = stageWatch.step({ nowMs: Date.now(), stagesCalled: reading.stagesCalled, pumps, lagTMin: lastLagTMin });
+  if (alertStateRestored && pumps != null && reading.stagesCalled != null) stageEvaluatedSinceRestore = true;
   for (const e of events) {
     if (e.kind === "open") {
       console.warn(`[stagewatch] ${e.title}: ${e.body}`);
@@ -734,6 +735,12 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
  * 4), scoped to rows started before boot, so it can never close a storm this process armed meanwhile.
  */
 const PROCESS_START = new Date();
+let pendingStandDownBefore: Date | null = null;
+async function retryStormStandDown(): Promise<void> {
+  if (!pendingStandDownBefore) return;
+  try { await store.closeStormEvents("stand-down", pendingStandDownBefore); pendingStandDownBefore = null; }
+  catch (e) { console.error("storm stand-down close failed (retried next tick):", (e as Error).message); }
+}
 let stormSweepDone = false;
 async function sweepStormOrphans(): Promise<void> {
   if (stormSweepDone) return;
@@ -754,6 +761,8 @@ async function sweepStormOrphans(): Promise<void> {
  * every row of that kind/key, so a duplicate opened meanwhile closes with it.
  */
 let alertStateRestored = false;
+let stageEvaluatedSinceRestore = false; // set by checkStages after a successful restore
+let spanEvaluatedSinceRestore = false;  // set by checkSpanLocal after a successful restore
 async function restoreAlertState(): Promise<void> {
   if (alertStateRestored) return;
   try {
@@ -787,6 +796,7 @@ async function checkSpanLocal(): Promise<void> {
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   spanLocalError = null;
   const n = spanLocalAlarm.step(spanLocal);
+  if (alertStateRestored && spanLocal.local_stale !== null) spanEvaluatedSinceRestore = true;
   if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
   else if (n) {
     await alerts.close("span_local_stale", "span");
@@ -1153,7 +1163,9 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
       "high",
     );
   } else {
-    await store.closeStormEvents("stand-down").catch((e) => console.error("storm event close failed:", (e as Error).message));
+    // a failed close is retried every tick, scoped to rows started before this stand-down (codex pass 5)
+    pendingStandDownBefore = new Date();
+    await retryStormStandDown();
     await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { resolved: true });
   }
 }
@@ -1872,6 +1884,8 @@ async function loop(): Promise<void> {
 }
 
 async function loopBody(): Promise<void> {
+  // restore FIRST, so this tick's stage / SPAN evaluation reconciles adopted episodes before any re-send (codex pass 5)
+  await restoreAlertState();
   try {
     await pollOnce();
     lastPollAt = new Date().toISOString();
@@ -1895,10 +1909,13 @@ async function loopBody(): Promise<void> {
 
   // #187 / #185: the SPAN-local check and the alert outbox depend on neither SensorLinx nor the poll's success —
   // they run every tick on their own, so a SensorLinx outage cannot hide a SPAN outage or stall a re-send (codex pass 2)
-  await restoreAlertState();
   await sweepStormOrphans();
+  await retryStormStandDown();
   await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
-  await alerts.retry().catch((e) => console.error("alert re-send failed:", (e as Error).message));
+  // a DB row is re-sent only once its watch has evaluated the condition since the restore that adopted it — a resolved
+  // incident is closed by that evaluation instead of paged (codex pass 5)
+  await alerts.retry((kind) => (kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
+    .catch((e) => console.error("alert re-send failed:", (e as Error).message));
 
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.

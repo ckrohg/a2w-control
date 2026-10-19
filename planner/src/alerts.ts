@@ -27,6 +27,8 @@ export class AlertOutbox {
   private openIds = new Map<string, Set<number>>();
   /** IDs whose close the DB refused: retried every retry(), never re-sent meanwhile */
   private unclosed = new Set<number>();
+  /** IDs a channel acknowledged but whose notified_at write failed: the MARK is retried, the page never re-sent */
+  private unmarked = new Set<number>();
   /** episodes whose row could not be written (with whether a channel already heard the page) */
   private unrecorded: Unrecorded[] = [];
 
@@ -49,7 +51,7 @@ export class AlertOutbox {
     });
     if (id != null) this.track(kind, key, id);
     const delivered = await this.send(title, body);
-    if (delivered && id != null) await this.store.markAlertNotified(id).catch((e) => this.log(`alert notified mark failed: ${(e as Error).message}`));
+    if (delivered && id != null) await this.mark(id);
     if (id == null) this.unrecorded.push({ kind, key, pumpId, title, body, delivered });
     return delivered;
   }
@@ -67,6 +69,12 @@ export class AlertOutbox {
     await this.flushCloses();
   }
 
+  /** notified_at — on failure the ID is remembered and only the write is retried (codex pass 5) */
+  private async mark(id: number): Promise<void> {
+    try { await this.store.markAlertNotified(id); this.unmarked.delete(id); }
+    catch (e) { this.unmarked.add(id); this.log(`alert notified mark failed (retried, not re-sent): ${(e as Error).message}`); }
+  }
+
   private async flushCloses(): Promise<void> {
     if (!this.unclosed.size) return;
     const ids = [...this.unclosed];
@@ -80,12 +88,14 @@ export class AlertOutbox {
   pendingCloses(): number { return this.unclosed.size; }
 
   /**
-   * Closes owed first; then unrecorded episodes (persisted if the DB is back — marked notified if already heard — else
-   * sent directly if still unheard); then open, unacknowledged rows oldest first, excluding any whose close is pending;
-   * stops sending at the first failure (channels still down). Returns pages sent.
+   * Closes and notified-marks owed first; then unrecorded episodes (persisted if the DB is back — marked notified if
+   * already heard — else sent directly if still unheard); then open, unacknowledged rows oldest first, excluding any
+   * whose close is pending or that a channel already heard, and any whose kind `canResend` holds back (index.ts: a watch
+   * that has not re-evaluated its condition since a restore); stops sending at the first failure. Returns pages sent.
    */
-  async retry(): Promise<number> {
+  async retry(canResend: (kind: string) => boolean = () => true): Promise<number> {
     await this.flushCloses();
+    for (const id of [...this.unmarked]) await this.mark(id);
     let sent = 0;
     const queue = this.unrecorded;
     this.unrecorded = [];
@@ -93,16 +103,17 @@ export class AlertOutbox {
       const id = await this.store.openAlertEpisode(u.kind, u.key, u.pumpId, u.title, u.body).catch(() => null);
       if (id != null) {
         this.track(u.kind, u.key, id);
-        if (u.delivered) await this.store.markAlertNotified(id).catch(() => { /* re-sent once by the loop below at worst */ });
+        if (u.delivered) await this.mark(id);
         continue; // an unheard one is now an outbox row: the loop below delivers it
       }
       if (!u.delivered && (await this.send(u.title, u.body + RESENT))) { sent++; u.delivered = true; }
       this.unrecorded.push(u); // still not durable — keep trying to persist it
     }
     for (const a of await this.store.undeliveredAlertEpisodes()) {
-      if (this.unclosed.has(a.id)) continue; // resolved; only its close is pending — never page it
+      if (this.unclosed.has(a.id) || this.unmarked.has(a.id)) continue; // resolved, or already heard
+      if (!canResend(a.kind)) continue; // its watch has not re-evaluated the condition since a restore (index.ts)
       if (!(await this.send(a.title, `${a.detail ?? ""}${RESENT}`))) break;
-      await this.store.markAlertNotified(a.id);
+      await this.mark(a.id);
       sent++;
     }
     return sent;

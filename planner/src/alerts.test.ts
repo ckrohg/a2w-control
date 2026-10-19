@@ -148,5 +148,33 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   await r4.close("span_local_stale", "span");
   assert.equal(row!.cleared, true);
 
+  // codex pass 5: (1) heard, but the notified mark FAILED → the mark is retried, the page is never re-sent, and the
+  // failure does not stop other episodes from being processed
+  let markUp = false;
+  const marky: AlertStore = { ...store, markAlertNotified: async (id) => { if (!markUp) throw new Error("db blip"); return store.markAlertNotified(id); } };
+  up = true;
+  const m = new AlertOutbox(marky, send, () => {});
+  const n3 = sent.length;
+  await m.open("fault_called", "1", "pump1", "⚠ heard, mark failed", "x");
+  const heardId = rows.length;
+  up = false;
+  await m.open("stage_unserved", "2", "pump2", "⚠ unheard neighbour", "y");
+  up = true;
+  for (let i = 0; i < 3; i++) await m.retry();
+  assert.equal(sent.slice(n3).filter((t) => t === "⚠ heard, mark failed").length, 1, "heard once, never re-sent while its mark is failing");
+  assert.ok(sent.slice(n3).includes("⚠ unheard neighbour"), "the failing mark does not block the other episode");
+  markUp = true;
+  await m.retry();
+  assert.equal(rows[heardId - 1].notified, true, "the mark lands once the DB takes it");
+  // (2) a kind held back by canResend (its watch has not re-evaluated since a restore) is not re-sent from the DB
+  up = false;
+  await m.open("stage_unserved", "9", "pump1", "⚠ maybe obsolete", "z");
+  up = true;
+  const n4 = sent.length;
+  await m.retry((kind) => kind !== "stage_unserved");
+  assert.ok(!sent.slice(n4).includes("⚠ maybe obsolete"), "held back");
+  await m.retry(() => true);
+  assert.ok(sent.slice(n4).includes("⚠ maybe obsolete"), "sent once its watch has re-evaluated");
+
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

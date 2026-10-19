@@ -68,13 +68,21 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
 // ── 5. defrost SUSPENDS the clock (neither runs nor resets) ─────────────────────────────────────────────────────
 {
   const w = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
-  const seq = ["idle", "defrost", "defrost", "defrost", "defrost", "idle"]; // steps at 0–25: only 20→25 (idle at 25) counts
+  // idle 0 → idle 5 (+5) → defrost 10–20 (suspended, the 5→10 interval that ENDED in defrost is not credited) → idle
+  // 25 (resumes, credits nothing for the defrost interval) → idle 30 (+5 = 10 min) → page (codex pass 5)
+  const seq = ["idle", "idle", "defrost", "defrost", "defrost", "idle"];
   const ev: { m: number; e: StageEvent }[] = [];
   seq.forEach((st, k) => { for (const e of w.step({ nowMs: min(k * 5), stagesCalled: [true, false], pumps: [hp1(st), hp2("idle")], lagTMin: 180 })) ev.push({ m: k * 5, e }); });
-  assert.deepEqual(ev, [], "a step judged in defrost adds nothing: 5 min of grace counted by 25");
+  assert.deepEqual(ev, [], "5 min before the defrost, nothing for the defrost or the interval leaving it");
   const more = w.step({ nowMs: min(30), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 });
   assert.equal(more.length, 1, "the clock resumed where it stood");
   assert.match(more[0].title, /Stage 1 called 10 min but Heat Pump 1 is not heating/);
+  // codex pass 5: heating at 0, first idle at 10 → the 0–10 interval is NOT unserved; the clock starts at 10
+  const hw = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  hw.step({ nowMs: min(0), stagesCalled: [true, false], pumps: [hp1("heating"), hp2("idle")], lagTMin: 180 });
+  assert.deepEqual(hw.step({ nowMs: min(10), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), [], "no credit for time spent heating");
+  assert.deepEqual(hw.step({ nowMs: min(15), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }), []);
+  assert.equal(hw.step({ nowMs: min(20), stagesCalled: [true, false], pumps: [hp1("idle"), hp2("idle")], lagTMin: 180 }).length, 1, "10 min after the first idle observation");
 }
 
 // ── 6. unverifiable hub state (pumps null) or unknown stages: nothing moves, and the blind spell never counts ──────

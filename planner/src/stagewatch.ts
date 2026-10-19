@@ -68,6 +68,7 @@ export interface StageEvent {
 
 interface StageState {
   calledMs: number;      // called-and-not-heating time accumulated (excluding defrost)
+  /** the previous observation, when it was itself called-not-heating-not-defrost — only then does the next credit */
   lastStepMs: number | null;
   unservedOpen: boolean;
   faultOpen: boolean;
@@ -150,15 +151,19 @@ export class StageWatch {
       const heating = !!pump && pump.online && pump.state === "heating";
       if (heating) {
         if (s.unservedOpen) out.push(this.close(stage, pumpId, "stage_unserved", `${label(pump, pumpId)} is heating again.`));
-        s.unservedOpen = false; s.calledMs = 0; s.lastStepMs = i.nowMs;
+        s.unservedOpen = false; s.calledMs = 0; s.lastStepMs = null;
         continue;
       }
       const defrost = !!pump && pump.online && pump.state === "defrost";
-      // a gap longer than MAX_STEP_MS (skipped polls) credits NOTHING — the call may have just begun (codex pass 1)
-      const gap = s.lastStepMs == null ? 0 : Math.max(0, i.nowMs - s.lastStepMs);
-      const dt = gap > MAX_STEP_MS ? 0 : gap;
-      if (!defrost) s.calledMs += dt; // defrost suspends the start-grace clock (it neither runs nor resets)
-      s.lastStepMs = i.nowMs;
+      // Time is credited only BETWEEN two observations that were both called-not-heating-not-defrost (codex pass 5):
+      // an interval that began heating or in defrost is not unserved time; a gap longer than MAX_STEP_MS (skipped
+      // polls) credits nothing (pass 1). Defrost SUSPENDS the clock — it neither runs nor resets.
+      if (defrost) { s.lastStepMs = null; }
+      else {
+        const gap = s.lastStepMs == null ? 0 : Math.max(0, i.nowMs - s.lastStepMs);
+        s.calledMs += gap > MAX_STEP_MS ? 0 : gap;
+        s.lastStepMs = i.nowMs;
+      }
       if (!s.unservedOpen && s.calledMs >= this.graceMs) {
         s.unservedOpen = true;
         out.push({
