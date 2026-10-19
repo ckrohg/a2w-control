@@ -18,12 +18,16 @@ function harness(planTargetF = 126) {
   const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean }> = [];
   const apLogs: Array<{ targetF: number | null; reason: string; result: string }> = [];
   const failRetire = { n: 0 }; // retireOpenBoosts throws this many more times
+  const failConfig = { n: 0 }; // patch()'s post-PATCH accepted-write audit insert throws this many more times
   let gate: Promise<void> | null = null; // while set, patchDevice waits on it (an in-flight PATCH)
   const store = {
     getLatestSlx: async () => ({ ts: new Date(), tankF: 120, targetF: 128, outdoorF: 30 }),
     latestConfig: async () => ({ ...live }),
     baselineConfig: async () => ({ ...cfg }),
-    insertHbxWrite: async (w: { source: string; action: string; result: string }) => { audits.push(w); },
+    insertHbxWrite: async (w: { source: string; action: string; result: string }) => {
+      if (w.result === "accepted" && failConfig.n > 0) { failConfig.n--; throw new Error("connection terminated"); }
+      audits.push(w);
+    },
     insertConfigVersion: async () => {},
     // the real insertBoost retires every open row in the same statement (store.ts; checked on PGlite)
     insertBoost: async (targetF: number, restoreAt: Date) => { for (const b of boosts) b.restored = true; boosts.push({ id: boosts.length + 1, targetF, restoreAt, restored: false }); },
@@ -44,7 +48,7 @@ function harness(planTargetF = 126) {
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
   const autopilot = new AutoPilot(store, writer, false, async () => {});
-  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, live: () => live };
+  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, live: () => live };
 }
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
@@ -228,6 +232,24 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(await status(h.writer.boost(128, 30, "dashboard")), "ok");
     assert.equal((await h.writer.status()).boost_cancel_pending, false);
     assert.deepEqual(h.boosts.map((b) => b.restored), [true, false], "only the new boost is open");
+  }
+  // (g) the dashboard cancel's PATCH lands but patch()'s bookkeeping throws AFTER it (codex pass 4): the error still
+  //     reaches the caller, and the boost is retired anyway — the device took the owner's command
+  {
+    const h = harness();
+    assert.equal(await status(h.writer.boost(129, 60, "dashboard")), "ok");
+    (h.writer as any).lastWriteAt = 0;
+    h.failConfig.n = 1;
+    let err: unknown = null;
+    try { await h.writer.restore("dashboard", { endsBoost: true }); } catch (e) { err = e; }
+    assert.match(String(err), /connection terminated/, "the bookkeeping failure is not hidden");
+    assert.equal(h.patches.length, 2, "the restore reached the device");
+    assert.ok(h.boosts.every((b) => b.restored), "…so the cancelled boost is retired");
+    // a human write refused BEFORE the device (rate limit) still leaves the boost alone
+    const k = harness();
+    assert.equal(await status(k.writer.boost(129, 60, "dashboard")), "ok");
+    assert.equal(await status(k.writer.setTarget(127, "dashboard", undefined, { endsBoost: true })), 429);
+    assert.ok(k.boosts.every((b) => !b.restored));
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -185,20 +185,30 @@ export class HbxWriter {
           throw err;
         }
       }
-      const result = await write();
-      if (opts.endsBoost) {
-        // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
-        try { await this.store.retireOpenBoosts(); }
-        catch (e) {
-          this.retirePending = true;
-          const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
-          console.error(`[boost] ${msg}`);
-          await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
-          return { ...result, boost_retire_failed: true };
-        }
-      }
-      return result;
+      if (!opts.endsBoost) return write();
+      // The cancel follows the DEVICE, not the bookkeeping: patch() bumps deviceWrites as soon as the PATCH is
+      // accepted, so a write whose later audit / config-version insert (or read-back) threw still ends the boost —
+      // otherwise its timer would restore over the owner's command (codex pass 4).
+      const before = this.deviceWrites;
+      let result: Record<string, unknown>;
+      try { result = await write(); }
+      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action); throw e; }
+      // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
+      return (await this.retireCancelledBoost(source, action)) ? result : { ...result, boost_retire_failed: true };
     });
+  }
+  /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after. */
+  private deviceWrites = 0;
+  /** Retire the open boost row for a landed human write; on failure arm the retry. true = retired. */
+  private async retireCancelledBoost(source: string, action: string): Promise<boolean> {
+    try { await this.store.retireOpenBoosts(); return true; }
+    catch (e) {
+      this.retirePending = true;
+      const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
+      console.error(`[boost] ${msg}`);
+      await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
+      return false;
+    }
   }
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
 
@@ -546,6 +556,7 @@ export class HbxWriter {
         let dev: Record<string, any>;
         try {
           dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
+          this.deviceWrites++;
         } catch (e) {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
           throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);
