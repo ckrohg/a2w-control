@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -65,9 +66,8 @@ class SelfHealer:
         persisted, self.history_problem = self._load()
         self._pumps: dict[str, dict] = {}
         for pid in self.cfg.circuits:
-            p = persisted.get(pid) if isinstance(persisted.get(pid), dict) else {}
-            attempts = [a for a in p.get("attempts", []) if isinstance(a, dict)
-                        and isinstance(a.get("wall"), (int, float))]
+            p = persisted.get(pid, {})
+            attempts = list(p.get("attempts", []))
             if self.history_problem:
                 # Unknown history = assume the budget is spent for one window (fails closed,
                 # and clears itself: the next save rewrites a valid file).
@@ -145,8 +145,8 @@ class SelfHealer:
         return {"wall": self._clock(), "mono": self._mono(), "boot": self._boot_id}
 
     def _age(self, a: dict) -> float:
-        if self._boot_id and a.get("boot") == self._boot_id and isinstance(a.get("mono"), (int, float)):
-            return self._mono() - a["mono"]        # same boot: immune to wall-clock steps
+        if isinstance(a.get("mono"), (int, float)) and (a.get("boot") == self._boot_id):
+            return self._mono() - a["mono"]        # this boot (or rebased into it): no wall steps
         return self._clock() - float(a["wall"])     # future-dated (negative) still counts as recent
 
     def _recent(self, st: dict) -> list[dict]:
@@ -219,6 +219,13 @@ class SelfHealer:
         if not self._startup_paged:
             self._startup_paged = True
             await self._startup_notes()
+        pruned = False
+        for st in self._pumps.values():
+            recent = self._recent(st)
+            if len(recent) != len(st["attempts"]):
+                st["attempts"], pruned = recent, True
+        if pruned:
+            self._save()
         for pid, st in self._pumps.items():
             if pid in self.config_errors:
                 st["status"] = f"unavailable: {self.config_errors[pid]}"
@@ -377,9 +384,10 @@ class SelfHealer:
                          f"{self.cfg.max_attempts}.", detail,
                          title=f"A2W self-heal: power-cycling {name}")
         try:
+            episode = (code, fault.get("since"), st["fault_seen"])
             result = await self.breakers.execute(
                 circuit, "power_cycle", off_s=self.cfg.off_s, source="self-heal",
-                precheck=lambda circ: self._precheck(pid, code, circ))
+                precheck=lambda circ: self._precheck(pid, episode, circ))
         except BreakerRefused as exc:
             text = str(exc)
             if text.startswith("precheck:") or "one at a time" in text:
@@ -411,9 +419,12 @@ class SelfHealer:
         st["status"] = f"cycled; verifying recovery (≤ {self.cfg.verify_min:g} min)"
         self._begin_verify(st, code, shadow=False)
 
-    def _precheck(self, pid: str, code: str, circ: dict) -> str | None:
-        """Re-run the pump guards on the CURRENT snapshots and the controller's FRESH panel read,
-        immediately before the OPEN is dispatched (no await between this and the OPEN)."""
+    def _precheck(self, pid: str, episode: tuple, circ: dict) -> str | None:
+        """Re-run the pump guards on the CURRENT snapshots and the controller's FRESH panel read.
+        Called twice by the controller: on the fresh read, and again in the worker immediately
+        before the POST (OpenPermit guard). The fault must still be the SAME episode that earned
+        the grace — same code, same onset — and still past the grace on both clocks."""
+        code, since, seen = episode
         poller = self.pollers.get(pid)
         if poller is None:
             return "pump not configured"
@@ -425,8 +436,14 @@ class SelfHealer:
         busy = self._heating_or_defrost(snap, st)
         if busy:
             return f"{poller.cfg.name} {busy}"
-        if self._target_fault(snap) is None:
+        f = self._target_fault(snap)
+        if f is None:
             return f"{code} cleared on its own"
+        if f.get("code") != code or f.get("since") != since:
+            return f"the fault episode changed ({f.get('code')} since {f.get('since')})"
+        if seen is None or min((self._clock() - float(since or self._clock())) / 60,
+                               (self._mono() - seen[1]) / 60) < self.cfg.grace_min:
+            return "the fault is inside its grace period"
         other = self._other_down(pid, span=None)   # the controller itself checks the relays
         if other:
             return other
@@ -529,7 +546,11 @@ class SelfHealer:
             t.add_done_callback(self._bg.discard)
 
     def _load(self) -> tuple[dict, str | None]:
-        """(pumps, problem). A missing file is a clean start; anything unreadable is a problem."""
+        """(pumps, problem). A missing file is a clean start; anything unreadable or not exactly
+        the expected shape is a problem (the caller then treats the budget as spent).
+        Attempts from ANOTHER boot are rebased to now: across a reboot neither clock can say how
+        long ago they were, so each counts for a full window from this start (conservative; the
+        file only ever holds attempts that were inside the window when it was last written)."""
         if not self._path:
             return {}, None
         try:
@@ -538,9 +559,31 @@ class SelfHealer:
             return {}, None
         except (OSError, ValueError) as exc:
             return {}, f"{type(exc).__name__}: {exc}"
-        if not isinstance(data, dict) or not isinstance(data.get("pumps", {}), dict):
-            return {}, "unexpected shape"
-        return data.get("pumps", {}), None
+        try:
+            pumps = data["pumps"]
+            if not isinstance(pumps, dict):
+                raise ValueError("pumps is not an object")
+            out: dict = {}
+            for pid, p in pumps.items():
+                if not isinstance(p, dict) or not isinstance(p.get("attempts", []), list):
+                    raise ValueError(f"{pid}: bad entry")
+                attempts = []
+                for a in p.get("attempts", []):
+                    wall, mono = a["wall"], a.get("mono")
+                    if isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(wall):
+                        raise ValueError(f"{pid}: bad attempt time {wall!r}")
+                    if mono is not None and (isinstance(mono, bool) or not isinstance(mono, (int, float))
+                                             or not math.isfinite(mono)):
+                        raise ValueError(f"{pid}: bad attempt mono {mono!r}")
+                    if not (self._boot_id and a.get("boot") == self._boot_id and mono is not None):
+                        a = {"wall": wall, "mono": self._mono(), "boot": self._boot_id, "rebased": True}
+                    attempts.append({"wall": wall, "mono": a["mono"], "boot": a["boot"],
+                                     **({"rebased": True} if a.get("rebased") else {})})
+                lo = p.get("last_outcome")
+                out[pid] = {"attempts": attempts, "last_outcome": lo if isinstance(lo, dict) else None}
+            return out, None
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            return {}, f"malformed history: {exc}"
 
     def _save(self) -> bool:
         if not self._path:

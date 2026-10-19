@@ -316,6 +316,66 @@ async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch
     assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 0   # not an attempt
 
 
+async def test_guard_at_the_dispatch_boundary_aborts_with_nothing_sent(rig, monkeypatch):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    real = r.ctl.client.set_relay
+
+    async def late_change(cid, want="CLOSED", **kw):
+        if want == "OPEN":
+            r.p2.snapshot["running"] = True      # changes AFTER the controller's precheck...
+        return await real(cid, want, **kw)       # ...and the permit guard sees it in the worker
+    monkeypatch.setattr(r.ctl.client, "set_relay", late_change)
+    await r.eligible(heal)
+    assert r.panel.writes == []                  # no OPEN — and so no CLOSE either
+    assert not (r.tmp_path / span_control.CYCLE_FILE).exists()
+    assert "cycle_aborted" in await codes(r.store)
+    assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 0
+
+
+async def test_a_new_fault_episode_does_not_inherit_the_grace(rig, monkeypatch):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    real_step = heal._step
+
+    async def refault(pid, code, *a, **k):
+        await real_step(pid, code, *a, **k)
+        if code == "cycle_start":
+            r.p2.fault(age_min=0.1)              # E21 cleared and came straight back: new onset
+    monkeypatch.setattr(heal, "_step", refault)
+    await r.eligible(heal)
+    assert r.panel.writes == []
+    assert "cycle_aborted" in await codes(r.store)
+
+
+async def test_nested_history_corruption_is_a_spent_budget_not_a_crash(rig):
+    r = rig
+    for bad in ({"pumps": {"pump2": {"attempts": None}}},
+                {"pumps": {"pump2": {"attempts": [{"wall": "yesterday"}]}}},
+                {"pumps": {"pump2": {"attempts": [{"mono": 5}]}}},
+                {"pumps": []}):
+        (r.tmp_path / sh_mod.STATE_FILE).write_text(json.dumps(bad))
+        heal = r.make(live=True)
+        assert heal.history_problem, bad
+        assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 2
+    (r.tmp_path / sh_mod.STATE_FILE).write_text(
+        '{"pumps": {"pump2": {"attempts": [{"wall": NaN, "mono": 1, "boot": "boot-A"}]}}}')
+    assert r.make(live=True).history_problem
+
+
+async def test_budget_survives_a_reboot_with_a_clock_step(rig):
+    r = rig
+    r.p2.fault(age_min=12)
+    heal = r.make(live=True)
+    await r.eligible(heal)
+    r.ft.wall_offset = 7 * 3600                  # reboot + NTP correction 7 h ahead
+    rebooted = SelfHealer(SelfHealConfig(live=True), {"pump1": r.p1, "pump2": r.p2}, r.ctl, r.store,
+                          state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.mono, boot_id="boot-B")
+    assert rebooted.status()["pumps"]["pump2"]["attempts_in_window"] == 1
+
+
 async def test_cold_or_stale_span_waits_then_pages_manual(rig):
     r = rig
     r.poller.latest_circuits = {}                           # just booted: no panel read yet

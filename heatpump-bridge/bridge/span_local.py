@@ -229,17 +229,24 @@ class SpanClient:
         return await asyncio.to_thread(_locked)
 
 
+class OpenAborted(Exception):
+    """The permit's guard refused at the dispatch boundary: NOTHING was sent to the panel."""
+
+
 class OpenPermit:
     """Capability to OPEN one SPAN circuit, once, within a few seconds. Minted only by
     span_control.BreakerController after its guards pass; SpanClient refuses OPEN without one.
-    Single-use so a stray reference can never be replayed into a second OFF."""
+    Single-use so a stray reference can never be replayed into a second OFF. An optional
+    `guard()` runs LAST — in the worker, under the client lock, immediately before the POST — and
+    aborts with OpenAborted if it returns a reason (callers' last-moment re-validation)."""
 
     TTL_S = 30.0
 
-    def __init__(self, circuit_id: str, name: str, reason: str):
+    def __init__(self, circuit_id: str, name: str, reason: str, guard=None):
         self.circuit_id = circuit_id
         self.name = name
         self.reason = reason
+        self.guard = guard
         self._expires = time.monotonic() + self.TTL_S
         self._used = False
 
@@ -251,6 +258,10 @@ class OpenPermit:
         if time.monotonic() > self._expires:
             raise ValueError(f"open permit for '{self.name}' expired")
         self._used = True
+        if self.guard is not None:
+            why = self.guard()
+            if why:
+                raise OpenAborted(why)
 
 
 def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
