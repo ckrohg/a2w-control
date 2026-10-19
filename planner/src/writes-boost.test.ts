@@ -289,5 +289,28 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(a.boosts[0].restored, true, "A's cancelled boost is retired");
     assert.equal(a.boosts[1].restored, false, "B's boost, started after A's PATCH landed, stays active");
   }
+  // (j) codex pass 8: a write slot stuck in a hung DB query (the main pool has no query timeouts) must not block the
+  //     restore — it proceeds past RESTORE_QUEUE_WAIT_MS — while ordinary writes keep waiting their turn
+  {
+    const h = harness();
+    (h.writer as any).restoreQueueWaitMs = 30;
+    const realLatest = h.store.getLatestSlx;
+    let unstick!: () => void; const stuck = new Promise<void>((r) => { unstick = r; });
+    h.store.getLatestSlx = async () => { await stuck; return realLatest(); }; // the auto-pilot's envelope read hangs
+    const ap = status(h.writer.setTarget(126, "autopilot"));
+    await settle();
+    h.store.getLatestSlx = realLatest;
+    const later = status(h.writer.setTarget(127, "dashboard")); // queued behind the stuck slot
+    const rs = await status(h.writer.restore("dashboard"));
+    assert.equal(rs, "ok", "the restore ran although an earlier slot never settled");
+    assert.deepEqual(h.patches, [{ dbt: 130, mbt: 126, dot: 10 }]);
+    let laterDone = false; void later.then(() => { laterDone = true; });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(laterDone, false, "an ordinary write still waits for the stuck slot");
+    unstick();
+    assert.equal(await ap, 429, "the unstuck write sees the restore's lastWriteAt — it does not land over it");
+    assert.equal(await later, 429);
+    assert.equal(h.patches.length, 1);
+  }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

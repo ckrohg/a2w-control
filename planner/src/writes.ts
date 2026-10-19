@@ -23,6 +23,11 @@ import { extractConfig, diffConfig, patchEcho } from "./drift";
 import { curveAlreadyInForce, curveOutputF, curveWriteGuard, type ShapedCurve } from "./curve";
 
 const WRITE_MIN_INTERVAL_MS = 15 * 60 * 1000;
+/**
+ * How long a restore waits for an earlier write slot before it proceeds anyway. Above a healthy slot's worst case
+ * (hub 20 s + SensorLinx PATCH 30 s, a re-auth, the audit rows), so only a genuinely stuck slot is overtaken.
+ */
+export const RESTORE_QUEUE_WAIT_MS = 120_000;
 const SLX_FRESH_MS = 20 * 60 * 1000;
 
 /**
@@ -144,9 +149,24 @@ export class HbxWriter {
    * its own fetch timeout, so a hung PATCH cannot wedge the chain.
    */
   private writeChain: Promise<unknown> = Promise.resolve();
-  private serial<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
-    this.writeChain = run.catch(() => {});
+  private restoreQueueWaitMs = RESTORE_QUEUE_WAIT_MS; // an instance field so the suite can shorten it
+  private serial<T>(fn: () => Promise<T>, maxWaitMs?: number): Promise<T> {
+    const prev = this.writeChain;
+    if (maxWaitMs == null) {
+      const run = prev.then(fn, fn);
+      this.writeChain = run.catch(() => {});
+      return run;
+    }
+    // Bounded wait (restore only): the main pool has no query timeouts, so a slot stuck in a hung query would
+    // otherwise block the one write that must never be blocked (codex pass 8). Past the bound the restore runs anyway —
+    // the device PATCH is still ordered by withDeviceLock — and later writers wait for BOTH the stuck slot and it.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const gate = Promise.race([
+      prev,
+      new Promise<void>((r) => { timer = setTimeout(() => { console.warn(`[writer] a write slot has not settled in ${maxWaitMs / 1000} s — the restore proceeds without it`); r(); }, maxWaitMs); }),
+    ]).finally(() => clearTimeout(timer));
+    const run = gate.then(fn, fn);
+    this.writeChain = Promise.allSettled([prev, run]);
     return run;
   }
   /**
@@ -172,7 +192,7 @@ export class HbxWriter {
     }
   }
   /** One serial slot with the WriteOpts boost semantics around the write. */
-  private guarded(source: string, action: string, requested: unknown, opts: WriteOpts, write: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  private guarded(source: string, action: string, requested: unknown, opts: WriteOpts, write: () => Promise<Record<string, unknown>>, maxWaitMs?: number): Promise<Record<string, unknown>> {
     return this.serial(async () => {
       // Before the yield check, so a cancelled boost whose row can now be retired no longer makes an automatic writer
       // yield. If the retry fails the stale row still yields — fail closed, like the auto-pilot's own pre-check: the
@@ -198,7 +218,7 @@ export class HbxWriter {
       catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt); throw e; }
       // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
       return (await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt)) ? result : { ...result, boost_retire_failed: true };
-    });
+    }, maxWaitMs);
   }
   /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after — and when the last one did. */
   private deviceWrites = 0;
@@ -504,7 +524,7 @@ export class HbxWriter {
 
   /** Re-apply the as-found curve endpoints. Never rate-limited, never envelope-checked. */
   async restore(source: string, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
-    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source));
+    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source), this.restoreQueueWaitMs);
   }
   private async restoreSerial(source: string): Promise<Record<string, unknown>> {
     const baseline = await this.store.baselineConfig();
