@@ -1,12 +1,16 @@
 # @purpose: Self-heal (#189, bridge/self_heal.py) against the real BreakerController and a fake
-# SPAN panel (sim/fake_span.py), with pump snapshots faked and time injected: the E21 grace,
-# never while heating / in defrost, SHADOW by default (logs "would cycle", switches nothing),
-# the live cycle + 15-min verification (recovered / not recovered), 2 attempts per 6 h then
-# escalate, never with the other pump down, SPAN unreachable -> manual page, a suspicious
-# pump<->circuit mapping refused, the budget surviving a restart, and /api/health.self_heal.
+# SPAN panel (sim/fake_span.py), with pump snapshots faked and time injected: the E21 grace (wall
+# AND in-process), never while heating / in defrost / on a failed identity check, SHADOW by default
+# (logs "would cycle", switches nothing), the live cycle + 15-min verification (recovered / not
+# recovered / replaced by another fault / telemetry gap restarts the hold), 2 attempts per 6 h
+# then escalate (also across a restart and a wall-clock step), never with the other pump down,
+# SPAN unreachable / never read -> manual page, the last-moment precheck aborting the OPEN, a
+# suspicious pump<->circuit mapping refused, unreadable history = budget spent, config problems
+# reported (never a boot failure), and /api/health.self_heal.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +29,12 @@ from sim.fake_span import FakeSpan
 class FakeTime:
     def __init__(self):
         self.t = 1_800_000_000.0
+        self.wall_offset = 0.0        # simulate a wall-clock step without moving monotonic time
 
     def clock(self) -> float:
+        return self.t + self.wall_offset
+
+    def mono(self) -> float:
         return self.t
 
     async def sleep(self, s: float) -> None:
@@ -38,15 +46,15 @@ class FakePoller:
     def __init__(self, pid, name, ft):
         self.cfg = SimpleNamespace(id=pid, name=name)
         self.ft = ft
-        self.snapshot = {"online": True, "last_poll_ts": ft.t, "running": False,
-                         "defrosting": False, "state": "idle", "active_faults": []}
+        self.snapshot = {"online": True, "last_poll_ts": ft.clock(), "running": False,
+                         "defrosting": False, "state": "idle", "active_faults": [], "identity_ok": True}
 
     def fresh(self, **kw):
-        self.snapshot.update(last_poll_ts=self.ft.t, **kw)
+        self.snapshot.update(last_poll_ts=self.ft.clock(), **kw)
 
     def fault(self, code="E21", age_min=11.0, severity="warning"):
         self.snapshot["active_faults"] = [{"key": "2111.13", "code": code, "severity": severity,
-                                           "since": self.ft.t - age_min * 60, "message": "x"}]
+                                           "since": self.ft.clock() - age_min * 60, "message": "x"}]
         self.snapshot["state"] = "fault"
 
     def clear(self):
@@ -81,19 +89,31 @@ async def rig(tmp_path, alerts):
     ft = FakeTime()
     poller = SpanLocalPoller(span, store)
     ctl = BreakerController(span, poller.client, store, cache=poller, state_dir=str(tmp_path),
-                            sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+                            sleep=ft.sleep, clock=ft.clock, mono=ft.mono)
     p1, p2 = FakePoller("pump1", "Heat Pump 1", ft), FakePoller("pump2", "Heat Pump 2", ft)
 
     def make(**cfg):
         return SelfHealer(SelfHealConfig(**cfg), {"pump1": p1, "pump2": p2}, ctl, store,
-                          state_dir=str(tmp_path), clock=ft.clock)
+                          state_dir=str(tmp_path), clock=ft.clock, mono=ft.mono, boot_id="boot-A")
 
-    async def prime():   # the controller's cache needs one panel read (the poll loop does this)
-        poller.note_circuits(await poller.client.fetch_circuits(), ft.t)
+    async def prime():   # one panel read, as the SPAN poll loop does every ~25 s
+        poller.note_circuits(await poller.client.fetch_circuits(), ft.clock())
+
+    async def step(heal, seconds=30.0):
+        ft.t += seconds
+        p1.fresh(); p2.fresh()
+        await prime()
+        await heal.tick()
+
+    async def eligible(heal):
+        """Seed the in-process first-seen time, then let the 10-minute grace pass."""
+        await heal.tick()
+        await step(heal, 601)
 
     await prime()
     yield SimpleNamespace(panel=panel, ctl=ctl, ft=ft, p1=p1, p2=p2, make=make, store=store,
-                          alerts=alerts, prime=prime, tmp_path=tmp_path)
+                          alerts=alerts, prime=prime, step=step, eligible=eligible, tmp_path=tmp_path,
+                          poller=poller)
     await ctl.stop()
     await store.close()
     panel.stop()
@@ -107,12 +127,16 @@ async def settle():
     await asyncio.sleep(0.05)   # let fire-and-forget alert tasks run
 
 
+def opens(panel):
+    return [w for w in panel.writes if w[1] == "OPEN"]
+
+
 async def test_shadow_is_the_default_and_switches_nothing(rig):
     r = rig
     r.p2.fault(age_min=11)
     heal = r.make()
     assert heal.status()["mode"] == "shadow"
-    await heal.tick()
+    await r.eligible(heal)
     await settle()
     assert r.panel.writes == []
     assert await codes(r.store) == ["would_cycle"]
@@ -121,69 +145,107 @@ async def test_shadow_is_the_default_and_switches_nothing(rig):
     st = heal.status()["pumps"]["pump2"]
     assert st["attempts_in_window"] == 1 and "SHADOW" in st["status"]
     assert heal.status()["trigger"]["stage_call"].startswith("unavailable")
-    # it does not re-log every tick while it watches
-    await heal.tick()
+    await r.step(heal)                                     # it does not re-log every tick
     assert await codes(r.store) == ["would_cycle"]
 
 
-async def test_grace_heating_defrost_and_stale_all_hold_off(rig):
+async def test_grace_needs_both_clocks(rig):
     r = rig
     heal = r.make(live=True)
-    r.p2.fault(age_min=5)                                   # inside the 10 min grace
-    await heal.tick()
+    r.p2.fault(age_min=60)        # the fault's onset is an hour ago (wall)...
+    await heal.tick()             # ...but this process only just saw it
+    await r.step(heal, 300)
+    assert opens(r.panel) == []
+    await r.step(heal, 301)       # 10 min observed in-process
+    assert len(opens(r.panel)) == 1
+
+
+async def test_heating_defrost_stale_and_identity_all_hold_off(rig):
+    r = rig
+    heal = r.make(live=True)
     r.p2.fault(age_min=11)
-    r.p2.fresh(running=True)                                # heating
     await heal.tick()
-    r.p2.fresh(running=False)                               # stopped just now: anti-short-cycle
+    r.p2.snapshot["running"] = True                         # heating
+    await r.step(heal, 601)
+    r.p2.snapshot["running"] = False                        # stopped just now: anti-short-cycle
+    await r.step(heal, 30)
+    r.p2.snapshot["defrosting"] = True                      # defrost
+    await r.step(heal, 200)
+    r.p2.snapshot["defrosting"] = False
+    await r.step(heal, 60)                                  # still inside the 5 min after defrost
+    r.ft.t += 400
+    await r.prime()
+    r.p1.fresh()
+    r.p2.snapshot["last_poll_ts"] = r.ft.clock() - 300      # stale
     await heal.tick()
-    r.ft.t += 200
-    r.p1.fresh(); r.p2.fresh(defrosting=True)               # defrost
+    r.p2.fresh(identity_ok=False)                           # identity check failed
     await heal.tick()
-    r.p2.fresh(defrosting=False)
-    r.p2.snapshot["last_poll_ts"] = r.ft.t - 300            # stale snapshot
-    await heal.tick()
+    await settle()
     assert r.panel.writes == []
-    assert await codes(r.store) == []
+    assert await codes(r.store) == ["identity_mismatch"]
 
 
 async def test_live_cycle_then_recovery_verified(rig):
     r = rig
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
-    await heal.tick()
+    await r.eligible(heal)
     assert r.panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
     assert await codes(r.store) == ["cycle_start"]
     assert heal.status()["pumps"]["pump2"]["phase"] == "verifying"
-    # the pump comes back: fault gone, idle (no call) — held cleared for 3 min
-    r.p2.clear()
+    r.p2.clear()                                            # back: no fault, idle (no call)
     for _ in range(8):
-        r.ft.t += 30
-        r.p1.fresh(); r.p2.fresh()
-        await heal.tick()
+        await r.step(heal)
     await settle()
     assert "recovered" in await codes(r.store)
     assert heal.status()["pumps"]["pump2"]["last_outcome"]["outcome"] == "recovered"
     assert any("recovered" in a[1] for a in r.alerts if a[0] == "push")
 
 
+async def test_a_telemetry_gap_restarts_the_clear_hold(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    await r.step(heal)                                      # one fresh clear observation
+    r.ft.t += 200                                           # then 200 s with no fresh data
+    r.p2.snapshot["last_poll_ts"] = r.ft.clock() - 150
+    await heal.tick()
+    await r.step(heal)                                      # fresh again: hold restarts here
+    assert "recovered" not in await codes(r.store)
+    for _ in range(7):
+        await r.step(heal)
+    assert "recovered" in await codes(r.store)
+
+
+async def test_a_replacement_fault_is_not_recovery(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.fault(code="E18", severity="high")                 # E21 gone, E18 instead
+    for _ in range(32):
+        await r.step(heal)
+    await settle()
+    c = await codes(r.store)
+    assert "recovered" not in c and "not_recovered" in c
+    assert "replaced by E18" in heal.status()["pumps"]["pump2"]["last_outcome"]["detail"]
+
+
 async def test_two_failures_escalate_instead_of_looping(rig):
     r = rig
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
-
-    async def run(minutes):
-        for _ in range(int(minutes * 2)):
-            r.ft.t += 30
-            r.p1.fresh(); r.p2.fresh()
-            await heal.tick()
-
-    await heal.tick()                       # attempt 1
-    await run(16)                           # verify window passes: not recovered -> attempt 2
-    await run(16)                           # not recovered again -> escalate
-    await run(30)                           # and it stays escalated: no third cycle
+    await r.eligible(heal)                                  # attempt 1
+    for _ in range(32):                                     # not recovered -> attempt 2
+        await r.step(heal)
+    for _ in range(32):                                     # not recovered again -> escalate
+        await r.step(heal)
+    for _ in range(60):                                     # and it stays escalated
+        await r.step(heal)
     await settle()
-    opens = [w for w in r.panel.writes if w[1] == "OPEN"]
-    assert len(opens) == 2
+    assert len(opens(r.panel)) == 2
     c = await codes(r.store)
     assert c.count("cycle_start") == 2 and c.count("not_recovered") == 2
     assert c.count("escalated") == 1
@@ -191,49 +253,88 @@ async def test_two_failures_escalate_instead_of_looping(rig):
     assert "escalated" in heal.status()["pumps"]["pump2"]["status"]
 
 
-async def test_budget_survives_a_restart(rig):
+async def test_budget_survives_a_restart_and_a_wall_clock_step(rig):
     r = rig
     r.p2.fault(age_min=12)
     heal = r.make(live=True)
-    await heal.tick()
-    heal2 = r.make(live=True)               # a bridge restart: same state dir
+    await r.eligible(heal)
+    r.ft.wall_offset = 7 * 3600                             # NTP jumps the wall clock 7 h ahead
+    heal2 = r.make(live=True)                               # restart, same boot
     assert heal2.status()["pumps"]["pump2"]["attempts_in_window"] == 1
+
+
+async def test_unreadable_history_counts_as_a_spent_budget(rig):
+    r = rig
+    (r.tmp_path / sh_mod.STATE_FILE).write_text("{garbage")
+    heal = r.make(live=True)
+    assert heal.history_problem
+    assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 2
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    assert opens(r.panel) == []
+    assert "history_unreadable" in await codes(r.store, "pump1")   # logged once, on the first pump
+    assert "escalated" in await codes(r.store)
 
 
 async def test_other_pump_down_pages_once_and_does_not_cycle(rig):
     r = rig
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
+    await heal.tick()
     r.p1.snapshot["online"] = False
     for _ in range(3):
-        r.ft.t += 30
+        r.ft.t += 300
         r.p2.fresh()
+        await r.prime()
         await heal.tick()
     await settle()
     assert r.panel.writes == []
     assert (await codes(r.store)).count("both_down") == 1
     assert any("both heat pumps" in a[1] for a in r.alerts if a[0] == "push")
-    # the other pump faulted (not just offline) counts too
+    # a faulted (not just offline) other pump counts too
     r.p1.snapshot["online"] = True
     r.p1.fault(code="E18", severity="high")
-    r.p1.fresh()
     heal2 = r.make(live=True)
-    await heal2.tick()
+    await r.eligible(heal2)
     assert r.panel.writes == []
 
 
-async def test_cold_span_cache_waits_instead_of_paging_both_down(rig):
+async def test_last_moment_precheck_aborts_before_any_switching(rig, monkeypatch):
     r = rig
-    r.ctl.cache.latest_circuits = {}                   # just booted: no panel read yet
-    r.ctl.cache.latest_circuits_ts = None
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    real_step = heal._step
+
+    async def compressor_starts(pid, code, *a, **k):
+        await real_step(pid, code, *a, **k)
+        if code == "cycle_start":
+            r.p2.snapshot["running"] = True                 # the call arrives mid-announcement
+    monkeypatch.setattr(heal, "_step", compressor_starts)
+    await r.eligible(heal)
+    assert r.panel.writes == []
+    assert "cycle_aborted" in await codes(r.store)
+    assert heal.status()["pumps"]["pump2"]["attempts_in_window"] == 0   # not an attempt
+
+
+async def test_cold_or_stale_span_waits_then_pages_manual(rig):
+    r = rig
+    r.poller.latest_circuits = {}                           # just booted: no panel read yet
+    r.poller.latest_circuits_ts = None
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
     await heal.tick()
-    await settle()
-    assert r.panel.writes == [] and await codes(r.store) == []
-    assert "waiting for a SPAN panel read" in heal.status()["pumps"]["pump2"]["status"]
-    await r.prime()
+    r.ft.t += 601
+    r.p1.fresh(); r.p2.fresh()
     await heal.tick()
+    assert "waiting for a fresh SPAN panel read" in heal.status()["pumps"]["pump2"]["status"]
+    assert await codes(r.store) == []
+    r.ft.t += 601                                           # still nothing from the panel
+    r.p1.fresh(); r.p2.fresh()
+    await heal.tick()
+    await settle()
+    assert await codes(r.store) == ["cycle_refused"]        # the manual-step page
+    assert r.panel.writes == []
+    await r.step(heal)                                      # panel answers: it proceeds
     assert ("Air-Water 2", "OPEN") in r.panel.writes
 
 
@@ -241,10 +342,14 @@ async def test_span_unreachable_pages_the_manual_step(rig):
     r = rig
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
+    await heal.tick()
+    r.ft.t += 601
+    r.p1.fresh(); r.p2.fresh()
+    await r.prime()
     r.panel.down = True
     await heal.tick()
     await settle()
-    assert [w for w in r.panel.writes if w[1] == "OPEN"] == []
+    assert opens(r.panel) == []
     assert "cycle_refused" in await codes(r.store)
     mail = [a for a in r.alerts if a[0] == "email" and "manual" in a[1]]
     assert mail and "SPAN panel" in mail[0][2]
@@ -253,25 +358,37 @@ async def test_span_unreachable_pages_the_manual_step(rig):
 async def test_suspicious_mapping_is_refused(rig):
     r = rig
     r.panel.set("Air-Water 2", instantPowerW=2600.0)   # "idle" pump's circuit draws compressor power
-    await r.prime()
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
-    await heal.tick()
+    await r.eligible(heal)
     await settle()
     assert r.panel.writes == []
     assert "mapping_suspect" in await codes(r.store)
 
 
-def test_config_guards():
+async def test_bad_mapping_is_reported_not_a_boot_failure(rig):
+    r = rig
+    heal = r.make(live=True, circuits={"pump1": "Air-Water 1", "pump2": "Buffer Tank"})
+    assert "pump2" in heal.config_errors
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    await settle()
+    assert r.panel.writes == []
+    assert "unavailable" in heal.status()["pumps"]["pump2"]["status"]
+    assert "unavailable" in await codes(r.store)
+
+
+def test_config_guards_and_compat():
     with pytest.raises(ValueError, match="off_s"):
         SelfHealConfig(off_s=30)
     d = SelfHealConfig()
     assert d.live is False and d.fault_codes == ["E21"] and d.grace_min == 10
     assert d.max_attempts == 2 and d.window_h == 6 and d.verify_min == 15
     assert d.circuits == {"pump1": "Air-Water 1", "pump2": "Air-Water 2"}
-    with pytest.raises(ValueError, match="self_heal.circuits"):
-        AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="h")],
-                  self_heal=SelfHealConfig(circuits={"pump1": "Buffer Tank"}))
+    # existing configs (no self_heal section) with any valid span settings still load
+    AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="h")], span=SpanConfig(min_off_s=120))
+    AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="h")],
+              span=SpanConfig(breakers=[{"name": "Buffer Tank"}]))
 
 
 def test_health_reports_self_heal(tmp_path):

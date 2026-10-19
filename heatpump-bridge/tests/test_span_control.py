@@ -364,6 +364,19 @@ async def test_panel_unreachable_is_a_clean_refusal(rig):
     assert e.value.status_code == 503 and panel.writes == []
 
 
+async def test_precheck_runs_on_the_fresh_read_and_can_refuse(rig):
+    panel, ctl, *_ = rig
+    seen = []
+
+    def no(circ):
+        seen.append(circ["power_w"])
+        return "pump started heating"
+    with pytest.raises(BreakerRefused, match="precheck: pump started heating"):
+        await ctl.execute("Air-Water 2", "power_cycle", precheck=no)
+    assert seen == [108.0] and panel.writes == []
+    assert (await ctl.execute("Air-Water 2", "power_cycle", precheck=lambda c: None))["ok"]
+
+
 # --- read-back --------------------------------------------------------------------------
 async def test_readback_mismatch_is_reported_not_confirmed(rig):
     panel, ctl, ft, store, _, _ = rig

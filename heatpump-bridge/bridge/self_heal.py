@@ -3,13 +3,18 @@
 # cycle its SPAN circuit through span_control.BreakerController (OFF >= 60 s, CLOSE in a
 # finally), then verify recovery within 15 min. Runs on the Pi, so it works with the cloud down.
 # Guards: never during defrost, never while the pump is heating, never if the other pump is also
-# down (page instead), at most max_attempts per window per pump (then escalate to a human), one
-# breaker action at a time (the controller's global lock). Default SHADOW: logs and pages what it
-# WOULD do and touches nothing until the owner sets self_heal.live = true.
+# down (page instead), never on a pump whose gateway identity check failed, at most max_attempts
+# per window per pump (then escalate to a human), one breaker action at a time (the controller's
+# global lock), and every guard is re-checked on the fresh panel read immediately before the OPEN
+# (BreakerController precheck). Default SHADOW: logs and pages what it WOULD do and touches
+# nothing until the owner sets self_heal.live = true.
 # Trigger scope: FAULT ONLY. The issue's second trigger ("stage N called, pump N not heating")
 # needs the HBX stage call, which the Pi cannot see today — the HBX calls the pumps by dry contact,
 # and the switch-word bit the poller logs as "remote_contact" was never verified to be that
 # contact (a Phase 1 commissioning item). That trigger stays planner-side (#185) until it is.
+# Time: in-process holds use the monotonic clock; the attempt budget is persisted with wall time
+# + boot id + monotonic time, so a clock step can neither expire attempts early nor (within a
+# boot) shorten a hold. Persisted history that can't be read counts as a spent budget.
 from __future__ import annotations
 
 import asyncio
@@ -21,45 +26,64 @@ import time
 from pathlib import Path
 
 from . import notify
-from .faults import Severity
-from .span_control import BreakerRefused
+from .span_control import BreakerRefused, read_boot_id
 
 log = logging.getLogger(__name__)
 
 TICK_S = 30.0
-FRESH_POLL_S = 90.0          # a snapshot older than this is not evidence of anything
+FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything
+SPAN_FRESH_S = 120.0         # nor is a SPAN panel read older than this
+SPAN_WAIT_PAGE_S = 600.0     # live, eligible, but no usable panel read for this long -> page
 RUNNING_QUIET_S = 120.0      # "not heating" = no compressor seen for this long (anti-short-cycle)
 DEFROST_QUIET_S = 300.0      # and no defrost for this long
-CLEAR_HOLD_S = 180.0         # a fault must stay cleared this long to count as recovered
+CLEAR_HOLD_S = 180.0         # recovered = no blocking fault, observed fresh, continuously this long
 STATE_FILE = "self-heal.json"
 EVENT_TYPE = "self_heal"
 
 
+def _is_blocking(f: dict) -> bool:
+    return str(f.get("severity", "")).lower() != "info"   # P17 anti-freeze etc. never count
+
+
 class SelfHealer:
-    def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None,
-                 state_dir: str | None = None, clock=time.time):
+    def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None, span_cfg=None,
+                 state_dir: str | None = None, clock=time.time, mono=time.monotonic,
+                 boot_id: str | None = None):
         self.cfg = cfg                  # SelfHealConfig
         self.pollers = pollers
         self.breakers = breakers        # span_control.BreakerController | None
         self.store = store
         self.notify_cfg = notify_cfg
+        self.span_cfg = span_cfg if span_cfg is not None else getattr(breakers, "cfg", None)
         self._clock = clock
+        self._mono = mono
+        self._boot_id = boot_id if boot_id is not None else read_boot_id()
         self._path = Path(state_dir) / STATE_FILE if state_dir else None
         self._task: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
-        persisted = self._load()
+        self.config_errors = self._check_config()
+        persisted, self.history_problem = self._load()
         self._pumps: dict[str, dict] = {}
         for pid in self.cfg.circuits:
-            p = persisted.get(pid, {}) if isinstance(persisted.get(pid), dict) else {}
+            p = persisted.get(pid) if isinstance(persisted.get(pid), dict) else {}
+            attempts = [a for a in p.get("attempts", []) if isinstance(a, dict)
+                        and isinstance(a.get("wall"), (int, float))]
+            if self.history_problem:
+                # Unknown history = assume the budget is spent for one window (fails closed,
+                # and clears itself: the next save rewrites a valid file).
+                attempts = [self._stamp() for _ in range(self.cfg.max_attempts)]
             self._pumps[pid] = {
-                "attempts": [float(t) for t in p.get("attempts", []) if isinstance(t, (int, float))],
+                "attempts": attempts,
                 "phase": "idle",            # idle | verifying
                 "status": "starting",
-                "verify": None,             # {cycle_at, until, shadow, code, cleared_since}
+                "verify": None,
                 "paged": set(),             # one page per episode per kind
-                "last_running": None, "last_defrost": None,
+                "last_running": None, "last_defrost": None,   # monotonic
+                "fault_seen": None,         # (code, monotonic first seen) for the grace
+                "span_wait": None,          # monotonic: since when live waits for a panel read
                 "last_outcome": p.get("last_outcome"),
             }
+        self._startup_paged = False
 
     # --- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -84,119 +108,203 @@ class SelfHealer:
             await asyncio.sleep(TICK_S)
 
     def status(self) -> dict:
-        now = self._clock()
-        window = self.cfg.window_h * 3600
         return {
             "enabled": self.cfg.enabled, "live": self.cfg.live,
             "mode": "off" if not self.cfg.enabled else "live" if self.cfg.live else "shadow",
             "trigger": {"fault_codes": list(self.cfg.fault_codes), "grace_min": self.cfg.grace_min,
                         "stage_call": "unavailable on the Pi (HBX stage call not visible) — fault trigger only"},
             "breaker_control": self.breakers is not None,
+            "history_problem": self.history_problem,
             "pumps": {pid: {"circuit": self.cfg.circuits[pid], "status": st["status"],
                             "phase": st["phase"],
-                            "attempts_in_window": sum(1 for t in st["attempts"] if now - t < window),
+                            "unavailable": self.config_errors.get(pid),
+                            "attempts_in_window": len(self._recent(st)),
                             "max_attempts": self.cfg.max_attempts,
                             "last_outcome": st["last_outcome"]}
                       for pid, st in self._pumps.items()},
         }
 
-    # --- the decision -----------------------------------------------------------
-    async def tick(self) -> None:
-        now = self._clock()
-        for pid, st in self._pumps.items():
-            poller = self.pollers.get(pid)
-            if poller is None:
-                st["status"] = "pump not configured"
-                continue
-            snap = poller.snapshot
-            fresh = bool(snap.get("online")) and snap.get("last_poll_ts") is not None \
-                and now - float(snap["last_poll_ts"]) < FRESH_POLL_S
-            if fresh and snap.get("running"):
-                st["last_running"] = now
-            if fresh and (snap.get("defrosting") or snap.get("state") == "defrost"):
-                st["last_defrost"] = now
-            if st["phase"] == "verifying":
-                await self._verify(pid, poller, st, now, fresh)
-                continue
-            fault = self._target_fault(snap)
-            if fault is None:
-                st["paged"].clear()     # episode over: the next one pages afresh
-                st["status"] = "no target fault"
-                continue
-            await self._consider(pid, poller, st, fault, now, fresh)
+    # --- config / time helpers -------------------------------------------------
+    def _check_config(self) -> dict[str, str]:
+        """Problems that make a pump ineligible — reported, never a boot failure."""
+        errs: dict[str, str] = {}
+        span = self.span_cfg
+        if span is None:
+            return errs
+        by_name = {b.name.strip(): b for b in span.breakers}
+        for pid, circuit in self.cfg.circuits.items():
+            b = by_name.get(circuit.strip())
+            if b is None or not (b.allow_cycle and b.heat_pump):
+                errs[pid] = f"'{circuit}' is not an allow_cycle heat-pump circuit in span.breakers"
+            elif not (span.min_off_s <= self.cfg.off_s <= span.max_off_s):
+                errs[pid] = (f"self_heal.off_s {self.cfg.off_s:g} is outside "
+                             f"[{span.min_off_s:g}, {span.max_off_s:g}]")
+        return errs
+
+    def _stamp(self) -> dict:
+        return {"wall": self._clock(), "mono": self._mono(), "boot": self._boot_id}
+
+    def _age(self, a: dict) -> float:
+        if self._boot_id and a.get("boot") == self._boot_id and isinstance(a.get("mono"), (int, float)):
+            return self._mono() - a["mono"]        # same boot: immune to wall-clock steps
+        return self._clock() - float(a["wall"])     # future-dated (negative) still counts as recent
+
+    def _recent(self, st: dict) -> list[dict]:
+        window = self.cfg.window_h * 3600
+        return [a for a in st["attempts"] if self._age(a) < window]
+
+    def _fresh(self, snap: dict) -> bool:
+        ts = snap.get("last_poll_ts")
+        if not snap.get("online") or ts is None:
+            return False
+        age = self._clock() - float(ts)
+        return 0 <= age < FRESH_POLL_S             # a future-dated poll is not fresh either
+
+    def _span(self) -> dict | None:
+        """The controller's last panel read, if it is fresh; else None."""
+        if self.breakers is None:
+            return None
+        snap = self.breakers.snapshot()
+        ts = snap.get("ts")
+        if ts is None or not (0 <= self._clock() - ts < SPAN_FRESH_S):
+            return None
+        if any(c["heat_pump"] and c["relay_state"] is None for c in snap["circuits"]):
+            return None
+        return snap
+
+    def _circuit_power(self, pid: str) -> float | None:
+        snap = self._span()
+        if snap is None:
+            return None
+        for c in snap["circuits"]:
+            if c["name"] == self.cfg.circuits[pid]:
+                return c["power_w"]
+        return None
 
     def _target_fault(self, snap: dict) -> dict | None:
         codes = {c.upper() for c in self.cfg.fault_codes}
         hits = [f for f in snap.get("active_faults", []) if str(f.get("code", "")).upper() in codes]
         return min(hits, key=lambda f: f.get("since") or 0) if hits else None
 
-    def _other_down(self, pid: str, now: float) -> str | None:
+    def _other_down(self, pid: str, *, span: dict | None) -> str | None:
         for oid, other in self.pollers.items():
             if oid == pid:
                 continue
-            s = other.snapshot
-            name = other.cfg.name
-            if not s.get("online") or s.get("last_poll_ts") is None \
-                    or now - float(s["last_poll_ts"]) >= FRESH_POLL_S:
+            s, name = other.snapshot, other.cfg.name
+            if not self._fresh(s):
                 return f"{name} is offline"
-            bad = [f for f in s.get("active_faults", []) if f.get("severity") != Severity.INFO
-                   and f.get("severity") != "info"]
+            if s.get("identity_ok") is False:
+                return f"{name}'s gateway identity check failed"
+            bad = [f for f in s.get("active_faults", []) if _is_blocking(f)]
             if bad:
                 return f"{name} is faulted ({', '.join(str(f.get('code')) for f in bad)})"
-        if self.breakers is not None:
-            for c in self.breakers.snapshot()["circuits"]:
-                if c["heat_pump"] and c["name"] != self.cfg.circuits[pid] \
-                        and c["relay_state"] not in ("CLOSED", None):
+        if span is not None:
+            for c in span["circuits"]:
+                if c["heat_pump"] and c["name"] != self.cfg.circuits[pid] and c["relay_state"] != "CLOSED":
                     return f"{c['name']} is not ON at the panel"
         return None
 
-    def _span_unknown(self) -> bool:
-        """No fresh SPAN read yet (just booted, or the panel is unreachable)."""
-        if self.breakers is None:
-            return False
-        snap = self.breakers.snapshot()
-        return snap["ts"] is None or any(c["heat_pump"] and c["relay_state"] is None
-                                         for c in snap["circuits"])
+    def _heating_or_defrost(self, snap: dict, st: dict) -> str | None:
+        now = self._mono()
+        if snap.get("running") or (st["last_running"] is not None
+                                   and now - st["last_running"] < RUNNING_QUIET_S):
+            return "is heating (or just stopped)"
+        if snap.get("defrosting") or snap.get("state") == "defrost" or (
+                st["last_defrost"] is not None and now - st["last_defrost"] < DEFROST_QUIET_S):
+            return "is in (or just out of) defrost"
+        return None
 
-    async def _consider(self, pid, poller, st, fault, now, fresh) -> None:
+    # --- the decision -----------------------------------------------------------
+    async def tick(self) -> None:
+        if not self._startup_paged:
+            self._startup_paged = True
+            await self._startup_notes()
+        for pid, st in self._pumps.items():
+            if pid in self.config_errors:
+                st["status"] = f"unavailable: {self.config_errors[pid]}"
+                continue
+            poller = self.pollers.get(pid)
+            if poller is None:
+                st["status"] = "pump not configured"
+                continue
+            snap = poller.snapshot
+            fresh = self._fresh(snap)
+            if fresh and snap.get("running"):
+                st["last_running"] = self._mono()
+            if fresh and (snap.get("defrosting") or snap.get("state") == "defrost"):
+                st["last_defrost"] = self._mono()
+            if st["phase"] == "verifying":
+                await self._verify(pid, poller, st, fresh)
+                continue
+            fault = self._target_fault(snap)
+            if fault is None:
+                st["paged"].clear()     # episode over: the next one pages afresh
+                st["fault_seen"] = None
+                st["span_wait"] = None
+                st["status"] = "no target fault"
+                continue
+            if st["fault_seen"] is None or st["fault_seen"][0] != fault.get("code"):
+                st["fault_seen"] = (fault.get("code"), self._mono())
+            await self._consider(pid, poller, st, fault, fresh)
+
+    async def _startup_notes(self) -> None:
+        if not self.cfg.enabled:
+            return
+        if self.history_problem:
+            await self._step(next(iter(self._pumps), "span"), "history_unreadable", "high",
+                             f"self-heal history unreadable ({self.history_problem}) — treating the "
+                             f"attempt budget as spent for {self.cfg.window_h:g} h.", {},
+                             title="A2W self-heal: history unreadable", priority="high")
+        if self.cfg.live and self.config_errors:
+            for pid, why in self.config_errors.items():
+                await self._step(pid, "unavailable", "high",
+                                 f"self-heal is LIVE but unavailable for {pid}: {why}.", {"reason": why},
+                                 title=f"A2W self-heal: {pid} unavailable", priority="high")
+
+    async def _consider(self, pid, poller, st, fault, fresh) -> None:
         name, code = poller.cfg.name, fault.get("code")
         circuit = self.cfg.circuits[pid]
-        age_min = (now - float(fault.get("since") or now)) / 60
+        snap = poller.snapshot
+        if snap.get("identity_ok") is False:
+            st["status"] = f"{code} active but {name}'s gateway identity check failed — not cycling"
+            if "identity" not in st["paged"]:
+                st["paged"].add("identity")
+                await self._step(pid, "identity_mismatch", "critical",
+                                 f"{name}: {code} active, but its gateway identity check failed — the "
+                                 f"data may be another unit's. Self-heal will not cycle '{circuit}'.",
+                                 {"code": code}, title=f"A2W self-heal: {name} identity check failed")
+            return
         if not fresh:
             st["status"] = f"{code} active but {name} is offline/stale — waiting"
             return
+        age_wall = (self._clock() - float(fault.get("since") or self._clock())) / 60
+        age_seen = (self._mono() - st["fault_seen"][1]) / 60
+        age_min = min(age_wall, age_seen)     # both clocks must agree the grace has passed
         if age_min < self.cfg.grace_min:
             st["status"] = f"{code} active {age_min:.0f} min (< {self.cfg.grace_min:g} min grace)"
             return
-        if snap_running(poller.snapshot) or (st["last_running"] is not None
-                                             and now - st["last_running"] < RUNNING_QUIET_S):
-            st["status"] = f"{code} active but {name} is heating — not cycling"
+        busy = self._heating_or_defrost(snap, st)
+        if busy:
+            st["status"] = f"{code} active but {name} {busy} — not cycling"
             return
-        if poller.snapshot.get("defrosting") or poller.snapshot.get("state") == "defrost" or (
-                st["last_defrost"] is not None and now - st["last_defrost"] < DEFROST_QUIET_S):
-            st["status"] = f"{code} active but {name} is in/just out of defrost — waiting"
-            return
-        window = self.cfg.window_h * 3600
-        st["attempts"] = [t for t in st["attempts"] if now - t < window]
-        if len(st["attempts"]) >= self.cfg.max_attempts:
-            st["status"] = (f"escalated: {code} persists after {len(st['attempts'])} power cycles "
+        recent = self._recent(st)
+        if len(recent) >= self.cfg.max_attempts:
+            st["status"] = (f"escalated: {code} persists after {len(recent)} power cycles "
                             f"in {self.cfg.window_h:g} h")
             if "escalated" not in st["paged"]:
                 st["paged"].add("escalated")
                 await self._step(pid, "escalated", "critical",
-                                 f"{name}: {code} persists after {len(st['attempts'])} "
+                                 f"{name}: {code} persists after {len(recent)} "
                                  f"{'(shadow) ' if not self.cfg.live else ''}power cycles in "
-                                 f"{self.cfg.window_h:g} h — A2W stops trying. Needs a human: check "
+                                 f"{self.cfg.window_h:g} h"
+                                 f"{' (history unreadable — budget treated as spent)' if self.history_problem else ''}"
+                                 f" — A2W stops trying. Needs a human: check "
                                  f"the unit, or power-cycle the '{circuit}' breaker at the SPAN panel.",
-                                 {"code": code, "attempts": st["attempts"]},
+                                 {"code": code, "attempts": recent},
                                  title=f"URGENT: {name} {code} not self-healing", priority="urgent")
             return
-        if self.cfg.live and self._span_unknown():
-            # Live needs the panel's view of both heat-pump circuits before switching anything.
-            # (The controller re-reads the panel itself; this just avoids paging on a cold cache.)
-            st["status"] = f"{code} active — waiting for a SPAN panel read"
-            return
-        other = self._other_down(pid, now)
+        span = self._span()
+        other = self._other_down(pid, span=span)
         if other:
             st["status"] = f"{code} active but {other} — not cycling (paged)"
             if "both_down" not in st["paged"]:
@@ -206,8 +314,24 @@ class SelfHealer:
                                  f"power-cycle while the other pump is down — check both units; "
                                  f"'{circuit}' can be cycled at the SPAN panel by hand.",
                                  {"code": code, "other": other},
-                                 title=f"URGENT: both heat pumps down", priority="urgent")
+                                 title="URGENT: both heat pumps down", priority="urgent")
             return
+        if self.cfg.live:
+            if self.breakers is None:
+                st["status"] = "live, but SPAN breaker control is not configured"
+                if "no_breakers" not in st["paged"]:
+                    st["paged"].add("no_breakers")
+                    await self._manual(pid, name, code, circuit, "SPAN local control is not configured")
+                return
+            if span is None:
+                st["span_wait"] = st["span_wait"] or self._mono()
+                waited = self._mono() - st["span_wait"]
+                st["status"] = f"{code} active — waiting for a fresh SPAN panel read ({waited / 60:.0f} min)"
+                if waited >= SPAN_WAIT_PAGE_S and "span_unknown" not in st["paged"]:
+                    st["paged"].add("span_unknown")
+                    await self._manual(pid, name, code, circuit, "the SPAN panel has not answered the Pi")
+                return
+            st["span_wait"] = None
         power = self._circuit_power(pid)
         if power is not None and power >= self.cfg.running_power_w:
             # The pump says it is not heating, yet its mapped circuit draws compressor-level
@@ -226,54 +350,54 @@ class SelfHealer:
         detail = {"code": code, "fault_age_min": round(age_min, 1), "circuit": circuit,
                   "off_s": self.cfg.off_s}
         if not self.cfg.live:
-            st["attempts"].append(now)
+            st["attempts"].append(self._stamp())
             self._save()
             st["status"] = f"SHADOW: would power-cycle '{circuit}' ({code} {age_min:.0f} min)"
             await self._step(pid, "would_cycle", "warning",
                              f"{name}: {code} active {age_min:.0f} min, not heating — WOULD power-cycle "
                              f"'{circuit}' ({self.cfg.off_s:g} s off). Shadow mode: nothing switched.",
                              detail, title=f"A2W self-heal (shadow): would cycle {name}")
-            st["phase"], st["verify"] = "verifying", {"cycle_at": now, "shadow": True, "code": code,
-                                                      "until": now + self.cfg.verify_min * 60,
-                                                      "cleared_since": None}
-            return
-        if self.breakers is None:
-            st["status"] = "live, but SPAN breaker control is not configured"
-            if "no_breakers" not in st["paged"]:
-                st["paged"].add("no_breakers")
-                await self._step(pid, "cycle_refused", "critical",
-                                 f"{name}: {code} {age_min:.0f} min — self-heal is LIVE but SPAN local "
-                                 f"control is not configured. Power-cycle '{circuit}' at the panel by hand.",
-                                 detail, title=f"URGENT: {name} {code} — manual power cycle needed",
-                                 priority="urgent")
+            self._begin_verify(st, code, shadow=True)
             return
         if self.breakers.snapshot()["busy"]:
             st["status"] = "waiting: another breaker action is running"
             return
-        st["attempts"].append(now)     # counted BEFORE acting: a crash mid-cycle still uses budget
-        self._save()
+        st["attempts"].append(self._stamp())
+        if not self._save():   # counted durably BEFORE acting, or not at all
+            st["attempts"].pop()
+            st["status"] = "refusing: cannot persist the attempt budget"
+            if "persist" not in st["paged"]:
+                st["paged"].add("persist")
+                await self._manual(pid, name, code, circuit, "the bridge cannot persist its attempt budget")
+            return
         st["status"] = f"power-cycling '{circuit}'"
         await self._step(pid, "cycle_start", "warning",
                          f"{name}: {code} active {age_min:.0f} min, not heating — power-cycling "
-                         f"'{circuit}' ({self.cfg.off_s:g} s off), attempt {len(st['attempts'])}/"
+                         f"'{circuit}' ({self.cfg.off_s:g} s off), attempt {len(self._recent(st))}/"
                          f"{self.cfg.max_attempts}.", detail,
                          title=f"A2W self-heal: power-cycling {name}")
         try:
-            result = await self.breakers.execute(circuit, "power_cycle", off_s=self.cfg.off_s,
-                                                 source="self-heal")
+            result = await self.breakers.execute(
+                circuit, "power_cycle", off_s=self.cfg.off_s, source="self-heal",
+                precheck=lambda circ: self._precheck(pid, code, circ))
         except BreakerRefused as exc:
-            if exc.status_code == 409 and "one at a time" in str(exc):
-                st["attempts"].pop()      # someone else is switching: not an attempt
+            text = str(exc)
+            if text.startswith("precheck:") or "one at a time" in text:
+                # Conditions changed at the last moment (or a human is switching): nothing was
+                # switched, so it is not an attempt. The next tick re-evaluates from scratch.
+                st["attempts"].pop()
                 self._save()
-                st["status"] = "waiting: another breaker action is running"
+                st["status"] = f"aborted before switching: {text}"
+                await self._step(pid, "cycle_aborted", "info",
+                                 f"{name}: power cycle aborted before anything was switched — {text}.",
+                                 {**detail, "reason": text},
+                                 title=f"A2W self-heal: {name} cycle aborted", priority="default")
                 return
-            st["status"] = f"cycle refused: {exc}"
-            self._record_outcome(st, "refused", str(exc))
-            await self._step(pid, "cycle_refused", "critical",
-                             f"{name}: self-heal could not power-cycle '{circuit}': {exc}. Do it by "
-                             f"hand: switch '{circuit}' OFF at the SPAN panel, wait a minute, switch it ON.",
-                             {**detail, "reason": str(exc)},
-                             title=f"URGENT: {name} {code} — manual power cycle needed", priority="urgent")
+            st["status"] = f"cycle refused: {text}"
+            self._record_outcome(st, "refused", text)
+            if "refused" not in st["paged"]:
+                st["paged"].add("refused")
+                await self._manual(pid, name, code, circuit, text)
             return
         if not result.get("ok"):
             # The controller already paged a failed CLOSE (urgent, with the manual step).
@@ -285,28 +409,55 @@ class SelfHealer:
                              title=f"A2W self-heal: {name} power cycle failed", priority="high")
             return
         st["status"] = f"cycled; verifying recovery (≤ {self.cfg.verify_min:g} min)"
-        st["phase"], st["verify"] = "verifying", {"cycle_at": self._clock(), "shadow": False,
-                                                  "code": code, "cleared_since": None,
-                                                  "until": self._clock() + self.cfg.verify_min * 60}
+        self._begin_verify(st, code, shadow=False)
 
-    async def _verify(self, pid, poller, st, now, fresh) -> None:
+    def _precheck(self, pid: str, code: str, circ: dict) -> str | None:
+        """Re-run the pump guards on the CURRENT snapshots and the controller's FRESH panel read,
+        immediately before the OPEN is dispatched (no await between this and the OPEN)."""
+        poller = self.pollers.get(pid)
+        if poller is None:
+            return "pump not configured"
+        snap, st = poller.snapshot, self._pumps[pid]
+        if not self._fresh(snap):
+            return f"{poller.cfg.name} telemetry is stale"
+        if snap.get("identity_ok") is False:
+            return f"{poller.cfg.name}'s gateway identity check failed"
+        busy = self._heating_or_defrost(snap, st)
+        if busy:
+            return f"{poller.cfg.name} {busy}"
+        if self._target_fault(snap) is None:
+            return f"{code} cleared on its own"
+        other = self._other_down(pid, span=None)   # the controller itself checks the relays
+        if other:
+            return other
+        if circ.get("power_w") is not None and circ["power_w"] >= self.cfg.running_power_w:
+            return f"'{circ.get('name')}' draws {circ['power_w']:.0f} W while the pump reports idle"
+        return None
+
+    def _begin_verify(self, st: dict, code: str, *, shadow: bool) -> None:
+        now = self._mono()
+        st["phase"] = "verifying"
+        st["verify"] = {"cycle": now, "until": now + self.cfg.verify_min * 60, "shadow": shadow,
+                        "code": code, "cleared_since": None}
+
+    async def _verify(self, pid, poller, st, fresh) -> None:
         v = st["verify"]
         name, code = poller.cfg.name, v["code"]
         snap = poller.snapshot
-        active = any(str(f.get("code", "")).upper() == str(code).upper()
-                     for f in snap.get("active_faults", []))
-        if fresh and not active:
-            v["cleared_since"] = v["cleared_since"] or now
-        elif active:
-            v["cleared_since"] = None
+        now = self._mono()
+        blocking = [f for f in snap.get("active_faults", []) if _is_blocking(f)]
+        target_active = any(str(f.get("code", "")).upper() == str(code).upper() for f in blocking)
+        clear_now = fresh and snap.get("identity_ok") is not False and not blocking
+        # the hold only counts FRESH, clear observations: any gap or fault restarts it
+        v["cleared_since"] = (v["cleared_since"] or now) if clear_now else None
         power = self._circuit_power(pid)
         running = bool(snap.get("running"))
         consistent = (not running) or (power is not None and power >= self.cfg.running_power_w)
-        recovered = (fresh and v["cleared_since"] is not None
-                     and now - v["cleared_since"] >= CLEAR_HOLD_S and consistent)
-        facts = {"code": code, "fault_active": active, "online": fresh, "running": running,
-                 "circuit_power_w": power, "shadow": v["shadow"],
-                 "minutes_since_cycle": round((now - v["cycle_at"]) / 60, 1)}
+        recovered = clear_now and now - v["cleared_since"] >= CLEAR_HOLD_S and consistent
+        facts = {"code": code, "target_fault_active": target_active,
+                 "blocking_faults": [str(f.get("code")) for f in blocking], "online": fresh,
+                 "running": running, "circuit_power_w": power, "shadow": v["shadow"],
+                 "minutes_since_cycle": round((now - v["cycle"]) / 60, 1)}
         if v["shadow"]:
             if recovered or now >= v["until"]:
                 outcome = "cleared on its own" if recovered else "still active (nothing was switched)"
@@ -324,14 +475,18 @@ class SelfHealer:
             st["status"] = "recovered"
             how = f"running, circuit {power:.0f} W" if running and power is not None else "idle, no call"
             await self._step(pid, "recovered", "info",
-                             f"{name}: recovered after the power cycle — {code} cleared ({how}).",
-                             facts, title=f"A2W self-heal: {name} recovered", priority="default")
+                             f"{name}: recovered after the power cycle — {code} cleared, no other "
+                             f"fault ({how}).", facts, title=f"A2W self-heal: {name} recovered",
+                             priority="default")
             return
         if now >= v["until"]:
             st["phase"], st["verify"] = "idle", None
-            why = (f"{code} still active" if active else "offline" if not fresh
+            others = [str(f.get("code")) for f in blocking if str(f.get("code", "")).upper() != str(code).upper()]
+            why = (f"{code} still active" if target_active
+                   else f"replaced by {', '.join(others)}" if others
+                   else "offline/stale" if not fresh
                    else f"power inconsistent with running ({power} W)" if not consistent
-                   else f"{code} not cleared for {CLEAR_HOLD_S / 60:g} min")
+                   else f"not observed clear for {CLEAR_HOLD_S / 60:g} min")
             self._record_outcome(st, "not_recovered", why)
             st["status"] = f"not recovered: {why}"
             await self._step(pid, "not_recovered", "critical",
@@ -341,15 +496,14 @@ class SelfHealer:
             return
         st["status"] = f"verifying recovery ({facts['minutes_since_cycle']} min since cycle)"
 
-    def _circuit_power(self, pid: str) -> float | None:
-        if self.breakers is None:
-            return None
-        for c in self.breakers.snapshot()["circuits"]:
-            if c["name"] == self.cfg.circuits[pid]:
-                return c["power_w"]
-        return None
-
     # --- audit / alerts / persistence -----------------------------------------
+    async def _manual(self, pid, name, code, circuit, why) -> None:
+        await self._step(pid, "cycle_refused", "critical",
+                         f"{name}: {code} — self-heal could not power-cycle '{circuit}': {why}. Do it "
+                         f"by hand: switch '{circuit}' OFF at the SPAN panel, wait a minute, switch it ON.",
+                         {"code": code, "circuit": circuit, "reason": why},
+                         title=f"URGENT: {name} {code} — manual power cycle needed", priority="urgent")
+
     def _record_outcome(self, st, outcome: str, detail: str) -> None:
         st["last_outcome"] = {"outcome": outcome, "detail": detail, "ts": self._clock()}
         self._save()
@@ -374,30 +528,38 @@ class SelfHealer:
             self._bg.add(t)
             t.add_done_callback(self._bg.discard)
 
-    def _load(self) -> dict:
+    def _load(self) -> tuple[dict, str | None]:
+        """(pumps, problem). A missing file is a clean start; anything unreadable is a problem."""
         if not self._path:
-            return {}
+            return {}, None
         try:
-            data = json.loads(self._path.read_text())
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+            data = json.loads(self._path.read_bytes())
+        except FileNotFoundError:
+            return {}, None
+        except (OSError, ValueError) as exc:
+            return {}, f"{type(exc).__name__}: {exc}"
+        if not isinstance(data, dict) or not isinstance(data.get("pumps", {}), dict):
+            return {}, "unexpected shape"
+        return data.get("pumps", {}), None
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         if not self._path:
-            return
-        data = {pid: {"attempts": st["attempts"], "last_outcome": st["last_outcome"]}
-                for pid, st in self._pumps.items()}
+            return False
+        data = {"v": 2, "pumps": {pid: {"attempts": st["attempts"], "last_outcome": st["last_outcome"]}
+                                  for pid, st in self._pumps.items()}}
         tmp = self._path.with_suffix(".tmp")
-        try:  # atomic: the attempt budget must survive a power blip
+        try:  # durable: the attempt budget must survive a power blip
             with open(tmp, "w") as f:
                 json.dump(data, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._path)
+            dfd = os.open(str(self._path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+            return True
         except OSError as exc:
             log.warning("self-heal state write failed: %s", exc)
-
-
-def snap_running(snap: dict) -> bool:
-    return bool(snap.get("running"))
+            return False

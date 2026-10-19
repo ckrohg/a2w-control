@@ -294,6 +294,9 @@ class SelfHealConfig(BaseModel):
     verify_min: float = Field(default=15.0, ge=5, le=120)   # recovery must show within this
     off_s: float = MIN_OFF_FLOOR_S       # power-cycle hold (>= 60 s, and >= span.min_off_s)
     running_power_w: float = Field(default=500.0, gt=0)  # SPAN circuit power that means "running"
+    # A pump whose circuit is not an allow_cycle heat-pump breaker, or an off_s outside the span
+    # limits, is reported "unavailable" in /api/health.self_heal (and paged once when live) —
+    # never a boot failure: the bridge also runs the setpoint path and must always start.
     # pump id -> SPAN circuit. VERIFY on the house: no record maps pump1/pump2 to the panel's
     # circuit names; a swapped map would cycle the healthy pump (self_heal refuses when the
     # "idle" pump's circuit draws running-level power, but that is a backstop, not the check).
@@ -330,19 +333,6 @@ class AppConfig(BaseModel):
         # treat it as "use defaults" instead of failing to start
         return {} if v is None else v
 
-    @model_validator(mode="after")
-    def _self_heal_circuits(self):
-        if not self.self_heal.enabled:
-            return self
-        by_name = {b.name.strip(): b for b in self.span.breakers}
-        for pid, circuit in self.self_heal.circuits.items():
-            b = by_name.get(circuit.strip())
-            if b is None or not (b.allow_cycle and b.heat_pump):
-                raise ValueError(f"self_heal.circuits: '{circuit}' (for {pid}) must be a span.breakers "
-                                 "heat-pump circuit with allow_cycle")
-        if not (self.span.min_off_s <= self.self_heal.off_s <= self.span.max_off_s):
-            raise ValueError("self_heal.off_s must be within [span.min_off_s, span.max_off_s]")
-        return self
 
 
 def load_config(path: str | os.PathLike | None = None) -> AppConfig:
