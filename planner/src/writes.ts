@@ -193,13 +193,16 @@ export class HbxWriter {
       const before = this.deviceWrites;
       let result: Record<string, unknown>;
       try { result = await write(); }
-      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action, new Date()); throw e; }
+      // The cutoff is the moment the PATCH landed (stamped beside deviceWrites), not now: patch()'s bookkeeping and
+      // ntfy run after it, and a successor planner's boost started in that gap must not be retired (codex pass 6).
+      catch (e) { if (this.deviceWrites !== before) await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt); throw e; }
       // The write has landed; a failed retire must not turn it into an error response — it is retried (above).
-      return (await this.retireCancelledBoost(source, action, new Date())) ? result : { ...result, boost_retire_failed: true };
+      return (await this.retireCancelledBoost(source, action, this.lastDeviceWriteAt)) ? result : { ...result, boost_retire_failed: true };
     });
   }
-  /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after. */
+  /** Device writes that reached SensorLinx (PATCH accepted), whatever happened after — and when the last one did. */
   private deviceWrites = 0;
+  private lastDeviceWriteAt = new Date(0);
   /** Retire the open boost row for a landed human write; on failure arm the retry. true = retired. */
   private async retireCancelledBoost(source: string, action: string, landedAt: Date): Promise<boolean> {
     try { await this.store.retireOpenBoosts(landedAt); return true; }
@@ -558,7 +561,7 @@ export class HbxWriter {
         let dev: Record<string, any>;
         try {
           dev = await this.slx.patchDevice(this.buildingId, this.syncCode, fields);
-          this.deviceWrites++;
+          this.deviceWrites++; this.lastDeviceWriteAt = new Date();
         } catch (e) {
           await this.store.insertHbxWrite({ source, action, requested: fields, result: "failed", detail: (e as Error).message });
           throw new WriteError(502, `SensorLinx write failed: ${(e as Error).message}`);

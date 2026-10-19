@@ -271,5 +271,23 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     assert.equal(a.boosts[0].restored, true, "A's cancelled boost is retired");
     assert.deepEqual(a.boosts.slice(1).map((x) => x.restored), [false, false], "the boosts started after A's cancel are untouched");
   }
+  // (i) codex pass 6: the cutoff is when the cancel's PATCH LANDED, not when patch() returned. A's post-PATCH ntfy
+  //     stalls; B starts a boost in that gap; A's retire must leave B's row open.
+  {
+    const a = harness();
+    let releaseNotify!: () => void; let notifyGate: Promise<void> | null = null;
+    const slow = new HbxWriter(a.slx, a.store, a.hub, "b", "s", async () => { if (notifyGate) await notifyGate; });
+    assert.equal(await status(slow.boost(129, 60, "dashboard")), "ok");
+    (slow as any).lastWriteAt = 0;
+    notifyGate = new Promise<void>((r) => { releaseNotify = r; });
+    const cancel = slow.restore("dashboard", { endsBoost: true });
+    await new Promise((res) => setTimeout(res, 5)); // A's PATCH has landed; its ntfy is stalled
+    assert.equal(a.patches.length, 2);
+    const b = new HbxWriter(a.slx, a.store, a.hub, "b", "s", async () => {});
+    assert.equal(await status(b.boost(128, 60, "dashboard")), "ok");
+    releaseNotify(); await cancel;
+    assert.equal(a.boosts[0].restored, true, "A's cancelled boost is retired");
+    assert.equal(a.boosts[1].restored, false, "B's boost, started after A's PATCH landed, stays active");
+  }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
