@@ -44,7 +44,10 @@ EVENT_TYPE = "self_heal"
 
 
 def _is_blocking(f: dict) -> bool:
-    return str(f.get("severity", "")).lower() != "info"   # P17 anti-freeze etc. never count
+    # Real snapshots carry faults.Severity members (str-mixin Enum: str() is "Severity.INFO", so
+    # compare the VALUE). P17 anti-freeze etc. are INFO and never count.
+    sev = f.get("severity", "")
+    return str(getattr(sev, "value", sev)).lower() != "info"
 
 
 class SelfHealer:
