@@ -139,7 +139,11 @@ class SelfHealer:
         if span is None:
             return errs
         by_name = {b.name.strip(): b for b in span.breakers}
+        names = [c.strip() for c in self.cfg.circuits.values()]
         for pid, circuit in self.cfg.circuits.items():
+            if names.count(circuit.strip()) > 1:
+                errs[pid] = f"'{circuit.strip()}' is mapped to more than one pump"
+                continue
             b = by_name.get(circuit.strip())
             if b is None or not (b.allow_cycle and b.heat_pump):
                 errs[pid] = f"'{circuit}' is not an allow_cycle heat-pump circuit in span.breakers"
@@ -480,7 +484,9 @@ class SelfHealer:
         now = self._mono()
         blocking = [f for f in snap.get("active_faults", []) if _is_blocking(f)]
         target_active = any(str(f.get("code", "")).upper() == str(code).upper() for f in blocking)
-        clear_now = fresh and snap.get("identity_ok") is not False and not blocking
+        switched_off = snap.get("on") is False or snap.get("state") == "off"
+        clear_now = (fresh and snap.get("identity_ok") is not False and not blocking
+                     and not switched_off)
         # the hold only counts FRESH, clear observations: any gap or fault restarts it
         v["cleared_since"] = (v["cleared_since"] or now) if clear_now else None
         power = self._circuit_power(pid)
@@ -518,6 +524,7 @@ class SelfHealer:
             why = (f"{code} still active" if target_active
                    else f"replaced by {', '.join(others)}" if others
                    else "offline/stale" if not fresh
+                   else "switched off" if switched_off
                    else f"power inconsistent with running ({power} W)" if not consistent
                    else f"not observed clear for {CLEAR_HOLD_S / 60:g} min")
             self._record_outcome(st, "not_recovered", why)

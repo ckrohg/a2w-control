@@ -303,12 +303,17 @@ class SelfHealConfig(BaseModel):
     circuits: dict[str, str] = Field(default_factory=lambda: {"pump1": "Air-Water 1",
                                                               "pump2": "Air-Water 2"})
 
+    @field_validator("circuits", mode="after")
+    @classmethod
+    def _strip(cls, v: dict[str, str]) -> dict[str, str]:
+        # names are matched stripped everywhere; normalise once so " Air-Water 1" can't pose as a
+        # different circuit (two pumps on one circuit is reported by self_heal, not a boot error)
+        return {pid: str(name).strip() for pid, name in v.items()}
+
     @model_validator(mode="after")
     def _floor(self):
         if not (self.off_s >= MIN_OFF_FLOOR_S):
             raise ValueError(f"self_heal.off_s must be >= {MIN_OFF_FLOOR_S:g} s (owner decision 2026-10-18)")
-        if len(set(self.circuits.values())) != len(self.circuits):
-            raise ValueError("self_heal.circuits maps two pumps to one circuit")
         return self
 
 
