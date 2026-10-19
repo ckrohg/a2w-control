@@ -99,7 +99,7 @@ async def rig(tmp_path, alerts):
                           state_dir=str(tmp_path), clock=ft.clock, mono=ft.mono, boot_id="boot-A")
 
     async def prime():   # one panel read, as the SPAN poll loop does every ~25 s
-        poller.note_circuits(await poller.client.fetch_circuits(), ft.clock())
+        poller.note_circuits(await poller.client.fetch_circuits(), ft.clock(), ft.mono())
 
     async def step(heal, seconds=30.0):
         ft.t += seconds
@@ -342,6 +342,22 @@ async def test_heating_seen_at_dispatch_starts_the_quiet_period(rig, monkeypatch
     assert r.panel.writes == []                          # still inside the 120 s quiet period
     await r.step(heal, 90)
     assert ("Air-Water 2", "OPEN") in r.panel.writes
+
+
+async def test_a_backward_clock_step_cannot_keep_an_old_panel_read_fresh(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    r.p2.clear()
+    r.panel.down = True                                 # no more panel reads from here on
+    for i in range(12):
+        r.ft.t += 30
+        if i == 2:
+            r.ft.wall_offset -= 90                      # NTP steps the wall clock back
+        r.p1.fresh(); r.p2.fresh()
+        await heal.tick()
+    assert "recovered" not in await codes(r.store)
 
 
 async def test_a_replacement_fault_is_not_recovery(rig):
@@ -662,6 +678,7 @@ async def test_cold_or_stale_span_waits_then_pages_manual(rig):
     r = rig
     r.poller.latest_circuits = {}                           # just booted: no panel read yet
     r.poller.latest_circuits_ts = None
+    r.poller.latest_circuits_mono = None
     heal = r.make(live=True)
     r.p2.fault(age_min=12)
     await heal.tick()
