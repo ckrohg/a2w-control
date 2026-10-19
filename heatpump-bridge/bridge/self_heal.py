@@ -319,6 +319,21 @@ class SelfHealer:
         if busy:
             st["status"] = f"{code} active but {name} {busy} — not cycling"
             return
+        # Both-down comes BEFORE the budget: an escalated pump must still page when its peer
+        # goes down afterwards (each kind is de-duplicated on its own).
+        span = self._span()
+        other = self._other_down(pid, span=span)
+        if other:
+            st["status"] = f"{code} active but {other} — not cycling (paged)"
+            if "both_down" not in st["paged"]:
+                st["paged"].add("both_down")
+                await self._step(pid, "both_down", "critical",
+                                 f"{name}: {code} for {age_min:.0f} min AND {other}. A2W will not "
+                                 f"power-cycle while the other pump is down — check both units; "
+                                 f"'{circuit}' can be cycled at the SPAN panel by hand.",
+                                 {"code": code, "other": other},
+                                 title="URGENT: both heat pumps down", priority="urgent")
+            return
         recent = self._recent(st)
         if len(recent) >= self.cfg.max_attempts:
             st["status"] = (f"escalated: {code} persists after {len(recent)} power cycles "
@@ -334,19 +349,6 @@ class SelfHealer:
                                  f"the unit, or power-cycle the '{circuit}' breaker at the SPAN panel.",
                                  {"code": code, "attempts": recent},
                                  title=f"URGENT: {name} {code} not self-healing", priority="urgent")
-            return
-        span = self._span()
-        other = self._other_down(pid, span=span)
-        if other:
-            st["status"] = f"{code} active but {other} — not cycling (paged)"
-            if "both_down" not in st["paged"]:
-                st["paged"].add("both_down")
-                await self._step(pid, "both_down", "critical",
-                                 f"{name}: {code} for {age_min:.0f} min AND {other}. A2W will not "
-                                 f"power-cycle while the other pump is down — check both units; "
-                                 f"'{circuit}' can be cycled at the SPAN panel by hand.",
-                                 {"code": code, "other": other},
-                                 title="URGENT: both heat pumps down", priority="urgent")
             return
         if self.cfg.live:
             if self.breakers is None:

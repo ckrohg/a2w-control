@@ -310,6 +310,20 @@ async def test_two_failures_escalate_instead_of_looping(rig):
     assert "escalated" in heal.status()["pumps"]["pump2"]["status"]
 
 
+async def test_peer_failing_after_escalation_still_pages_both_down(rig):
+    r = rig
+    (r.tmp_path / sh_mod.STATE_FILE).write_text("{garbage")   # budget spent -> escalates at once
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    assert "escalated" in await codes(r.store)
+    r.p1.snapshot.update(on=False, state="off")               # then the other pump goes down
+    await r.step(heal)
+    await settle()
+    assert "both_down" in await codes(r.store)
+    assert r.panel.writes == []
+
+
 async def test_budget_survives_a_restart_and_a_wall_clock_step(rig):
     r = rig
     r.p2.fault(age_min=12)
