@@ -952,6 +952,7 @@ export class Store {
     const absent = (e: unknown) => (e as { code?: string }).code === "42P01"; // undefined_table
     let lastByPump: PiLinkInputs["lastByPump"] = null;
     let readings: PiLinkInputs["readings"] = null;
+    let contaminated: { start: number; end: number }[] = [];
     try {
       // the newest reading per pump over the WHOLE table: a silence longer than the analysis range must keep an
       // honest, growing age rather than drop to null (codex pass 1 on #193); index (pump_id, ts)
@@ -963,6 +964,14 @@ export class Store {
         `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
            SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1 AND ts <= $3) d
          ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS, nowS + o.futureS]);
+      // readings.id is the mirror's INGESTION order — real arrival time — which system_stats lacks (codex pass 8 on
+      // #193). A backward Pi-clock step shows here unambiguously: ts FALLS between consecutive rows of a pump in id
+      // order. The span it re-stamps, (new ts, old ts], is clock-contaminated: rows there were stamped twice.
+      const back = await this.pool.query(
+        `SELECT ts::float8 AS start, prev_ts::float8 AS "end" FROM (
+           SELECT ts, lag(ts) OVER (PARTITION BY pump_id ORDER BY id) AS prev_ts FROM readings WHERE ts >= $1
+         ) x WHERE prev_ts - ts > $2 ORDER BY ts`, [fromS - 3_600, o.clockStepS]);
+      contaminated = back.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) }));
       lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
       readings = {
         gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
@@ -988,7 +997,7 @@ export class Store {
       // they sort after the resumed samples and fake a reboot; and a reboot is certain only once SETTLE_S of later
       // history has stayed on its track — until then it is ambiguous (the window reads unknown, the count lags).
       const b = await this.pool.query(
-        `SELECT boot_at::float8 AS at,
+        `SELECT boot_at::float8 AS at, ts::float8 AS sample_ts,
                 (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)
                  AND max_next_ts >= ts + $4) AS certain FROM (
            SELECT ts, uptime_s, ts - uptime_s AS boot_at,
@@ -1011,9 +1020,14 @@ export class Store {
              AND abs((ts - prev_ts) - (uptime_s - prev_up)) > $2
          ORDER BY ts`, [fromS - 3_600, o.clockStepS, nowS + o.futureS]);
       latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
+      // a candidate sampled inside a clock-contaminated span is never certain: its "settled" history may be the
+      // displaced samples themselves (codex pass 8 on #193)
+      const dirty = (t: number) => contaminated.some((c) => t >= c.start - 60 && t <= c.end + 60);
+      const certain = (r: any) => r.certain && !dirty(Number(r.sample_ts));
       stats = {
-        boots: b.rows.filter((r: any) => r.certain).map((r: any) => ({ at: Number(r.at) })),
-        ambiguous: b.rows.filter((r: any) => !r.certain).map((r: any) => ({ at: Number(r.at) })),
+        boots: b.rows.filter(certain).map((r: any) => ({ at: Number(r.at) })),
+        ambiguous: b.rows.filter((r: any) => !certain(r)).map((r: any) => ({ at: Number(r.at) })),
+        clockIntervals: contaminated,
         // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
         // window cannot read as resolved while they exist
         clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
@@ -1025,8 +1039,8 @@ export class Store {
     // `no Pi connected` refusal), oldest first, from the lookback start (pilink.ts filters windows by END)
     const pb = await this.pool.query(
       `SELECT (EXTRACT(EPOCH FROM ts) * 1000)::float8 AS ts, result FROM phase_b_log
-       WHERE ts >= to_timestamp($1) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
-       ORDER BY ts`, [fromS]);
+       WHERE ts >= to_timestamp($1) AND ts <= to_timestamp($2) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
+       ORDER BY ts`, [fromS, nowS]);
     // a run already OPEN at the range start keeps its real start (codex pass 2 on #193): the first failure after the
     // last `sent` before the boundary, however long ago — prepended, so dropoutRuns opens the run there
     const open = await this.pool.query(

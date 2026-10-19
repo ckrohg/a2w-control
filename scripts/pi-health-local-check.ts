@@ -175,6 +175,40 @@ async function main() {
   await pool.query(`INSERT INTO readings (ts, pump_id) VALUES ($1, 'pump1')`, [NOW - 20 * D]);
   const old = piHealth(await store.piLinkInputs(NOW * 1000, OPTS), NOW * 1000);
   assert.ok(old.last_reading_age_s != null && Math.abs(old.last_reading_age_s - 20 * D) <= 1, `a 20-day silence keeps an age (${old.last_reading_age_s})`);
+  // ── codex pass 8 on #193: a 20-min +1 h clock FLICK, evaluated at planner times THROUGH its catch-up ───────────
+  // Pi booted at T0−3 h; both paths keep exporting; from real T0 to T0+20 min the clock reads +1 h, then it is right
+  // again. system_stats keeps the displaced rows on ts conflicts (ingest's ON CONFLICT DO NOTHING) — at catch-up
+  // they supply their own "settled" history; readings (ingestion-ordered ids) show the backward step at T0+20 min.
+  // A socket outage T0..T0+25 min must read unknown, with no reboot, at every evaluation time.
+  await pool.query(`TRUNCATE readings, system_stats, phase_b_log RESTART IDENTITY`);
+  const T0 = NOW - 2 * D, B = T0 - 3 * H, F1 = T0 + 20 * 60;
+  const stamp = (t: number) => (t >= T0 && t < F1 ? t + H : t);
+  const sys: string[] = [];
+  for (let t = T0 - 3 * H + 60; t <= T0 + 3 * H; t += 60) sys.push(`(${stamp(t)}, ${t - B})`);   // real-time order
+  for (let i = 0; i < sys.length; i += 500) {
+    await pool.query(`INSERT INTO system_stats (ts, uptime_s) VALUES ${sys.slice(i, i + 500).join(",")} ON CONFLICT (ts) DO NOTHING`);
+  }
+  // readings in REAL-time (= ingestion, = id) order — one VALUES list per batch, so ids follow arrival
+  const rd: string[] = [];
+  for (let t = T0 - 3 * H + 60; t <= T0 + 3 * H; t += 60) for (const p of ["pump1", "pump2"]) rd.push(`(${stamp(t)}, '${p}', true, 'heating')`);
+  for (let i = 0; i < rd.length; i += 500) {
+    await pool.query(`INSERT INTO readings (ts, pump_id, online, state) VALUES ${rd.slice(i, i + 500).join(",")}`);
+  }
+  await pool.query(
+    `INSERT INTO phase_b_log (ts, pump_id, mode, value_c, result)
+     SELECT to_timestamp(t), 'pump1', 'active', 55, CASE WHEN t >= $2 AND t < $3 THEN 'failed: no Pi connected' ELSE 'sent' END
+     FROM generate_series($1::bigint, $4::bigint, 300) t`, [T0 - 3 * H, T0, T0 + 25 * 60, T0 + 3 * H]);
+  for (const evalS of [T0 + H + 5 * 60, T0 + H + 15 * 60, T0 + H + 19 * 60, T0 + H + 30 * 60, T0 + 3 * H]) {
+    const fin = await store.piLinkInputs(evalS * 1000, OPTS);
+    const fh = piHealth(fin, evalS * 1000);
+    const w6 = fh.dropouts_7d.find((w) => Math.abs(Date.parse(w.start) / 1000 - T0) <= 60);
+    const at = `at T0+${Math.round((evalS - T0) / 60)} min`;
+    assert.equal(fin.stats?.boots.length, 0, `${at}: the flick never makes a certain reboot (${JSON.stringify(fin.stats?.boots)})`);
+    assert.equal(fh.reboots_24h, 0, `${at}: and is never counted`);
+    assert.equal(w6?.verdict, "unknown", `${at}: the outage during the flick is unknown (got ${w6?.verdict})`);
+    assert.ok((fin.stats?.clockIntervals ?? []).some((c) => c.start <= F1 + 60 && c.end >= F1 + H - 120), `${at}: the re-stamped span is known from readings' ingestion order`);
+  }
+
   console.log(`pi-health-local-check: all assertions passed (${rows.length} system_stats rows, ${inputs.phaseB.length} phase_b rows)`);
 }
 

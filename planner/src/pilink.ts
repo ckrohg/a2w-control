@@ -95,6 +95,11 @@ export interface StatsView {
   ambiguous?: Boot[];
   /** Pi-clock discontinuities (epoch s): ts moved unlike uptime between consecutive samples — an NTP step */
   clockSteps?: number[];
+  /**
+   * Clock-CONTAMINATED spans (epoch s) from readings in ingestion order: a backward step re-stamped (start, end] — rows
+   * there were stamped twice, so timestamps cannot order events in it (codex pass 8 on #193).
+   */
+  clockIntervals?: { start: number; end: number }[];
   firstTs: number | null;
   lastTs: number | null;
 }
@@ -143,7 +148,8 @@ export function classifyWindows(
     const unclear = gaps.some((g) => core(g) > 0 && !belongs(g));
     // a Pi-clock step anywhere in the window ± slack: timestamp order no longer proves arrival order, so a silence may
     // have been papered over (a backward step refills the gap) — never socket_only / gap_only on that evidence
-    const stepNear = (stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi);
+    const stepNear = (stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi)
+      || (stats?.clockIntervals ?? []).some((c) => c.start <= hi && c.end >= lo);
     const near = (g: ReadingGap, t: number) => t >= g.start - 120 && t <= g.end + 120;
     let boot: Boot | null = null;
     let unresolved = false;
