@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from bridge import self_heal as sh_mod
 from bridge import span_control
 from bridge.config import AppConfig, PumpConfig, SelfHealConfig, SpanConfig
+from bridge.faults import Severity
 from bridge.self_heal import SelfHealer
 from bridge.span_control import BreakerController
 from bridge.span_local import SpanLocalPoller
@@ -274,6 +275,23 @@ async def test_a_backward_clock_step_cannot_revive_frozen_telemetry(rig):
     await heal.tick()
     assert r.panel.writes == []
     assert "stale" in heal.status()["pumps"]["pump2"]["status"]
+
+
+async def test_info_protections_are_not_faults(rig):
+    """P17 anti-freeze (Severity.INFO, the real enum) on the peer is not 'down', and on the
+    cycled pump does not block recovery."""
+    r = rig
+    p17 = {"key": "2116.0", "code": "P17", "severity": Severity.INFO, "since": r.ft.clock(), "message": "x"}
+    r.p1.snapshot["active_faults"] = [dict(p17)]
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12, severity=Severity.WARNING)
+    await r.eligible(heal)
+    assert ("Air-Water 2", "OPEN") in r.panel.writes        # the peer's P17 did not block it
+    r.p2.snapshot["active_faults"] = [dict(p17)]            # E21 gone; P17 on the cycled pump
+    for _ in range(8):
+        await r.step(heal)
+    c = await codes(r.store)
+    assert "recovered" in c and "both_down" not in c
 
 
 async def test_a_replacement_fault_is_not_recovery(rig):
