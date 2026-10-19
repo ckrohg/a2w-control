@@ -95,6 +95,7 @@ async def rig(tmp_path, alerts):
     p1, p2 = FakePoller("pump1", "Heat Pump 1", ft), FakePoller("pump2", "Heat Pump 2", ft)
 
     def make(**cfg):
+        cfg.setdefault("circuits_verified", True)   # live tests assume a commissioned map
         return SelfHealer(SelfHealConfig(**cfg), {"pump1": p1, "pump2": p2}, ctl, store,
                           state_dir=str(tmp_path), clock=ft.clock, mono=ft.mono, boot_id="boot-A")
 
@@ -456,7 +457,7 @@ async def test_other_pump_down_pages_once_and_does_not_cycle(rig):
 
 async def test_a_peer_without_telemetry_counts_as_down(rig):
     r = rig
-    heal = SelfHealer(SelfHealConfig(live=True), {"pump2": r.p2}, r.ctl, r.store,   # no pump1 poller
+    heal = SelfHealer(SelfHealConfig(live=True, circuits_verified=True), {"pump2": r.p2}, r.ctl, r.store,   # no pump1 poller
                       state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.mono, boot_id="boot-A")
     r.p2.fault(age_min=12)
     await r.eligible(heal)
@@ -630,7 +631,7 @@ async def test_budget_survives_a_reboot_with_a_clock_step(rig):
     heal = r.make(live=True)
     await r.eligible(heal)
     r.ft.wall_offset = 7 * 3600                  # reboot + NTP correction 7 h ahead
-    rebooted = SelfHealer(SelfHealConfig(live=True), {"pump1": r.p1, "pump2": r.p2}, r.ctl, r.store,
+    rebooted = SelfHealer(SelfHealConfig(live=True, circuits_verified=True), {"pump1": r.p1, "pump2": r.p2}, r.ctl, r.store,
                           state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.mono, boot_id="boot-B")
     assert rebooted.status()["pumps"]["pump2"]["attempts_in_window"] == 1
 
@@ -741,6 +742,19 @@ async def test_suspicious_mapping_is_refused(rig):
     assert "mapping_suspect" in await codes(r.store)
 
 
+async def test_live_needs_a_verified_map(rig):
+    r = rig
+    heal = r.make(live=True, circuits_verified=False)
+    r.p2.fault(age_min=12)
+    await r.eligible(heal)
+    await settle()
+    assert r.panel.writes == []
+    assert "not verified" in heal.status()["pumps"]["pump2"]["unavailable"]
+    assert "unavailable" in await codes(r.store)
+    shadow = r.make(live=False, circuits_verified=False)       # shadow still evaluates
+    assert shadow.config_errors == {}
+
+
 async def test_bad_mapping_is_reported_not_a_boot_failure(rig):
     r = rig
     heal = r.make(live=True, circuits={"pump1": "Air-Water 1", "pump2": "Buffer Tank"})
@@ -760,6 +774,7 @@ def test_config_guards_and_compat():
     assert d.live is False and d.fault_codes == ["E21"] and d.grace_min == 10
     assert d.max_attempts == 2 and d.window_h == 6 and d.verify_min == 15
     assert d.circuits == {"pump1": "Air-Water 1", "pump2": "Air-Water 2"}
+    assert d.circuits_verified is False
     # existing configs (no self_heal section) with any valid span settings still load
     AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="h")], span=SpanConfig(min_off_s=120))
     AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="h")],
