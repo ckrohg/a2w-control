@@ -1,7 +1,7 @@
 // @purpose Weekly email digest v2 (owner asks 2026-08-06): every Monday morning a Vercel
 // cron hits this route, which composes the week from Neon — electricity, measured COP,
 // realized savings (all with week-over-week deltas), a 7-day savings bar strip, hot-water
-// usage (TempIQ aggregate), backup-element cost, hygiene recency, comm quality, faults —
+// usage (TempIQ aggregate), backup-element cost, hygiene recency, comm quality, the Pi link (#165), faults —
 // and mails it via Resend. Cookie sessions get a browser preview of the same HTML; only
 // the cron's CRON_SECRET bearer (or ?send=1) actually sends. No-ops with a clear body
 // when Resend env is missing so the cron never error-spams while unconfigured.
@@ -11,6 +11,7 @@
 import { NextResponse } from "next/server";
 import { sql } from "@/lib/sql";
 import { isAuthed } from "@/lib/auth";
+import { normalizePi, normalizeHub, esc } from "@/lib/pi-tile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -250,6 +251,24 @@ async function buildDigest() {
     headline = `A quiet week: $${fmt(cur.saved, 2)} saved, no active faults.`;
   }
 
+  // ---- Pi link (#165) ------------------------------------------------------------------
+  // Two independent sources that should corroborate: the planner's /health.pi (windows from its own phase_b_log
+  // `no Pi connected` runs, each given a gap-vs-reboot verdict from this DB's readings + system_stats) and the hub's
+  // own dropout counters (/health pi_dropouts_*, #178 — in-memory, so they restart from zero on a hub redeploy).
+  // Both endpoints are open; a failure is shown as "—", never fails the digest.
+  const health = async (base: string | undefined): Promise<Record<string, any> | null> => {
+    if (!base) return null;
+    try {
+      const r = await fetch(`${base.replace(/\/$/, "")}/health`, { signal: AbortSignal.timeout(8_000), cache: "no-store" });
+      // the planner answers 503 with the same body when it is unwell — the pi block is still worth showing
+      return r.ok || r.status === 503 ? ((await r.json()) as Record<string, any>) : null;
+    } catch { return null; }
+  };
+  const [plannerHealth, hubHealth] = await Promise.all([health(process.env.PLANNER_URL), health(process.env.HUB_URL)]);
+  // validated into finite numbers (lib/pi-tile.ts): a malformed body renders "unavailable", never throws or injects
+  const pi = normalizePi(plannerHealth);
+  const hubDrops = normalizeHub(hubHealth);
+
   // ---- stat tiles ------------------------------------------------------------------
   const tile = (label: string, value: string, sub: string) => `
     <td width="50%" style="padding:12px 14px;background:${TILE_BG};border-radius:8px">
@@ -269,6 +288,15 @@ async function buildDigest() {
            `${delta(cur.saved, prev?.saved, "up")} <span style="color:${MUTED}">· $${fmt(totalSaved, 0)} since Jul 16</span>`)}
     ${tile("hot water", dhw?.weekKwh != null ? `≈${fmt(dhw.weekKwh, 1)} kWh/wk` : "—",
            dhw ? `<span style="color:${INK2}">${fmt(dhw.dailyKwh, 2)} kWh/d estimate${dhw.cycles != null ? `, ${dhw.cycles} recharge${dhw.cycles === 1 ? "" : "s"} in the estimate` : ""}</span> <span style="color:${MUTED}">· DHW COP ${dhw.cop != null ? fmt(dhw.cop, 1) : "—"}${dhw.caveat ? ` · ${dhw.caveat}${dhw.weekKwh == null ? " — weekly figure withheld" : ""}` : ""}</span>` : `<span style="color:${MUTED}">no TempIQ data</span>`)}
+  </tr><tr>
+    ${tile("Pi dropouts this week", pi ? String(pi.count) : "—",
+           pi
+             ? `<span style="color:${INK2}">${pi.count ? `longest ${fmt(pi.longestMin, 0)} min · ` : ""}gap+reboot ${pi.gapReboot} · gap only ${pi.gapOnly} · socket only ${pi.socketOnly}${pi.unknown ? ` · unknown ${pi.unknown}` : ""}</span> <span style="color:${MUTED}">· ${pi.reboots7d ?? "—"} reboot${pi.reboots7d === 1 ? "" : "s"} · planner /health.pi</span>`
+             : `<span style="color:${MUTED}">planner /health.pi unavailable or stale</span>`)}
+    ${tile("hub-counted dropouts (7 d)", hubDrops ? String(hubDrops.d7) : "—",
+           hubDrops
+             ? `<span style="color:${INK2}">24 h: ${hubDrops.d24} · longest 24 h ${fmt(hubDrops.longest24Min, 0)} min</span> <span style="color:${MUTED}">· counting since ${hubDrops.since ? esc(day(Date.parse(hubDrops.since) / 1000)) : "—"}${pi && hubDrops.d7 !== pi.count ? " — differs from the planner's count (the hub restarts from zero on a redeploy)" : ""}</span>`
+             : `<span style="color:${MUTED}">hub /health has no dropout counters (pre-#178) or is unreachable</span>`)}
   </tr></table>`;
 
   // ---- 7-day savings bar strip (single series -> no legend; title names it; ---------

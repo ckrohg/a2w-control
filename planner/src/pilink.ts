@@ -1,0 +1,350 @@
+/**
+ * @purpose #165 (wave N1, eval 2026-10-18 F1): the Pi link's story from tables the planner already shares with the
+ * analytics mirror — no house network needed. Five 2–3 h dropouts in four days (Oct 14–17) left `phase_b_log` full of
+ * `failed: no Pi connected`; the question each one raises is WHICH failure it was:
+ *   gap+reboot  — the Pi's 60-s exporter (a path that bypasses the hub) ALSO went silent (`readings` gap) and the Pi
+ *                 came back freshly booted (`system_stats.uptime_s` reset at reconnect): a WiFi stall cleared only by
+ *                 deploy/bridge-watchdog.sh's 120-min reboot ladder;
+ *   gap_only    — readings stopped too, but the Pi did not reboot: the link recovered on its own;
+ *   socket_only — readings CONTINUED: the Pi was online and only the hub websocket was down;
+ *   unknown     — the mirror tables do not cover the window (absent, or no readings before it).
+ * Pure: the SQL reductions (readings gaps, uptime resets) live in store.ts piLinkInputs; this module turns them into
+ * windows and verdicts so planner/src/pilink.test.ts can assert all of it over a synthetic history.
+ */
+
+/** phase_b_log's own words for a write the hub refused because the Pi was gone (hub/src/index.ts 503 detail). */
+export const NO_PI = /no Pi connected/;
+/** Readings arrive every ~60 s; a step of more than this between consecutive pushes is a gap. */
+export const READING_GAP_MIN_S = 5 * 60;
+/** How far outside a window a readings gap or a boot may sit and still belong to it (phase_b_log is 5-min grained). */
+export const WINDOW_SLACK_S = 10 * 60;
+/**
+ * A reboot between two system_stats samples needs uptime evidence, not just a moved boot time (codex passes 1–2 on
+ * #193: an NTP step forward moves ts − uptime_s exactly like a reboot does). CERTAIN: uptime fell. AMBIGUOUS: the boot
+ * time jumped by more than this while uptime kept rising but is shorter than the time since the previous sample — a
+ * reboot of a Pi that had only just booted, or a clock step on one; two samples cannot tell which. A clock step on a
+ * Pi up longer than the step is neither. store.piLinkInputs applies it in SQL.
+ */
+export const BOOT_JUMP_S = 5 * 60;
+/** A difference between the ts step and the uptime step larger than this between two samples is a clock step. */
+export const CLOCK_STEP_S = 2 * 60;
+/** Mirror samples stamped further than this AHEAD of the planner's clock are quarantined (a Pi clock running fast). */
+export const FUTURE_S = 2 * 60;
+/** A reboot is certain only after this much later history stayed on its new boot track (codex pass 7 on #193). */
+export const SETTLE_S = 15 * 60;
+
+export type PiVerdict = "gap+reboot" | "gap_only" | "socket_only" | "unknown";
+
+/** One phase_b_log row (mode 'active'): epoch ms + the result string. */
+export interface PhaseBRow { ts: number; result: string }
+/** A readings gap: the last push before it and the first after it (epoch s, the Pi's clock). */
+export interface ReadingGap { start: number; end: number }
+/** A detected reboot: the new boot time (epoch s = ts − uptime_s of the first row after it). */
+export interface Boot { at: number }
+
+export interface DropoutRun { start: number; end: number | null }
+export interface DropoutWindow {
+  start: string;
+  /** null = still ongoing at the last phase_b_log row */
+  end: string | null;
+  minutes: number;
+  verdict: PiVerdict;
+  /** The longest readings gap overlapping the window (minutes), or null. */
+  readings_gap_min: number | null;
+  /** The boot inside the window's slack, or null. */
+  reboot_at: string | null;
+}
+
+/**
+ * Maximal runs of `no Pi connected` in phase_b_log (both pumps interleaved, sorted by time). A run ends at the first
+ * `sent` — the hub accepted a write, so the Pi was back. Other results (lease skips, dry-runs, other failures) say
+ * nothing about the Pi and neither extend nor end a run. A run with no closing `sent` is ongoing (end null).
+ */
+export function dropoutRuns(rows: PhaseBRow[]): DropoutRun[] {
+  const out: DropoutRun[] = [];
+  let open: number | null = null;
+  for (const r of [...rows].sort((a, b) => a.ts - b.ts)) {
+    if (NO_PI.test(r.result)) { open ??= r.ts; continue; }
+    if (r.result === "sent" && open !== null) { out.push({ start: open, end: r.ts }); open = null; }
+  }
+  if (open !== null) out.push({ start: open, end: null });
+  return out;
+}
+
+/** Reboots closer together than this are one boot (a fresh Pi's NTP step right after boot re-trips the predicate). */
+export const BOOT_MERGE_S = 15 * 60;
+
+/** Collapse near-duplicate boots (sorted output). */
+export function mergeBoots(boots: Boot[]): Boot[] {
+  const out: Boot[] = [];
+  for (const b of [...boots].sort((x, y) => x.at - y.at)) {
+    if (!out.length || b.at - out[out.length - 1].at > BOOT_MERGE_S) out.push(b);
+  }
+  return out;
+}
+
+export interface ReadingsView {
+  gaps: ReadingGap[];
+  firstTs: number | null;
+  lastTs: number | null;
+  /**
+   * Clock-CONTAMINATED spans (epoch s) from readings in INGESTION order (readings.id): a backward step re-stamped
+   * (start, end] — rows there were stamped twice, so timestamps cannot order events in it (codex passes 8–9 on #193).
+   */
+  clockIntervals?: { start: number; end: number }[];
+}
+export interface StatsView {
+  /** certain reboots: uptime FELL between consecutive samples */
+  boots: Boot[];
+  /**
+   * boot-time jumps that are a reboot OR a clock step on a freshly booted Pi — uptime kept rising but is shorter than
+   * the time since the previous sample. Indistinguishable from two samples (codex pass 2 on #193): never counted as a
+   * reboot, and a gap whose only evidence is one of these is `unknown`.
+   */
+  ambiguous?: Boot[];
+  /** Pi-clock discontinuities (epoch s): ts moved unlike uptime between consecutive samples — an NTP step */
+  clockSteps?: number[];
+  /** hourly buckets of the clock's cumulative sub-threshold slew per boot track (store.piLinkInputs) */
+  drift?: { track: number; start: number; end: number; cmin: number; cmax: number }[];
+  /** system_stats silences (> READING_GAP_MIN_S): where the clock's evolution is NOT observed */
+  gaps?: ReadingGap[];
+  firstTs: number | null;
+  lastTs: number | null;
+}
+
+/**
+ * Verdict per window (codex pass 1 on #193 tightened every rule):
+ * - the readings gap must substantially belong to the window — at least half of it inside the window ± slack — so an
+ *   unrelated gap just before/after does not turn a socket outage into a gap;
+ * - the reboot must be the one that ended THAT gap — inside [gap start − 1 min, gap end + 2 min] (the Pi boots, then
+ *   its first push closes the gap) — not merely somewhere in the window;
+ * - a gap overlapping the window that does NOT clearly belong to it, or a Pi-clock step within window ± slack →
+ *   `unknown` (unless a certain reboot was found): continuity is never assumed;
+ * - gap+reboot vs gap_only needs system_stats samples bracketing the gap (first ≤ gap start, last ≥ gap end): absent,
+ *   empty, late-starting stats, a gap still open now, or only an AMBIGUOUS boot jump in it → `unknown`, never a
+ *   guessed gap_only;
+ * - no readings before the window → `unknown`.
+ * `readings` null = the table is absent; `stats` null likewise. A silence that has not ended (trailing) is a gap.
+ */
+export function classifyWindows(
+  runs: DropoutRun[],
+  readings: ReadingsView | null,
+  stats: StatsView | null,
+  nowS: number,
+): DropoutWindow[] {
+  const gaps: ReadingGap[] = readings ? [...readings.gaps] : [];
+  const trailing = readings?.lastTs != null && nowS - readings.lastTs > READING_GAP_MIN_S;
+  if (trailing) gaps.push({ start: readings!.lastTs as number, end: nowS });
+  const boots = stats ? mergeBoots(stats.boots) : [];
+  return runs.map((r) => {
+    const s = r.start / 1000;
+    const e = r.end == null ? nowS : r.end / 1000;
+    const lo = s - WINDOW_SLACK_S, hi = e + WINDOW_SLACK_S;
+    const covered = readings != null && readings.firstTs != null && readings.firstTs <= s;
+    const inside = (g: ReadingGap) => Math.max(0, Math.min(g.end, hi) - Math.max(g.start, lo));
+    const core = (g: ReadingGap) => Math.max(0, Math.min(g.end, e) - Math.max(g.start, s));
+    // a gap belongs to the window when at least half of it lies inside window ± slack, OR it covers at least half of
+    // the window itself (a long silence spanning a short socket outage — codex pass 2 on #193)
+    const belongs = (g: ReadingGap) => inside(g) >= READING_GAP_MIN_S
+      && (inside(g) >= (g.end - g.start) / 2 || core(g) >= (e - s) / 2);
+    // EVERY gap that belongs is weighed (codex pass 3 on #193): a reboot in any of them is gap+reboot; otherwise any
+    // unresolved one (still open, not bracketed by stats, only an ambiguous boot, or a clock step at its edges — the
+    // "gap" may be the Pi's clock jumping, not a silence) makes the verdict unknown; only all-resolved is gap_only
+    const mine = gaps.filter(belongs);
+    // a gap that overlaps the window itself but does not clearly belong to it — whether or not another gap does: its
+    // uncertainty is kept (codex pass 4 on #193); continuity is NOT established
+    const unclear = gaps.some((g) => core(g) > 0 && !belongs(g));
+    // a Pi-clock step anywhere in the window ± slack: timestamp order no longer proves arrival order, so a silence may
+    // have been papered over (a backward step refills the gap) — never socket_only / gap_only on that evidence
+    const stepNear = (stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi)
+      || (readings?.clockIntervals ?? []).some((c) => c.start <= hi && c.end >= lo);
+    const near = (g: ReadingGap, t: number) => t >= g.start - 120 && t <= g.end + 120;
+    let boot: Boot | null = null;
+    let unresolved = false;
+    for (const g of mine) {
+      const open = trailing && g.end === nowS;
+      const bracketed = !open && stats != null && stats.firstTs != null && stats.lastTs != null
+        && stats.firstTs <= g.start && stats.lastTs >= g.end;
+      const certain = bracketed ? boots.find((b) => near(g, b.at) && b.at >= g.start - 60) ?? null : null;
+      if (certain) { boot ??= certain; continue; }
+      if (!bracketed || (stats?.ambiguous ?? []).some((b) => near(g, b.at)) || (stats?.clockSteps ?? []).some((t) => near(g, t))) unresolved = true;
+    }
+    const longest = mine.reduce<ReadingGap | null>((a, g) => (!a || g.end - g.start > a.end - a.start ? g : a), null);
+    const verdict: PiVerdict = !covered ? "unknown"
+      : boot ? "gap+reboot"
+      : unclear || stepNear || unresolved ? "unknown"
+      : !mine.length ? "socket_only" : "gap_only";
+    return {
+      start: new Date(r.start).toISOString(),
+      end: r.end == null ? null : new Date(r.end).toISOString(),
+      minutes: Math.round((e - s) / 6) / 10,
+      verdict,
+      readings_gap_min: longest ? Math.round((longest.end - longest.start) / 6) / 10 : null,
+      reboot_at: boot ? new Date(boot.at * 1000).toISOString() : null,
+    };
+  });
+}
+
+export interface PiLinkInputs {
+  /** newest readings ts per pump over the WHOLE table (epoch s), or null when the readings table is absent */
+  lastByPump: Record<string, number> | null;
+  /** gaps + coverage over the analysis range, or null when the table is absent */
+  readings: ReadingsView | null;
+  /** newest system_stats row, or null when absent / empty */
+  latestStat: { ts: number; uptime_s: number | null } | null;
+  /** reboots (with uptime evidence) + coverage over the analysis range, or null when the table is absent */
+  stats: StatsView | null;
+  /** phase_b_log rows from a day BEFORE the 7-d window, so a run that straddles the edge keeps its real start */
+  phaseB: PhaseBRow[];
+  /** any readings / system_stats row stamped ahead of the planner clock (beyond FUTURE_S): the Pi clock runs fast NOW */
+  futureRows?: boolean;
+  /** planner-measured Pi-clock offsets (store pi_clock_observations): at = planner epoch s, offset = planner − Pi */
+  clockObs?: { at: number; offset: number }[];
+}
+
+/** An observation brackets a window when it lies within this of the window's edge. */
+export const OBS_BRACKET_S = 30 * 60;
+/** |planner − frame ts| within this = aligned (a connected frame is ≤ ~15 s old, plus latency). */
+export const OBS_ALIGNED_S = CLOCK_STEP_S;
+
+/** Windows are reported when they ENDED (or are still open) within this — the hub's own convention (#178). */
+export const DROPOUT_WINDOW_S = 7 * 86_400;
+/** How much earlier the inputs start, so runs straddling the 7-d edge are seen whole (store.piLinkInputs). */
+export const LOOKBACK_S = 86_400;
+
+export interface PiHealth {
+  computed_at: string;
+  /** mirror tables present — false in a fresh DB the mirror never wrote (the rehearsal) */
+  mirror_tables: { readings: boolean; system_stats: boolean };
+  last_reading_age_s: number | null;
+  last_reading_by_pump: Record<string, { ts: string; age_s: number }>;
+  uptime_s: number | null;
+  /** age of the system_stats row uptime_s came from */
+  uptime_age_s: number | null;
+  reboots_24h: number | null;
+  reboots_7d: number | null;
+  last_reboot_at: string | null;
+  /** the clock rule (windowClockTrusted): planner-measured observations must bracket a window for its verdict to stand */
+  pi_clock: { live_offset_s: number | null; future_rows: boolean; observations_7d: number; misaligned_observations_7d: number; last_observation: { at: string; offset_s: number } | null };
+  dropouts_7d: DropoutWindow[];
+  summary: { count: number; longest_min: number | null; verdicts: Record<PiVerdict, number> };
+}
+
+/**
+ * THE CLOCK RULE (codex passes 14–18 on #193). Windows are planner-clock (phase_b_log); the evidence is Pi-clock
+ * (readings / system_stats). Reasoning backward from the present cannot see a clock that was corrected inside a
+ * reboot, so a verdict needs PLANNER-CLOCK evidence around the window itself: the offsets the planner measures each
+ * poll from the hub frame (pi_clock_observations). A window's verdict stands only if
+ *   (1) an ALIGNED observation lies within OBS_BRACKET_S before its start, and one within OBS_BRACKET_S after its end
+ *       (an open window: a fresh aligned live offset now);
+ *   (2) no MISALIGNED observation lies between those two; and
+ *   (3) no clock event (a clock step, a re-stamped span, future-stamped rows) lies between them.
+ * The Pi clock was then shown right just before and just after the window and did not jump in between, so its stamps
+ * can be taken at face value. Anything else is `unknown` — honest; an NTP-disciplined Pi with the planner polling keeps
+ * every verdict. Before observations accumulate (a fresh deploy), windows read unknown. Pure.
+ */
+export function windowClockTrusted(
+  w: { start: number; end: number | null }, input: PiLinkInputs, nowS: number, liveOffsetS: number | null,
+): boolean {
+  const obs = input.clockObs ?? [];
+  const aligned = (o: { offset: number }) => Math.abs(o.offset) <= OBS_ALIGNED_S;
+  const before = obs.filter((o) => o.at <= w.start && o.at >= w.start - OBS_BRACKET_S && aligned(o));
+  if (!before.length) return false;
+  const from = Math.max(...before.map((o) => o.at));
+  let to: number;
+  if (w.end == null) {
+    if (liveOffsetS == null || Math.abs(liveOffsetS) > OBS_ALIGNED_S || input.futureRows) return false;
+    to = nowS;
+  } else {
+    const after = obs.filter((o) => o.at >= w.end! && o.at <= w.end! + OBS_BRACKET_S && aligned(o));
+    if (!after.length) return false;
+    to = Math.min(...after.map((o) => o.at));
+  }
+  if (obs.some((o) => o.at > from && o.at < to && !aligned(o))) return false;
+  // a Pi-stamped event may sit up to a clock error away from planner time — compare with the slack around [from, to];
+  // a re-stamped span is checked for OVERLAP, not by its endpoints (codex pass 19: one enclosing the bracket counts)
+  const lo = from - WINDOW_SLACK_S, hi = to + WINDOW_SLACK_S;
+  // CLOCK-EVOLUTION COVERAGE (codex pass 21): the absence of steps and slew is evidence only where system_stats
+  // speaks for the clock — present across the bracket, and silent only where the readings are silent too (the same
+  // pushes carry both; stats missing while readings flow means the clock is unobserved exactly when it matters).
+  const st = input.stats;
+  if (!st || st.firstTs == null || st.lastTs == null || st.firstTs > lo || st.lastTs < Math.min(hi, nowS - 180)) return false;
+  const rgaps = input.readings?.gaps ?? [];
+  const uncovered = (st.gaps ?? []).some((g) => g.start < hi && g.end > lo
+    && !rgaps.some((r) => r.start <= g.start + 120 && r.end >= g.end - 120));
+  if (uncovered) return false;
+  // gradual movement: within one boot track, the slew across the bracket must stay within CLOCK_STEP_S (codex pass 20)
+  const byTrack = new Map<number, { cmin: number; cmax: number }>();
+  for (const b of input.stats?.drift ?? []) {
+    if (b.end < lo || b.start > hi) continue;
+    const t = byTrack.get(b.track) ?? { cmin: Infinity, cmax: -Infinity };
+    byTrack.set(b.track, { cmin: Math.min(t.cmin, b.cmin), cmax: Math.max(t.cmax, b.cmax) });
+  }
+  if ([...byTrack.values()].some((t) => t.cmax - t.cmin > CLOCK_STEP_S)) return false;
+  return !(input.stats?.clockSteps ?? []).some((t) => t >= lo && t <= hi)
+    && !(input.readings?.clockIntervals ?? []).some((c) => c.start <= hi && c.end >= lo)
+    && !(input.futureRows && to >= nowS - OBS_BRACKET_S);
+}
+
+/** Assemble /health.pi. The windows come from the planner's own phase_b_log, corroborated by the mirror's tables. */
+export function piHealth(input: PiLinkInputs, nowMs: number, liveOffsetS: number | null = null): PiHealth {
+  const nowS = nowMs / 1000;
+  const by: PiHealth["last_reading_by_pump"] = {};
+  for (const [id, ts] of Object.entries(input.lastByPump ?? {})) by[id] = { ts: new Date(ts * 1000).toISOString(), age_s: Math.round(nowS - ts) };
+  const tsList = Object.values(input.lastByPump ?? {});
+  const newest = tsList.length ? Math.max(...tsList) : null;
+  const windows = classifyWindows(
+    dropoutRuns(input.phaseB).filter((r) => r.end == null || nowS - r.end / 1000 <= DROPOUT_WINDOW_S),
+    input.readings, input.stats, nowS,
+  ).map((w) => {
+    const trusted = windowClockTrusted(
+      { start: Date.parse(w.start) / 1000, end: w.end == null ? null : Date.parse(w.end) / 1000 }, input, nowS, liveOffsetS);
+    return trusted ? w : { ...w, verdict: "unknown" as PiVerdict };
+  });
+  const obs = input.clockObs ?? [];
+  const lastObs = obs.length ? obs[obs.length - 1] : null;
+  const verdicts: Record<PiVerdict, number> = { "gap+reboot": 0, gap_only: 0, socket_only: 0, unknown: 0 };
+  for (const w of windows) verdicts[w.verdict]++;
+  const boots = input.stats ? mergeBoots(input.stats.boots) : [];
+  const lastBoot = boots.length ? Math.max(...boots.map((b) => b.at)) : null;
+  return {
+    computed_at: new Date(nowMs).toISOString(),
+    mirror_tables: { readings: input.lastByPump !== null, system_stats: input.stats !== null },
+    last_reading_age_s: newest == null ? null : Math.round(nowS - newest),
+    last_reading_by_pump: by,
+    uptime_s: input.latestStat?.uptime_s ?? null,
+    uptime_age_s: input.latestStat ? Math.round(nowS - input.latestStat.ts) : null,
+    reboots_24h: input.stats === null ? null : boots.filter((b) => nowS - b.at <= 86_400).length,
+    reboots_7d: input.stats === null ? null : boots.filter((b) => nowS - b.at <= DROPOUT_WINDOW_S).length,
+    last_reboot_at: lastBoot == null ? null : new Date(lastBoot * 1000).toISOString(),
+    pi_clock: {
+      live_offset_s: liveOffsetS == null ? null : Math.round(liveOffsetS),
+      future_rows: !!input.futureRows,
+      observations_7d: obs.filter((o) => nowS - o.at <= DROPOUT_WINDOW_S).length,
+      misaligned_observations_7d: obs.filter((o) => nowS - o.at <= DROPOUT_WINDOW_S && Math.abs(o.offset) > OBS_ALIGNED_S).length,
+      last_observation: lastObs ? { at: new Date(lastObs.at * 1000).toISOString(), offset_s: Math.round(lastObs.offset) } : null,
+    },
+    dropouts_7d: windows,
+    summary: {
+      count: windows.length,
+      longest_min: windows.length ? Math.max(...windows.map((w) => w.minutes)) : null,
+      verdicts,
+    },
+  };
+}
+
+/**
+ * /health serves the cached computation (refreshed every few minutes off the request path) with its ages advanced
+ * to the scrape time, so `last_reading_age_s` keeps climbing between refreshes instead of freezing. Never mutates.
+ */
+export function withLiveAges(h: PiHealth, nowMs: number): PiHealth {
+  const dt = Math.max(0, Math.round((nowMs - Date.parse(h.computed_at)) / 1000));
+  const by: PiHealth["last_reading_by_pump"] = {};
+  for (const [id, v] of Object.entries(h.last_reading_by_pump)) by[id] = { ...v, age_s: v.age_s + dt };
+  return {
+    ...h,
+    last_reading_age_s: h.last_reading_age_s == null ? null : h.last_reading_age_s + dt,
+    last_reading_by_pump: by,
+    uptime_age_s: h.uptime_age_s == null ? null : h.uptime_age_s + dt,
+  };
+}

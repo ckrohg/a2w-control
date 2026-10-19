@@ -12,6 +12,7 @@ import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
+import type { PiLinkInputs } from "./pilink";
 
 export interface SlxReading {
   ts: Date;
@@ -151,6 +152,13 @@ export class Store {
         target_f   real NOT NULL,
         restore_at timestamptz NOT NULL,
         restored   boolean NOT NULL DEFAULT false
+      );
+      -- #165: the Pi clock as the PLANNER measures it — planner now − the hub frame's Pi time, recorded each poll
+      -- while the Pi is connected (a frame is ≤ ~15 s old). The only planner-clock evidence of the Pi clock over time:
+      -- /health.pi trusts a dropout verdict only when aligned observations bracket the window (pilink.ts clockGate).
+      CREATE TABLE IF NOT EXISTS pi_clock_observations (
+        at       timestamptz PRIMARY KEY DEFAULT now(),
+        offset_s real NOT NULL
       );
       CREATE TABLE IF NOT EXISTS phase_b_log (
         id       serial PRIMARY KEY,
@@ -933,6 +941,192 @@ export class Store {
       `UPDATE hbx_config_versions SET diagnosis = diagnosis || jsonb_build_object('resolved_at', now())
        WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL`,
     );
+  }
+
+  /**
+   * #165: record one Pi-clock observation at its MEASUREMENT time (a delayed write cannot move clock evidence later).
+   * Runs on the bounded pool (connect / statement / query timeouts): it is diagnostic and must never hold anything up
+   * (codex pass 19). `prune` drops rows older than 9 days.
+   */
+  async insertPiClockObservation(at: Date, offsetS: number, prune = false): Promise<void> {
+    await this.locked.query(`INSERT INTO pi_clock_observations (at, offset_s) VALUES ($1, $2) ON CONFLICT (at) DO NOTHING`, [at, offsetS]);
+    if (prune) await this.locked.query(`DELETE FROM pi_clock_observations WHERE at < now() - interval '9 days'`);
+  }
+
+  /**
+   * #165: what the analytics mirror's own tables say about the Pi link, for pilink.ts. READ-ONLY, on the planner's own
+   * connection (no laptop query against production — CLAUDE.md). The mirror owns `readings` and `system_stats` (Pi
+   * epoch seconds, ~1 row/min); either may be absent in a DB the mirror never wrote (the rehearsal) → null, never an
+   * error. The two heavy reductions run in SQL so the planner only ships a handful of rows: readings gaps (> gapS
+   * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS, with uptime
+   * evidence), each with its table's coverage over the range.
+   */
+  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number; clockStepS: number; windowS: number; lookbackS: number; futureS: number; settleS: number }): Promise<PiLinkInputs> {
+    // the analysis range starts a day before the 7-d window (runs straddling the edge keep their real start) plus an
+    // hour of context for the first gap / boot
+    const nowS = nowMs / 1000;
+    const fromS = nowS - o.windowS - o.lookbackS;
+    const absent = (e: unknown) => (e as { code?: string }).code === "42P01"; // undefined_table
+    let lastByPump: PiLinkInputs["lastByPump"] = null;
+    let readings: PiLinkInputs["readings"] = null;
+    let contaminated: { start: number; end: number }[] = [];
+    let futureRows = false; // any mirror row stamped ahead of our clock = the Pi clock runs fast NOW
+    try {
+      // the newest reading per pump over the WHOLE table: a silence longer than the analysis range must keep an
+      // honest, growing age rather than drop to null (codex pass 1 on #193); index (pump_id, ts)
+      // (future-dated rows — a Pi clock ahead of ours — are left out here too; they are flagged via system_stats)
+      const last = await this.pool.query(`SELECT pump_id, max(ts)::float8 AS ts FROM readings WHERE ts <= $1 GROUP BY pump_id`, [nowS + o.futureS]);
+      const span = await this.pool.query(
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1 AND ts <= $2`, [fromS - 3_600, nowS + o.futureS]);
+      const gaps = await this.pool.query(
+        `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
+           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1 AND ts <= $3) d
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS, nowS + o.futureS]);
+      // readings.id is the mirror's INGESTION order — real arrival time — which system_stats lacks (codex pass 8 on
+      // #193). A backward Pi-clock step shows here unambiguously: ts FALLS between consecutive rows of a pump in id
+      // order. The span it re-stamps, (new ts, old ts], is clock-contaminated: rows there were stamped twice.
+      // The span starts where the clock LEFT real time, not where it returned (codex pass 12 on #193): for a flick
+      // (forward jump, then this backward step) that is the last row stamped before the return time — the row just
+      // before the forward jump — so the skipped stretch between the two is contaminated too.
+      const back = await this.pool.query(
+        `SELECT COALESCE((SELECT max(r2.ts) FROM readings r2
+                          WHERE r2.pump_id = x.pump_id AND r2.id < x.id AND r2.ts < x.ts), x.ts)::float8 AS start,
+                x.prev_ts::float8 AS "end"
+         FROM (SELECT id, pump_id, ts, lag(ts) OVER (PARTITION BY pump_id ORDER BY id) AS prev_ts FROM readings WHERE ts >= $1) x
+         WHERE x.prev_ts - x.ts > $2 ORDER BY x.ts`, [fromS - 3_600, o.clockStepS]);
+      contaminated = back.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) }));
+      const rf = await this.pool.query(`SELECT EXISTS (SELECT 1 FROM readings WHERE ts > $1) AS f`, [nowS + o.futureS]);
+      futureRows ||= rf.rows[0]?.f === true;
+      lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
+      readings = {
+        gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
+        firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
+        lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
+        // carried with READINGS, so the evidence holds even when system_stats is absent (codex pass 9 on #193)
+        clockIntervals: contaminated,
+      };
+    } catch (e) { if (!absent(e)) throw e; }
+    let latestStat: PiLinkInputs["latestStat"] = null;
+    let stats: PiLinkInputs["stats"] = null;
+    try {
+      const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats WHERE ts <= $1 ORDER BY ts DESC LIMIT 1`, [nowS + o.futureS]);
+      const span = await this.pool.query(
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM system_stats WHERE ts >= $1 AND ts <= $2 AND uptime_s IS NOT NULL`, [fromS - 3_600, nowS + o.futureS]);
+      // a reboot needs UPTIME evidence (pilink.ts BOOT_JUMP_S): certain when uptime fell; ambiguous when the boot time
+      // jumped while uptime kept rising but is shorter than the time since the previous sample (a fresh Pi's clock step
+      // looks the same) — an NTP step on a long-running Pi is neither
+      // A NEW boot must also be later than EVERY boot time seen before it (codex pass 3 on #193): a backward clock
+      // step re-orders samples by ts so uptime seems to fall, but the "new" boot time is one already seen.
+      // …and no LATER sample may return to a boot track seen BEFORE it (codex pass 5 on #193): a brief forward clock flick
+      // displaces a few samples onto a "new" track whose uptime seems to fall, then the old track resumes — that is
+      // a clock artefact, kept as ambiguous, never a certain reboot.
+      // Samples stamped AHEAD of our clock are quarantined (codex pass 7 on #193): during a forward flick's catch-up
+      // they sort after the resumed samples and fake a reboot; and a reboot is certain only once SETTLE_S of later
+      // history has stayed on its track — until then it is ambiguous (the window reads unknown, the count lags).
+      const b = await this.pool.query(
+        `SELECT boot_at::float8 AS at, ts::float8 AS sample_ts, (max_prev_boot + uptime_s)::float8 AS origin,
+                (uptime_s < prev_up - 5 AND (min_next_boot IS NULL OR min_next_boot > max_prev_boot + $2)
+                 AND last_ts >= ts + $4) AS certain FROM (
+           -- every frame is EXPANDING (incremental in Postgres — codex pass 11 on #193: a suffix frame
+           -- ROWS 1 FOLLOWING..UNBOUNDED re-scans the rest of the series per row, quadratic): the suffix minimum is an
+           -- expanding frame over DESCENDING ts, and the latest ts is one value for the whole set
+           SELECT ts, uptime_s, ts - uptime_s AS boot_at,
+                  lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up,
+                  max(ts - uptime_s) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS max_prev_boot,
+                  min(ts - uptime_s) OVER (ORDER BY ts DESC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS min_next_boot,
+                  max(ts) OVER () AS last_ts
+           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts ASC)
+         ) s WHERE prev_ts IS NOT NULL AND boot_at > max_prev_boot + $2
+             AND (uptime_s < prev_up - 5 OR uptime_s < ts - prev_ts)
+         ORDER BY boot_at`, [fromS - 3_600, o.bootJumpS, nowS + o.futureS, o.settleS]);
+      const future = await this.pool.query(`SELECT count(*)::int AS n FROM system_stats WHERE ts > $1`, [nowS + o.futureS]);
+      // gradual clock movement (codex pass 20): within each boot track (a new track starts where uptime falls), the
+      // running sum of SUB-threshold ts-vs-uptime increments is the clock's slew; hourly min/max of it per track let
+      // pilink.ts see a bracket the clock moved through by more than CLOCK_STEP_S without any single step. Expanding
+      // frames only (incremental).
+      const drift = await this.pool.query(
+        `WITH s AS (
+           SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
+           FROM system_stats WHERE ts >= $1 AND ts <= $2 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+         ), d AS (
+           SELECT ts,
+                  CASE WHEN prev_ts IS NULL OR uptime_s < prev_up - 5 THEN 1 ELSE 0 END AS newtrack,
+                  CASE WHEN prev_ts IS NULL OR uptime_s < prev_up - 5 THEN 0
+                       WHEN abs((ts - prev_ts) - (uptime_s - prev_up)) > $3 THEN 0
+                       ELSE (ts - prev_ts) - (uptime_s - prev_up) END AS inc
+           FROM s
+         ), c AS (
+           SELECT ts, sum(newtrack) OVER (ORDER BY ts) AS track, sum(inc) OVER (ORDER BY ts) AS cum FROM d
+         )
+         SELECT track::int AS track, min(ts)::float8 AS start, max(ts)::float8 AS "end", min(cum)::float8 AS cmin, max(cum)::float8 AS cmax
+         FROM c GROUP BY track, floor(ts / 3600) ORDER BY 2`, [fromS - 3_600, nowS + o.futureS, o.clockStepS]);
+      futureRows ||= Number(future.rows[0]?.n ?? 0) > 0;
+      // clock discontinuities: consecutive samples whose ts advanced unlike uptime (which is real elapsed time) while
+      // uptime kept rising — an NTP step either way; a readings gap there may be the step, not a silence
+      const steps = await this.pool.query(
+        `SELECT ts::float8 AS ts FROM (
+           SELECT ts, uptime_s, lag(ts) OVER w AS prev_ts, lag(uptime_s) OVER w AS prev_up
+           FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL WINDOW w AS (ORDER BY ts)
+         ) s WHERE prev_ts IS NOT NULL AND uptime_s >= prev_up - 5
+             AND abs((ts - prev_ts) - (uptime_s - prev_up)) > $2
+         ORDER BY ts`, [fromS - 3_600, o.clockStepS, nowS + o.futureS]);
+      // stats silences (> gapS between consecutive samples): clock-evolution coverage for pilink.ts — a bracket is only
+      // judged where system_stats speaks for the clock (codex pass 21)
+      const sgaps = await this.pool.query(
+        `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
+           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM system_stats WHERE ts >= $1 AND ts <= $3 AND uptime_s IS NOT NULL
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [fromS - 3_600, o.gapS, nowS + o.futureS]);
+      latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
+      // a candidate sampled inside a clock-contaminated span is never certain: its "settled" history may be the
+      // displaced samples themselves (codex pass 8 on #193)
+      const dirty = (t: number) => contaminated.some((c) => t >= c.start - 60 && t <= c.end + 60);
+      // …and only where readings' arrival order COVERS the candidate: without it (table absent, or no readings yet at
+      // that time) displaced history cannot be excluded, so nothing is certain (codex pass 9 on #193)
+      const arrivalCovers = (t: number) => readings != null && readings.firstTs != null && readings.firstTs <= t - 600
+        && readings.lastTs != null && readings.lastTs >= t;
+      // Had the candidate been a sample DISPLACED from the previous boot track, it was taken at origin = previous boot +
+      // its uptime. A real reboot is only certain if the Pi's pushes were flowing normally at that would-be origin —
+      // no readings gap contains it (codex pass 10 on #193: readings missing exactly during a flick bracket the
+      // candidate yet prove nothing). An origin older than the analysis range is a clock error of > 8 days: accepted.
+      // (the out-of-range exception is against the ANALYSIS boundary, not the first reading: an origin inside the range
+      // but before readings begin has no evidence either way — codex pass 13 on #193)
+      const originCovered = (o: number) => readings != null && readings.firstTs != null && (o < fromS - 3_600
+        || (o >= readings.firstTs && readings.lastTs != null && o <= readings.lastTs
+            && !readings.gaps.some((g) => o > g.start - 60 && o < g.end + 60)));
+      const certain = (r: any) => r.certain && arrivalCovers(Number(r.sample_ts)) && originCovered(Number(r.origin))
+        && !dirty(Number(r.sample_ts));
+      stats = {
+        boots: b.rows.filter(certain).map((r: any) => ({ at: Number(r.at) })),
+        ambiguous: b.rows.filter((r: any) => !certain(r)).map((r: any) => ({ at: Number(r.at) })),
+        // future-dated samples ARE a clock discontinuity, at an unknown real time — mark it at now, so a current
+        // window cannot read as resolved while they exist
+        clockSteps: [...steps.rows.map((r: any) => Number(r.ts)), ...(Number(future.rows[0]?.n ?? 0) > 0 ? [nowS] : [])],
+        drift: drift.rows.map((r: any) => ({ track: Number(r.track), start: Number(r.start), end: Number(r.end), cmin: Number(r.cmin), cmax: Number(r.cmax) })),
+        gaps: sgaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
+        firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
+        lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
+      };
+    } catch (e) { if (!absent(e)) throw e; }
+    // phase_b_log is the planner's own: the active-mode rows that say anything about the Pi (a `sent`, or the hub's
+    // `no Pi connected` refusal), oldest first, from the lookback start (pilink.ts filters windows by END)
+    const pb = await this.pool.query(
+      `SELECT (EXTRACT(EPOCH FROM ts) * 1000)::float8 AS ts, result FROM phase_b_log
+       WHERE ts >= to_timestamp($1) AND ts <= to_timestamp($2) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
+       ORDER BY ts`, [fromS, nowS]);
+    // a run already OPEN at the range start keeps its real start (codex pass 2 on #193): the first failure after the
+    // last `sent` before the boundary, however long ago — prepended, so dropoutRuns opens the run there
+    const open = await this.pool.query(
+      `SELECT (EXTRACT(EPOCH FROM min(ts)) * 1000)::float8 AS ts FROM phase_b_log
+       WHERE mode = 'active' AND result LIKE '%no Pi connected%' AND ts < to_timestamp($1)
+         AND ts > COALESCE((SELECT max(ts) FROM phase_b_log
+                            WHERE mode = 'active' AND result = 'sent' AND ts < to_timestamp($1)), '-infinity'::timestamptz)`, [fromS]);
+    const phaseB = pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) }));
+    if (open.rows[0]?.ts != null) phaseB.unshift({ ts: Number(open.rows[0].ts), result: "failed: no Pi connected" });
+    const obs = await this.pool.query(
+      `SELECT EXTRACT(EPOCH FROM at)::float8 AS at, offset_s::float8 AS off FROM pi_clock_observations
+       WHERE at >= to_timestamp($1) AND at <= to_timestamp($2) ORDER BY at`, [fromS - 3_600, nowS]);
+    const clockObs = obs.rows.map((r: any) => ({ at: Number(r.at), offset: Number(r.off) }));
+    return { lastByPump, readings, latestStat, stats, phaseB, futureRows, clockObs };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

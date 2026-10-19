@@ -60,6 +60,38 @@ the plan's `meta.pre_boosts` records what was applied. Raises only — a pre-boo
 shower colder. Acceptance (#135): evening-window troughs ≥ `dhwFloorF` on normal days, element minutes
 attributable to DHW sags → ~0 without relying on `lagT`, whole-system daily kWh not up.
 
+## Pi link — `/health.pi` (#165)
+
+Answers "which failure was that dropout?" from tables the planner already shares with the analytics
+mirror, without the house network. Every 10 min (off the request path; `/health` serves the cached
+result with its ages advanced) `pilink.ts` turns the last 7 days into:
+
+- **dropout windows** — maximal runs of Phase B `failed: no Pi connected` in `phase_b_log` (both
+  pumps; a run ends at the next `sent`; lease skips and other failures neither extend nor end it);
+- a **verdict per window** from the mirror's own tables, read-only: `gap+reboot` (the Pi's 60-s
+  exporter — a path that bypasses the hub — went silent too, *and* `system_stats` shows a fresh boot
+  within ±10 min: the WiFi stall the bridge-watchdog's 120-min reboot cleared), `gap_only` (silent,
+  no reboot), `socket_only` (readings kept arriving; only the hub socket dropped), `unknown` (no
+  readings before the window, or the tables are absent — e.g. the rehearsal DB);
+- `last_reading_age_s` (+ per pump), `uptime_s`, `reboots_24h` / `reboots_7d` / `last_reboot_at`
+  (a reboot = the boot time `ts − uptime_s` jumping forward by > 5 min), and a `summary`.
+
+**The clock rule.** Windows are planner-clock; the evidence is Pi-clock. Every poll the planner
+measures the Pi clock against its own (planner now − the hub frame's Pi time) and records it in
+`pi_clock_observations` (9 days). A verdict stands only if an aligned observation (≤ 2 min) lies
+within 30 min before the window and another within 30 min after it (an open window: a fresh aligned
+live offset), no misaligned observation lies between them, and no clock event (a step seen in
+system_stats, a re-stamped span seen in readings' ingestion order, future-stamped rows) does either;
+otherwise `unknown`. A reboot is counted only when uptime fell, the new boot track persists 15 min,
+readings were flowing at its would-be origin, and it is outside any re-stamped span. Right after
+the deploy (no observations yet) windows read `unknown`. `/health.pi.pi_clock` shows the counts and
+the last observation.
+
+The two SQL reductions (readings gaps > 5 min, uptime resets) run in `store.piLinkInputs`; the
+weekly digest shows a tile with this beside the hub's own counters (`pi_dropouts_*`, #178), which
+reset on a hub redeploy — the two sources should corroborate. Proven on a synthetic week by
+`scripts/pi-health-local-check.ts` (local Postgres only).
+
 ## Single-writer invariant
 
 **The deployed Railway planner (`a2w-hub` → service `a2w-planner`) is the SOLE authorized

@@ -10,12 +10,13 @@
  */
 import assert from "node:assert/strict";
 import { Store } from "../planner/src/store";
+import { assertLocalDatabaseUrl } from "../planner/src/local-db";
 import { withDeviceLock } from "../planner/src/writes";
 import { extractConfig, handlePolledConfig, pendingUnconfirmedNotice, UNCONFIRMED_TITLE, type DriftDeps } from "../planner/src/drift";
 
 const url = process.env.LOCAL_DATABASE_URL ?? "";
-if (!/^postgres(ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) {
-  console.error("refusing: LOCAL_DATABASE_URL must point at localhost (this check is for a local database only)");
+try { assertLocalDatabaseUrl(url); } catch (e) {
+  console.error(`refusing: LOCAL_DATABASE_URL must point at a loopback host (this check is for a local database only): ${(e as Error).message}`);
   process.exit(2);
 }
 
