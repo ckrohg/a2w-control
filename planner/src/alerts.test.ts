@@ -245,5 +245,36 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   await sy.retry();
   assert.ok(Date.now() - t1 < 2_000);
 
+  // codex pass 11: the uid close runs BEFORE a slow insert commits → the tombstone survives until the insert settles,
+  // then closes the late row; nothing is paged for the resolved incident
+  let release!: () => void;
+  const slowStore: AlertStore = {
+    ...store,
+    openAlertEpisode: (...args) => new Promise<void>((res) => { release = res; }).then(() => store.openAlertEpisode(...args)),
+  };
+  up = false; closeUp = true;
+  const sl = new AlertOutbox(slowStore, send, () => {}, 30);
+  await sl.open("fault_called", "13", "pump2", "⚠ late commit", "E21");   // bounded call times out; insert still pending
+  await sl.close("fault_called", "13");                                    // recovery: the uid close finds nothing yet
+  release();                                                              // …and NOW the insert commits
+  await new Promise((r) => setTimeout(r, 10));
+  const late = rows.find((r) => r.title === "⚠ late commit");
+  assert.ok(late && !late.cleared, "the late row exists, open");
+  up = true;
+  const n9 = sent.length;
+  await sl.retry();                                                       // tombstone kept → closes it, never pages it
+  assert.equal(late!.cleared, true, "closed by the surviving tombstone");
+  assert.ok(!sent.slice(n9).includes("⚠ late commit"));
+  // isClosing() reports an ID pending close (what a late restore filters on)
+  closeUp = false;
+  const ic = new AlertOutbox(store, send, () => {});
+  await ic.open("stage_unserved", "14", "pump1", "⚠ ic", "x");
+  const icRow = rows.at(-1)!;
+  await ic.close("stage_unserved", "14");
+  assert.equal(ic.isClosing(icRow.id, icRow.uid), true);
+  closeUp = true;
+  await ic.retry();
+  assert.equal(ic.isClosing(icRow.id, icRow.uid), false);
+
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

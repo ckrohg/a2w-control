@@ -47,10 +47,20 @@ export class AlertOutbox {
   private unrecorded: Unrecorded[] = [];
 
   private readonly store: AlertStore;
+  /**
+   * uids whose INSERT is still outstanding (a bounded call timed out but the statement may yet commit): a uid tombstone
+   * is dropped only once its insert has SETTLED and a close ran after that (codex pass 11 on the incident-fixes PR)
+   */
+  private inflight = new Set<string>();
   constructor(store: AlertStore, private readonly send: Send, private readonly log: (m: string) => void = (m) => console.error(m), timeoutMs = STORE_TIMEOUT_MS) {
     // the same store, every call bounded
     this.store = {
-      openAlertEpisode: (...a) => bounded(store.openAlertEpisode(...a), timeoutMs),
+      openAlertEpisode: (uid, ...a) => {
+        this.inflight.add(uid);
+        const raw = store.openAlertEpisode(uid, ...a);
+        raw.then(() => this.inflight.delete(uid), () => this.inflight.delete(uid));
+        return bounded(raw, timeoutMs);
+      },
       markAlertNotified: (id) => bounded(store.markAlertNotified(id), timeoutMs),
       undeliveredAlertEpisodes: () => bounded(store.undeliveredAlertEpisodes(), timeoutMs),
       closeAlertEpisodeIds: (ids) => bounded(store.closeAlertEpisodeIds(ids), timeoutMs),
@@ -109,9 +119,16 @@ export class AlertOutbox {
     }
     if (this.unclosedUids.size) {
       const uids = [...this.unclosedUids];
-      try { await this.store.closeAlertEpisodeUids(uids); for (const u of uids) this.unclosedUids.delete(u); }
+      // only uids whose insert had already settled when this close started may be dropped after it succeeds
+      const settled = uids.filter((u) => !this.inflight.has(u));
+      try { await this.store.closeAlertEpisodeUids(uids); for (const u of settled) this.unclosedUids.delete(u); }
       catch (e) { this.log(`alert episode close by uid failed (retried): ${(e as Error).message}`); }
     }
+  }
+
+  /** True when the outbox is closing this episode (by ID or uid) — a late restore must not re-adopt it (codex pass 11). */
+  isClosing(id: number, uid: string | null): boolean {
+    return this.unclosed.has(id) || (uid != null && this.unclosedUids.has(uid));
   }
 
   /** Unrecorded episodes (in memory only). */

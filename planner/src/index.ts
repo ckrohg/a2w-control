@@ -707,6 +707,7 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
   let pumps: StagePump[] | null = live;
   if (live && live.some((p) => p.state === "fault")) {
     // codes only ANNOTATE a live fault, and only from a snapshot ≤ 15 min old (the Pi attaches one every ~5 min)
+    // an annotation only — bounded (store's bounded pool), and a failure or timeout simply means no codes
     const codes = await store.pumpFaultCodes().catch(() => ({} as Record<string, { codes: string[]; ts: number }>));
     const nowS = Date.now() / 1000;
     pumps = live.map((p) => {
@@ -772,7 +773,9 @@ async function restoreAlertState(): Promise<void> {
     // a stage episode is re-adopted only if it is about the pump that stage maps to NOW: after STAGE_PUMP_MAP was
     // corrected, an old episode for the wrong unit is closed, never allowed to suppress the right one (codex pass 10)
     const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called";
-    const { keep, stale } = partitionRestore(open, STAGE_MAP.map);
+    // an episode the outbox is already closing (opened and recovered while restore was failing) is never re-adopted —
+    // re-adopting it would latch the watch "open" over rows being closed and silence a recurrence (codex pass 11)
+    const { keep, stale } = partitionRestore(open.filter((o) => !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
     if (stale.length) await store.closeAlertEpisodeIds(stale.map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
     stageWatch.restore(keep.filter(isStage)

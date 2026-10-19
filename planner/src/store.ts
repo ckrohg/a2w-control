@@ -884,9 +884,9 @@ export class Store {
   }
 
   /** Episodes still open (a restart re-adopts them so they close instead of re-paging). */
-  async openAlertEpisodes(): Promise<{ id: number; kind: string; key: string; pumpId: string | null }[]> {
-    const r = await this.locked.query(`SELECT id, kind, key, pump_id FROM alert_episodes WHERE cleared_at IS NULL ORDER BY id`);
-    return r.rows.map((x: any) => ({ id: Number(x.id), kind: String(x.kind), key: String(x.key), pumpId: x.pump_id == null ? null : String(x.pump_id) }));
+  async openAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; key: string; pumpId: string | null }[]> {
+    const r = await this.locked.query(`SELECT id, uid, kind, key, pump_id FROM alert_episodes WHERE cleared_at IS NULL ORDER BY id`);
+    return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), key: String(x.key), pumpId: x.pump_id == null ? null : String(x.pump_id) }));
   }
 
   /** Open episodes whose page no channel has acknowledged yet — re-sent every poll. */
@@ -910,7 +910,7 @@ export class Store {
    */
   async pumpFaultCodes(): Promise<Record<string, { codes: string[]; ts: number }>> {
     try {
-      const r = await this.pool.query(
+      const r = await this.locked.query(
         `SELECT pump_id, ts::float8 AS ts, snapshot->'active_faults' AS faults FROM pump_snapshots`);
       const out: Record<string, { codes: string[]; ts: number }> = {};
       for (const row of r.rows) {
@@ -933,7 +933,7 @@ export class Store {
    */
   async spanLocalLatest(nowS: number): Promise<Record<string, number> | null> {
     try {
-      const r = await this.pool.query(
+      const r = await this.locked.query(
         `WITH RECURSIVE n AS (
            (SELECT name FROM span_readings ORDER BY name LIMIT 1)
            UNION ALL
@@ -962,7 +962,7 @@ export class Store {
     // orphan) — a close retried later still ends the row then (codex passes 6, 8). clampToWindowEnd is for ORPHANS
     // only: an orphan ends at its stored windowEnd if that came first; the CURRENT episode ends at its real stand-down
     // even if an outage extended its window in memory past the stored one (codex pass 8).
-    const r = await this.pool.query(
+    const r = await this.locked.query(
       `UPDATE storm_events SET
          ended_at = GREATEST(started_at, CASE WHEN $4::boolean THEN LEAST(COALESCE($3::timestamptz, now()),
            CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)
