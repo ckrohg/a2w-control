@@ -58,6 +58,21 @@ export function boostChartSpan(nowMs: number, restoreAtIso: string): { start: nu
   return { start: etHour(nowMs), hours: Math.min(hours, 24) };
 }
 
+/**
+ * The tank-target line with a boost on record laid over it. A boost REPLACES the target for its span
+ * (writes.ts boost() → setTarget writes a near-flat curve on the boost target) — it is not a floor, so
+ * a boost below the planned target draws below it (Codex pass 5). Pump setpoints are untouched.
+ */
+export function overlayBoost(tank: number[], span: { start: number; hours: number; target: number } | null): number[] {
+  const out = tank.slice();
+  if (!span) return out;
+  for (let i = 0; i < span.hours; i++) {
+    const h = (span.start + i) % 24;
+    if (h < out.length) out[h] = span.target;
+  }
+  return out;
+}
+
 export function fmtMinutes(min: number): string {
   if (min % 60 === 0) return `${min / 60} h`;
   if (min > 60) return `${Math.floor(min / 60)} h ${min % 60} min`;

@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useBoost } from "../ui/use-boost";
-import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes } from "@/lib/boost-state";
+import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes, overlayBoost } from "@/lib/boost-state";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
 
@@ -216,16 +216,10 @@ function PlanChart({
     const isSet = mode === "set";
 
     // per-mode plan arrays; set&forget holds one reset curve (tracks outdoor, ignores the clock)
-    const tankArr = isSet ? OUT.map(setCurve) : TANK.slice();
-    const hpArr = isSet ? tankArr.map((t) => Math.min(t + 5, 160)) : HPbase.slice();
-    if (boost) {
-      // a boost moves the TANK target only — pump setpoints are not touched by it
-      for (let bb = 0; bb < boost.hours; bb++) {
-        const bh = (boost.start + bb) % 24;
-        if (bh >= tankArr.length) continue;
-        tankArr[bh] = Math.max(tankArr[bh], boost.target);
-      }
-    }
+    // a boost on record replaces the tank target for its span (not a floor); pump setpoints untouched
+    const planTank = isSet ? OUT.map(setCurve) : TANK.slice();
+    const hpArr = isSet ? planTank.map((t) => Math.min(t + 5, 160)) : HPbase.slice();
+    const tankArr = overlayBoost(planTank, boost);
     const copArr = OUT.map((o, i) => cop(o, tankArr[i]));
     const changes = hpArr.map((v, i) => i !== 0 && v !== hpArr[(i + 23) % 24]);
     geoRef.current = { X, Xc, pw, tank: tankArr, hp: hpArr, copA: copArr };

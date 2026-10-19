@@ -4,7 +4,7 @@
 // Run: npx tsx tests/boost-state.test.ts
 import assert from "node:assert/strict";
 import {
-  boostView, boostChartSpan, etHour, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
+  boostView, boostChartSpan, etHour, overlayBoost, classifyRejection, preflight, confirmText, estimateLines, pumpsLine, boostBody,
   type WriterStatus, type BoostPhase, type HubState,
 } from "../lib/boost-state";
 
@@ -194,6 +194,16 @@ t("an unchanged cached 'in force' read-back expires at restore_at (Codex pass 3)
   assert.match(v.text, /ended at 2:43 AM — waiting for the writer status to show the restore/);
   assert.equal(boostView({ phase: "idle" }, inForce, end + 1_000, end - 30_000).key, "expired_unrestored");
   assert.equal(boostChartSpan(end + 1_000, restore), null);
+});
+
+t("chart overlay replaces the target for the span, even below the plan (Codex pass 5)", () => {
+  const plan = Array.from({ length: 24 }, () => 135);
+  const out = overlayBoost(plan, { start: 23, hours: 2, target: 132 });
+  assert.equal(out[23], 132);
+  assert.equal(out[0], 132); // wraps past midnight
+  assert.equal(out[1], 135);
+  assert.equal(plan[23], 135); // input untouched
+  assert.deepEqual(overlayBoost(plan, null), plan);
 });
 
 console.log(`boost-state: ${n} passed`);
