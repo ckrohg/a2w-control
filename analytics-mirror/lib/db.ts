@@ -83,7 +83,7 @@ export async function latestSpanReading(name: string): Promise<{ ts: number; pow
 /**
  * #186: has the HBX curve been written since the active boost was? The planner's hbx_boosts row is
  * inserted right AFTER its own accepted set_target (writes.ts boost()), so any accepted hbx_writes row
- * later than created_at — or a foreign dbt/mbt/dot change the drift detector recorded (a config
+ * later than created_at (or a verify_mismatch one: that PATCH reached the device, #196) — or a foreign dbt/mbt/dot change the drift detector recorded (a config
  * version without `_source`) — means the boost's curve was replaced. Durable: survives page reloads
  * and planner restarts, unlike the writer's in-memory last_write_at. null = not superseded.
  */
@@ -92,8 +92,9 @@ export async function boostSupersededBy(): Promise<{ at: string; by: string } | 
     WITH b AS (
       SELECT created_at FROM hbx_boosts WHERE NOT restored AND restore_at > now() ORDER BY id DESC LIMIT 1)
     SELECT to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS at, x.by FROM (
-      SELECT w.ts AS at, w.source || ' ' || w.action AS by FROM hbx_writes w, b
-        WHERE w.ts > b.created_at AND w.result = 'accepted'
+      SELECT w.ts AS at, w.source || ' ' || w.action || CASE WHEN w.result = 'verify_mismatch' THEN ' (read-back mismatch)' ELSE '' END AS by
+        FROM hbx_writes w, b
+        WHERE w.ts > b.created_at AND w.result IN ('accepted', 'verify_mismatch')
       UNION ALL
       SELECT v.observed_at AS at, 'a change outside A2W (HBX app or device)' AS by FROM hbx_config_versions v, b
         WHERE v.observed_at > b.created_at AND v.changed_fields IS NOT NULL AND v.changed_fields->>'_source' IS NULL
