@@ -150,7 +150,7 @@ const COPY: Record<Mode, ModeCopy> = {
 
 // ---- boost model ----------------------------------------------------------------------
 // Chart overlay for a boost ON RECORD (writer status active_boost) — never a preview.
-type Boost = { start: number; hours: number; target: number };
+type Boost = { start: number; hours: number; target: number; note: string };
 // Presets fit the planner's limits (writes.ts boost(): ≤ strictCapF 135 °F, 15–120 min). The old
 // preview offered "Guests · 8 h" and "Extra heat · 138° / 4 h", which the planner would refuse.
 const PRESETS: { label: string; target: number; minutes: number }[] = [
@@ -383,7 +383,7 @@ function PlanChart({
     }
     const inBoost = !!boost && (((h - boost.start + 24) % 24) < boost.hours);
     const why = inBoost
-      ? "Boost on record — the planner restores the curve when its timer ends"
+      ? boost!.note
       : mode === "set"
         ? "Held reset curve — tracks outdoor, not the clock"
         : WHY[h] ?? "";
@@ -550,8 +550,17 @@ export default function OptimizeClient({
 
   // The chart overlay and the estimate follow the boost ON RECORD (read-back), never a click.
   const ab = bst.st?.active_boost ?? null;
-  const boost: Boost | null = ab
-    ? { ...boostChartSpan(bst.nowMs, ab.restore_at), target: ab.target_f }
+  // Drawn only for a FRESH read-back that still centres on the boost (commanded / in force) — not for
+  // a superseded or stale one (Codex pass 2).
+  const boostDrawn = ab && (bst.view.key === "commanded" || bst.view.key === "in_force");
+  const boost: Boost | null = boostDrawn
+    ? {
+        ...boostChartSpan(bst.nowMs, ab.restore_at),
+        target: ab.target_f,
+        note: bst.view.key === "in_force"
+          ? "Boost in force — the planner restores the curve when its timer ends"
+          : "Boost commanded — the HBX adopts it at its next reheat cycle",
+      }
     : null;
   const estTarget = ab?.target_f ?? null;
   const est = estimateLines(bst.st?.tank_f ?? null, estTarget ?? STRICT_CAP_F);

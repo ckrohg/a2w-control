@@ -4,6 +4,7 @@
 // arm/disarm A2W. Phase 1 = shadow: nothing is toggled on SPAN; this only controls whether A2W *would*.
 import { useState } from "react";
 import { SPAN_STALE_S } from "@/lib/backup-state";
+import { useNowS } from "./backup-line";
 
 export type ArmState = {
   circuit: string | null; relay_state: string | null; armed: boolean | null;
@@ -13,7 +14,8 @@ export type ArmEvent = {
   ts: number; relay_state: string | null; armed: boolean; live: boolean; action: string; detail: string | null;
 };
 
-export function SpanArmCard({ state, events, nowS }: { state: ArmState | null; events: ArmEvent[]; nowS: number }) {
+export function SpanArmCard({ state, events, nowS: serverNowS }: { state: ArmState | null; events: ArmEvent[]; nowS: number }) {
+  const nowS = useNowS(serverNowS);
   const [pending, setPending] = useState(false);
   const [desired, setDesired] = useState<boolean | null>(state?.desired_armed ?? state?.armed ?? false);
   const armed = desired ?? false;

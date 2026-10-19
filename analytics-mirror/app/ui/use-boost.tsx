@@ -26,11 +26,17 @@ export function useBoost() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const stRef = useRef<WriterStatus | null>(null);
   const hubRef = useRef<HubState | null>(null);
-  // Responses can arrive out of order (a slow poll after a fast one) — only the newest request wins.
-  const stSeq = useRef(0);
-  const hubSeq = useRef(0);
+  // One poll in flight per endpoint (an interval tick while one is pending is skipped, so slow answers
+  // are never starved by newer starts — Codex pass 2); a forced load (after a write) may overlap, and
+  // then a response older than the last APPLIED one is dropped.
+  const stSeq = useRef(0), stApplied = useRef(0), stBusy = useRef(false);
+  const hubSeq = useRef(0), hubApplied = useRef(0), hubBusy = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
-  const loadStatus = useCallback(async () => {
+  const loadStatus = useCallback(async (force = false) => {
+    if (stBusy.current && !force) return;
+    stBusy.current = true;
     const seq = ++stSeq.current;
     let next: WriterStatus | null = null, err = "";
     try {
@@ -41,13 +47,17 @@ export function useBoost() {
     } catch {
       err = "could not reach the dashboard server";
     }
-    if (seq !== stSeq.current) return;
+    if (seq === stSeq.current) stBusy.current = false;
+    if (!mounted.current || seq < stApplied.current) return;
+    stApplied.current = seq;
     setSt(next); stRef.current = next; setStErr(err);
     if (next) setStAtMs(Date.now());
     setNowMs(Date.now());
   }, []);
 
-  const loadHub = useCallback(async () => {
+  const loadHub = useCallback(async (force = false) => {
+    if (hubBusy.current && !force) return;
+    hubBusy.current = true;
     const seq = ++hubSeq.current;
     let next: HubState | null = null, err = "";
     try {
@@ -58,7 +68,9 @@ export function useBoost() {
     } catch {
       err = "could not reach the dashboard server";
     }
-    if (seq !== hubSeq.current) return;
+    if (seq === hubSeq.current) hubBusy.current = false;
+    if (!mounted.current || seq < hubApplied.current) return;
+    hubApplied.current = seq;
     setHub(next); hubRef.current = next; setHubErr(err);
   }, []);
 
@@ -83,8 +95,8 @@ export function useBoost() {
   useEffect(() => {
     loadStatus();
     loadHub();
-    const a = setInterval(loadStatus, waiting ? FAST_MS : SLOW_MS);
-    const b = setInterval(loadHub, SLOW_MS);
+    const a = setInterval(() => loadStatus(), waiting ? FAST_MS : SLOW_MS);
+    const b = setInterval(() => loadHub(), SLOW_MS);
     return () => { clearInterval(a); clearInterval(b); };
   }, [loadStatus, loadHub, waiting]);
 
@@ -111,8 +123,8 @@ export function useBoost() {
     } catch {
       setPhase({ phase: "rejected", req, status: 0, error: "network error — the request may not have reached the planner; check the writer status before retrying" });
     } finally {
-      loadStatus();
-      loadHub();
+      loadStatus(true);
+      loadHub(true);
     }
   }, [confirm, loadStatus, loadHub]);
 

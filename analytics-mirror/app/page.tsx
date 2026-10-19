@@ -5,8 +5,10 @@
 import { sql } from "@/lib/sql";
 import { ensureSchema, recentReadings, recentSpanReadings, getSpanArmState, recentSpanArmEvents,
   latestSpanReading, type Reading } from "@/lib/db";
-import { backupView, type BackupView } from "@/lib/backup-state";
+import { backupView, type BackupInputs } from "@/lib/backup-state";
 import { HeatNow } from "./heat-now";
+import { BackupLine } from "./backup-line";
+import { AutoRefresh } from "./auto-refresh";
 import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
@@ -143,16 +145,17 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   if (slx?.backup_called) chips.push({ cls: "offline", text: "16.5 kW backup CALLED" });
   if (driftAt) chips.push({ cls: "warn", text: `HBX config changed ${fmtDateTime(driftAt)}` });
   if (faults.length) chips.push({ cls: "offline", text: `${faults.length} active pump fault${faults.length > 1 ? "s" : ""}` });
-  const backup: BackupView | null = backupShadow
-    ? backupView({
+  const backupInputs: BackupInputs | null = backupShadow
+    ? {
         nowS: now,
         relay: spanArm ? { relay_state: spanArm.relay_state, ts: spanArm.ts } : null,
         latestPower: bufferTankLatest,
         episodes7d: backupShadow.episodes7d,
         lastCalled: backupShadow.lastCalled,
         calledNow: !!slx?.backup_called,
-      })
+      }
     : null;
+  const backup = backupInputs ? backupView(backupInputs) : null;
   if (backup?.tone === "red") chips.push({ cls: "offline", text: "backup element unavailable (breaker OPEN)" });
 
   if (!chips.length) chips.push({ cls: "ok", text: "all systems normal" });
@@ -168,6 +171,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
 
   return (
     <>
+      <AutoRefresh />
       <I1Banner />
       <StormBanner />
 
@@ -235,15 +239,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <div className="meta">
                 Stages: {stagesTxt} · Backup: {slx?.backup_called ? "CALLED" : "off"} · <a href="/hbx" style={{ color: "#4dabf7" }}>details →</a>
               </div>
-              {backup && (
-                <div className="meta" style={{ marginTop: 4 }}>
-                  <span className={`chip ${backup.tone === "red" ? "offline" : backup.tone === "amber" ? "warn" : ""}`} style={{ marginRight: 6 }}>
-                    {backup.chip}
-                  </span>
-                  <span style={{ color: backup.tone === "red" ? "var(--crit)" : undefined }}>{backup.headline}</span>
-                  <div style={{ marginTop: 2 }}>{backup.calledLine}</div>
-                </div>
-              )}
+              {backupInputs && <BackupLine inputs={backupInputs} />}
               {autopilot && (
                 <div className="meta" style={{ marginTop: 4 }}>
                   <span className={`chip ${autopilot.dryRun ? "warn" : "ok"}`} style={{ marginRight: 6 }}>
