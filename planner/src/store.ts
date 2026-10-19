@@ -12,6 +12,7 @@ import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
+import type { PiLinkInputs } from "./pilink";
 
 export interface SlxReading {
   ts: Date;
@@ -933,6 +934,55 @@ export class Store {
       `UPDATE hbx_config_versions SET diagnosis = diagnosis || jsonb_build_object('resolved_at', now())
        WHERE verdict = 'unconfirmed' AND diagnosis IS NOT NULL AND diagnosis->>'resolved_at' IS NULL`,
     );
+  }
+
+  /**
+   * #165: what the analytics mirror's own tables say about the Pi link, for pilink.ts. READ-ONLY, on the planner's own
+   * connection (no laptop query against production — CLAUDE.md). The mirror owns `readings` and `system_stats` (Pi
+   * epoch seconds, ~1 row/min); either may be absent in a DB the mirror never wrote (the rehearsal) → null, never an
+   * error. The two heavy reductions run in SQL so the planner only ships a handful of rows: readings gaps (> gapS
+   * between consecutive pushes) and reboots (the boot time ts − uptime_s jumping forward by > bootJumpS).
+   */
+  async piLinkInputs(nowMs: number, o: { gapS: number; bootJumpS: number }): Promise<PiLinkInputs> {
+    const sinceS = nowMs / 1000 - 7 * 86_400 - 3_600; // an hour of context before the 7-d window
+    const absent = (e: unknown) => (e as { code?: string }).code === "42P01"; // undefined_table
+    let lastByPump: PiLinkInputs["lastByPump"] = null;
+    let readings: PiLinkInputs["readings"] = null;
+    try {
+      const last = await this.pool.query(
+        `SELECT pump_id, max(ts)::float8 AS ts FROM readings WHERE ts >= $1 GROUP BY pump_id`, [sinceS]);
+      const span = await this.pool.query(
+        `SELECT min(ts)::float8 AS first, max(ts)::float8 AS last FROM readings WHERE ts >= $1`, [sinceS]);
+      const gaps = await this.pool.query(
+        `SELECT prev_ts::float8 AS start, ts::float8 AS "end" FROM (
+           SELECT ts, lag(ts) OVER (ORDER BY ts) AS prev_ts FROM (SELECT DISTINCT ts FROM readings WHERE ts >= $1) d
+         ) g WHERE ts - prev_ts > $2 ORDER BY ts`, [sinceS, o.gapS]);
+      lastByPump = Object.fromEntries(last.rows.map((r: any) => [String(r.pump_id), Number(r.ts)]));
+      readings = {
+        gaps: gaps.rows.map((r: any) => ({ start: Number(r.start), end: Number(r.end) })),
+        firstTs: span.rows[0]?.first == null ? null : Number(span.rows[0].first),
+        lastTs: span.rows[0]?.last == null ? null : Number(span.rows[0].last),
+      };
+    } catch (e) { if (!absent(e)) throw e; }
+    let latestStat: PiLinkInputs["latestStat"] = null;
+    let boots: PiLinkInputs["boots"] = null;
+    try {
+      const latest = await this.pool.query(`SELECT ts::float8 AS ts, uptime_s::float8 AS uptime_s FROM system_stats ORDER BY ts DESC LIMIT 1`);
+      const b = await this.pool.query(
+        `SELECT boot_at::float8 AS at FROM (
+           SELECT ts - uptime_s AS boot_at, lag(ts - uptime_s) OVER (ORDER BY ts) AS prev_boot
+           FROM system_stats WHERE ts >= $1 AND uptime_s IS NOT NULL
+         ) s WHERE prev_boot IS NOT NULL AND boot_at - prev_boot > $2 ORDER BY boot_at`, [sinceS, o.bootJumpS]);
+      latestStat = latest.rowCount ? { ts: Number(latest.rows[0].ts), uptime_s: latest.rows[0].uptime_s == null ? null : Number(latest.rows[0].uptime_s) } : null;
+      boots = b.rows.map((r: any) => ({ at: Number(r.at) }));
+    } catch (e) { if (!absent(e)) throw e; }
+    // phase_b_log is the planner's own: the active-mode rows that say anything about the Pi (a `sent`, or the hub's
+    // `no Pi connected` refusal) over the 7-d window, oldest first
+    const pb = await this.pool.query(
+      `SELECT (EXTRACT(EPOCH FROM ts) * 1000)::float8 AS ts, result FROM phase_b_log
+       WHERE ts >= to_timestamp($1) AND mode = 'active' AND (result = 'sent' OR result LIKE '%no Pi connected%')
+       ORDER BY ts`, [nowMs / 1000 - 7 * 86_400]);
+    return { lastByPump, readings, latestStat, boots, phaseB: pb.rows.map((r: any) => ({ ts: Number(r.ts), result: String(r.result) })) };
   }
 
   /** #177: the newest curve diagnosis on record — seeds /health.drift.last_foreign across restarts. */

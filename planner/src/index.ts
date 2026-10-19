@@ -11,6 +11,7 @@ import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
 import { extractConfig, handlePolledConfig, PendingTracker, type CurveDiagnosis } from "./drift";
+import { piHealth, withLiveAges, READING_GAP_MIN_S, BOOT_JUMP_S, type PiHealth } from "./pilink";
 import crypto from "node:crypto";
 import os from "node:os";
 import { TempiqPusher } from "./tempiq";
@@ -303,6 +304,26 @@ let lastDriftAt: string | null = null;
 // #177: the newest curve diagnosis (echo_suspected | foreign | reverted) → /health.drift.last_foreign. Seeded from the
 // DB at boot so a redeploy does not blank it.
 let lastCurveDiagnosis: CurveDiagnosis | null = null;
+// #165: the Pi link's story from the mirror's tables (pilink.ts) — computed off the request path every
+// PI_LINK_REFRESH_MS and served from here, so a /health scrape never touches the database.
+const PI_LINK_REFRESH_MS = 10 * 60 * 1000;
+let piLink: PiHealth | null = null;
+let piLinkError: string | null = null;
+let piLinkBusy = false;
+async function refreshPiLink(): Promise<void> {
+  if (piLinkBusy) return; // a slow DB must not stack refreshes
+  piLinkBusy = true;
+  try {
+    const now = Date.now();
+    piLink = piHealth(await store.piLinkInputs(now, { gapS: READING_GAP_MIN_S, bootJumpS: BOOT_JUMP_S }), now);
+    piLinkError = null;
+  } catch (e) {
+    piLinkError = (e as Error).message;
+    console.error("pi-link refresh failed:", piLinkError);
+  } finally {
+    piLinkBusy = false;
+  }
+}
 // #177: an `unconfirmed` curve change awaiting the next poll's re-check (drift.ts PendingTracker) — reloaded from the
 // DB on the first poll (retried until it succeeds once), settled in the DB once announced or superseded.
 const pendingUnconfirmed = new PendingTracker(() => store.pendingUnconfirmed(), () => store.resolveUnconfirmed());
@@ -1831,6 +1852,7 @@ async function main(): Promise<void> {
     await once("score", scoreOnce);
     await once("decay scan", () => decayScanOnce(store));
     await once("realized-savings", () => realized.computeAndStore());
+    await once("pi-link", refreshPiLink);
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-ua-push", () => pushTankUa(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (TEMPIQ_PUSH_ENABLED && TEMPIQ_SURFACE_TOKEN) await once("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     if (tempiq) await once("tempiq-push", () => tempiq.tick());
@@ -1868,6 +1890,12 @@ async function main(): Promise<void> {
             ok, lastPollAt, lastDriftAt, lastShadowAt, consecutiveFailures,
             // #177: the newest curve event, self-diagnosed — verdict echo_suspected (within 2 °F of a value the planner
             // wrote in the previous 60 min; default page) | foreign (high page) | reverted (re-read showed it gone; no page).
+            // #165: Pi uptime, reboots and the 7-d dropout windows (phase_b_log `no Pi connected` runs), each with a
+            // gap-vs-reboot verdict from the mirror's readings + system_stats. Corroborates the hub's own counters
+            // (hub /health pi_dropouts_24h / _7d, #178), which reset on a hub redeploy; these come from the DB.
+            pi: piLink
+              ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
+              : { pending: true, refresh_error: piLinkError },
             drift: {
               last_at: lastDriftAt,
               last_foreign: lastCurveDiagnosis
@@ -2217,6 +2245,9 @@ async function main(): Promise<void> {
   // (inside loop) already sees fresh NWS/OpenMeteo triggers.
   await stormTriggerPoll();
   setInterval(() => void stormTriggerPoll(), 30 * 60 * 1000);
+  // #165: first computation in the background (never delays startup), then every 10 min
+  void refreshPiLink();
+  setInterval(() => void refreshPiLink(), PI_LINK_REFRESH_MS);
 
   // SPAN backup-element power alarm on its own tight cadence (default 60s) — independent of the
   // 5-min main loop so a running element is caught fast. No-op unless SPAN_USERNAME is configured.
