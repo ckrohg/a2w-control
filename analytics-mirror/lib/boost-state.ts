@@ -36,6 +36,8 @@ export type WriterStatus = {
   last_write_at?: string | null;
   /** the curve on the device; output_at_live_outdoor_f is what setTarget solved to equal the target */
   curve_in_force?: { output_at_live_outdoor_f: number | null } | null;
+  /** added by the mirror's /api/planner/target from the shared DB: a write after the boost row (undefined = unknown) */
+  boost_superseded_by?: { at: string; by: string } | null;
 };
 
 /** The subset of the hub's /api/state this module reads (planner hub.ts HubState). */
@@ -253,6 +255,12 @@ function activeView(ab: { target_f: number; restore_at: string }, st: WriterStat
   // auto-pilot tick, a manual write) — say so rather than claim the boost is running. Three tests, any
   // one is enough: a later write stamp than ours; the curve's output at the live outdoor off the boost
   // target; or (no curve block) the commanded midpoint off it.
+  // The DB check is the durable one (it survives a reload, where ourWriteAt is unknown, and catches a
+  // 1 °F-neighbour replacement the curve cannot tell apart from rounding — Codex pass 7).
+  const sup = st.boost_superseded_by ?? null;
+  if (sup) {
+    return { key: "superseded", tone: "bad", text: `boost to ${ab.target_f} °F is on record until ${until}, but the HBX curve was written again at ${fmtClock(sup.at)} by ${sup.by} — another write replaced it` };
+  }
   const laterWrite = ourWriteAt != null && st.last_write_at != null && st.last_write_at !== ourWriteAt;
   const curveOff = out != null ? Math.abs(out - ab.target_f) > CURVE_TOL_F : cmd != null && Math.abs(cmd - ab.target_f) > ADOPT_TOL_F;
   if (laterWrite || curveOff) {
@@ -260,6 +268,11 @@ function activeView(ab: { target_f: number; restore_at: string }, st: WriterStat
     return { key: "superseded", tone: "bad", text: `boost to ${ab.target_f} °F is on record until ${until}, but the HBX curve now targets ${now}${laterWrite ? ` (written again at ${fmtClock(st.last_write_at!)})` : ""} — another write replaced it` };
   }
   const op = st.target_f;
+  // Without the DB answer, identity is a best guess from the curve — never shown as confirmed green.
+  if (st.boost_superseded_by === undefined) {
+    const opNow = st.target_f;
+    return { key: "commanded", tone: "pending", text: `boost to ${ab.target_f} °F on record until ${until} (HBX on ${opNow != null ? `${r0(opNow)} °F` : "?"}) — could not check for later writes, so not confirmed in force` };
+  }
   const inForce = st.adoption_pending === false && op != null && Math.abs(op - ab.target_f) <= ADOPT_TOL_F;
   if (inForce) return { key: "in_force", tone: "ok", text: `in force: tank target ${r0(op!)} °F until ${until}, then the curve restores` };
   return {

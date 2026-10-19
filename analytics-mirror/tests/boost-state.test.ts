@@ -13,7 +13,7 @@ const restore = new Date(NOW + 120 * 60_000).toISOString();
 const req = { target_f: 132, minutes: 120 };
 const accepted: BoostPhase = { phase: "accepted", req, atMs: NOW, restoreAt: restore };
 const before: WriterStatus = { tank_f: 78, target_f: 120, commanded_target_f: 120, adoption_pending: false, band: { lo: 104, hi: 135 }, i1_margin_f: 5, active_boost: null };
-const commanded: WriterStatus = { ...before, commanded_target_f: 133, adoption_pending: true, active_boost: { target_f: 132, restore_at: restore } };
+const commanded: WriterStatus = { ...before, commanded_target_f: 133, adoption_pending: true, active_boost: { target_f: 132, restore_at: restore }, boost_superseded_by: null };
 const inForce: WriterStatus = { ...commanded, target_f: 132, adoption_pending: false };
 let n = 0;
 const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ✓ ${name}`); };
@@ -226,6 +226,23 @@ t("chart overlay replaces the target for the span, even below the plan (Codex pa
   assert.equal(out[1], 135);
   assert.equal(plan[23], 135); // input untouched
   assert.deepEqual(overlayBoost(plan, null), plan);
+});
+
+t("DB says the curve was written after the boost → superseded, even a 1 °F neighbour after reload (Codex pass 7)", () => {
+  // 132 → 133 replacement: curve output 133 is within rounding of 132, operative at 133, no writeAt (reload)
+  const st: WriterStatus = { ...inForce, target_f: 133, commanded_target_f: 133, curve_in_force: { output_at_live_outdoor_f: 133 },
+    boost_superseded_by: { at: "2026-10-16T05:05:00Z", by: "autopilot set_target" } };
+  const v = boostView({ phase: "idle" }, st, NOW + 30 * 60_000);
+  assert.equal(v.key, "superseded");
+  assert.equal(v.text, "boost to 132 °F is on record until 2:43 AM, but the HBX curve was written again at 1:05 AM by autopilot set_target — another write replaced it");
+});
+
+t("DB answer unavailable → never green, says it could not check", () => {
+  const { boost_superseded_by: _drop, ...noDb } = inForce;
+  const v = boostView(accepted, noDb, NOW + 60_000);
+  assert.equal(v.key, "commanded");
+  assert.equal(v.tone, "pending");
+  assert.match(v.text, /could not check for later writes, so not confirmed in force/);
 });
 
 console.log(`boost-state: ${n} passed`);
