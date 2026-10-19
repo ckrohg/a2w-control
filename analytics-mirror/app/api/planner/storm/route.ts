@@ -1,10 +1,12 @@
 // @purpose Server-side proxy to the planner's storm-mode API (GET status / POST
 // arm|disarm). Cookie-gated by middleware + isAuthed() defense-in-depth, same pattern
 // as the /api/planner/target proxy — PLANNER_API_TOKEN never reaches the browser. GET
-// proxies the planner's /health and returns just its `storm` field; POST relays
+// returns just the planner's /health `storm` field (lib/planner-health.ts, shared with the
+// storm banner so both read the same authority, #183); POST relays
 // {action: "arm"|"disarm", hours?} to /api/storm/arm or /api/storm/disarm.
 import { NextResponse } from "next/server";
 import { isAuthed } from "@/lib/auth";
+import { fetchPlannerStorm } from "@/lib/planner-health";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,20 +21,9 @@ function plannerEnv() {
 
 export async function GET() {
   if (!isAuthed()) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  const env = plannerEnv();
-  if (!env) return NextResponse.json({ error: "planner not configured" }, { status: 503 });
-  try {
-    const res = await fetch(`${env.base}/health`, {
-      headers: { Authorization: `Bearer ${env.token}` },
-      cache: "no-store",
-    });
-    const out: { storm?: unknown } = await res.json().catch(() => ({}));
-    // /health goes 503 when polls are failing, but the storm field is still authoritative.
-    if (out.storm != null) return NextResponse.json({ storm: out.storm });
-    return NextResponse.json({ error: `planner health gave no storm state (${res.status})` }, { status: 502 });
-  } catch (e) {
-    return NextResponse.json({ error: "planner unreachable", detail: String(e) }, { status: 502 });
-  }
+  const { storm, status, error } = await fetchPlannerStorm();
+  if (storm) return NextResponse.json({ storm });
+  return NextResponse.json({ error }, { status });
 }
 
 export async function POST(req: Request) {

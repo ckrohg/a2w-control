@@ -3,6 +3,8 @@
 // relay state + A2W's arm intent + the recent SHADOW "would-arm" decisions, and a one-tap toggle to
 // arm/disarm A2W. Phase 1 = shadow: nothing is toggled on SPAN; this only controls whether A2W *would*.
 import { useState } from "react";
+import { SPAN_STALE_S } from "@/lib/backup-state";
+import { useNowS } from "./backup-line";
 
 export type ArmState = {
   circuit: string | null; relay_state: string | null; armed: boolean | null;
@@ -12,11 +14,17 @@ export type ArmEvent = {
   ts: number; relay_state: string | null; armed: boolean; live: boolean; action: string; detail: string | null;
 };
 
-export function SpanArmCard({ state, events }: { state: ArmState | null; events: ArmEvent[] }) {
+export function SpanArmCard({ state, events, nowS: serverNowS }: { state: ArmState | null; events: ArmEvent[]; nowS: number }) {
+  const nowS = useNowS(serverNowS);
   const [pending, setPending] = useState(false);
   const [desired, setDesired] = useState<boolean | null>(state?.desired_armed ?? state?.armed ?? false);
   const armed = desired ?? false;
-  const relayOpen = state?.relay_state === "OPEN";
+  const relayOpen = state?.relay_state?.toUpperCase() === "OPEN";
+  const relayClosed = state?.relay_state?.toUpperCase() === "CLOSED"; // anything else is unknown, never "available"
+  // #184: a relay reading older than 15 min is not a state — say how old it is instead.
+  const relayAgeS = state?.ts != null ? nowS - (state.ts > 1e12 ? state.ts / 1000 : state.ts) : null;
+  const relayAgeMin = relayAgeS != null ? Math.round(relayAgeS / 60) : null;
+  const relayStale = relayAgeS == null || relayAgeS > SPAN_STALE_S; // seconds, same rule as lib/backup-state
   const live = !!state?.live;
 
   async function toggle(next: boolean) {
@@ -38,8 +46,12 @@ export function SpanArmCard({ state, events }: { state: ArmState | null; events:
         </span>
       </h3>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", margin: "8px 0" }}>
-        <span>Element (SPAN “Buffer Tank”): <b style={{ color: relayOpen ? "#e67e22" : "#2ecc71" }}>
-          {state?.relay_state == null ? "—" : relayOpen ? "OFF (unavailable)" : "available"}</b></span>
+        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale || !(relayOpen || relayClosed) ? "#888" : relayOpen ? "var(--crit)" : "#e0b24d" }}>
+          {state?.relay_state == null ? "—"
+            : relayStale ? `unknown (SPAN data ${relayAgeMin == null ? "undated" : `${relayAgeMin} min old`})`
+            : relayOpen ? "OPEN — unavailable"
+            : relayClosed ? "CLOSED — available"
+            : `unknown (relay state "${state.relay_state}")`}</b></span>
         <span>A2W: <b style={{ color: armed ? "#4dabf7" : "#888" }}>{armed ? "ARMED" : "DISARMED"}</b></span>
         <button
           disabled={pending}

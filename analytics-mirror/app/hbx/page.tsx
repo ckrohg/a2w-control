@@ -7,6 +7,8 @@ import { sql } from "@/lib/sql";
 import { fmtTime, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "../i1-banner";
 import { StormBanner } from "../storm-banner";
+import { fetchPlannerStorm } from "@/lib/planner-health";
+import { stormRowStatus, type HealthStorm } from "@/lib/storm-state";
 import { Chart, type Series } from "@/app/ui/chart";
 
 export const runtime = "nodejs";
@@ -93,6 +95,8 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
   let scored: { t: number; s: number }[] = [];
   let phasebLog: { t: number; pump_id: string; mode: string; value_c: number | null; result: string }[] = [];
   let stormEvents: { id: number; s: number; e: number | null; trigger: string; ceiling_f: number | null }[] = [];
+  // #183: an open row is only "open" if the planner agrees — restarts orphan rows (see storm-state.ts).
+  let healthStorm: HealthStorm | null = null;
   let floorSnap: {
     t: number;
     zones: { name: string; deliveryType: string; awtF: number | null; calling: boolean; verified?: boolean | null }[];
@@ -144,6 +148,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
       stormEvents = (await sql`
         SELECT id, EXTRACT(EPOCH FROM started_at)::float8 AS s, EXTRACT(EPOCH FROM ended_at)::float8 AS e, trigger, ceiling_f
         FROM storm_events ORDER BY id DESC LIMIT 5`).rows as typeof stormEvents;
+      if (stormEvents.some((ev) => ev.e == null)) healthStorm = (await fetchPlannerStorm()).storm;
     } catch { /* storm_events appears with the W0-5 planner deploy */ }
     try {
       const zf = await sql`
@@ -314,7 +319,7 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               <h3>Storm events <span className="dim">(armed heat-banking windows — manual or automatic)</span></h3>
               {stormEvents.map((ev) => (
                 <div className="meta" key={ev.id}>
-                  {fmtDateTime(ev.s)} · {ev.trigger} · {ev.e ? `${((ev.e - ev.s) / 3600).toFixed(1)} h` : "open"}
+                  {fmtDateTime(ev.s)} · {ev.trigger} · {stormRowStatus(ev, healthStorm)}
                 </div>
               ))}
             </div>

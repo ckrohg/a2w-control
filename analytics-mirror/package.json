@@ -7,7 +7,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "for f in tests/*.test.ts; do npx tsx \"$f\" || exit 1; done"
+    "test": "for f in tests/*.test.ts lib/*.test.ts; do echo \"── $f\"; npx tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
     "@simplewebauthn/browser": "^13.3.0",

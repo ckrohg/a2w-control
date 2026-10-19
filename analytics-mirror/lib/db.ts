@@ -73,6 +73,36 @@ export async function recentSpanReadings(hours: number, name?: string): Promise<
   return rows;
 }
 
+/** Newest sample for one circuit (#184: proves freshness / a live draw on "Buffer Tank"). Uses idx_span_readings_name_ts. */
+export async function latestSpanReading(name: string): Promise<{ ts: number; power_w: number | null } | null> {
+  const { rows } = await sql<{ ts: number; power_w: number | null }>`SELECT ts, power_w FROM span_readings
+    WHERE name = ${name} ORDER BY ts DESC LIMIT 1`;
+  return rows[0] ?? null;
+}
+
+/**
+ * #186: has the HBX curve been written since the active boost was? The planner's hbx_boosts row is
+ * inserted right AFTER its own accepted set_target (writes.ts boost()), so any accepted hbx_writes row
+ * later than created_at (or a verify_mismatch one: that PATCH reached the device, #196) — or a foreign dbt/mbt/dot change the drift detector recorded (a config
+ * version without `_source`) — means the boost's curve was replaced. Durable: survives page reloads
+ * and planner restarts, unlike the writer's in-memory last_write_at. null = not superseded.
+ */
+export async function boostSupersededBy(): Promise<{ at: string; by: string } | null> {
+  const { rows } = await sql<{ at: string; by: string }>`
+    WITH b AS (
+      SELECT created_at FROM hbx_boosts WHERE NOT restored AND restore_at > now() ORDER BY id DESC LIMIT 1)
+    SELECT to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS at, x.by FROM (
+      SELECT w.ts AS at, w.source || ' ' || w.action || CASE WHEN w.result = 'verify_mismatch' THEN ' (read-back mismatch)' ELSE '' END AS by
+        FROM hbx_writes w, b
+        WHERE w.ts > b.created_at AND w.result IN ('accepted', 'verify_mismatch')
+      UNION ALL
+      SELECT v.observed_at AS at, 'a change outside A2W (HBX app or device)' AS by FROM hbx_config_versions v, b
+        WHERE v.observed_at > b.created_at AND v.changed_fields IS NOT NULL AND v.changed_fields->>'_source' IS NULL
+          AND (v.changed_fields ? 'dbt' OR v.changed_fields ? 'mbt' OR v.changed_fields ? 'dot')
+    ) x ORDER BY x.at ASC LIMIT 1`;
+  return rows[0] ?? null;
+}
+
 // Backup-element ARM (spec: knowledge/reference/span-backup-arm-spec.md). span_arm_events = the
 // shadow/live decision stream (idempotent on source_id); span_arm_state = single-row current relay+
 // intent snapshot + the owner's desired_armed (the portal toggle writes it; the ingest echoes it to
