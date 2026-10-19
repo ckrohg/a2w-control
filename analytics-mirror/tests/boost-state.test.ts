@@ -186,4 +186,14 @@ t("chart span is in Eastern hours and ends with the timer (Codex pass 1)", () =>
   assert.deepEqual(boostChartSpan(NOW + 3_600_000, restore), { start: 1, hours: 2 });
 });
 
+t("an unchanged cached 'in force' read-back expires at restore_at (Codex pass 3)", () => {
+  const end = Date.parse(restore);
+  assert.equal(boostView(accepted, inForce, end - 1_000, end - 30_000).key, "in_force");
+  const v = boostView(accepted, inForce, end + 1_000, end - 30_000);
+  assert.equal(v.key, "expired_unrestored");
+  assert.match(v.text, /ended at 2:43 AM — waiting for the writer status to show the restore/);
+  assert.equal(boostView({ phase: "idle" }, inForce, end + 1_000, end - 30_000).key, "expired_unrestored");
+  assert.equal(boostChartSpan(end + 1_000, restore), null);
+});
+
 console.log(`boost-state: ${n} passed`);

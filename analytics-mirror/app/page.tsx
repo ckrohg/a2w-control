@@ -7,7 +7,7 @@ import { ensureSchema, recentReadings, recentSpanReadings, getSpanArmState, rece
   latestSpanReading, type Reading } from "@/lib/db";
 import { backupView, type BackupInputs } from "@/lib/backup-state";
 import { HeatNow } from "./heat-now";
-import { BackupLine } from "./backup-line";
+import { BackupLine, BackupChip } from "./backup-line";
 import { AutoRefresh } from "./auto-refresh";
 import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
@@ -155,10 +155,10 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
         calledNow: !!slx?.backup_called,
       }
     : null;
-  const backup = backupInputs ? backupView(backupInputs) : null;
-  if (backup?.tone === "red") chips.push({ cls: "offline", text: "backup element unavailable (breaker OPEN)" });
+  // the red backup chip renders client-side (<BackupChip/>) so it ages out with its sample
+  const backupRed = backupInputs ? backupView(backupInputs).tone === "red" : false;
 
-  if (!chips.length) chips.push({ cls: "ok", text: "all systems normal" });
+  if (!chips.length && !backupRed) chips.push({ cls: "ok", text: "all systems normal" });
 
   // current + next interesting shadow block
   const nowBlock = shadow?.find((b) => {
@@ -177,6 +177,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
 
       <div className="chips-row">
         {chips.map((c, i) => <span key={i} className={`chip ${c.cls}`}>{c.text}</span>)}
+        {backupInputs && <BackupChip inputs={backupInputs} />}
       </div>
 
       {faults.length > 0 && (

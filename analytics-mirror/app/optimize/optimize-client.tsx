@@ -553,10 +553,11 @@ export default function OptimizeClient({
   // Drawn only for a FRESH read-back that still centres on the boost (commanded / in force) — not for
   // a superseded or stale one (Codex pass 2).
   const boostDrawn = ab && (bst.view.key === "commanded" || bst.view.key === "in_force");
-  const boost: Boost | null = boostDrawn
+  const span = boostDrawn ? boostChartSpan(bst.nowMs, ab.restore_at) : null;
+  const boost: Boost | null = boostDrawn && span
     ? {
-        ...boostChartSpan(bst.nowMs, ab.restore_at),
-        target: ab.target_f,
+        ...span,
+        target: ab!.target_f,
         note: bst.view.key === "in_force"
           ? "Boost in force — the planner restores the curve when its timer ends"
           : "Boost commanded — the HBX adopts it at its next reheat cycle",

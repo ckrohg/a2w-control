@@ -50,10 +50,11 @@ export function etHour(ms: number): number {
  * The chart span of a boost on record: from the current Eastern hour through the hour its timer
  * ends. Eastern offsets are whole hours, so UTC hour boundaries are Eastern hour boundaries.
  */
-export function boostChartSpan(nowMs: number, restoreAtIso: string): { start: number; hours: number } {
-  const hourStart = nowMs - (nowMs % 3_600_000);
+export function boostChartSpan(nowMs: number, restoreAtIso: string): { start: number; hours: number } | null {
   const end = Date.parse(restoreAtIso);
-  const hours = Number.isFinite(end) ? Math.max(1, Math.ceil((end - hourStart) / 3_600_000)) : 1;
+  if (!Number.isFinite(end) || nowMs >= end) return null; // expired → nothing to draw
+  const hourStart = nowMs - (nowMs % 3_600_000);
+  const hours = Math.max(1, Math.ceil((end - hourStart) / 3_600_000));
   return { start: etHour(nowMs), hours: Math.min(hours, 24) };
 }
 
@@ -178,7 +179,7 @@ export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number,
 
 function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): BoostView {
   if (p.phase === "idle") {
-    if (st?.active_boost) return activeView(st.active_boost, st);
+    if (st?.active_boost) return activeView(st.active_boost, st, nowMs);
     return { key: "idle", tone: "neutral", text: "no boost active" };
   }
   if (p.phase === "sending") return { key: "sending", tone: "pending", text: `sending boost to ${p.req.target_f} °F…` };
@@ -209,11 +210,16 @@ function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): 
     }
     return { key: "verifying", tone: "pending", text: "planner accepted the request — reading back the writer status…" };
   }
-  return activeView(ab, st!);
+  return activeView(ab, st!, nowMs);
 }
 
-function activeView(ab: { target_f: number; restore_at: string }, st: WriterStatus): BoostView {
+function activeView(ab: { target_f: number; restore_at: string }, st: WriterStatus, nowMs: number): BoostView {
   const until = fmtClock(ab.restore_at);
+  // The timer has run out since this read-back: whatever it said is no longer the state (Codex pass 3).
+  const endMs = Date.parse(ab.restore_at);
+  if (Number.isFinite(endMs) && nowMs >= endMs) {
+    return { key: "expired_unrestored", tone: "pending", text: `boost timer for ${ab.target_f} °F ended at ${until} — waiting for the writer status to show the restore` };
+  }
   const cmd = st.commanded_target_f;
   // The boost row exists but the curve no longer centres on it: something wrote over it (an armed
   // auto-pilot tick, a manual write) — say so rather than claim the boost is running.

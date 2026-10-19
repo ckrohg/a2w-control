@@ -29,3 +29,13 @@ export function BackupLine({ inputs }: { inputs: BackupInputs }) {
     </div>
   );
 }
+
+/** The top-row alert chip, on the same ticking clock: red only while a FRESH sample says OPEN. */
+export function BackupChip({ inputs }: { inputs: BackupInputs }) {
+  const nowS = useNowS(inputs.nowS);
+  const v = backupView({ ...inputs, nowS });
+  if (v.tone === "red") return <span className="chip offline">backup element unavailable (breaker OPEN)</span>;
+  // it was red at render and has aged out — say unknown rather than drop to silence
+  if (backupView(inputs).tone === "red") return <span className="chip warn">backup element state unknown</span>;
+  return null;
+}

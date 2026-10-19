@@ -45,10 +45,10 @@ export function SpanArmCard({ state, events, nowS: serverNowS }: { state: ArmSta
         </span>
       </h3>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", margin: "8px 0" }}>
-        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale ? "#888" : relayOpen ? "#e67e22" : "#2ecc71" }}>
+        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale ? "#888" : relayOpen ? "var(--crit)" : "#e0b24d" }}>
           {state?.relay_state == null ? "—"
             : relayStale ? `unknown (SPAN data ${relayAgeMin == null ? "undated" : `${relayAgeMin} min old`})`
-            : relayOpen ? "OFF (unavailable)" : "available"}</b></span>
+            : relayOpen ? "OPEN — unavailable" : "CLOSED — available"}</b></span>
         <span>A2W: <b style={{ color: armed ? "#4dabf7" : "#888" }}>{armed ? "ARMED" : "DISARMED"}</b></span>
         <button
           disabled={pending}
