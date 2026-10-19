@@ -4,7 +4,9 @@
 // Deep views: /hbx (tank, curve, plan detail), /control (setpoint writes).
 import { sql } from "@/lib/sql";
 import { ensureSchema, recentReadings, recentSpanReadings, getSpanArmState, recentSpanArmEvents,
-  type Reading } from "@/lib/db";
+  latestSpanReading, type Reading } from "@/lib/db";
+import { backupView, type BackupView } from "@/lib/backup-state";
+import { HeatNow } from "./heat-now";
 import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
@@ -46,10 +48,11 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   let spanElement: { x: number; y: number | null }[] = [];
   let spanArm: ArmState | null = null;
   let spanArmEvents: ArmEvent[] = [];
-  // Backup shadow-test: with the 16.5 kW element's SPAN breaker physically OFF, backup_called
-  // still reflects the HBX's DECISION to call it — so this counts how often our settings would
-  // have fired the element over 7 days (cost-free while the breaker is off). 0 = settings clean.
+  // Backup element (#184): backup_called is the HBX's DECISION to call the 16.5 kW element; whether
+  // the element CAN run is the SPAN "Buffer Tank" relay. The 7-day call count and the relay state are
+  // separate facts — lib/backup-state.ts maps them; the breaker is read, never assumed.
   let backupShadow: { episodes7d: number; lastCalled: number | null } | null = null;
+  let bufferTankLatest: { ts: number; power_w: number | null } | null = null;
   let dbError = false;
   try {
     await ensureSchema();
@@ -96,6 +99,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
           .filter((s) => s.name === "Buffer Tank")
           .map((s) => ({ x: s.ts, y: s.power_w }));
       } catch { /* span_readings not created until the bridge deploys — ignore */ }
+      try { bufferTankLatest = await latestSpanReading("Buffer Tank"); } catch { /* span_readings not created yet */ }
       try {
         spanArm = await getSpanArmState();
         spanArmEvents = await recentSpanArmEvents(hours, 12);
@@ -139,6 +143,18 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
   if (slx?.backup_called) chips.push({ cls: "offline", text: "16.5 kW backup CALLED" });
   if (driftAt) chips.push({ cls: "warn", text: `HBX config changed ${fmtDateTime(driftAt)}` });
   if (faults.length) chips.push({ cls: "offline", text: `${faults.length} active pump fault${faults.length > 1 ? "s" : ""}` });
+  const backup: BackupView | null = backupShadow
+    ? backupView({
+        nowS: now,
+        relay: spanArm ? { relay_state: spanArm.relay_state, ts: spanArm.ts } : null,
+        latestPower: bufferTankLatest,
+        episodes7d: backupShadow.episodes7d,
+        lastCalled: backupShadow.lastCalled,
+        calledNow: !!slx?.backup_called,
+      })
+    : null;
+  if (backup?.tone === "red") chips.push({ cls: "offline", text: "backup element unavailable (breaker OPEN)" });
+
   if (!chips.length) chips.push({ cls: "ok", text: "all systems normal" });
 
   // current + next interesting shadow block
@@ -219,27 +235,13 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <div className="meta">
                 Stages: {stagesTxt} · Backup: {slx?.backup_called ? "CALLED" : "off"} · <a href="/hbx" style={{ color: "#4dabf7" }}>details →</a>
               </div>
-              {backupShadow && (
+              {backup && (
                 <div className="meta" style={{ marginTop: 4 }}>
-                  <span
-                    className={`chip ${backupShadow.episodes7d === 0 && !slx?.backup_called ? "ok" : "warn"}`}
-                    style={{ marginRight: 6 }}
-                  >
-                    backup shadow-test
+                  <span className={`chip ${backup.tone === "red" ? "offline" : backup.tone === "amber" ? "warn" : ""}`} style={{ marginRight: 6 }}>
+                    {backup.chip}
                   </span>
-                  {backupShadow.episodes7d === 0 && !slx?.backup_called
-                    ? "HBX hasn't called the backup in 7 days ✓ — breaker off, settings clean"
-                    : `HBX called the backup ${backupShadow.episodes7d}× in 7 days${
-                        backupShadow.lastCalled
-                          ? ` · last ${new Date(backupShadow.lastCalled * 1000).toLocaleString("en-US", {
-                              month: "short",
-                              day: "numeric",
-                              hour: "numeric",
-                              minute: "2-digit",
-                              timeZone: "America/New_York",
-                            })}`
-                          : ""
-                      } — investigate (a setting may be triggering it)`}
+                  <span style={{ color: backup.tone === "red" ? "var(--crit)" : undefined }}>{backup.headline}</span>
+                  <div style={{ marginTop: 2 }}>{backup.calledLine}</div>
                 </div>
               )}
               {autopilot && (
@@ -256,6 +258,8 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
                 </div>
               )}
             </div>
+
+            <HeatNow />
 
             <div className="card">
               <h2>Planner (practice mode)<span className="chip">not in control</span></h2>
@@ -358,7 +362,7 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
               <span><i style={{ background: "#ff6b6b" }} />16.5 kW electric element — SPAN live watts</span>
             </div>
           </div>
-          <SpanArmCard state={spanArm} events={spanArmEvents} />
+          <SpanArmCard state={spanArm} events={spanArmEvents} nowS={now} />
         </>
       )}
     </>

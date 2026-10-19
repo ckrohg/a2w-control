@@ -6,7 +6,7 @@
 // or the input autofocuses. No portals — the dialog renders in-tree.
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type ConfirmOpts = { title: string; body?: string; danger?: boolean };
+type ConfirmOpts = { title: string; body?: string; danger?: boolean; confirmLabel?: string };
 type PromptOpts = { title: string; body?: string; inputType?: string };
 
 type Pending =
@@ -95,7 +95,7 @@ export function useModals() {
         aria-label={pending.opts.title}
       >
         <div className="modal-title">{pending.opts.title}</div>
-        {pending.opts.body ? <div className="modal-body">{pending.opts.body}</div> : null}
+        {pending.opts.body ? <div className="modal-body" style={{ whiteSpace: "pre-line" }}>{pending.opts.body}</div> : null}
         {pending.kind === "prompt" ? (
           <div className="modal-body">
             <input
@@ -123,7 +123,7 @@ export function useModals() {
             onClick={accept}
             autoFocus={pending.kind === "confirm"}
           >
-            {pending.kind === "prompt" ? "OK" : pending.opts.danger ? "Confirm" : "OK"}
+            {pending.kind === "prompt" ? "OK" : pending.opts.confirmLabel ?? (pending.opts.danger ? "Confirm" : "OK")}
           </button>
         </div>
       </div>

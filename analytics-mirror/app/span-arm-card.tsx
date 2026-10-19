@@ -12,11 +12,14 @@ export type ArmEvent = {
   ts: number; relay_state: string | null; armed: boolean; live: boolean; action: string; detail: string | null;
 };
 
-export function SpanArmCard({ state, events }: { state: ArmState | null; events: ArmEvent[] }) {
+export function SpanArmCard({ state, events, nowS }: { state: ArmState | null; events: ArmEvent[]; nowS: number }) {
   const [pending, setPending] = useState(false);
   const [desired, setDesired] = useState<boolean | null>(state?.desired_armed ?? state?.armed ?? false);
   const armed = desired ?? false;
   const relayOpen = state?.relay_state === "OPEN";
+  // #184: a relay reading older than 15 min is not a state — say how old it is instead.
+  const relayAgeMin = state?.ts != null ? Math.round((nowS - (state.ts > 1e12 ? state.ts / 1000 : state.ts)) / 60) : null;
+  const relayStale = relayAgeMin == null || relayAgeMin > 15;
   const live = !!state?.live;
 
   async function toggle(next: boolean) {
@@ -38,8 +41,10 @@ export function SpanArmCard({ state, events }: { state: ArmState | null; events:
         </span>
       </h3>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center", margin: "8px 0" }}>
-        <span>Element (SPAN “Buffer Tank”): <b style={{ color: relayOpen ? "#e67e22" : "#2ecc71" }}>
-          {state?.relay_state == null ? "—" : relayOpen ? "OFF (unavailable)" : "available"}</b></span>
+        <span>Element (SPAN “Buffer Tank”): <b style={{ color: state?.relay_state == null || relayStale ? "#888" : relayOpen ? "#e67e22" : "#2ecc71" }}>
+          {state?.relay_state == null ? "—"
+            : relayStale ? `unknown (SPAN data ${relayAgeMin == null ? "undated" : `${relayAgeMin} min old`})`
+            : relayOpen ? "OFF (unavailable)" : "available"}</b></span>
         <span>A2W: <b style={{ color: armed ? "#4dabf7" : "#888" }}>{armed ? "ARMED" : "DISARMED"}</b></span>
         <button
           disabled={pending}

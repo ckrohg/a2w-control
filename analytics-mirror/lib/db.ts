@@ -73,6 +73,13 @@ export async function recentSpanReadings(hours: number, name?: string): Promise<
   return rows;
 }
 
+/** Newest sample for one circuit (#184: proves freshness / a live draw on "Buffer Tank"). Uses idx_span_readings_name_ts. */
+export async function latestSpanReading(name: string): Promise<{ ts: number; power_w: number | null } | null> {
+  const { rows } = await sql<{ ts: number; power_w: number | null }>`SELECT ts, power_w FROM span_readings
+    WHERE name = ${name} ORDER BY ts DESC LIMIT 1`;
+  return rows[0] ?? null;
+}
+
 // Backup-element ARM (spec: knowledge/reference/span-backup-arm-spec.md). span_arm_events = the
 // shadow/live decision stream (idempotent on source_id); span_arm_state = single-row current relay+
 // intent snapshot + the owner's desired_armed (the portal toggle writes it; the ingest echoes it to

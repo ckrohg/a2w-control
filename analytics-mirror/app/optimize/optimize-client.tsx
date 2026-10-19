@@ -5,10 +5,12 @@
 //      plus a reporting/stale indicator). This is ground truth and CANNOT drift from the planner.
 //      The Off·Set·Request·Armed switch below it: Off and Armed ACTUATE (W2-B — they POST to the
 //      planner's guarded /api/autonomy, flipping both controllers shadow↔live via controller_flags);
-//      Set & forget and Request are still PREVIEW ONLY (they re-render the chart, no planner mode
-//      exists for them yet — honest fast-follow). The switch seeds from the planner's runtime row.
-//   2. Boost card — presets + a Custom… reveal + a capacity readout. PREVIEW ONLY: it overlays a
-//      raised segment on the chart; it does not call the planner's boost endpoint yet.
+//      Set & forget and Request are NOT WIRED (no planner mode exists for them yet), so they render
+//      disabled with a "soon" tag (#186). The switch seeds from the planner's runtime row.
+//   2. Boost card (#186) — presets + Custom POST the planner's guarded /api/hbx/boost through
+//      /api/planner/boost (app/ui/use-boost.tsx). Status text comes ONLY from read-back of the writer
+//      status (lib/boost-state.ts): "commanded X °F · adopts on the next reheat cycle" → "in force";
+//      a planner rejection is shown verbatim. Estimates start from the CURRENT tank.
 //   3. The timeline chart — a devicePixelRatio-aware canvas; ports the mockup's drawPlan/cop model.
 //   4. "How it reacts to demand" copy card.
 // Both levers are live-capable: the HP setpoint (Modbus) and the buffer-tank target (the HBX cloud
@@ -16,12 +18,13 @@
 // BOTTOM keeps the guarded 131°F summer recommendation + Restore (Apply is live, same I4/I1 guards).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useBoost } from "../ui/use-boost";
+import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, estimateLines, fmtMinutes } from "@/lib/boost-state";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
 
 const SAFE_FLOOR_F = 131; // ≥ daily sanitize threshold → no separate sanitize automation needed
 const WINTER_CUTOFF_F = 50; // below this outdoor temp, a static cool tank would underheat the rooms
-const CEFF_GAL = 110; // tank C_eff (gal), measured/learned by TempIQ — see ceff-110-gallons memory
 
 // ---- shared data model (24 blocks per plan; mirrors curve/page.tsx) -------------------
 export type ShadowBlock = {
@@ -146,24 +149,15 @@ const COPY: Record<Mode, ModeCopy> = {
 };
 
 // ---- boost model ----------------------------------------------------------------------
-type BoostKind = "dhw" | "heat";
-type Boost = { start: number; hours: number; target: number; kind: BoostKind; zone: string };
-
-function boostCap(tankB: number, kind: BoostKind, zone: string): { line: string; est: string } {
-  if (kind === "heat") {
-    const mins = Math.round(48 + (tankB - 120) * 5);
-    return {
-      line: `≈ ${mins} min of extra ${zone} heat`,
-      est: `estimate from TempIQ — zone design load + tank C_eff ${CEFF_GAL} gal`,
-    };
-  }
-  const gal = Math.max(0, Math.round((tankB - 110) * 3.4));
-  const shower = Math.round(gal / 2);
-  return {
-    line: `≈ ${gal} gal of hot water · about ${shower} min of showers`,
-    est: `estimate from TempIQ — tank C_eff ${CEFF_GAL} gal + DHW draw model`,
-  };
-}
+// Chart overlay for a boost ON RECORD (writer status active_boost) — never a preview.
+type Boost = { start: number; hours: number; target: number };
+// Presets fit the planner's limits (writes.ts boost(): ≤ strictCapF 135 °F, 15–120 min). The old
+// preview offered "Guests · 8 h" and "Extra heat · 138° / 4 h", which the planner would refuse.
+const PRESETS: { label: string; target: number; minutes: number }[] = [
+  { label: "Long shower", target: 132, minutes: 120 },
+  { label: "Guests / full house", target: 135, minutes: 120 },
+  { label: "Extra heat", target: 135, minutes: 60 },
+];
 
 // ---- the timeline chart (canvas, ported from the mockup's drawPlan) -------------------
 const PMIN = 58, PMAX = 146, CMIN = 1, CMAX = 5;
@@ -225,11 +219,11 @@ function PlanChart({
     const tankArr = isSet ? OUT.map(setCurve) : TANK.slice();
     const hpArr = isSet ? tankArr.map((t) => Math.min(t + 5, 160)) : HPbase.slice();
     if (boost) {
+      // a boost moves the TANK target only — pump setpoints are not touched by it
       for (let bb = 0; bb < boost.hours; bb++) {
         const bh = (boost.start + bb) % 24;
         if (bh >= tankArr.length) continue;
-        hpArr[bh] = Math.max(hpArr[bh], boost.target);
-        tankArr[bh] = Math.max(tankArr[bh], boost.target - 5);
+        tankArr[bh] = Math.max(tankArr[bh], boost.target);
       }
     }
     const copArr = OUT.map((o, i) => cop(o, tankArr[i]));
@@ -389,7 +383,7 @@ function PlanChart({
     }
     const inBoost = !!boost && (((h - boost.start + 24) % 24) < boost.hours);
     const why = inBoost
-      ? "Boosted — reverts to the plan after"
+      ? "Boost on record — the planner restores the curve when its timer ends"
       : mode === "set"
         ? "Held reset curve — tracks outdoor, not the clock"
         : WHY[h] ?? "";
@@ -495,7 +489,7 @@ export default function OptimizeClient({
   const router = useRouter();
   // ---- autonomy + boost view state --------------------------------------------------
   // mode seeds from the planner's RUNTIME autonomy row (initialMode). Off/Armed actuate; Set/Request
-  // are chart previews only. (Boost state below is still preview.)
+  // are not wired and render disabled. Boost is real (useBoost below).
   const [mode, setMode] = useState<Mode>(initialMode);
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoMsg, setAutoMsg] = useState("");
@@ -508,10 +502,10 @@ export default function OptimizeClient({
   const [identMode, setIdentMode] = useState<IdentMode>(initialIdentification);
   const [identBusy, setIdentBusy] = useState(false);
   const [identMsg, setIdentMsg] = useState("");
-  const [boost, setBoost] = useState<Boost | null>(null);
+  const bst = useBoost();
   const [customOpen, setCustomOpen] = useState(false);
-  const [customDeg, setCustomDeg] = useState(8);
-  const [customHrs, setCustomHrs] = useState(3);
+  const [customF, setCustomF] = useState(STRICT_CAP_F);
+  const [customMin, setCustomMin] = useState(BOOST_MAX_MINUTES);
   // display-only ✓ toggles for the Request-mode "changes waiting" chips
   const [approved, setApproved] = useState<Set<number>>(new Set());
   const nowH = useMemo(() => new Date().getHours(), []);
@@ -553,15 +547,18 @@ export default function OptimizeClient({
     return out;
   }, [blocks, hasPlan]);
 
-  // boost capacity readout — target-5 is the tank floor the boost lifts to (mockup applyBoost)
-  const cap = boost ? boostCap(boost.target - 5, boost.kind, boost.zone) : null;
-  const boostEndLabel = boost ? hh((boost.start + boost.hours) % 24).replace(" ", "") : "";
-
-  const applyBoost = (b: Boost | null) => setBoost(b);
-  const applyCustom = () => {
-    const d = clamp(Math.round(customDeg) || 8, 1, 30);
-    const y = clamp(Math.round(customHrs) || 3, 1, 24);
-    applyBoost({ start: nowH, hours: y, target: 124 + d, kind: "dhw", zone: "the zone" });
+  // The chart overlay and the estimate follow the boost ON RECORD (read-back), never a click.
+  const ab = bst.st?.active_boost ?? null;
+  const boost: Boost | null = ab
+    ? { start: nowH, hours: Math.max(1, Math.ceil((Date.parse(ab.restore_at) - bst.nowMs) / 3_600_000)), target: ab.target_f }
+    : null;
+  const estTarget = ab?.target_f ?? null;
+  const est = estimateLines(bst.st?.tank_f ?? null, estTarget ?? STRICT_CAP_F);
+  const customReq = boostBody(clamp(Math.round(customF) || STRICT_CAP_F, 120, STRICT_CAP_F),
+    clamp(Math.round(customMin) || BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, BOOST_MAX_MINUTES));
+  const sendBoost = (target: number, minutes: number, label: string) => {
+    const e = estimateLines(bst.st?.tank_f ?? null, target);
+    bst.send(target, minutes, `${label}: boost the tank to ${target} °F for ${fmtMinutes(minutes)}?`, `Hot water ${e.now}.\nHot water ${e.ifCompletes}.`);
   };
   const toggleApproved = (h: number) =>
     setApproved((prev) => {
@@ -794,8 +791,8 @@ export default function OptimizeClient({
                   type="button"
                   className={`ps-btn ps-${m}`}
                   aria-pressed={mode === m}
-                  disabled={autoBusy}
-                  title={preview ? "Preview only — this mode isn't live yet" : undefined}
+                  disabled={autoBusy || preview}
+                  title={preview ? "Not wired yet — this mode doesn't exist in the planner" : undefined}
                   onClick={() => selectMode(m)}
                 >
                   <span className="ps-led" />
@@ -1041,80 +1038,66 @@ export default function OptimizeClient({
         </div>
       </div>
 
-      {/* ============ BOOST (preview only) ============ */}
+      {/* ============ BOOST (real — #186) ============ */}
       <div className="card plan-boost">
         <div className="pb-row">
           <p className="plan-eyebrow" style={{ margin: 0 }}>
             Need more, briefly?
           </p>
-          <span className={`pb-status${boost ? " on" : ""}`}>
-            {boost ? `boosting to ${boost.target}° until ${boostEndLabel} — reverts to plan` : "off"}
+          <span className={`pb-status pb-${bst.view.tone}`} role="status">
+            {bst.st || bst.view.key !== "idle" ? bst.view.text : bst.stErr ? `writer status unavailable (${bst.stErr})` : "reading writer status…"}
           </span>
         </div>
         <div className="pb-btns">
-          <button type="button" onClick={() => applyBoost({ start: nowH, hours: 2, target: 132, kind: "dhw", zone: "the zone" })}>
-            Long shower · 2 h
-          </button>
-          <button type="button" onClick={() => applyBoost({ start: nowH, hours: 8, target: 132, kind: "dhw", zone: "the zone" })}>
-            Guests / full house · 8 h
-          </button>
-          <button type="button" onClick={() => applyBoost({ start: nowH, hours: 4, target: 138, kind: "heat", zone: "Living Room" })}>
-            Extra heat · 4 h
-          </button>
+          {PRESETS.map((p) => (
+            <button key={p.label} type="button" disabled={bst.busy || !!ab}
+              onClick={() => sendBoost(p.target, p.minutes, p.label)}>
+              {p.label} · {p.target}° · {fmtMinutes(p.minutes)}
+            </button>
+          ))}
           <button
             type="button"
             className="pb-custom-toggle"
             aria-expanded={customOpen}
+            disabled={bst.busy || !!ab}
             onClick={() => setCustomOpen((v) => !v)}
           >
             Custom…
           </button>
-          <button type="button" className="pb-clear" onClick={() => applyBoost(null)}>
-            Clear
-          </button>
         </div>
-        {customOpen && (
+        {customOpen && !ab && (
           <div className="pb-custom">
             <label>
-              +
-              <input
-                type="number"
-                min={1}
-                max={30}
-                value={customDeg}
-                aria-label="degrees warmer"
-                onChange={(e) => setCustomDeg(Number(e.target.value))}
-              />
-              °
+              to
+              <input type="number" min={120} max={STRICT_CAP_F} step={1} value={customF}
+                aria-label="boost target °F" onChange={(e) => setCustomF(Number(e.target.value))} />
+              °F
             </label>
             <label>
               for{" "}
-              <input
-                type="number"
-                min={1}
-                max={24}
-                value={customHrs}
-                aria-label="hours"
-                onChange={(e) => setCustomHrs(Number(e.target.value))}
-              />{" "}
-              h
+              <input type="number" min={BOOST_MIN_MINUTES} max={BOOST_MAX_MINUTES} step={15} value={customMin}
+                aria-label="boost minutes" onChange={(e) => setCustomMin(Number(e.target.value))} />{" "}
+              min
             </label>
-            <button type="button" className="pb-apply" onClick={applyCustom}>
-              Apply
+            <button type="button" className="pb-apply" disabled={bst.busy}
+              onClick={() => sendBoost(customReq.target_f, customReq.minutes, "Custom")}>
+              Boost {customReq.target_f}° / {fmtMinutes(customReq.minutes)}
             </button>
           </div>
         )}
-        {cap && (
-          <div className="pb-cap">
-            {cap.line}
-            <span className="pb-est">{cap.est}</span>
-          </div>
-        )}
+        <div className="pb-cap">
+          Pumps: {bst.pumps}
+          <span className="pb-est">Hot water {est.now}</span>
+          {estTarget != null && <span className="pb-est">Hot water {est.ifCompletes}</span>}
+          <span className="pb-est">estimate: ≈3.4 gal per °F above 110 °F (TempIQ tank model), ~2 gal/min shower</span>
+        </div>
         <p className="pb-note">
-          Tell the planner about a draw it can&apos;t forecast. It lifts the floor for the window,
-          then automatically falls back to the plan — even in <b style={{ color: "#4bbd77" }}>Armed</b>.{" "}
-          <b>Preview — these buttons don&apos;t call the planner yet (the write path itself is live).</b>
+          Writes through the planner&apos;s guarded boost: I4 envelope (≤ {STRICT_CAP_F} °F), I1 pump-setpoint
+          check, one HBX write per 15 min, {BOOST_MIN_MINUTES}–{BOOST_MAX_MINUTES} min. The HBX adopts a new target
+          only at its next reheat cycle; the planner restores the curve itself when the timer ends. There is
+          no early-stop button yet — <b>Restore as-found curve</b> at the bottom reverts immediately.
         </p>
+        {bst.Modals}
       </div>
 
       {/* ============ TIMELINE CHART ============ */}
@@ -1707,8 +1690,19 @@ export default function OptimizeClient({
           color: #71809a;
           letter-spacing: 0.02em;
         }
-        .pb-status.on {
+        .pb-status.pb-pending {
           color: #e0b24d;
+        }
+        .pb-status.pb-ok {
+          color: #4bbd77;
+        }
+        .pb-status.pb-bad {
+          color: #ff6b6b;
+        }
+        .pb-btns button:disabled,
+        .pb-apply:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
         }
         .pb-btns {
           display: flex;
