@@ -7,11 +7,16 @@ import { AlertOutbox, type AlertStore } from "./alerts";
 
 (async () => {
   // an in-memory alert_episodes table, shared across "restarts"
-  const rows: { id: number; kind: string; key: string; title: string; detail: string; notified: boolean; cleared: boolean }[] = [];
+  const rows: { id: number; uid: string; kind: string; key: string; title: string; detail: string; notified: boolean; cleared: boolean }[] = [];
   let closeUp = true;
   const store: AlertStore = {
     closeAlertEpisodeIds: async (ids) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (ids.includes(r.id)) r.cleared = true; },
-    openAlertEpisode: async (kind, key, _p, title, detail) => { rows.push({ id: rows.length + 1, kind, key, title, detail, notified: false, cleared: false }); return rows.length; },
+    openAlertEpisode: async (uid, kind, key, _p, title, detail) => {
+      const hit = rows.find((r) => r.uid === uid);
+      if (hit) return hit.id; // idempotent on uid, like the SQL
+      rows.push({ id: rows.length + 1, uid, kind, key, title, detail, notified: false, cleared: false }); return rows.length;
+    },
+    closeAlertEpisodeUids: async (uids) => { if (!closeUp) throw new Error("db down"); for (const r of rows) if (uids.includes(r.uid)) r.cleared = true; },
     markAlertNotified: async (id) => { rows[id - 1].notified = true; },
     undeliveredAlertEpisodes: async () => rows.filter((r) => !r.cleared && !r.notified).map((r) => ({ id: r.id, kind: r.kind, title: r.title, detail: r.detail })),
   };
@@ -175,6 +180,27 @@ import { AlertOutbox, type AlertStore } from "./alerts";
   assert.ok(!sent.slice(n4).includes("⚠ maybe obsolete"), "held back");
   await m.retry(() => true);
   assert.ok(sent.slice(n4).includes("⚠ maybe obsolete"), "sent once its watch has re-evaluated");
+
+  // codex pass 8: the INSERT committed but its reply was lost → treated as unrecorded; the recovery must still close
+  // that committed row (by uid), and nothing is paged after the recovery
+  up = false; closeUp = true;
+  let lostReply = true;
+  const ghost: AlertStore = { ...store, openAlertEpisode: async (...args) => { const id = await store.openAlertEpisode(...args); if (lostReply) throw new Error("connection reset"); return id; } };
+  const gx = new AlertOutbox(ghost, send, () => {});
+  await gx.open("fault_called", "7", "pump2", "⚠ ghost", "E21");
+  const ghostRow = rows.at(-1)!;
+  assert.equal(ghostRow.title, "⚠ ghost", "the row WAS committed");
+  assert.equal(gx.pending(), 1, "…but the outbox could not know");
+  await gx.close("fault_called", "7");                         // HP2 recovers
+  assert.equal(ghostRow.cleared, true, "closed by uid");
+  lostReply = false; up = true;
+  const n5 = sent.length;
+  await gx.retry();
+  assert.ok(!sent.slice(n5).includes("⚠ ghost"), "the resolved incident is never paged");
+  // and a retried insert of the same uid returns the same row (no duplicate)
+  const before2 = rows.length;
+  await gx.open("stage_unserved", "8", "pump1", "⚠ one row", "b");
+  assert.equal(rows.length, before2 + 1);
 
   console.log("alerts.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -40,7 +40,7 @@ async function main() {
     [iso(now - 21 * day), iso(now - 20 * day), iso(now - 19 * day), iso(now - 18.5 * day),
      iso(now - 3_600_000), iso(now + 6 * 3_600_000), iso(now - 2 * day), iso(now - 30 * day)]);
   await pool.query(`UPDATE storm_events SET ended_at = started_at + interval '1 hour' WHERE trigger = 'closed long ago'`);
-  const closed = await store.closeStormEvents("planner restart while idle");
+  const closed = await store.closeStormEvents("planner restart while idle", undefined, undefined, true);
   assert.equal(closed, 4, "every open row closes — not just max(id)");
   const rows = (await pool.query(`SELECT trigger, started_at, ended_at, detail FROM storm_events ORDER BY id`)).rows;
   assert.ok(rows.every((r: any) => r.ended_at != null), "nothing left open");
@@ -55,7 +55,7 @@ async function main() {
   // the STARTUP sweep is scoped to rows started before boot: a storm this process armed meanwhile stays open
   const boot = new Date(Date.now() - 60_000);
   await pool.query(`INSERT INTO storm_events (started_at, trigger, detail) VALUES ($1, 'orphan', NULL), (now(), 'armed by this process', NULL)`, [iso(now - 3_600_000)]);
-  assert.equal(await store.closeStormEvents("planner restart while idle", boot), 1);
+  assert.equal(await store.closeStormEvents("planner restart while idle", boot, boot, true), 1);
   const live = (await pool.query(`SELECT trigger, ended_at FROM storm_events WHERE trigger IN ('orphan', 'armed by this process') ORDER BY id`)).rows;
   assert.deepEqual(live.map((r: any) => [r.trigger, r.ended_at != null]), [["orphan", true], ["armed by this process", false]]);
   // a stand-down at 10:00 whose close only lands at 11:00 still ends the row at 10:00 (codex pass 6)
@@ -66,6 +66,22 @@ async function main() {
   assert.equal(await store.closeStormEvents("stand-down", standDown, standDown), 1);
   const ended = (await pool.query(`SELECT ended_at FROM storm_events`)).rows[0].ended_at;
   assert.equal(new Date(ended).toISOString(), standDown.toISOString(), "ended at the stand-down, not at the retry");
+  // codex pass 8: the CURRENT episode ends at its real stand-down even past its stored windowEnd (an outage extended it
+  // in memory); an orphan swept at startup clamps to its windowEnd and otherwise ends at the PROCESS START
+  await pool.query(`TRUNCATE storm_events RESTART IDENTITY`);
+  const ext = new Date(now - 600_000);
+  await pool.query(`INSERT INTO storm_events (started_at, trigger, detail) VALUES ($1, 'outage', jsonb_build_object('windowEnd', $2::text))`,
+    [iso(now - 18 * 3_600_000), iso(now - 12 * 3_600_000)]);
+  await store.closeStormEvents("stand-down", ext, ext);
+  assert.equal(new Date((await pool.query(`SELECT ended_at FROM storm_events`)).rows[0].ended_at).toISOString(), ext.toISOString(),
+    "an extended outage stands down when it really did — not at the stale stored windowEnd");
+  await pool.query(`TRUNCATE storm_events RESTART IDENTITY`);
+  const procStart = new Date(now - 3_600_000);
+  await pool.query(`INSERT INTO storm_events (started_at, trigger, detail) VALUES ($1, 'orphan-long', jsonb_build_object('windowEnd', $2::text))`,
+    [iso(now - 5 * 3_600_000), iso(now + 5 * 3_600_000)]);
+  await store.closeStormEvents("planner restart while idle", procStart, procStart, true);   // the sweep only succeeded now
+  assert.equal(new Date((await pool.query(`SELECT ended_at FROM storm_events`)).rows[0].ended_at).toISOString(), procStart.toISOString(),
+    "a delayed startup sweep ends the orphan at the process start, not at the retry");
   // two stand-downs queued during one DB outage, applied oldest first (codex pass 7): each storm ends at ITS stand-down
   await pool.query(`TRUNCATE storm_events RESTART IDENTITY`);
   const sd1 = new Date(now - 2 * 3_600_000), sd2 = new Date(now - 3_600_000);
@@ -77,13 +93,14 @@ async function main() {
 
   // ── #185 / #187: the alert-episode outbox ─────────────────────────────────────────────────────────────────────
   await pool.query(`TRUNCATE alert_episodes RESTART IDENTITY`);
-  const f = await store.openAlertEpisode("fault_called", "2", "pump2", "⚠ Stage 2 called but Heat Pump 2 is FAULTED", "E21");
-  const u = await store.openAlertEpisode("stage_unserved", "2", "pump2", "⚠ Stage 2 called 10 min but Heat Pump 2 is not heating", "…");
-  await store.openAlertEpisode("span_local_stale", "span", null, "⚠ SPAN local stream stale", "…");
+  const f = await store.openAlertEpisode("uid-f", "fault_called", "2", "pump2", "⚠ Stage 2 called but Heat Pump 2 is FAULTED", "E21");
+  const u = await store.openAlertEpisode("uid-u", "stage_unserved", "2", "pump2", "⚠ Stage 2 called 10 min but Heat Pump 2 is not heating", "…");
+  await store.openAlertEpisode("uid-s", "span_local_stale", "span", null, "⚠ SPAN local stream stale", "…");
+  assert.equal(await store.openAlertEpisode("uid-f", "fault_called", "2", "pump2", "dup", "dup"), f, "idempotent on uid (codex pass 8)");
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [1, 2, 3], "nothing acknowledged yet → all in the outbox");
   await store.markAlertNotified(f);
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u, 3]);
-  const recur = await store.openAlertEpisode("fault_called", "2", "pump2", "⚠ again", "E21");
+  const recur = await store.openAlertEpisode("uid-r", "fault_called", "2", "pump2", "⚠ again", "E21");
   await store.closeAlertEpisodeIds([f, 3]);
   assert.deepEqual((await store.openAlertEpisodes()).map((x) => x.id), [u, recur], "closes exactly the IDs given — a recurrence stays open");
   await store.closeAlertEpisodeIds([recur]);
@@ -91,6 +108,9 @@ async function main() {
   assert.deepEqual((await store.openAlertEpisodes()).map((x) => [x.kind, x.key]), [["stage_unserved", "2"]], "a restart re-adopts what is still open");
   assert.deepEqual((await store.undeliveredAlertEpisodes()).map((x) => x.id), [u], "a cleared episode leaves the outbox");
   assert.deepEqual(await store.alertEpisodes24h(), { fault_called: 2, stage_unserved: 1, span_local_stale: 1 });
+  const ghost = await store.openAlertEpisode("uid-g", "fault_called", "7", "pump2", "⚠ ghost", "x");
+  await store.closeAlertEpisodeUids(["uid-g"]);
+  assert.ok(!(await store.openAlertEpisodes()).some((x) => x.id === ghost), "closed by uid");
 
   // ── #185: fault codes from pump_snapshots (the mirror's latest-only full snapshot) ────────────────────────────────
   await pool.query(`DROP TABLE IF EXISTS pump_snapshots`);

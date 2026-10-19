@@ -152,6 +152,7 @@ export class Store {
       -- never silently "already alerted", and a restart re-adopts open episodes instead of re-paging them.
       CREATE TABLE IF NOT EXISTS alert_episodes (
         id          serial PRIMARY KEY,
+        uid         text UNIQUE,                 -- client-generated: an insert retried after a lost reply is idempotent
         kind        text NOT NULL,
         key         text NOT NULL,
         pump_id     text,
@@ -161,6 +162,7 @@ export class Store {
         detail      text,
         notified_at timestamptz
       );
+      ALTER TABLE alert_episodes ADD COLUMN IF NOT EXISTS uid text UNIQUE;
       CREATE TABLE IF NOT EXISTS hbx_boosts (
         id         serial PRIMARY KEY,
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -853,11 +855,19 @@ export class Store {
   }
 
   /** #185 / #187: open an alert episode; returns its id (the outbox row). */
-  async openAlertEpisode(kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number> {
+  async openAlertEpisode(uid: string, kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number> {
+    // idempotent on uid (codex pass 8): a retry after a commit whose reply was lost returns the SAME row
     const r = await this.pool.query(
-      `INSERT INTO alert_episodes (kind, key, pump_id, title, detail) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [kind, key, pumpId, title, detail]);
+      `INSERT INTO alert_episodes (uid, kind, key, pump_id, title, detail) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (uid) DO UPDATE SET uid = EXCLUDED.uid RETURNING id`,
+      [uid, kind, key, pumpId, title, detail]);
     return Number(r.rows[0].id);
+  }
+
+  /** Close episodes by their client uid — for an insert whose outcome was never learned. */
+  async closeAlertEpisodeUids(uids: string[]): Promise<void> {
+    if (!uids.length) return;
+    await this.pool.query(`UPDATE alert_episodes SET cleared_at = now() WHERE cleared_at IS NULL AND uid = ANY($1::text[])`, [uids]);
   }
 
   /** The page for this episode was acknowledged by a channel. */
@@ -944,17 +954,20 @@ export class Store {
    * (pendingCurveWrites) does not stretch it over the weeks it sat open. `note` lands in detail.closed. Returns the
    * number closed.
    */
-  async closeStormEvents(note: string, startedBefore?: Date, endedAt?: Date): Promise<number> {
+  async closeStormEvents(note: string, startedBefore?: Date, endedAt?: Date, clampToWindowEnd = false): Promise<number> {
     // startedBefore scopes the STARTUP sweep / a retried stand-down to rows that existed then: a retry must never close
-    // a storm armed meanwhile (codex pass 4). endedAt is the real moment of the stand-down — a close retried later
-    // still ends the row then, so the idle gap is not classified storm-active (codex pass 6). Default now().
+    // a storm armed meanwhile (codex pass 4). endedAt is the real moment (the stand-down, or the process start for an
+    // orphan) — a close retried later still ends the row then (codex passes 6, 8). clampToWindowEnd is for ORPHANS
+    // only: an orphan ends at its stored windowEnd if that came first; the CURRENT episode ends at its real stand-down
+    // even if an outage extended its window in memory past the stored one (codex pass 8).
     const r = await this.pool.query(
       `UPDATE storm_events SET
-         ended_at = GREATEST(started_at, LEAST(COALESCE($3::timestamptz, now()),
-           CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)),
+         ended_at = GREATEST(started_at, CASE WHEN $4::boolean THEN LEAST(COALESCE($3::timestamptz, now()),
+           CASE WHEN detail->>'windowEnd' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (detail->>'windowEnd')::timestamptz ELSE now() END)
+           ELSE COALESCE($3::timestamptz, now()) END),
          detail = COALESCE(detail, '{}'::jsonb) || jsonb_build_object('closed', $1::text)
        WHERE ended_at IS NULL AND ($2::timestamptz IS NULL OR started_at < $2::timestamptz)`,
-      [note, startedBefore ?? null, endedAt ?? null],
+      [note, startedBefore ?? null, endedAt ?? null, clampToWindowEnd],
     );
     return r.rowCount ?? 0;
   }

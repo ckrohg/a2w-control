@@ -747,7 +747,7 @@ let stormSweepDone = false;
 async function sweepStormOrphans(): Promise<void> {
   if (stormSweepDone) return;
   try {
-    const closed = await store.closeStormEvents("planner restart while idle", PROCESS_START);
+    const closed = await store.closeStormEvents("planner restart while idle", PROCESS_START, PROCESS_START, true);
     stormSweepDone = true;
     if (closed) console.log(`[storm] closed ${closed} orphaned storm_events row(s) — planner restart while idle`);
   } catch (e) {

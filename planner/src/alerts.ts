@@ -10,15 +10,18 @@
  * in memory with its delivery status until it can be persisted (then marked notified if it was already heard) or, if
  * still unheard, delivered directly; a recovery cancels it outright.
  */
+import { randomUUID } from "node:crypto";
+
 export interface AlertStore {
-  openAlertEpisode(kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number>;
+  openAlertEpisode(uid: string, kind: string, key: string, pumpId: string | null, title: string, detail: string): Promise<number>;
+  closeAlertEpisodeUids(uids: string[]): Promise<void>;
   markAlertNotified(id: number): Promise<void>;
   undeliveredAlertEpisodes(): Promise<{ id: number; kind: string; title: string; detail: string | null }[]>;
   closeAlertEpisodeIds(ids: number[]): Promise<void>;
 }
 export type Send = (title: string, body: string) => Promise<boolean>;
 
-interface Unrecorded { kind: string; key: string; pumpId: string | null; title: string; body: string; delivered: boolean }
+interface Unrecorded { uid: string; kind: string; key: string; pumpId: string | null; title: string; body: string; delivered: boolean }
 const k = (kind: string, key: string) => `${kind}\u0000${key}`;
 const RESENT = "\n\n(re-sent: the first delivery was not acknowledged by any channel)";
 
@@ -29,6 +32,8 @@ export class AlertOutbox {
   private unclosed = new Set<number>();
   /** IDs a channel acknowledged but whose notified_at write failed: the MARK is retried, the page never re-sent */
   private unmarked = new Set<number>();
+  /** uids of cancelled unrecorded episodes: the insert may have committed with its reply lost — close them by uid */
+  private unclosedUids = new Set<string>();
   /** episodes whose row could not be written (with whether a channel already heard the page) */
   private unrecorded: Unrecorded[] = [];
 
@@ -46,13 +51,14 @@ export class AlertOutbox {
   }
 
   async open(kind: string, key: string, pumpId: string | null, title: string, body: string): Promise<boolean> {
-    const id = await this.store.openAlertEpisode(kind, key, pumpId, title, body).catch((e) => {
+    const uid = randomUUID(); // the episode's identity before any write: retries are idempotent (codex pass 8)
+    const id = await this.store.openAlertEpisode(uid, kind, key, pumpId, title, body).catch((e) => {
       this.log(`alert episode open failed: ${(e as Error).message}`); return null;
     });
     if (id != null) this.track(kind, key, id);
     const delivered = await this.send(title, body);
     if (delivered && id != null) await this.mark(id);
-    if (id == null) this.unrecorded.push({ kind, key, pumpId, title, body, delivered });
+    if (id == null) this.unrecorded.push({ uid, kind, key, pumpId, title, body, delivered });
     return delivered;
   }
 
@@ -61,10 +67,11 @@ export class AlertOutbox {
    * a failed close is retried by ID, so an episode opened later for the same kind/key is never closed by it.
    */
   async close(kind: string, key: string): Promise<void> {
+    // a cancelled unrecorded episode may in fact be committed (reply lost): close it by uid as well
+    for (const u of this.unrecorded) if (u.kind === kind && u.key === key) this.unclosedUids.add(u.uid);
     this.unrecorded = this.unrecorded.filter((u) => !(u.kind === kind && u.key === key));
     const ids = [...(this.openIds.get(k(kind, key)) ?? [])];
     this.openIds.delete(k(kind, key));
-    if (!ids.length) return;
     for (const id of ids) this.unclosed.add(id);
     await this.flushCloses();
   }
@@ -76,10 +83,16 @@ export class AlertOutbox {
   }
 
   private async flushCloses(): Promise<void> {
-    if (!this.unclosed.size) return;
-    const ids = [...this.unclosed];
-    try { await this.store.closeAlertEpisodeIds(ids); for (const id of ids) this.unclosed.delete(id); }
-    catch (e) { this.log(`alert episode close failed (retried): ${(e as Error).message}`); }
+    if (this.unclosed.size) {
+      const ids = [...this.unclosed];
+      try { await this.store.closeAlertEpisodeIds(ids); for (const id of ids) this.unclosed.delete(id); }
+      catch (e) { this.log(`alert episode close failed (retried): ${(e as Error).message}`); }
+    }
+    if (this.unclosedUids.size) {
+      const uids = [...this.unclosedUids];
+      try { await this.store.closeAlertEpisodeUids(uids); for (const u of uids) this.unclosedUids.delete(u); }
+      catch (e) { this.log(`alert episode close by uid failed (retried): ${(e as Error).message}`); }
+    }
   }
 
   /** Unrecorded episodes (in memory only). */
@@ -100,7 +113,7 @@ export class AlertOutbox {
     const queue = this.unrecorded;
     this.unrecorded = [];
     for (const u of queue) {
-      const id = await this.store.openAlertEpisode(u.kind, u.key, u.pumpId, u.title, u.body).catch(() => null);
+      const id = await this.store.openAlertEpisode(u.uid, u.kind, u.key, u.pumpId, u.title, u.body).catch(() => null);
       if (id != null) {
         this.track(u.kind, u.key, id);
         if (u.delivered) await this.mark(id);
