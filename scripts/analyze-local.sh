@@ -23,7 +23,11 @@ DB="${1:-a2w_local}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-command -v psql >/dev/null || { echo "error: psql not found (brew install postgresql@17)" >&2; exit 1; }
+# Every tool the restore pipes through. The restore itself runs with errors suppressed, so a
+# missing tool (gpg, on 2026-10-19) otherwise "succeeds" with 0 tables and no hint why.
+for t in psql createdb dropdb gpg gunzip; do
+  command -v "$t" >/dev/null || { echo "error: $t not found on PATH (Postgres client tools + gnupg; e.g. brew install postgresql@18 gnupg)" >&2; exit 1; }
+done
 pg_isready -q 2>/dev/null || { echo "error: no local postgres running (brew services start postgresql@17)" >&2; exit 1; }
 
 if [ -z "${BACKUP_PASSPHRASE:-}" ]; then
@@ -60,6 +64,7 @@ ROWS="$(psql -Atd "$DB" -c "select count(*) from readings" 2>/dev/null || echo 0
 TABLES="$(psql -Atd "$DB" -c "select count(*) from pg_tables where schemaname='public'" 2>/dev/null || echo 0)"
 echo
 echo "restored: $TABLES tables, $ROWS rows in readings"
+[ "$TABLES" -gt 0 ] || { echo "error: nothing restored -- wrong passphrase, or a decrypt/restore step failed (rerun the pipeline without the >/dev/null to see why)" >&2; exit 1; }
 echo "snapshot is from ${LATEST#a2w-db-}; anything newer than that is NOT here."
 echo
 echo "query it with:   psql $DB"
