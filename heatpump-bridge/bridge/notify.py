@@ -17,9 +17,48 @@ log = logging.getLogger(__name__)
 # ntfy still gets everything.
 
 
+def _sixbb_eligible(priority: str, tags: str) -> bool:
+    """What reaches the owner's phone via 6bb: the alerts that matter (high/urgent) and their all-clears."""
+    return priority in ("high", "urgent") or "white_check_mark" in (tags or "")
+
+
+async def sixbb_push(cfg, *, title: str, message: str, priority: str, tag: str = "") -> bool:
+    """Push to the owner's devices through 6bb's /api/external/alert. No-op unless configured; never raises."""
+    if not cfg or not getattr(cfg, "sixbb_alert_url", None) or not getattr(cfg, "sixbb_alert_key", None):
+        return False
+    slug = "".join(ch if ch.isalnum() else "-" for ch in title.lower()).strip("-")
+    payload = json.dumps({"source": "a2w-pi", "title": title.strip(), "body": message, "priority": priority,
+                          "tag": tag or "a2w-pi-" + "-".join(p for p in slug.split("-") if p)[:44]}).encode("utf-8")
+
+    def _post() -> bool:
+        try:
+            req = urllib.request.Request(
+                cfg.sixbb_alert_url, data=payload, method="POST",
+                headers={"Authorization": f"Bearer {cfg.sixbb_alert_key}", "Content-Type": "application/json",
+                         "User-Agent": "a2w-bridge/1.0"})
+            urllib.request.urlopen(req, timeout=10).read()
+            return True
+        except Exception as exc:  # noqa: BLE001 — alerting must never break the poller
+            log.warning("6bb push failed: %s", exc)
+            return False
+
+    return await asyncio.to_thread(_post)
+
+
 async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
                tags: str = "") -> None:
-    """Fire-and-forget push to an ntfy topic. No-op if not configured."""
+    """Fire-and-forget push to an ntfy topic (and, for high/urgent alerts and all-clears, to the owner's phone
+    via 6bb). No-op if neither is configured."""
+    six = (asyncio.create_task(sixbb_push(cfg, title=title, message=message, priority=priority))
+           if _sixbb_eligible(priority, tags) else None)   # in parallel: a slow 6bb never delays ntfy
+    try:
+        await _ntfy_post(cfg, title=title, message=message, priority=priority, tags=tags)
+    finally:
+        if six is not None:
+            await six
+
+
+async def _ntfy_post(cfg, *, title: str, message: str, priority: str, tags: str) -> None:
     if not cfg or not cfg.ntfy_topic:
         return
     url = f"{cfg.ntfy_server.rstrip('/')}/{cfg.ntfy_topic}"

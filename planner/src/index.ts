@@ -415,6 +415,34 @@ async function ntfy(title: string, body: string, priority = "default",
  * configured channel failed or refused. ntfy() is the fire-and-log form every alert uses; #177's pending-notice path
  * calls this one and resolves its evidence only on true (codex pass 9).
  */
+// ── 6bb push (owner 2026-10-19) ─────────────────────────────────────────────────────────────────────────────
+// ntfy had no subscriber (the owner never installed it — 2026-08-23: "emails are plenty"), so no A2W push ever
+// reached a phone. High/urgent alerts and their all-clears now also go to the 6bb app's token-protected
+// /api/external/alert, which pushes to the owner's devices. Email is untouched. No-op unless both vars are set.
+const SIXBB_ALERT_URL = process.env.SIXBB_ALERT_URL ?? "";
+const SIXBB_ALERT_KEY = process.env.SIXBB_ALERT_KEY ?? "";
+async function sixbbPush(source: string, title: string, body: string, priority: string, tag: string): Promise<boolean> {
+  if (!SIXBB_ALERT_URL || !SIXBB_ALERT_KEY) return false;
+  for (const delay of [0, 3_000, 12_000]) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    try {
+      const r = await fetch(SIXBB_ALERT_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${SIXBB_ALERT_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ source, title: title.trim(), body, priority, tag }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (r.ok || r.status === 429) return r.ok;   // answered: a rate cap is not retried
+      console.error(`6bb push rejected: HTTP ${r.status}`);
+      return false;
+    } catch (e) {
+      console.error("6bb push attempt failed:", (e as Error).message);
+    }
+  }
+  return false;
+}
+const pushTag = (t: string) => t.replace(/[^A-Za-z0-9 ]/g, "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 50);
+
 async function ntfyDelivered(title: string, body: string, priority = "default",
                              opts: { resolved?: boolean; email?: boolean } = {}): Promise<boolean> {
   let delivered = false;
@@ -448,6 +476,9 @@ async function ntfyDelivered(title: string, body: string, priority = "default",
       }
     }
   }
+  if (priority === "high" || priority === "urgent" || opts.resolved) {
+    if (await sixbbPush("a2w-planner", title, body, priority, pushTag(title))) delivered = true;
+  }
   // opts.email is the explicit override in BOTH directions: false mutes a high-priority
   // signal that fires too often to be worth an inbox slot, true forces one through.
   const wantsEmail = opts.email ?? (EMAIL_PRIORITIES.has(priority) || !!opts.resolved);
@@ -472,7 +503,8 @@ async function ntfyDelivered(title: string, body: string, priority = "default",
       console.error("resend email failed:", (e as Error).message);
     }
   }
-  const anyChannel = !!NTFY_TOPIC || (wantsEmail && !!RESEND_API_KEY && !!RESEND_TO);
+  const anyChannel = !!NTFY_TOPIC || (wantsEmail && !!RESEND_API_KEY && !!RESEND_TO)
+    || ((priority === "high" || priority === "urgent" || !!opts.resolved) && !!SIXBB_ALERT_URL && !!SIXBB_ALERT_KEY);
   return delivered || !anyChannel;
 }
 
