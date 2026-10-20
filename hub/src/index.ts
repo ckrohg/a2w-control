@@ -110,6 +110,34 @@ function describeFetchError(err: unknown): string {
   return `${e.message} — cause: ${one(cause)}`;
 }
 
+// ── 6bb push (owner 2026-10-19) ─────────────────────────────────────────────────────────────────────────────
+// ntfy had no subscriber (the owner never installed it — 2026-08-23: "emails are plenty"), so no A2W push ever
+// reached a phone. High/urgent alerts and their all-clears now also go to the 6bb app's token-protected
+// /api/external/alert, which pushes to the owner's devices. Email is untouched. No-op unless both vars are set.
+const SIXBB_ALERT_URL = process.env.SIXBB_ALERT_URL ?? "";
+const SIXBB_ALERT_KEY = process.env.SIXBB_ALERT_KEY ?? "";
+async function sixbbPush(source: string, title: string, body: string, priority: string, tag: string): Promise<boolean> {
+  if (!SIXBB_ALERT_URL || !SIXBB_ALERT_KEY) return false;
+  for (const delay of [0, 3_000, 12_000]) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    try {
+      const r = await fetch(SIXBB_ALERT_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${SIXBB_ALERT_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ source, title: title.trim(), body, priority, tag }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (r.ok || r.status === 429) return r.ok;   // answered: a rate cap is not retried
+      console.error(`6bb push rejected: HTTP ${r.status}`);
+      return false;
+    } catch (e) {
+      console.error("6bb push attempt failed:", (e as Error).message);
+    }
+  }
+  return false;
+}
+const pushTag = (t: string) => t.replace(/[^A-Za-z0-9 ]/g, "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 50);
+
 /** Fire-and-forget ntfy push. No-op when NTFY_TOPIC is unset; never throws.
  *  Retries over ~15s: #66 diagnosis showed Railway→ntfy.sh connectivity is INTERMITTENT —
  *  connect-level AggregateError on one boot, HTTP 200 minutes later — and dead-man pushes
@@ -117,6 +145,11 @@ function describeFetchError(err: unknown): string {
  *  response is NOT retried (the server answered; hammering a 429 makes it worse). */
 async function notifyNtfy(title: string, message: string,
                           opts: { priority?: string; tags?: string } = {}): Promise<void> {
+  // high/urgent alerts and their all-clears (white_check_mark) also reach the owner's phone via 6bb; same tag so
+  // the all-clear replaces the alert on the device
+  if (opts.priority === "high" || opts.priority === "urgent" || opts.tags === "white_check_mark") {
+    void sixbbPush("a2w-hub", title, message, opts.priority ?? "default", "a2w-hub-pi-link");
+  }
   if (!NTFY_TOPIC) return;
   // HTTP headers are ByteStrings (Latin-1) — strip anything above U+00FF so a stray emoji in
   // a title can never throw and silently kill the alert. Emoji belong in `tags`, which ntfy

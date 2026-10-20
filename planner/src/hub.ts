@@ -1,7 +1,8 @@
 /**
- * @purpose Read-only hub client — GET /api/state (Bearer HUB_CLIENT_TOKEN) for the pump
- * setpoints/online flags the Pi pushes. Used by the I1 monitor. This client never sends
- * commands; the planner's write path (Phase B) will be a separate, deliberate addition.
+ * @purpose Hub client — GET /api/state (Bearer HUB_CLIENT_TOKEN) for the pump setpoints/online flags and the SPAN
+ * breaker snapshot the Pi pushes (I1 monitor, stage watch, backup gate); POST /api/command for Phase B's leased
+ * setpoints; POST /api/breaker for the LIVE backup-element gate only (backupgate.ts — also needs HUB_ARM_TOKEN, the
+ * same second factor the dashboard releases after a password re-entry; the Pi applies every breaker guard itself).
  */
 
 export interface HubPump {
@@ -25,6 +26,21 @@ export interface HubPump {
   active_faults?: number | null;
 }
 
+/** One allowlisted breaker in the Pi's SPAN snapshot (bridge span_control.BreakerController.snapshot). */
+export interface HubBreaker {
+  name: string;
+  found?: boolean;
+  relay_state?: "OPEN" | "CLOSED" | string | null;
+  /** SPAN instantPowerW — NEGATIVE for consumption on this panel */
+  power_w?: number | null;
+}
+export interface HubSpan {
+  ts?: number | null;
+  circuits?: HubBreaker[];
+  /** the Pi-local fallback (bridge backup_fallback.py), when the bridge has it */
+  backup_fallback?: Record<string, unknown> | null;
+}
+
 export interface HubState {
   pi_connected: boolean;
   /**
@@ -36,6 +52,8 @@ export interface HubState {
    */
   ts: number | null;
   pumps: HubPump[];
+  /** the Pi's SPAN breaker snapshot (null: no SPAN on the bridge, or a hub predating it) */
+  span?: HubSpan | null;
 }
 
 export class HubClient {
@@ -50,11 +68,12 @@ export class HubClient {
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) throw new Error(`hub GET /api/state: HTTP ${res.status}`);
-    const body = (await res.json()) as { pi_connected?: boolean; ts?: number | null; pumps?: HubPump[] };
+    const body = (await res.json()) as { pi_connected?: boolean; ts?: number | null; pumps?: HubPump[]; span?: HubSpan | null };
     return {
       pi_connected: body.pi_connected ?? false,
       ts: body.ts ?? null,
       pumps: Array.isArray(body.pumps) ? body.pumps : [],
+      span: body.span && typeof body.span === "object" ? body.span : null,
     };
   }
 
@@ -78,6 +97,28 @@ export class HubClient {
       return { ok: false, detail: body.detail || `HTTP ${res.status}` };
     } catch (e) {
       return { ok: false, detail: (e as Error).message };
+    }
+  }
+
+  /** LIVE backup gate only: one breaker action through the hub → Pi BreakerController. ok = the Pi VERIFIED the relay
+   *  read-back. Never throws; a refusal / timeout is a normal outcome the caller retries later. */
+  async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string): Promise<{ ok: boolean; refused: boolean; detail: string }> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/breaker`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.token}`, "X-Arm-Token": armToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ circuit, action, source }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string; result?: { refused?: boolean } | null };
+      const ok = res.ok && body.ok === true;
+      // refused = definitely nothing switched and a retry cannot help: a bridge guard (result.refused), or the hub
+      // rejecting the request itself (auth, validation, a bridge without breaker control). 502 without `refused` is
+      // "switched but not verified"; 503 / 504 are no Pi / no answer — those retry.
+      const refused = !ok && (body.result?.refused === true || [400, 401, 403, 404, 422, 501].includes(res.status));
+      return { ok, refused, detail: body.detail || `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, refused: false, detail: (e as Error).message };
     }
   }
 }

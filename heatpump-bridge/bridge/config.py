@@ -156,6 +156,11 @@ class NotifyConfig(BaseModel):
     resend_api_key: str | None = None
     resend_to: str | None = None
     resend_from: str = "A2W Alerts <onboarding@resend.dev>"
+    # Phone push via the 6bb app (owner 2026-10-19). Nobody subscribed to the ntfy topic, so no A2W push ever
+    # reached a phone. High/urgent alerts and their all-clears also POST to 6bb's token-protected
+    # /api/external/alert, which pushes to the owner's devices. Email is unchanged.
+    sixbb_alert_url: str | None = None
+    sixbb_alert_key: str | None = None
     # Comm-loss alert shaping (owner asks 2026-08-06, after a morning of 20-min WiFi flaps
     # each paging individually): brief dropouts are LOGGED (events/dashboard) but not
     # pushed. An ntfy PAGE fires for what's actionable:
