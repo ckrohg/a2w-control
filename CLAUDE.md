@@ -37,7 +37,7 @@ Write journal entries AS YOU WORK, not at session end. Each entry needs:
 against both real pumps; write_enabled was flipped on pump 1 on 2026-07-13 and both pumps are
 write-enabled now. The cloud side is live: Railway hub + Railway Postgres (migrated off Neon
 2026-08-23, #79) + Vercel dashboard. **Phase B is ACTIVE** — the planner drives both pumps'
-setpoints to track the HBX tank target (52 °C at last check) on 90-minute leases. The winter DP
+setpoints to track the HBX tank target (52–63 °C in Oct 2026) on 90-minute leases. The winter DP
 solver runs in SHADOW; `demand_forecast` is idle with both gates off. TempIQ push/read are
 live (18 zones, 38 spatial edges). Winnie's thread CLOSED 2026-07-14 — nothing is owed either
 direction. Dev quickstart in `heatpump-bridge/README.md`.
@@ -46,20 +46,31 @@ direction. Dev quickstart in `heatpump-bridge/README.md`.
 was ROADMAP.md. `scripts/drift-check.sh` now asserts declared-vs-live; run it before believing
 any stage claim, including this one.
 
-**OPEN SAFETY ITEM — FINDING-1 (read before touching the control path):** the
-revert-to-baseline failsafe that every doc promises is **not armed on the live Pi**.
-`baseline_setpoint_c` is unset, so the Pi records NO lease (`poller.py:600`), `check_lease()`
-returns early every tick, and the revert + its alert + the 15-min warning cannot fire. Measured:
-`remote_lease_until: null` on both pumps. Not an imminent freeze hazard (the pumps hold their
-last warm setpoint) but there is no automatic recovery from a dead planner. Remediation is a
-hands-on Pi edit — `knowledge/reference/finding1-arm-baseline-runbook.md`. The live config is
-`~/bridge-data/config.yaml`, OUTSIDE the repo; no merge, tag, or deploy can change it.
+**FINDING-1 is CLOSED (armed 2026-10-18).** The revert-to-baseline failsafe is live on the Pi.
+`~/bridge-data/config.yaml` has `guardrails.baseline_setpoint_c: 52`, `lease_max_minutes: 180` and
+`lease_warn_minutes: 15`, so `check_lease()` runs every tick. Planner `/health.phase_b` reports
+`lease Nm armed` per pump. Treat the revert as a SAFETY write: nothing may hold, queue or rate-limit it (see #208).
+The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; edit it on the Pi, back it up first.
 
-**Next:** run the FINDING-1 runbook; then the winter backlog (#89 TempIQ/local required-supply
-divergence up to 45 °F, #87 winter DP v2, #76 comm degradation, #94 bridge-tests segfault).
-The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
-`FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated,
-not work-gated.
+**Live safety layer (2026-10-19; verify with `scripts/drift-check.sh` and `/health`, not this list):**
+- **HBX `lagT` = 60** (drift-check [9]). At 180 the HBX never added the second pump or the backup, which was the
+  Oct 14–16 incident's root cause (`incident-20261016-hp2-e21-investigation.md` §6). Never raise it to save
+  element energy; the element is gated by its SPAN breaker ("Buffer Tank", kept OPEN) instead.
+- **Self-heal LIVE** on the Pi (`self_heal.live`, `circuits_verified`): power-cycles a pump's SPAN circuit on E21.
+  The **backup-element gate** (planner `BACKUP_GATE`, Pi `backup_fallback`) and **pump-health** checks run in SHADOW.
+  Promotion is the owner's call.
+- **6bb also switches SPAN breakers, heating circuits included.** That is the owner's decision; the panel reports
+  USER for both systems. A pump switched off by a person is deliberate, not a fault (#212).
+- **Alerts:** high/urgent alerts and all-clears push to the owner's phone via 6bb `/api/external/alert`
+  (`SIXBB_ALERT_*`; Pi `notifications.sixbb_alert_*`). Email is unchanged. Nobody subscribes to the ntfy topic.
+- **SPAN local API v1 is removed 2026-12-31** (#199): migrate `span_local` to v2 in November.
+- **DB backups** cover the live Railway Postgres 18 again (#203). Restore with `scripts/analyze-local.sh`; on the
+  administrator Mac, put `~/micromamba/envs/pg/bin` on PATH first.
+
+**Next:** the Pi gets Ethernet about 2026-10-26; its Wi-Fi is −79 dBm and causes the remaining dropouts. Then the
+winter backlog: #89 TempIQ/local required-supply divergence, #87 winter DP v2, #76 comm degradation, #94 bridge-tests
+segfault. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
+`FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated.
 
 **Working rules (added 2026-09-16 after the Pi went offline mid-session — see
 `knowledge/reference/incident-20260916-pi-offline.md`):**
