@@ -244,6 +244,23 @@ if [ -n "$HEALTH" ]; then
   fi
 fi
 
+echo "[9] HBX lag-stage timer — the setting behind the 2026-10-16 no-heat incident (#132)"
+# lagT is the HBX's stage-ON lag. At 180 (2026-08-07 -> 2026-10-19) the HBX called the second heat pump and the
+# backup ZERO times in 10 weeks, including the 14 h incident call with the lead pump faulted. Set back to 60 on
+# 2026-10-19 (owner-authorized); the element stays gated by its SPAN breaker instead. The planner reads the live value
+# from the HBX every poll and reports it at /health.unserved.lag_t_min.
+EXPECT_LAGT=60
+if [ -n "$HEALTH" ]; then
+  LAGT="$(jq -r '.unserved.lag_t_min // empty' <<<"$HEALTH")"
+  if [ -z "$LAGT" ]; then
+    skip "planner does not report /health.unserved.lag_t_min yet"
+  elif [ "${LAGT%.*}" -eq "$EXPECT_LAGT" ]; then
+    pass "HBX lagT=${LAGT} min (declared ${EXPECT_LAGT}) — a faulted lead pump hands over within the hour"
+  else
+    fail "HBX lagT=${LAGT} min, declared ${EXPECT_LAGT} — at 180 the second heat pump never joined (#132, incident 2026-10-16)"
+  fi
+fi
+
 echo "[8] SPAN local stream — the path every SPAN safety action depends on (#187, incident 2026-10-16 F5)"
 # The Pi's LAN poller (span_local.py) lands span_readings in the mirror every ~25 s; the planner reports the newest
 # sample's age at /health.span. The cloud path failing alone is reported there but is not drift.

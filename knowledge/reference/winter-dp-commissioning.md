@@ -117,9 +117,16 @@ a replacement).
 
 ## Standing hardware items before real cold
 
+- **HBX `lagT` = 60 min (set 2026-10-19, owner-authorized; asserted by `scripts/drift-check.sh` [9]).** At 180
+  (2026-08-07 → 2026-10-19) the HBX called the second heat pump and the backup **zero** times in 10 weeks, including
+  a 20.1 h and the 14.2 h incident single-stage call (`incident-20261016-hp2-e21-investigation.md` §6). The summer
+  reason for 180, keeping the 16.5 kW element out of shower sags, is now handled by the element's **SPAN breaker**
+  ("Buffer Tank", kept OPEN). A2W closes it only when a pump has failed or both can't hold the tank; that dynamic
+  gate is building in shadow. Do not raise `lagT` again to save element energy. Gate the breaker instead.
+
 - **#76** comm degradation (Aug 5 onset, both pumps) — root cause + fix; done = ≤ 1
   offline/pump/week for 7 days.
 - **HP2 E21 history** — cleared 2026-08-06 but ran 2 silent weeks in July; winter
   failure-to-start is HP2's known pattern. Fault emails now page same-day. Winnie follow-up
   drafted (`winnie-followup-draft.md`): E21 semantics + forced-defrost register + serial.
-- **SPAN element breaker** ON + backup alarm armed (physical checklist in winter-drill.md).
+- **SPAN element breaker**: superseded 2026-10-19. It stays OPEN by default, and A2W's dynamic gate closes it when a pump has failed or both can't hold the tank (shadow first; see the lagT item above). The backup alarm stays armed (physical checklist in winter-drill.md).
