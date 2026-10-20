@@ -1,13 +1,17 @@
 /**
  * @purpose SPAN backup-element power alarm via the SPAN CLOUD API — no tunnel (planner is cloud,
  * SPAN's local API is LAN-only, so we use the same cloud path TempIQ uses). Auths with the SPAN
- * account (SRP via amazon-cognito-identity-js), polls the per-circuit current-hour energy, and pages
- * HIGH-priority when the 16.5 kW backup circuit consumes real energy this hour — an idle circuit reads
- * ~0 kWh, the element running spikes it to kWh within a minute. Independent net vs the HBX's own
- * backup_called DECISION flag (this confirms ACTUAL draw). Config-gated: dormant unless SPAN_USERNAME
- * is set. STANDALONE — A2W's own SPAN login; the pattern is copied from TempIQ (span-cloud.ts), no
- * runtime coupling. Detection latency ~1h (SPAN's hourly energy aggregation) — fine here: the element
- * runs for hours, and backup_called is the instant signal.
+ * account (SRP via amazon-cognito-identity-js) and polls each circuit's DAY-cumulative energy:
+ * HOUR_ENERGY_Q asks measurementAggregation for duration: DAY / calendarWindows: true, so `value` is
+ * "kWh so far today" — 0 at the building's local midnight, the day's total at 23:00 (established
+ * against stored data in #207; the query's name predates that finding). The alarm differences that
+ * running total poll to poll and sums the increments of the trailing 60 minutes: it pages HIGH when
+ * the 16.5 kW backup circuit drew more than alarmKwh in any 60-minute window — an idle circuit adds
+ * ~0, the element running adds ~0.275 kWh per minute — and clears once the trailing hour is back under
+ * the threshold. Independent net vs the HBX's own backup_called DECISION flag (this confirms ACTUAL
+ * draw). Config-gated: dormant unless SPAN_USERNAME is set. STANDALONE — A2W's own SPAN login; the
+ * pattern is copied from TempIQ (span-cloud.ts), no runtime coupling. The same poll records the pump
+ * circuits' day-cumulative value into span_energy for the realized-savings ledger (#207).
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
 import type { Store } from "./store";
@@ -16,7 +20,13 @@ import type { Store } from "./store";
 const COGNITO = { userPoolId: "us-west-2_xqz9y67ID", clientId: "21vd907gimk5ctc0pop94l2lip" };
 const API_BASE = "https://app-api.prod.span-csp.com";
 
+/** The alarm's window: energy the element drew in the last this-many ms is what is compared to alarmKwh. */
+export const BACKUP_WINDOW_MS = 60 * 60_000;
+
 const BUILDINGS_Q = `query { data: currentUser { buildings { name buildingId accepted } } }`;
+// `currentHour` is a historical alias: with duration: DAY / calendarWindows: true the value is the circuit's
+// energy so far TODAY (local calendar day), not the current hour's. Kept as-is so the field name in stored
+// evidence and in #207's analysis still matches; the semantics are handled below.
 const HOUR_ENERGY_Q = `
   query getCurrentHourEnergy($buildingId: String!) {
     data: currentUser {
@@ -36,25 +46,37 @@ export class SpanWatch {
   private token: string | null = null;
   private tokenExpMs = 0;
   private buildingId: string | null = null;
-  private alarmed = false;
   private loggedOk = false;
-  public lastKwh: number | null = null;
+  /** edge state: a page is open until the trailing hour is back under alarmKwh (/health.span.cloud.backup_alarmed) */
+  public alarmed = false;
+  /** kWh the backup circuit drew in the trailing BACKUP_WINDOW_MS — what the alarm compares to alarmKwh */
+  public lastHourKwh: number | null = null;
+  /** SPAN's day-cumulative reading for the backup circuit at the last successful poll (kWh so far today) */
+  public lastDayKwh: number | null = null;
   public lastError: string | null = null;
   /** #187: when the cloud path last answered, and how many ticks in a row have failed since (/health.span.cloud) */
   public lastOkAt: string | null = null;
   public failStreak = 0;
+  // The day counter at the previous poll, and the per-poll increments still inside the window.
+  private prevDayKwh: number | null = null;
+  private increments: { t: number; kwh: number }[] = [];
 
   constructor(
     private readonly username: string,
     private readonly password: string,
     private readonly circuitMatch: string, // case-insensitive circuit-name substring
-    private readonly alarmKwh: number,      // page when this hour's energy exceeds this (kWh)
+    private readonly alarmKwh: number,      // page when the trailing 60 minutes' energy exceeds this (kWh)
     private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
     private readonly fixedBuildingId?: string,
     private readonly store?: Store,         // when set, accumulate pump energy → span_energy
     private readonly pumpMatch?: string,    // case-insensitive substring for the pump circuits (Air-Water)
   ) {
     if (fixedBuildingId) this.buildingId = fixedBuildingId;
+  }
+
+  /** The clock — overridable so spanwatch.test.ts can walk a scripted sequence through hour and day boundaries. */
+  protected now(): Date {
+    return new Date();
   }
 
   /** SRP login (amazon-cognito-identity-js), same as TempIQ. Returns a JWT access token. */
@@ -78,7 +100,8 @@ export class SpanWatch {
     return this.token;
   }
 
-  private async gql(query: string, variables: Record<string, unknown>): Promise<any> {
+  /** The HTTP layer — protected so a test can script the GraphQL responses without Cognito or the network. */
+  protected async gql(query: string, variables: Record<string, unknown>): Promise<any> {
     const token = await this.accessToken();
     const res = await fetch(`${API_BASE}/graphql`, {
       method: "POST",
@@ -102,14 +125,39 @@ export class SpanWatch {
     return this.buildingId;
   }
 
-  /** Poll once. Alarms when the backup circuit's current-hour energy exceeds alarmKwh. */
+  /**
+   * Fold one day-cumulative reading into the trailing-hour window; returns the window's energy (kWh).
+   *
+   * Why difference the DAY counter here instead of asking SPAN for an HOUR window: (1) the DAY field's
+   * semantics are verified against stored data (#207) — an HOUR / calendarWindows variant is not, and
+   * the owner's account cannot be exercised from a dev box; (2) a calendar-hour reading restarts at 0
+   * every top of the hour, so a continuously running element would clear and re-page hourly, while a
+   * trailing window stays up until the element has been off for an hour; (3) the window does not care
+   * how often SPAN's cloud refreshes the aggregate — a once-an-hour step of 0.3 kWh pages exactly like
+   * a smooth climb. One query, one field, no second alias.
+   *
+   * A DROP in the counter is SPAN's calendar DAY rolling over at the building's local midnight — the
+   * planner's clock never needs to know where that is. That step counts as 0: at most one poll interval
+   * (~0.275 kWh at 16.5 kW) of real energy is lost at the crossing, and the following polls keep adding
+   * at that rate if the element is still running. The first sample after a start only sets the baseline.
+   */
+  private accrue(dayKwh: number, nowMs: number): number {
+    if (this.prevDayKwh !== null && dayKwh > this.prevDayKwh) this.increments.push({ t: nowMs, kwh: dayKwh - this.prevDayKwh });
+    this.prevDayKwh = dayKwh;
+    const cutoff = nowMs - BACKUP_WINDOW_MS;
+    this.increments = this.increments.filter((x) => x.t > cutoff);
+    return this.increments.reduce((s, x) => s + x.kwh, 0);
+  }
+
+  /** Poll once. Alarms when the backup circuit drew more than alarmKwh in the trailing 60 minutes. */
   async tick(): Promise<void> {
     try {
       const buildingId = await this.findBuilding();
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });
+      const now = this.now();
       const panels: any[] = d?.data?.building?.multiPanels ?? [];
       let hit: { name: string; kwh: number; unit: string } | null = null;
-      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' current-hour energy
+      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' day-to-date energy (see below)
       for (const p of panels) for (const s of p.spaces ?? []) {
         const name = (s.name ?? "").toLowerCase();
         if (name.includes(this.circuitMatch.toLowerCase())) {
@@ -121,10 +169,14 @@ export class SpanWatch {
           if (Number.isFinite(v)) pumpKwh += v;
         }
       }
-      // Accumulate the pumps' metered energy for the current hour (SPAN's per-hour value grows then
-      // resets; upsertSpanEnergyHour keeps the MAX seen). Never fails the alarm path.
+      // Record the pumps' metered energy. HOUR_ENERGY_Q asks for duration: DAY / calendarWindows: true,
+      // so the value is SPAN's DAY-cumulative kWh (0 at local midnight, the day's total at 23:00), not
+      // the hour's energy: each span_energy row is a running total and upsertSpanEnergyHour keeps the
+      // MAX seen within the hour. Readers take a day's MAX row, never a sum (store.getRealizedDayInputs;
+      // deep dive 2026-10-19 §4.1). Stored RAW on purpose — the alarm's differencing below is not applied
+      // here. Never fails the alarm path.
       if (this.store && this.pumpMatch) {
-        await this.store.upsertSpanEnergyHour(new Date(), pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
+        await this.store.upsertSpanEnergyHour(now, pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
       }
       if (!hit) {
         const names = panels.flatMap((p) => (p.spaces ?? []).map((s: any) => s.name)).filter(Boolean);
@@ -134,23 +186,25 @@ export class SpanWatch {
         return;
       }
       this.lastError = null;
-      this.lastKwh = hit.kwh;
-      this.lastOkAt = new Date().toISOString();
+      const hourKwh = this.accrue(hit.kwh, now.getTime());
+      this.lastDayKwh = hit.kwh;
+      this.lastHourKwh = hourKwh;
+      this.lastOkAt = now.toISOString();
       this.failStreak = 0;
       if (!this.loggedOk) {
         this.loggedOk = true;
-        console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${hit.kwh} ${hit.unit} this hour (alarm > ${this.alarmKwh} kWh)`);
+        console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${hit.kwh} ${hit.unit} so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
       }
-      if (hit.kwh > this.alarmKwh && !this.alarmed) {
+      if (hourKwh > this.alarmKwh && !this.alarmed) {
         this.alarmed = true;
         await this.notify(
           "16.5 kW backup element DREW POWER",
-          `SPAN "${hit.name}" consumed ${hit.kwh.toFixed(2)} kWh this hour — the resistive element actually ran (≈$${(hit.kwh * 0.3).toFixed(2)} so far). Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
+          `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today, ≈$${(hit.kwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
           "high",
         );
-      } else if (hit.kwh <= this.alarmKwh && this.alarmed) {
+      } else if (hourKwh <= this.alarmKwh && this.alarmed) {
         this.alarmed = false;
-        await this.notify("Backup element power cleared", `SPAN "${hit.name}" back to ${hit.kwh.toFixed(2)} kWh this hour.`);
+        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today).`);
       }
     } catch (e) {
       // Never alarm on a read/auth failure (transient) — backup_called is the redundant net. Just log.
