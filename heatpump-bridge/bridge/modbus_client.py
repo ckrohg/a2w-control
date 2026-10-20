@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+import struct
 import time
 from dataclasses import dataclass, field
 
@@ -120,7 +122,22 @@ class PumpClient:
         client disconnects, so a response still in flight (WiFi stall) can never be
         matched to a LATER request — RTU framing has no transaction IDs to catch that."""
         if category in ("timeout", "io"):
-            self._client.close()
+            self._hard_close()
+
+    def _hard_close(self) -> None:
+        """Close with SO_LINGER 0 (RST), not the default graceful FIN. A timeout usually
+        means the Pi's WiFi stalled with our request frame still unacknowledged in the
+        kernel's send queue; a graceful close leaves that orphaned socket retransmitting,
+        so the stale frame can reach the W610 — and HP2's CN22 bus — after the link comes
+        back, alongside the fresh session's first poll. RST discards it instead."""
+        transport = getattr(getattr(self._client, "ctx", None), "transport", None)
+        sock = transport.get_extra_info("socket") if transport is not None else None
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            except OSError:
+                pass  # already dead — the plain close below is all that's left to do
+        self._client.close()
 
     async def read_block(self, block: ReadBlock) -> dict[int, int]:
         """Read one batched register block, returning {address: raw}."""
