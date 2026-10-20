@@ -5,6 +5,7 @@
  * run-hour counters) is deliberately excluded so drift means "someone changed a setting".
  * Canonical as-found baseline: knowledge/reference/hbx-config-asfound-20260713.json.
  */
+import type { NotifyOpts } from "./alertpolicy";
 
 export const CONFIG_FIELDS = [
   // hot-tank curve + differential
@@ -197,7 +198,7 @@ export interface DriftDeps {
    */
   latest?: () => Promise<{ config: HbxConfig; raw: Record<string, any> | null } | null>;
   /** Resolves false when no channel acknowledged the alert (index.ts ntfyDelivered); void = assume delivered. */
-  notify: (title: string, body: string, priority: string, opts?: { email?: boolean }) => Promise<boolean | void>;
+  notify: (title: string, body: string, priority: string, opts: NotifyOpts) => Promise<boolean | void>;
   /** writes.ts withDeviceLock — serialises the re-read → record with the planner's own PATCH → record. */
   lock?: <T>(fn: () => Promise<T>) => Promise<T>;
   now?: () => number;
@@ -304,8 +305,8 @@ export async function handlePolledConfig(
     const summary = fmtChanges(changes);
     log(`HBX CONFIG DRIFT (outside the planner):\n${summary}`);
     // ~0.98/day of foreign edits — genuine drift signal, but it belongs in the versioned
-    // history and the /hbx page, not in a daily email that would dilute the warn tier.
-    await deps.notify("HBX config changed (outside the planner)", summary, "high", { email: false });
+    // history and the /hbx page, not in the owner's inbox or on their phone.
+    await deps.notify("HBX config changed (outside the planner)", summary, "high", { tier: "record" });
     return { kind: "config_drift", config, device: dev, changes, diagnosis: null };
   }
 
@@ -429,7 +430,7 @@ export async function handlePolledConfig(
     // The change did not persist — a stale/transient cloud read (or superseded by our own write), not a writer.
     // Both reads are recorded; nobody is paged. A NON-curve field that did change for good is still drift.
     log(`HBX curve change reverted on re-read (transient, not paged):\n${fmtChanges(changes)}`);
-    if (finalChanges) await deps.notify("HBX config changed (outside the planner)", fmtChanges(finalChanges), "high", { email: false });
+    if (finalChanges) await deps.notify("HBX config changed (outside the planner)", fmtChanges(finalChanges), "high", { tier: "record" });
     return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis };
   }
 
@@ -443,7 +444,8 @@ export async function handlePolledConfig(
         `${ECHO_TOLERANCE_F} °F of a value the planner itself wrote in the last 60 min — the signature of the device or ` +
         `the SensorLinx cloud echoing/transforming an earlier planner write, not of a second writer.\n\n${evidence}`,
       "default",
-      { email: true }, // the email IS the evidence (#177 acceptance)
+      // the evidence is the hbx_config_versions row (verdict + diagnosis) and the notifications log; no human is needed
+      { tier: "record" },
     );
   } else {
     log(`FOREIGN HBX CURVE WRITE — single-writer violation:\n${fmtChanges(diagnosis.fields)}`);
@@ -455,6 +457,9 @@ export async function handlePolledConfig(
       FOREIGN_TITLE,
       `A writer OTHER than the planner moved the reset curve, bypassing I4/I1/rate-limit/audit:\n${fmtChanges(diagnosis.fields)}\n\nThe deployed a2w-planner must be the SOLE HBX writer — retire any direct-to-SensorLinx script or parallel instance (README §Single-writer invariant, #36).\n\n${evidence}`,
       "high",
+      // two writers fighting over the reset curve: a human has to find and stop the other one. Latched, so a writer
+      // that keeps at it pages once a day, not on every write.
+      { tier: "page", key: "foreign-hbx-writer" },
     );
   }
   return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis, delivered: ack !== false };

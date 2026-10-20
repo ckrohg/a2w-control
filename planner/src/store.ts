@@ -164,6 +164,29 @@ export class Store {
         notified_at timestamptz
       );
       ALTER TABLE alert_episodes ADD COLUMN IF NOT EXISTS uid text UNIQUE;
+      -- Owner alert policy (alertpolicy.ts, 2026-10-20). notify_latches: one row per OPEN keyed alert that reached the
+      -- owner, so a redeploy never re-pages it and a still-true condition re-sends at most daily. notifications: every
+      -- notification decision (record tier included), the event history the dashboard and Monday digest read.
+      CREATE TABLE IF NOT EXISTS notify_latches (
+        key         text PRIMARY KEY,
+        tier        text NOT NULL,
+        opened_at   timestamptz NOT NULL DEFAULT now(),
+        notified_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS notifications (
+        id         serial PRIMARY KEY,
+        ts         timestamptz NOT NULL DEFAULT now(),
+        source     text NOT NULL,
+        tier       text NOT NULL,
+        resolved   boolean NOT NULL DEFAULT false,
+        key        text,
+        title      text NOT NULL,
+        body       text,
+        pushed     boolean NOT NULL DEFAULT false,
+        emailed    boolean NOT NULL DEFAULT false,
+        suppressed text
+      );
+      CREATE INDEX IF NOT EXISTS notifications_ts ON notifications (ts);
       -- pump health (pumphealth.ts): one row per pump per America/New_York day — the SPAN-metered rollup and the 5 °C
       -- outdoor-bin sums the drift trend pools. Shadow episodes of the window checks live in alert_episodes
       -- (kind shadow_pump_<check>, never paged); the daily digest claims its day here before it sends.
@@ -927,6 +950,36 @@ export class Store {
        ON CONFLICT (uid) DO UPDATE SET uid = EXCLUDED.uid RETURNING id`,
       [uid, kind, key, pumpId, title, detail]);
     return Number(r.rows[0].id);
+  }
+
+  async getNotifyLatch(key: string): Promise<{ tier: string; notifiedAt: Date } | null> {
+    const r = await this.locked.query(`SELECT tier, notified_at FROM notify_latches WHERE key = $1`, [key]);
+    return r.rows[0] ? { tier: String(r.rows[0].tier), notifiedAt: new Date(r.rows[0].notified_at) } : null;
+  }
+
+  async upsertNotifyLatch(key: string, tier: string): Promise<void> {
+    await this.locked.query(
+      `INSERT INTO notify_latches (key, tier) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET tier = EXCLUDED.tier, notified_at = now()`, [key, tier]);
+  }
+
+  async deleteNotifyLatch(key: string): Promise<{ tier: string } | null> {
+    const r = await this.locked.query(`DELETE FROM notify_latches WHERE key = $1 RETURNING tier`, [key]);
+    return r.rows[0] ? { tier: String(r.rows[0].tier) } : null;
+  }
+
+  async logNotification(n: { source: string; tier: string; resolved: boolean; key: string | null; title: string; body: string;
+                             pushed: boolean; emailed: boolean; suppressed: string | null }): Promise<void> {
+    await this.locked.query(
+      `INSERT INTO notifications (source, tier, resolved, key, title, body, pushed, emailed, suppressed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [n.source, n.tier, n.resolved, n.key, n.title, n.body, n.pushed, n.emailed, n.suppressed]);
+  }
+
+  /** Pages sent in the last 7 days — the page budget survives a restart. */
+  async pagesLast7d(): Promise<number> {
+    const r = await this.locked.query(`SELECT count(*)::int AS n FROM notifications WHERE tier = 'page' AND NOT resolved AND pushed AND ts > now() - interval '7 days'`);
+    return Number(r.rows[0]?.n ?? 0);
   }
 
   /** Close episodes by their client uid — for an insert whose outcome was never learned. */

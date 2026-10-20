@@ -92,7 +92,16 @@ async def test_resend_email_skips_unconfigured(monkeypatch):
     assert calls == 0
 
 
-async def test_high_alert_and_all_clear_also_push_via_6bb(monkeypatch):
+def _channels(sent):
+    out = set()
+    for url, _h, _b in sent:
+        out.add("6bb" if "6bb" in url else "email" if "resend" in url else "ntfy")
+    return out
+
+
+async def test_tiers_pick_the_channels(monkeypatch):
+    """alert-policy.md: page = phone + email, attention = email, record = the ntfy log only;
+    an all-clear only for a page. Priority never picks a channel."""
     sent = []
 
     def fake_urlopen(req, timeout=8):
@@ -100,22 +109,43 @@ async def test_high_alert_and_all_clear_also_push_via_6bb(monkeypatch):
         return _FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    cfg = NotifyConfig(ntfy_topic="a2w-test", ntfy_server="http://ntfy.invalid",
+    cfg = NotifyConfig(ntfy_topic="a2w-test", ntfy_server="http://ntfy.invalid", resend_api_key="re_x",
+                       resend_to="owner@example.invalid",
                        sixbb_alert_url="http://6bb.invalid/api/external/alert", sixbb_alert_key="k123")
 
-    await notify.ntfy(cfg, title="⚠ Heat Pump 2: E21", message="fault", priority="high", tags="warning")
-    six = [s for s in sent if s[0].startswith("http://6bb.invalid")]
-    assert len(six) == 1 and len(sent) == 2                       # 6bb AND ntfy
-    url, headers, body = six[0]
+    await notify.alert(cfg, tier="page", title="⚠ Heat Pump 2: E21 for 31 min", message="fault",
+                       priority="high", tag="a2w-pi-fault-pump2-x")
+    assert _channels(sent) == {"ntfy", "6bb", "email"}
+    url, headers, body = next(s for s in sent if "6bb" in s[0])
     assert headers["Authorization"] == "Bearer k123"
     import json as _json
     p = _json.loads(body)
-    assert p["source"] == "a2w-pi" and p["priority"] == "high" and p["title"] == "⚠ Heat Pump 2: E21"
+    assert p["source"] == "a2w-pi" and p["priority"] == "high" and p["tag"] == "a2w-pi-fault-pump2-x"
+    mail = _json.loads(next(s for s in sent if "resend" in s[0])[2])
+    assert mail["subject"].startswith("🚨 A2W — Heat Pump 2: E21")
 
     sent.clear()
-    await notify.ntfy(cfg, title="✓ Heat Pump 2: E21 cleared", message="ok", priority="default",
-                      tags="white_check_mark")
-    assert len([s for s in sent if s[0].startswith("http://6bb.invalid")]) == 1   # all-clear reaches the phone
+    await notify.alert(cfg, tier="page", resolved=True, title="✓ Heat Pump 2: E21 cleared", message="ok",
+                       tag="a2w-pi-fault-pump2-x")
+    assert _channels(sent) == {"ntfy", "6bb", "email"}, "a page's all-clear replaces it on the phone"
+    assert _json.loads(next(s for s in sent if "6bb" in s[0])[2])["tag"] == "a2w-pi-fault-pump2-x"
+
+    sent.clear()
+    await notify.alert(cfg, tier="attention", title="Pi disk almost full", message="x", priority="urgent")
+    assert _channels(sent) == {"ntfy", "email"}, "attention never reaches the phone, whatever its priority"
+
+    sent.clear()
+    await notify.alert(cfg, tier="attention", resolved=True, title="Pi disk recovered", message="x")
+    assert _channels(sent) == {"ntfy"}
+
+    sent.clear()
+    await notify.alert(cfg, tier="record", title="✓ Heat Pump 1 back online", message="x", priority="high",
+                       tags="white_check_mark")
+    assert _channels(sent) == {"ntfy"}, "record: the log only, even at high priority with a check-mark tag"
+
+    import pytest
+    with pytest.raises(ValueError):
+        notify.route("loud")
 
 
 async def test_routine_push_does_not_reach_6bb(monkeypatch):
@@ -123,8 +153,8 @@ async def test_routine_push_does_not_reach_6bb(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=8: sent.append(req.full_url) or _FakeResp())
     cfg = NotifyConfig(ntfy_topic="a2w-test", ntfy_server="http://ntfy.invalid",
                        sixbb_alert_url="http://6bb.invalid/api/external/alert", sixbb_alert_key="k123")
-    await notify.ntfy(cfg, title="A2W weekly digest", message="fine", priority="default", tags="")
-    assert sent == ["http://ntfy.invalid/a2w-test"]               # ntfy only
+    await notify.ntfy(cfg, title="⚠ Heat Pump 2: E21", message="fault", priority="urgent", tags="warning")
+    assert sent == ["http://ntfy.invalid/a2w-test"]               # ntfy() is the log: never the phone
 
 
 async def test_6bb_failure_never_raises_and_ntfy_still_sends(monkeypatch):
@@ -139,5 +169,5 @@ async def test_6bb_failure_never_raises_and_ntfy_still_sends(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     cfg = NotifyConfig(ntfy_topic="a2w-test", ntfy_server="http://ntfy.invalid",
                        sixbb_alert_url="http://6bb.invalid/x", sixbb_alert_key="k")
-    await notify.ntfy(cfg, title="Heat Pump 1 offline", message="x", priority="high", tags="warning")
+    await notify.alert(cfg, tier="page", title="Heat Pump 1 offline", message="x", priority="high", tags="warning")
     assert sent == ["http://ntfy.invalid/a2w-test"]

@@ -19,13 +19,13 @@ const ELEMENT_KWH_PER_MIN = 16.5 / 60; // 0.275 — one minute of the resistive 
 class FakeSpan extends SpanWatch {
   nowMs: number;
   reading = { backup: 0, pumps: 0 };
-  readonly pages: { title: string; body: string; priority?: string }[] = [];
+  readonly pages: { title: string; body: string; priority?: string; tier?: string; resolved?: boolean }[] = [];
   readonly upserts: { hour: string; kwh: number }[] = [];
   constructor(startIso: string) {
     const pages: FakeSpan["pages"] = [];
     const upserts: FakeSpan["upserts"] = [];
     const store = { upsertSpanEnergyHour: async (hour: Date, kwh: number) => { upserts.push({ hour: hour.toISOString(), kwh }); } } as unknown as Store;
-    super("user", "pass", "buffer tank", ALARM_KWH, async (title, body, priority) => { pages.push({ title, body, priority }); }, "bld-1", store, "air-water");
+    super("user", "pass", "buffer tank", ALARM_KWH, async (title, body, priority, opts) => { pages.push({ title, body, priority, tier: opts.tier, resolved: !!opts.resolved }); }, "bld-1", store, "air-water");
     this.nowMs = Date.parse(startIso);
     // the field initializers above ran after super(); point them at the arrays the callbacks captured
     (this as { pages: FakeSpan["pages"] }).pages = pages;
@@ -78,6 +78,7 @@ const r3 = (x: number) => Math.round(x * 1000) / 1000;
   await w.poll(1, r2(0.05 + 2 * ELEMENT_KWH_PER_MIN)); // 0.6 today, 0.55 in the window
   assert.equal(w.pages.length, 1, "the second minute of element draw pages");
   assert.equal(w.pages[0].priority, "high");
+  assert.equal(w.pages[0].tier, "attention", "an element draw costs money but never endangers the house: email, no phone");
   assert.equal(w.pages[0].title, "16.5 kW backup element DREW POWER");
   assert.match(w.pages[0].body, /drew 0\.55 kWh in the last 60 min \(0\.60 kWh so far today/);
   assert.equal(w.alarmed, true);
@@ -100,7 +101,8 @@ const r3 = (x: number) => Math.round(x * 1000) / 1000;
   }
   assert.equal(w.pages.length, 2, "the page clears");
   assert.equal(w.pages[1].title, "Backup element power cleared");
-  assert.equal(w.pages[1].priority, undefined, "the clear is a default-priority notice");
+  assert.equal(w.pages[1].priority, "default", "the clear is a default-priority notice");
+  assert.equal(w.pages[1].resolved, true, "and an all-clear: record-only, since the alarm was attention tier");
   assert.match(w.pages[1].body, /drew 0\.00 kWh in the last 60 min \(0\.40 kWh so far today\)/);
   assert.equal(clearedAfterMin, BACKUP_WINDOW_MS / 60_000, "exactly when the draw leaves the 60-minute window");
   assert.equal(w.alarmed, false);

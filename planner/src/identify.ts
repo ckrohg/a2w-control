@@ -36,6 +36,7 @@
  * to the autonomy switch, and in /status.identification.
  */
 import { randomBytes } from "node:crypto";
+import type { Notify } from "./alertpolicy";
 import type { HubClient } from "./hub";
 import type { Store } from "./store";
 import type { HbxWriter } from "./writes";
@@ -178,7 +179,7 @@ export interface IdentDeps {
   hub: Pick<HubClient, "getState">;
   baseUrl: string;
   token: string;
-  notify: (title: string, body: string, priority?: string) => Promise<void>;
+  notify: Notify;
   isI1Violated: () => boolean;
   isStormActive: () => boolean;
   /**
@@ -698,7 +699,7 @@ export class IdentificationDriver {
     w.state = "active"; w.startedAt = startedAt; w.writeId = writeId; w.writeAccepted = true;
     this.lastResult = `ACTIVE #${w.id}: wrote ${w.targetF} °F (cap ${w.capF}) — ${label}`;
     console.log(`[identify] ${this.lastResult}`);
-    await this.d.notify("Identification probe started", `${label}\nWindow ${w.durationMin} min; the auto-pilot is held; aborts on I1 / room deficit / DHW draw.`, "default");
+    await this.d.notify("Identification probe started", `${label}\nWindow ${w.durationMin} min; the auto-pilot is held; aborts on I1 / room deficit / DHW draw.`, "default", { tier: "record" });
     await this.postOpen(w);
   }
 
@@ -754,7 +755,8 @@ export class IdentificationDriver {
     console.log(`[identify] ${this.lastResult}`);
     const cleaned = wasLive ? await this.cleanup(w, reason.startsWith("aborted:")) : null;
     if (reason.startsWith("aborted:") && !w.dryRun) {
-      await this.d.notify("Identification probe aborted", `#${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F: ${reason}${wasLive ? (cleaned ? ` — ${cleaned}` : " — plant NOT yet returned to base; retrying every poll") : ""}`, "high");
+      await this.d.notify("Identification probe aborted", `#${w.id} ${w.arm} ${w.direction} @ ${w.targetF} °F: ${reason}${wasLive ? (cleaned ? ` — ${cleaned}` : " — plant NOT yet returned to base; retrying every poll") : ""}`, "high",
+        { tier: "record" }); // an abort is the safety working; a cleanup that never lands escalates below
     }
     // Only a window that HAPPENED is closed on TempIQ: a hold arm (opened at the draw) or a probe whose
     // write was accepted. A probe that never got written is not evidence of anything — posting it
@@ -796,7 +798,8 @@ export class IdentificationDriver {
       w.cleanupDetail = detail;
       console.error(`[identify] cleanup #${w.id} (attempt ${attempts}): ${detail} — will retry`);
       if (attempts % CLEANUP_ALERT_EVERY === 0) {
-        await this.d.notify("Identification cleanup stuck", `#${w.id}: the plant has NOT been returned to base after ${attempts} attempts — ${detail}. Check the HBX / SensorLinx.`, "high");
+        await this.d.notify("Identification cleanup stuck", `#${w.id}: the plant has NOT been returned to base after ${attempts} attempts — ${detail}. Check the HBX / SensorLinx.`, "high",
+          { tier: "attention", key: `identify-cleanup-${w.id}` }); // latched: at most daily, not every hour
       }
       return null;
     };

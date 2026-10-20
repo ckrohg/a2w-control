@@ -56,14 +56,20 @@ class FakeTime:
 def alerts(monkeypatch):
     sent: list[tuple[str, str, str]] = []
 
+    # "push" = the owner's phone (6bb), "email" = their inbox, "log" = ntfy (reaches nobody: the record tier)
     async def ntfy(cfg, *, title, message, priority="default", tags=""):
+        sent.append(("log", title, priority, message))
+
+    async def sixbb_push(cfg, *, title, message, priority, tag=""):
         sent.append(("push", title, priority))
+        return True
 
     async def email(cfg, *, subject, body):
         sent.append(("email", subject, body))
 
     monkeypatch.setattr(span_control.notify, "ntfy", ntfy)
     monkeypatch.setattr(span_control.notify, "email", email)
+    monkeypatch.setattr(span_control.notify, "sixbb_push", sixbb_push)
     return sent
 
 
@@ -105,7 +111,7 @@ async def test_unlisted_circuit_is_refused_audited_and_alerted(rig):
     assert panel.writes == []
     ev = await events(store)
     assert ev and ev[0]["code"] == "refused" and "Garage" in ev[0]["message"]
-    assert any(k == "push" for k, *_ in alerts) and any(k == "email" for k, *_ in alerts)
+    assert any(k == "log" for k, *_ in alerts) and not any(k in ("push", "email") for k, *_ in alerts), "a refusal is record-only"
 
 
 async def test_backup_element_is_close_only_and_heat_pumps_cycle_only(rig):

@@ -11,15 +11,48 @@ import urllib.request
 
 log = logging.getLogger(__name__)
 
-# Email is the INTERVENTION channel (owner policy 2026-08-06): equipment errors that need
-# a human, and prolonged outages — decided explicitly at each call site, NOT inferred from
-# ntfy priority (priority tunes phone loudness; it says nothing about inbox-worthiness).
-# ntfy still gets everything.
+# Owner alert policy (knowledge/reference/alert-policy.md, 2026-10-20) — the same tiers as the planner and hub:
+#   page       6bb phone push + email   the house is at risk, or a human must act soon
+#   attention  email only               worth a look this week
+#   record     ntfy log only            the events table, the dashboard and the Monday digest carry it
+# ntfy (which nobody subscribes to) gets everything as the log. An all-clear carries the tier of the alert it
+# resolves, and only a page gets one. ntfy priority only tunes loudness; it never picks a channel.
+TIERS = ("page", "attention", "record")
 
 
-def _sixbb_eligible(priority: str, tags: str) -> bool:
-    """What reaches the owner's phone via 6bb: the alerts that matter (high/urgent) and their all-clears."""
-    return priority in ("high", "urgent") or "white_check_mark" in (tags or "")
+def route(tier: str, resolved: bool = False) -> tuple[bool, bool]:
+    """(push, email) for a tier. Raises on an unknown tier, so a typo can never silently drop a page."""
+    if tier not in TIERS:
+        raise ValueError(f"unknown alert tier {tier!r}")
+    if resolved:
+        return (tier == "page", tier == "page")
+    return (tier == "page", tier != "record")
+
+
+def tier_subject(title: str, tier: str, resolved: bool = False) -> str:
+    core = title.strip().lstrip("⚠✓✅🚨\ufe0f ").strip() or title.strip()
+    if resolved:
+        return f"✅ A2W RESOLVED — {core}"
+    if tier == "page":
+        return f"🚨 A2W — {core}"
+    if tier == "attention":
+        return f"A2W needs a look — {core}"
+    return core if core.lower().startswith("a2w") else f"A2W — {core}"
+
+
+async def alert(cfg, *, tier: str, title: str, message: str, priority: str = "default", tags: str = "",
+                resolved: bool = False, tag: str = "") -> None:
+    """The one way the bridge tells anyone anything. Never raises (bad tier aside)."""
+    push, mail = route(tier, resolved)
+    log.info("alert %s%s: %s (push %s, email %s)", tier, " resolved" if resolved else "", title.strip(), push, mail)
+    jobs = [ntfy(cfg, title=title, message=message, priority=priority, tags=tags)]
+    if push:
+        # the tag names the incident, so its all-clear replaces it on the phone
+        jobs.append(sixbb_push(cfg, title=title, message=message,
+                               priority="default" if resolved else ("urgent" if priority == "urgent" else "high"), tag=tag))
+    if mail:
+        jobs.append(email(cfg, subject=tier_subject(title, tier, resolved), body=message))
+    await asyncio.gather(*jobs, return_exceptions=True)
 
 
 async def sixbb_push(cfg, *, title: str, message: str, priority: str, tag: str = "") -> bool:
@@ -47,15 +80,8 @@ async def sixbb_push(cfg, *, title: str, message: str, priority: str, tag: str =
 
 async def ntfy(cfg, *, title: str, message: str, priority: str = "default",
                tags: str = "") -> None:
-    """Fire-and-forget push to an ntfy topic (and, for high/urgent alerts and all-clears, to the owner's phone
-    via 6bb). No-op if neither is configured."""
-    six = (asyncio.create_task(sixbb_push(cfg, title=title, message=message, priority=priority))
-           if _sixbb_eligible(priority, tags) else None)   # in parallel: a slow 6bb never delays ntfy
-    try:
-        await _ntfy_post(cfg, title=title, message=message, priority=priority, tags=tags)
-    finally:
-        if six is not None:
-            await six
+    """Fire-and-forget post to the ntfy topic — the alert LOG. Reaches no human; use alert() for that."""
+    await _ntfy_post(cfg, title=title, message=message, priority=priority, tags=tags)
 
 
 async def _ntfy_post(cfg, *, title: str, message: str, priority: str, tags: str) -> None:

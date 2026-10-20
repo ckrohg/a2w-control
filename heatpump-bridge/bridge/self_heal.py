@@ -31,6 +31,10 @@ from .span_control import BreakerRefused, read_boot_id
 
 log = logging.getLogger(__name__)
 
+# Self-heal steps that mean the feature itself cannot work as configured (owner alert policy, alert-policy.md):
+# emailed. Every other step — shadow "would cycle", attempts, recoveries, escalations — is record-only.
+SELF_HEAL_ATTENTION = frozenset({"history_unreadable", "unavailable", "identity_mismatch", "mapping_suspect"})
+
 TICK_S = 30.0
 FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything
 SPAN_FRESH_S = 120.0         # nor is a SPAN panel read older than this
@@ -688,16 +692,19 @@ class SelfHealer:
 
     async def _step(self, pid, code, severity, message, detail, *, title: str,
                     priority: str = "high") -> None:
-        """Audit + push + email one step (owner: every self-heal step is visible)."""
+        """Audit one step (every step is in the events table and the dashboard) and route it through
+        the owner alert policy. Steps are RECORD: the incident the owner hears about is the pump fault
+        itself, which the poller pages once it has stuck for 30 min (poller.FAULT_PAGE_AFTER_S) and
+        clears when it clears; a stuck-OFF circuit pages from span_control. Only a self-heal that
+        cannot work as configured is worth an email (SELF_HEAL_ATTENTION)."""
         log.info("self-heal [%s] %s: %s", pid, code, message)
         await self._audit(pid, code, severity, message, detail)
         tags = "rotating_light" if priority == "urgent" else "wrench"
-        for coro in (notify.ntfy(self.notify_cfg, title=title, message=message,
-                                 priority=priority, tags=tags),
-                     notify.email(self.notify_cfg, subject=title, body=message)):
-            t = asyncio.create_task(coro)
-            self._bg.add(t)
-            t.add_done_callback(self._bg.discard)
+        tier = "attention" if code in SELF_HEAL_ATTENTION else "record"
+        t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
+                                             priority=priority, tags=tags))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
 
     def _load(self) -> tuple[dict, str | None]:
         """(pumps, problem). A missing file is a clean start; anything unreadable or not exactly

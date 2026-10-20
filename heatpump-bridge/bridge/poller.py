@@ -22,6 +22,20 @@ log = logging.getLogger(__name__)
 
 COMM_SNAPSHOT_INTERVAL_S = 900  # heartbeat row; errors also force a row
 
+# Owner alert policy (knowledge/reference/alert-policy.md). A pump fault pages only once it has
+# stuck for FAULT_PAGE_AFTER_S; the same code FAULT_PATTERN_COUNT times in FAULT_PATTERN_DAYS emails.
+FAULT_PAGE_AFTER_S = 30 * 60
+FAULT_PATTERN_COUNT = 3
+FAULT_PATTERN_DAYS = 7
+# Codes that are the weather, not the equipment: logged, never paged.
+WEATHER_FAULT_CODES = frozenset({"PC"})
+
+
+def _pages(fdef: FaultDef) -> bool:
+    """Whether a fault can reach the owner at all (P17 anti-freeze is INFO; PC is the weather)."""
+    return (fdef.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING)
+            and fdef.code not in WEATHER_FAULT_CODES)
+
 # Runtime edges worth a discrete event (group, key, code, on-message, off-message).
 # The remote/linkage contact is how the HBX calls for heat — bit mapping to CN33 is a
 # Phase 1 verification item, hence the hedged wording.
@@ -71,6 +85,7 @@ class PumpPoller:
         self.guard = guard
         self.client = PumpClient(cfg.host, cfg.port, cfg.device_id, app_cfg.modbus_timeout_s)
         self.active_faults: dict[str, dict] = {}  # key -> {code,message,severity,since}
+        self._fault_paged: set[str] = set()       # fault keys whose sustained page went out
         self._prev_flags: dict[str, bool] | None = None  # runtime edge detection state
         self._prev_config: dict[str, int] | None = None  # external-change detection state
         # remote-optimizer lease (in-memory, so a restart safely discards a stale override
@@ -135,6 +150,8 @@ class PumpPoller:
             fdef = FAULTS.get((int(reg), int(bit)))
             if fdef:
                 self.active_faults[key] = self._fault_entry(key, fdef, since)
+                if await self.store.alert_event_since(self.cfg.id, "fault_sustained", key, since):
+                    self._fault_paged.add(key)  # paged before the restart: its all-clear is still due
         self._task = asyncio.create_task(self._run(), name=f"poller-{self.cfg.id}")
 
     async def stop(self) -> None:
@@ -291,12 +308,13 @@ class PumpPoller:
                 self._push(title=f"✓ {self.cfg.name} back online",
                            message=f"Communication restored after ~{mins} min offline.",
                            priority="high", tags="white_check_mark",
-                           email=self._offline_email_sent)
+                           tier="attention" if self._offline_email_sent else "record", resolved=True)
             else:
                 # Brief blip: "min"-priority breadcrumb — lands in the ntfy app's list with
                 # no banner/sound/email (owner: blips are FYI at most, never a notification).
                 self._push(title=f"✓ {self.cfg.name} back online",
-                           message="Communication restored.", priority="min", tags="white_check_mark")
+                           message="Communication restored.", priority="min", tags="white_check_mark",
+                           tier="record", resolved=True)
         self._ever_online = True
         self._offline_alerted = False
         self._offline_push_sent = False
@@ -428,7 +446,7 @@ class PumpPoller:
                 self._push(title=f"⚠ {self.cfg.name} offline",
                            message=f"No response for {failures} polls ({exc.category}). "
                                    f"Check the gateway / WiFi.", priority="high", tags="warning",
-                           email=True)
+                           tier="attention")
             else:
                 self._note_offline_edge(exc.category)
         else:
@@ -436,8 +454,10 @@ class PumpPoller:
             if failures >= threshold:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
-        # Sustained outage: the edge was logged quietly; PAGE (ntfy only) once the silence
-        # outlasts a WiFi blip. Email waits for the prolonged tier below.
+        # Sustained outage: the edge was logged quietly; RECORD once the silence outlasts a WiFi
+        # blip. The owner hears only at the prolonged tier below (alert-policy.md): the pump keeps
+        # running on its own controller, and a pump that has really stopped heating is caught by
+        # the planner's one "no heat" page.
         ncfg = self.app_cfg.notifications
         if (self._offline_alerted and not self._offline_push_sent
                 and self._offline_since is not None
@@ -447,8 +467,8 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name} offline {mins}+ min",
                        message=f"No response for {mins} minutes ({exc.category}). "
                                f"Check the gateway / WiFi / pump comm board.",
-                       priority="high", tags="warning")
-        # Prolonged outage: the "requires intervention" tier — this one emails.
+                       priority="high", tags="warning", tier="record")
+        # Prolonged outage: the "requires intervention" tier — attention (email, no phone).
         if (self._offline_alerted and not self._offline_email_sent
                 and self._offline_since is not None
                 and time.monotonic() - self._offline_since >= ncfg.offline_email_min * 60):
@@ -457,7 +477,7 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name} offline {hrs:.1f} h — prolonged outage",
                        message=f"Still no response after {hrs:.1f} hours ({exc.category}). "
                                f"This needs a look: gateway power/WiFi, or the pump's comm board.",
-                       priority="high", tags="rotating_light", email=True)
+                       priority="high", tags="rotating_light", tier="attention")
         if not self.snapshot.get("online"):
             link, detail = self._link_status()
             self.snapshot["link"] = link
@@ -482,7 +502,7 @@ class PumpPoller:
                 title=f"⚠ {self.cfg.name}: link degrading",
                 message=f"{n} comm dropouts within {int(ncfg.flap_window_min)} min "
                         f"(latest: {category}). Check WiFi / RS-485 / the pump's comm board.",
-                priority="high", tags="warning")
+                priority="high", tags="warning", tier="record")  # comm_stats + the digest carry the trend
 
     def _link_status(self) -> tuple[str, str]:
         """Which layer is down, in plain language — the question a commissioning operator asks
@@ -529,7 +549,7 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name}: gateway identity mismatch",
                        message=f"{self.cfg.host} answers with the wrong MAC — writes "
                                f"blocked. Check DHCP reservations.",
-                       priority="urgent", tags="rotating_light")
+                       priority="urgent", tags="rotating_light", tier="attention")
             log.error("[%s] identity mismatch at %s: %s != %s",
                       self.cfg.id, self.cfg.host, actual, self.cfg.mac)
         else:
@@ -587,7 +607,7 @@ class PumpPoller:
                             title=f"{self.cfg.name}: {label} changed at the unit",
                             message=f"{label} is now {value} — changed outside the "
                                     f"dashboard (wall controller, or check gateway isolation).",
-                            tags="eyes")
+                            tags="eyes", tier="record")
         self._prev_config = {k: v for k, (_, v) in current.items()}
 
     async def _emit_state_events(self, decoded: dict) -> None:
@@ -613,18 +633,14 @@ class PumpPoller:
         return {"key": key, "code": fdef.code, "message": fdef.message,
                 "severity": fdef.severity, "since": since}
 
-    def _push(self, title: str, message: str, priority: str = "default", tags: str = "",
-              email: bool = False) -> None:
-        """Fire-and-forget alert; safe if unconfigured. ntfy always; email only when the
-        call site says so — email is the intervention channel (owner policy 2026-08-06:
-        equipment errors needing a human + prolonged outages), independent of ntfy
-        priority, which only tunes phone loudness."""
-        asyncio.create_task(notify.ntfy(
-            self.app_cfg.notifications, title=title, message=message,
-            priority=priority, tags=tags))
-        if email:
-            asyncio.create_task(notify.email(
-                self.app_cfg.notifications, subject=title, body=message))
+    def _push(self, title: str, message: str, priority: str = "default", tags: str = "", *,
+              tier: str, resolved: bool = False, tag: str = "") -> None:
+        """Fire-and-forget alert; safe if unconfigured. The TIER picks the owner's channels
+        (notify.alert, knowledge/reference/alert-policy.md); priority only tunes ntfy loudness."""
+        notify.route(tier, resolved)  # validate now: a bad tier must fail loudly here, not in a background task
+        asyncio.create_task(notify.alert(
+            self.app_cfg.notifications, tier=tier, title=title, message=message,
+            priority=priority, tags=tags, resolved=resolved, tag=tag))
 
     async def _update_faults(self, current: dict[str, FaultDef]) -> None:
         """Edge detection: log fault_on for new bits, fault_off for cleared bits."""
@@ -635,18 +651,14 @@ class PumpPoller:
                     self.cfg.id, "fault_on", code=fdef.code, severity=fdef.severity,
                     message=fdef.message, detail={"key": key})
                 log.info("[%s] fault ON %s %s", self.cfg.id, fdef.code, fdef.message)
-                # push every real fault, not only high/critical: WARNING covers the
-                # degraded-but-heating states (failed sensors, E21 display comm loss) that
-                # otherwise sit unnoticed for weeks — an E21 lived 2 weeks before the owner
-                # spotted it on the dashboard. Equipment fault codes are exactly the
-                # "requires intervention" class, so they email. P17 (info) never pages.
-                if fdef.severity in (Severity.CRITICAL, Severity.HIGH, Severity.WARNING):
-                    self._push(
-                        title=f"⚠ {self.cfg.name}: {fdef.code}",
-                        message=fdef.message,
-                        priority="urgent" if fdef.severity == Severity.CRITICAL else "high",
-                        tags="rotating_light" if fdef.severity == Severity.CRITICAL else "warning",
-                        email=True)
+                # Owner alert policy (alert-policy.md): an onset is RECORD. R02 on HP1 sets and
+                # clears itself in ~3 min; paging every onset buried the faults that stick (an E21
+                # sat for 2 days in Oct 2026 among ~420 emails). A fault still active after
+                # FAULT_PAGE_AFTER_S pages (below); a code that keeps coming back is an email.
+                if _pages(fdef):
+                    self._push(title=f"{self.cfg.name}: {fdef.code}", message=fdef.message,
+                               priority="high", tags="warning", tier="record")
+                    await self._check_fault_pattern(fdef)
         for key in list(self.active_faults):
             if key not in current:
                 gone = self.active_faults.pop(key)
@@ -655,6 +667,53 @@ class PumpPoller:
                     message=f"Cleared: {gone['message']}",
                     detail={"key": key, "active_s": round(time.time() - gone["since"])})
                 log.info("[%s] fault OFF %s", self.cfg.id, gone["code"])
+                if key in self._fault_paged:
+                    self._fault_paged.discard(key)
+                    mins = max(1, round((time.time() - gone["since"]) / 60))
+                    self._push(title=f"✓ {self.cfg.name}: {gone['code']} cleared",
+                               message=f"Cleared after ~{mins} min: {gone['message']}",
+                               tags="white_check_mark", tier="page", resolved=True,
+                               tag=f"a2w-pi-fault-{self.cfg.id}-{key}")
+        await self._check_sustained_faults()
+
+    async def _check_sustained_faults(self) -> None:
+        """PAGE once for a fault still active after FAULT_PAGE_AFTER_S. The page is recorded as an
+        `alert` event, so a bridge restart re-adopts it instead of paging again."""
+        now = time.time()
+        for key, f in self.active_faults.items():
+            if key in self._fault_paged or now - f["since"] < FAULT_PAGE_AFTER_S:
+                continue
+            fdef = FaultDef(f["code"], f["message"], f["severity"])
+            if not _pages(fdef):
+                continue
+            self._fault_paged.add(key)
+            mins = round((now - f["since"]) / 60)
+            await self.store.add_event(self.cfg.id, "alert", code="fault_sustained", severity="page",
+                                       message=f"{f['code']} active {mins} min", detail={"key": key})
+            self._push(title=f"⚠ {self.cfg.name}: {f['code']} for {mins} min",
+                       message=f"{f['message']}\n\nActive since "
+                               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(f['since']))} and not clearing "
+                               f"on its own. A2W will tell you when it clears.",
+                       priority="urgent" if f["severity"] == Severity.CRITICAL else "high",
+                       tags="rotating_light", tier="page", tag=f"a2w-pi-fault-{self.cfg.id}-{key}")
+
+    async def _check_fault_pattern(self, fdef: FaultDef) -> None:
+        """ATTENTION once per FAULT_PATTERN_DAYS when the same code keeps coming back — the
+        self-clearing kind (R02) that no single onset justifies a page for, but whose
+        recurrence is a service call."""
+        since = time.time() - FAULT_PATTERN_DAYS * 86400
+        n = await self.store.count_events(self.cfg.id, "fault_on", fdef.code, since)
+        if n < FAULT_PATTERN_COUNT:
+            return
+        if await self.store.count_events(self.cfg.id, "alert", f"fault_pattern:{fdef.code}", since):
+            return
+        await self.store.add_event(self.cfg.id, "alert", code=f"fault_pattern:{fdef.code}",
+                                   severity="attention", message=f"{fdef.code} x{n} in {FAULT_PATTERN_DAYS} days")
+        self._push(title=f"{self.cfg.name}: {fdef.code} {n} times in {FAULT_PATTERN_DAYS} days",
+                   message=f"{fdef.message}\n\nIt has set {n} times in the last {FAULT_PATTERN_DAYS} days. "
+                           f"Each one cleared or may clear on its own, but a code that keeps coming back is "
+                           f"worth a service call. History: the dashboard's Events tab for {self.cfg.name}.",
+                   priority="high", tags="warning", tier="attention")
 
     async def _maybe_comm_row(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -685,7 +744,7 @@ class PumpPoller:
                 self._reverted = False
                 self._push(title=f"✓ {self.cfg.name}: optimizer resumed",
                            message=f"{source} is setting the setpoint again.",
-                           priority="low", tags="white_check_mark")
+                           priority="low", tags="white_check_mark", tier="record", resolved=True)
         return result
 
     async def _write_setpoint_locked(self, value: float, source: str,
@@ -864,14 +923,14 @@ class PumpPoller:
                 title=f"⚠ {self.cfg.name}: optimizer stale — reverted to baseline",
                 message=f"No fresh setpoint from {source} — reverted to the "
                         f"{g.baseline_setpoint_c:g}°C baseline. House is fine; savings paused.",
-                priority="high", tags="warning")
+                priority="high", tags="warning", tier="record")  # the failsafe working as designed
         elif remaining <= g.lease_warn_minutes * 60 and not self._lease["warned"]:
             self._lease["warned"] = True
             self._push(
                 title=f"{self.cfg.name}: optimizer setpoint expiring",
                 message=f"No renewal from {self._lease['source']} — reverting to baseline "
                         f"in ~{int(remaining / 60)} min unless it resumes.",
-                priority="default", tags="hourglass")
+                priority="default", tags="hourglass", tier="record")
 
     async def write_mode(self, kind: str, source: str) -> dict:
         """Switch heating <-> cooling (reg 2001). Only 0/1 ever written — the protocol

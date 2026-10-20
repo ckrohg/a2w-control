@@ -64,9 +64,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
 
-        async def span_notify(title, message, priority="default"):
+        async def span_notify(title, message, priority="default", *, tier, resolved=False):
             from . import notify
-            await notify.ntfy(cfg.notifications, title=title, message=message, priority=priority)
+            await notify.alert(cfg.notifications, tier=tier, title=title, message=message, priority=priority,
+                               resolved=resolved, tag="a2w-pi-span-local")
         span_poller = SpanLocalPoller(
             cfg.span, store, notify=span_notify,
             token_path=str(Path(cfg.db_path).resolve().parent / "span-local-token"),

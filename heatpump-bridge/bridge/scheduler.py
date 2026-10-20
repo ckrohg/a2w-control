@@ -162,19 +162,12 @@ class Scheduler:
         active = key in self._health_alerts
         if raise_now and not active:
             self._health_alerts.add(key)
-            await self._push_alert(title, message, "high")  # high → also emails (sticky)
+            await notify.alert(self.notifications, tier="attention", title=title, message=message,
+                               priority="high", tags="warning")  # the Pi needs a look; the house is fine
         elif clear_now and active:
             self._health_alerts.discard(key)
-            await self._push_alert(clear_title, clear_message, "default")  # recovery: push-only
-
-    async def _push_alert(self, title: str, message: str, priority: str) -> None:
-        tags = "warning" if title.startswith("⚠") else "white_check_mark"
-        await notify.ntfy(self.notifications, title=title, message=message,
-                          priority=priority, tags=tags)
-        # Pi-health crossings (hot CPU, full disk) are intervention-worthy; their
-        # recoveries come through at default priority and stay push-only.
-        if priority in ("high", "urgent"):
-            await notify.email(self.notifications, subject=title, body=message)
+            await notify.alert(self.notifications, tier="attention", resolved=True, title=clear_title,
+                               message=clear_message, tags="white_check_mark")  # record only
 
     async def _fire(self, poller: PumpPoller, action: str) -> None:
         """Execute a timer. Under unattended-write restriction (default), the scheduler

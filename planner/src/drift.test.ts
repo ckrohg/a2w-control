@@ -29,7 +29,7 @@ const write = (at: string, action: string, requested: Record<string, number>): P
 interface Harness {
   deps: DriftDeps;
   rows: ConfigVersionRecord[];
-  pages: { title: string; body: string; priority: string; email?: boolean }[];
+  pages: { title: string; body: string; priority: string; tier: string }[];
   waits: number[];
 }
 function harness(o: {
@@ -53,7 +53,7 @@ function harness(o: {
       recent: writes.filter((w) => Date.parse(w.at) >= sinceMs),
     }),
     record: async (r) => { rows.push(r); },
-    notify: async (title, body, priority, opts) => { pages.push({ title, body, priority, email: opts?.email }); },
+    notify: async (title, body, priority, opts) => { pages.push({ title, body, priority, tier: opts.tier }); },
     log: () => {},
     ...(o.latest !== undefined ? { latest: async () => o.latest! } : {}),
   };
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
     assert.equal(h.pages.length, 1);
     assert.equal(h.pages[0].title, ECHO_TITLE);
     assert.equal(h.pages[0].priority, "default", "an echo pages at default priority");
-    assert.equal(h.pages[0].email, true, "the email carries the evidence");
+    assert.equal(h.pages[0].tier, "record", "echo: the hbx_config_versions row carries the evidence, no human needed");
     assert.doesNotMatch(h.pages[0].body, /single-writer/i, "an echo must not claim a single-writer violation");
     assert.match(h.pages[0].body, /dbt: 120 -> 141/);
     assert.match(h.pages[0].body, /planner wrote 142 at 2026-10-18T20:41:05\.000Z/);
@@ -126,6 +126,7 @@ async function main(): Promise<void> {
     if (expected === "foreign") {
       assert.equal(h.pages[0].title, FOREIGN_TITLE);
       assert.equal(h.pages[0].priority, "high", "a true foreign write keeps the high page");
+      assert.equal(h.pages[0].tier, "page", "two writers on the reset curve: the owner is paged");
       assert.match(h.pages[0].body, /single-writer invariant/i);
       assert.match(h.pages[0].body, /planner wrote 142 at .*Δ -3 °F/, "the foreign page carries the same evidence");
     } else {
@@ -192,7 +193,7 @@ async function main(): Promise<void> {
     assert.deepEqual(h.rows[0].changes, { htDif: { old: 4, new: 5 } });
     assert.equal(h.pages.length, 1);
     assert.equal(h.pages[0].title, "HBX config changed (outside the planner)");
-    assert.equal(h.pages[0].email, false);
+    assert.equal(h.pages[0].tier, "record");
   }
 
   // ── 8. Re-read FAILS → unconfirmed: nothing recorded, nobody paged; latestConfig stays, so the next poll re-checks
@@ -537,7 +538,7 @@ async function main(): Promise<void> {
     assert.equal(h.waits.length, 0, "only a dbt/mbt diff waits for a re-read");
     assert.deepEqual(h.rows[0].raw, device(120, 118, { htDif: 6 }));
     assert.equal(h.pages[0].priority, "high");
-    assert.equal(h.pages[0].email, false);
+    assert.equal(h.pages[0].tier, "record");
   }
 
   // ── 11b. #182: dmd is a live demand bitmask, not configuration — a dmd-only change makes no version row and no page,

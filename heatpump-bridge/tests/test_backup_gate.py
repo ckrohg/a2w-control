@@ -56,8 +56,13 @@ class FakePoller:
 def alerts(monkeypatch):
     sent: list[tuple[str, str, str]] = []
 
+    # "push" = the owner's phone (6bb), "email" = their inbox, "log" = ntfy (reaches nobody: the record tier)
     async def ntfy(cfg, *, title, message, priority="default", tags=""):
+        sent.append(("log", title, priority, message))
+
+    async def sixbb_push(cfg, *, title, message, priority, tag=""):
         sent.append(("push", title, priority))
+        return True
 
     async def email(cfg, *, subject, body):
         sent.append(("email", subject, body))
@@ -65,6 +70,7 @@ def alerts(monkeypatch):
     for mod in (span_control, bf_mod):
         monkeypatch.setattr(mod.notify, "ntfy", ntfy)
         monkeypatch.setattr(mod.notify, "email", email)
+        monkeypatch.setattr(mod.notify, "sixbb_push", sixbb_push)
     return sent
 
 
@@ -143,7 +149,8 @@ async def test_reopen_enabled_uses_the_guarded_open_path(rig):
     ev = [e for e in await rig.store.get_events("span", 1) if e["type"] == "span_breaker"]
     assert ev[0]["code"] == "opened" and "hub:backup-gate" in ev[0]["message"]
     await settle()
-    assert any("Buffer Tank OFF" in a[1] for a in rig.alerts if a[0] == "push")
+    assert any("Buffer Tank OFF" in a[1] for a in rig.alerts if a[0] == "log")
+    assert not any("Buffer Tank OFF" in a[1] for a in rig.alerts if a[0] in ("push", "email")), "an OFF is record-only"
     # the minimum off time applies to the element too, then it can be closed again
     with pytest.raises(BreakerRefused, match="minimum off time"):
         await ctl.execute("Buffer Tank", "close")
@@ -184,7 +191,8 @@ async def test_fallback_shadow_pages_once_and_switches_nothing(rig):
     await rig.step(fb)
     await settle()
     assert await fb_events(rig.store) == ["would_close"]
-    assert any(a[0] == "email" and "WOULD close" in a[1] for a in rig.alerts), "shadow: one email"
+    assert any(a[0] == "log" and "WOULD close" in a[1] for a in rig.alerts), "shadow: logged"
+    assert not any(a[0] == "email" for a in rig.alerts), "shadow never emails (alert-policy.md)"
     assert not any(a[0] == "push" for a in rig.alerts), "shadow is never a phone push (#211: high/urgent push via 6bb)"
     assert rig.panel.writes == []
     for _ in range(60):
@@ -231,7 +239,8 @@ async def test_fallback_live_closes_never_opens_and_respects_cooldown(rig):
     await settle()
     assert rig.panel.writes == [("Buffer Tank", "CLOSED")] and rig.panel.relay("Buffer Tank") == "CLOSED"
     assert await fb_events(rig.store) == ["closed"]
-    assert any("A2W closed the backup element breaker" in a[1] for a in rig.alerts if a[0] == "push")
+    assert any("A2W closed the backup element breaker" in a[1] for a in rig.alerts if a[0] == "email"), "attention: email"
+    assert not any("A2W closed the backup element breaker" in a[1] for a in rig.alerts if a[0] == "push"), "not a page"
     # recovered, then down again within the 6-h cooldown: no second decision
     rig.p1.snapshot.update(active_faults=[], state="idle")
     await rig.step(fb)
