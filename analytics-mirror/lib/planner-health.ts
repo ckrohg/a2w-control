@@ -55,3 +55,22 @@ export async function fetchPlannerPumpHealth(): Promise<{ pumpHealth: unknown; s
     return { pumpHealth: null, status: 502, error: `planner unreachable: ${String(e)}` };
   }
 }
+
+/** The planner's /health `backup_gate` block (backupgate.ts), raw — lib/backup-gate.ts normalizes it. Same auth + timeout. */
+export async function fetchPlannerBackupGate(): Promise<{ backupGate: unknown; status: number; error?: string }> {
+  const base = process.env.PLANNER_URL;
+  const token = process.env.PLANNER_API_TOKEN;
+  if (!base || !token) return { backupGate: null, status: 503, error: "planner not configured" };
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, "")}/health`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const out: { backup_gate?: unknown } = await res.json().catch(() => ({}));
+    return out.backup_gate ? { backupGate: out.backup_gate, status: 200 }
+      : { backupGate: null, status: 502, error: `planner health gave no backup_gate (${res.status})` };
+  } catch (e) {
+    return { backupGate: null, status: 502, error: `planner unreachable: ${String(e)}` };
+  }
+}

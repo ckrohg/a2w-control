@@ -11,6 +11,7 @@ import { BackupLine, BackupChip } from "./backup-line";
 import { AutoRefresh } from "./auto-refresh";
 import { SpanArmCard, type ArmState, type ArmEvent } from "./span-arm-card";
 import { PumpHealthCard } from "./pump-health-card";
+import { BackupGateCard } from "./backup-gate-card";
 import { fmtTime, fmtDay, fmtDateTime } from "@/lib/tz";
 import { I1Banner } from "./i1-banner";
 import { StormBanner } from "./storm-banner";
@@ -260,6 +261,8 @@ export default async function Dashboard({ searchParams }: { searchParams: { hour
             <HeatNow />
 
             <PumpHealthCard />
+
+            <BackupGateCard />
 
             <div className="card">
               <h2>Planner (practice mode)<span className="chip">not in control</span></h2>

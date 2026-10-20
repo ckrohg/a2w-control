@@ -937,6 +937,13 @@ export class Store {
     return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
   }
 
+  /** Episodes of one kind opened in the last `hours` (/health.backup_gate.episodes_7d). */
+  async alertEpisodesSince(kind: string, hours: number): Promise<number> {
+    const r = await this.locked.query(
+      `SELECT count(*)::int AS n FROM alert_episodes WHERE kind = $1 AND started_at > now() - make_interval(hours => $2)`, [kind, hours]);
+    return Number(r.rows[0]?.n ?? 0);
+  }
+
   /** Episodes opened in the last 24 h, by kind (/health.unserved). */
   async alertEpisodes24h(): Promise<Record<string, number>> {
     const r = await this.locked.query(
