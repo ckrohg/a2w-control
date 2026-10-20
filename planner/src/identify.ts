@@ -45,6 +45,7 @@ import type { PhaseB } from "./phaseb";
 import type { DemandFeed, InsightZone } from "./demand";
 import { DEFAULT_OPTS } from "./shadow";
 import { detectDrawTimes } from "./dhw";
+import { staleReportedTarget, ADOPTION_TOLERANCE_F, type RecentPoll, type StaleReportVerdict } from "./stale-target";
 
 export type IdentMode = "off" | "shadow" | "armed";
 export type IdentArm = "probe" | "hold";
@@ -157,7 +158,7 @@ export interface IdentStore {
   getLatestSlx(): Promise<{ ts: Date; tankF: number | null; targetF: number | null; outdoorF: number | null } | null>;
   activeBoost(): Promise<{ targetF: number; restoreAt: Date } | null>;
   recentPlans(hours: number): Promise<{ computedAt: Date; plan: any[] }[]>;
-  getRecentSeries(hours: number): Promise<{ ts: Date; tankF: number | null; anyCall: boolean }[]>;
+  getRecentSeries(hours: number): Promise<RecentPoll[]>;
   openIdentificationWindow(): Promise<IdentWindow | null>;
   lastIdentificationWindowEnd(includeDryRun?: boolean): Promise<Date | null>;
   insertIdentificationWindow(w: Omit<IdentWindow, "id">): Promise<number>;
@@ -480,6 +481,21 @@ export class IdentificationDriver {
     }
   }
 
+  /**
+   * Is SensorLinx's reported target a frozen snapshot? Only asked when the report sits above the command by more
+   * than the adoption tolerance (the post-soak / post-bank lowering, 99 % of adoption_pending time); the proof is
+   * the last hour of polls (stale-target.ts). The curve output at the live outdoor is what the device drives to;
+   * htDif sizes the tank margin. A failed series read is "unproven", never an exception out of the gate.
+   */
+  private async staleReportVerdict(st: Record<string, unknown>, reportedF: number | null, commandedF: number | null, nowMs: number): Promise<StaleReportVerdict> {
+    if (reportedF == null || commandedF == null || reportedF - commandedF <= ADOPTION_TOLERANCE_F) return { kind: "not_applicable" };
+    const recent = await this.d.store.getRecentSeries(1).catch(() => [] as RecentPoll[]);
+    const cif = (st.curve_in_force ?? null) as { output_at_live_outdoor_f?: unknown } | null;
+    const curveOutputF = typeof cif?.output_at_live_outdoor_f === "number" ? cif.output_at_live_outdoor_f : null;
+    const htDifF = typeof st.ht_dif_f === "number" ? (st.ht_dif_f as number) : null;
+    return staleReportedTarget({ reportedF, commandedF, curveOutputF, htDifF, recent, nowMs });
+  }
+
   // ── idle → arming/active ──
   private async maybeStart(): Promise<void> {
     const nowMs = this.now().getTime();
@@ -507,17 +523,30 @@ export class IdentificationDriver {
     this.eligibleNow = this.plan.cells.filter((c) => cellEligibleAt(c, slx.outdoorF!)).length;
     if (!cell || !cell.suggest) { this.lastResult = `idle: no safe cell for ${slx.outdoorF} °F outdoor`; return; }
 
-    // The base is the target the device is ACTUALLY driving to (temp1.target), and only when the last
-    // command has been adopted: commanded and operative differ until the next reheat cycle, and a
-    // window opened on a pending command records a base the plant never delivered and gets an
-    // unlabelled transition mid-window (codex 2026-09-29 high). TempIQ's estimate is never the base
-    // of a real window — with no settled operative target there is no window.
+    // The base is the target the device is ACTUALLY driving to, and only when the last command has been
+    // adopted: a window opened on a pending command records a base the plant never delivered and gets an
+    // unlabelled transition mid-window (codex 2026-09-29 high). TempIQ's estimate is never the base of a
+    // real window — with no settled operative target there is no window.
+    // The device's REPORTED target (temp1.target) is a frozen snapshot while it is idle, not the operative
+    // value: after every soak/bank lowering it kept reading the old target for 7–16 h while the device sat on
+    // the new curve without calling (54 such stretches since 2026-07-16; this gate idled the driver 49 % of its
+    // first three armed days — stale-slx-target-2026-10-19.md). When the physics PROVE the report stale — tank
+    // below the report's call threshold, demand present, no call for three polls — the base is the curve in
+    // force (stale-target.ts). A report the proof cannot clear still idles the driver, with the reason.
     const st = await this.d.writer.status().catch(() => ({} as Record<string, unknown>));
     const commanded = typeof st.commanded_target_f === "number" ? (st.commanded_target_f as number) : null;
-    const operative = typeof st.target_f === "number" ? (st.target_f as number) : null;
-    if (st.adoption_pending === true) { this.lastResult = `idle: last command (${commanded ?? "?"} °F) not yet adopted (operative ${operative ?? "?"} °F) — base not settled`; return; }
+    const reported = typeof st.target_f === "number" ? (st.target_f as number) : null;
+    const verdict = await this.staleReportVerdict(st, reported, commanded, nowMs);
+    const operative = verdict.kind === "stale" ? verdict.operativeF : reported;
+    if (st.adoption_pending === true && verdict.kind !== "stale") {
+      this.lastResult = `idle: last command (${commanded ?? "?"} °F) not yet adopted (operative ${reported ?? "?"} °F) — base not settled${verdict.kind === "unproven" ? `; stale-report proof: ${verdict.why}` : ""}`;
+      return;
+    }
     if (operative == null || !Number.isFinite(operative)) { this.lastResult = "idle: no operative tank target from SensorLinx — base unknown"; return; }
-    if (commanded != null && Math.abs(commanded - operative) > 3) { this.lastResult = `idle: commanded ${commanded} °F vs operative ${operative} °F disagree — base not settled`; return; }
+    if (commanded != null && Math.abs(commanded - operative) > ADOPTION_TOLERANCE_F) { this.lastResult = `idle: commanded ${commanded} °F vs operative ${operative} °F disagree — base not settled`; return; }
+    const baseNote = verdict.kind === "stale"
+      ? ` [SensorLinx still reports ${reported} °F — stale: tank ${verdict.tankF} °F below its call threshold for ${verdict.polls} polls, no call; base is the curve in force]`
+      : "";
     // The base must also be where the PLAN wants the plant right now. The driver ticks before the
     // auto-pilot in the same poll, so a floor the hourly plan or the 5-min re-check just raised has not
     // been written yet: drawing here would freeze the OLD target as a "hold" (or probe from it) and the
@@ -565,7 +594,7 @@ export class IdentificationDriver {
     const id = await this.d.store.insertIdentificationWindow(row);
     const w: IdentWindow = { id, ...row };
     this.currentWindow = w;
-    const label = `${cell.zoneName} [${cell.band[0]},${cell.band[1]}) ${arm === "probe" ? `${cell.suggest.direction} ${tgt.stepF} °F → ${tgt.targetF}` : `HOLD at ${baseF}`} (p=${cell.suggest.assignmentProbability}, u=${seed})`;
+    const label = `${cell.zoneName} [${cell.band[0]},${cell.band[1]}) ${arm === "probe" ? `${cell.suggest.direction} ${tgt.stepF} °F → ${tgt.targetF}` : `HOLD at ${baseF}`} (p=${cell.suggest.assignmentProbability}, u=${seed})${baseNote}`;
     // Hold the auto-pilot for the window in every LIVE arm (a hold arm is a hold of the base, too). A
     // shadow window changes nothing on the plant, so it must not stop a live auto-pilot from following
     // its plan (codex on #152).

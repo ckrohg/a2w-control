@@ -1822,6 +1822,10 @@ async function shadowOnce(): Promise<void> {
  * Plan-vs-actual: for each completed hour, score the shadow block from the most recent
  * plan computed BEFORE that hour against what HBX actually targeted. gap_f > 0 = the
  * as-found system ran hotter than the shadow plan wanted — the opportunity, in °F-hours.
+ * "Actually targeted" is the OPERATIVE target: the reported temp1.target freezes while the device is idle and
+ * read 139.9 °F for 7 h after the 2026-10-19 soak with the 120 °F curve in force (gap +19.9 all evening), so an
+ * hour whose samples prove the report stale (store.hourlyActuals reportedStale) scores against the curve in
+ * force instead. Both values are recorded (stale-slx-target-2026-10-19.md).
  */
 async function scoreOnce(): Promise<void> {
   const [plans, actuals] = await Promise.all([store.recentPlans(30), store.hourlyActuals(26)]);
@@ -1836,7 +1840,8 @@ async function scoreOnce(): Promise<void> {
       (b: { ts: string }) => new Date(b.ts).getTime() === a.hour.getTime(),
     );
     if (!block) continue;
-    const gap = a.targetF == null ? null : a.targetF - block.tank_target_f;
+    const operativeF = a.reportedStale && a.commandedF != null ? a.commandedF : a.targetF;
+    const gap = operativeF == null ? null : operativeF - block.tank_target_f;
     await store.upsertPlanScore({
       hourTs: a.hour,
       shadowTargetF: block.tank_target_f,
@@ -1844,6 +1849,8 @@ async function scoreOnce(): Promise<void> {
       actualTankF: a.tankF,
       gapF: gap,
       planComputedAt: plan.computedAt,
+      commandedTargetF: a.commandedF,
+      reportedStale: a.reportedStale,
     });
     scored++;
     if (gap != null) gaps.push(gap);

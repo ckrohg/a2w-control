@@ -78,7 +78,7 @@ not work-gated.
   cause this?" with anything better than a guess. On home-heating infrastructure that is the
   difference that matters.
 
-**Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed.
+**Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed. SensorLinx's reported tank target (`temp1.target`, `slx_readings.tank_target_f`) is a snapshot that freezes while the HBX is idle — after a soak/bank lowering it reads the OLD target for 7–16 h while the device is on the new curve; the curve in force (`/health.curve.in_force`) is the operative target (`knowledge/reference/stale-slx-target-2026-10-19.md`).
 
 Owner rejects over-engineering — right-sized solutions first (SQLite, single process, Cloudflare Tunnel).
 

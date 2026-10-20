@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; curveOutputF?: number | null; htDifF?: number | null; recentSeries?: Array<{ ts: Date; tankF: number | null; anyCall: boolean; hdActive?: boolean | null }>; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -130,7 +130,7 @@ async function main(): Promise<void> {
         const settledF = typeof seededBase === "number" ? seededBase : typeof over.operative === "number" ? over.operative : typeof over.commanded === "number" ? over.commanded : 135;
         return [{ computedAt: now(), plan: over.planBlocks ?? [{ ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 40, tank_target_f: settledF, hp1_setpoint_f: settledF + 5, reason: "test block" }] }];
       },
-      async getRecentSeries() { return []; },
+      async getRecentSeries() { return over.recentSeries ?? []; },
       async openIdentificationWindow() { return rows.find((r) => r.state !== "ended") ?? null; },
       async lastIdentificationWindowEnd(includeDryRun = false) {
         if (over.lastEnd !== undefined) return over.lastEnd;
@@ -169,7 +169,11 @@ async function main(): Promise<void> {
           // the device commands the last ACCEPTED write when there was one, else the configured base
           const last = writes.at(-1);
           const c = last ? last.targetF : (over.commanded === undefined ? 135 : over.commanded);
-          return { commanded_target_f: c, target_f: last ? last.targetF : (over.operative === undefined ? c : over.operative), adoption_pending: over.adoptionPending ?? false };
+          return {
+            commanded_target_f: c, target_f: last ? last.targetF : (over.operative === undefined ? c : over.operative), adoption_pending: over.adoptionPending ?? false,
+            ht_dif_f: over.htDifF === undefined ? 4 : over.htDifF,
+            curve_in_force: over.curveOutputF === undefined ? null : { output_at_live_outdoor_f: over.curveOutputF },
+          };
         },
       } as any,
       autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false } as any,
@@ -893,6 +897,46 @@ async function main(): Promise<void> {
       await h.driver.tick();
       assert.equal(h.rows[0].baseF, 133);
       assert.equal(h.rows[0].targetF, 141);
+    }
+    // stale-slx-target-2026-10-19.md: SensorLinx's reported target freezes while the device is idle. The Oct 19
+    // afternoon — command 119 °F (curve 120/118, output 119.5 at the live outdoor), report still 139.9 from the
+    // soak, tank coasting 130 °F, no call for three polls — PROVES the report stale, and the base is the curve.
+    {
+      const idle = (minAgo: number, tankF: number | null, over: Partial<{ anyCall: boolean; hdActive: boolean | null }> = {}) => ({ ts: new Date(T0.getTime() - minAgo * 60_000), tankF, anyCall: false, hdActive: true, ...over });
+      const block120 = [{ ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 40, tank_target_f: 120, hp1_setpoint_f: 125, reason: "DHW window floor" }];
+      const stale = { plan: upPlan, commanded: 119, operative: 139.9, adoptionPending: true, curveOutputF: 119.5, planBlocks: block120, pumpsCoverF: 150 };
+      const proven = harness({ ...stale, recentSeries: [idle(10, 130.2), idle(5, 130.1), idle(0, 130.1)] });
+      await proven.driver.tick();
+      assert.equal(proven.rows.length, 1, "the proven-stale report no longer idles the driver");
+      assert.equal(proven.rows[0].baseF, 120, "the base is the curve output (119.5 → 120), not the frozen 139.9 report");
+      assert.equal(proven.rows[0].targetF, 128, "probe = base + 8");
+      assert.match(proven.driver.status().lastResult ?? "", /SensorLinx still reports 139\.9 °F — stale: tank 130\.1 °F below its call threshold for 3 polls/);
+      // the proof incomplete → still idle, and the status says what is missing
+      const noPolls = harness({ ...stale, recentSeries: [] });
+      await noPolls.driver.tick();
+      assert.equal(noPolls.rows.length, 0);
+      assert.match(noPolls.driver.status().lastResult ?? "", /not yet adopted .*stale-report proof: needs 3 idle polls/);
+      const called = harness({ ...stale, recentSeries: [idle(10, 141.0, { anyCall: true }), idle(5, 141.3), idle(0, 140.7)] });
+      await called.driver.tick();
+      assert.equal(called.rows.length, 0); assert.match(called.driver.status().lastResult ?? "", /a stage was called/);
+      const warm = harness({ ...stale, recentSeries: [idle(10, 138.0), idle(5, 137.5), idle(0, 137.0)] });
+      await warm.driver.tick();
+      assert.equal(warm.rows.length, 0); assert.match(warm.driver.status().lastResult ?? "", /is not below 136\.9 °F/);
+      const noDemand = harness({ ...stale, recentSeries: [idle(10, 130.2), idle(5, 130.1, { hdActive: false }), idle(0, 130.1)] });
+      await noDemand.driver.tick();
+      assert.equal(noDemand.rows.length, 0); assert.match(noDemand.driver.status().lastResult ?? "", /no heat demand/);
+      // a raise (report BELOW the command) has no idle proof: the old gate stands
+      const raise = harness({ plan: upPlan, commanded: 135, operative: 128, adoptionPending: true, curveOutputF: 135, recentSeries: [idle(10, 125), idle(5, 125), idle(0, 125)] });
+      await raise.driver.tick();
+      assert.equal(raise.rows.length, 0); assert.match(raise.driver.status().lastResult ?? "", /not yet adopted/); assert.doesNotMatch(raise.driver.status().lastResult ?? "", /stale-report proof/);
+      // the plan-settled guard still runs on the operative base: plan 132, curve 120 → the auto-pilot settles first
+      const planMoved = harness({ ...stale, recentSeries: [idle(10, 130.2), idle(5, 130.1), idle(0, 130.1)], planBlocks: [{ ...block120[0], tank_target_f: 132 }] });
+      await planMoved.driver.tick();
+      assert.equal(planMoved.rows.length, 0); assert.match(planMoved.driver.status().lastResult ?? "", /plan wants 132 °F but the plant is at 120 °F/);
+      // a wider differential (htDif 8 → margin 5) needs the tank below 134.9: 130 still qualifies, 135 does not
+      const wide = harness({ ...stale, htDifF: 8, recentSeries: [idle(10, 135.5), idle(5, 135.2), idle(0, 135.0)] });
+      await wide.driver.tick();
+      assert.equal(wide.rows.length, 0); assert.match(wide.driver.status().lastResult ?? "", /not below 134\.9 °F/);
     }
   }
   // 10. The plan is fetched with the actuator's bounds as query knobs.
