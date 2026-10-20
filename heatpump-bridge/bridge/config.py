@@ -70,6 +70,10 @@ class GuardrailConfig(BaseModel):
     # for reconnect_write_hold_s once polls succeed again, and those first polls are paced.
     # HP2's E21 onsets cluster after the Pi's own WiFi outages; the evidence doesn't show
     # our traffic as the cause, but this takes it off the table for ~2 min. 0 disables.
+    # Never held: the baseline revert, power-ON, and person-initiated writes (ui, dashboard);
+    # at most one hold per 10 min, so a flapping gateway can't starve the planner. No hold
+    # after a bridge restart: every deploy would nack the planner's first command, and the
+    # evidence doesn't implicate writes — the restart's first poll is not paced either.
     reconnect_min_outage_s: float = 60.0
     reconnect_write_hold_s: float = 120.0
 

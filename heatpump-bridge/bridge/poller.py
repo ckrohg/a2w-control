@@ -51,6 +51,16 @@ REDISCOVER_MIN_INTERVAL_S = 300  # at most one MAC-following network sweep per 5
 # GuardrailConfig.reconnect_write_hold_s): a ~2 s burst becomes ~4 s, so the first frames
 # a W610 forwards after an outage arrive one at a time with idle bus between them.
 RECONNECT_BLOCK_GAP_S = 1.0
+# At most one write hold per this window, measured from the end of the previous hold. A
+# gateway flapping down >= reconnect_min_outage_s and back would otherwise restart the hold
+# on every return and no write would ever land.
+RECONNECT_HOLD_MIN_SPACING_S = 600.0
+# Writes the hold never blocks: the lease's revert to the warm baseline (a safety action)
+# and anything a person started — the local UI and the owner's dashboard via the hub. The
+# hold exists to keep the planner's routine traffic off a just-reconnected bus, nothing more.
+# Powering a pump ON is exempt too (write_power).
+RECONNECT_HOLD_EXEMPT_SOURCES = frozenset(
+    {"baseline-revert", "ui", "hub:dashboard", "hub:armed-dashboard"})
 
 
 class PumpPoller:
@@ -110,7 +120,9 @@ class PumpPoller:
         # of failures (None while healthy), and until when writes stay refused after the
         # pump comes back from an outage >= reconnect_min_outage_s.
         self._failing_since: float | None = None
-        self._writes_held_until = 0.0
+        # -inf, not 0.0: time.monotonic() is ~seconds-since-boot (see _last_rediscover),
+        # and the spacing check reads this as "when did the last hold end".
+        self._writes_held_until = float("-inf")
 
     @property
     def online(self) -> bool:
@@ -174,8 +186,6 @@ class PumpPoller:
                 return
             try:
                 await self._poll_decode_and_store(client, regs)
-                self._recent_outcomes.append("ok")
-                await self._note_poll_ok()
             except Exception as exc:  # noqa: BLE001 — a decode/store bug must never leave a
                 # stale "online" zombie: count it as a FAILED poll so the offline watchdog,
                 # the health endpoint, and the dead-man all see the truth.
@@ -184,6 +194,9 @@ class PumpPoller:
                 client.record_poll(ok=False)
                 self._recent_outcomes.append("decode")
                 await self._handle_poll_failure(ModbusError(f"decode/store failed: {exc!r}", "decode"))
+                return
+            self._recent_outcomes.append("ok")
+            await self._note_poll_ok()   # outside the try: a good poll stays a good poll
 
     def _reconnect_pacing(self) -> bool:
         """True while this pump is coming back from an outage: the poll about to run is
@@ -211,14 +224,25 @@ class PumpPoller:
         outage = time.monotonic() - since
         if outage < g.reconnect_min_outage_s:
             return
-        self._writes_held_until = time.monotonic() + g.reconnect_write_hold_s
-        await self.store.add_event(
-            self.cfg.id, "comm", code="reconnect_hold", severity="info",
-            message=f"{self.cfg.name} back after ~{outage:.0f}s unreachable — writes held "
-                    f"{g.reconnect_write_hold_s:.0f}s, first polls paced",
-            detail={"outage_s": round(outage), "hold_s": g.reconnect_write_hold_s})
+        now = time.monotonic()
+        if now - self._writes_held_until < RECONNECT_HOLD_MIN_SPACING_S:
+            log.info("[%s] back after ~%.0fs unreachable — no write hold (one already ran "
+                     "in the last %.0f min)", self.cfg.id, outage,
+                     RECONNECT_HOLD_MIN_SPACING_S / 60)
+            return
+        self._writes_held_until = now + g.reconnect_write_hold_s
+        try:
+            await self.store.add_event(
+                self.cfg.id, "comm", code="reconnect_hold", severity="info",
+                message=f"{self.cfg.name} back after ~{outage:.0f}s unreachable — writes "
+                        f"held {g.reconnect_write_hold_s:.0f}s, first polls paced",
+                detail={"outage_s": round(outage), "hold_s": g.reconnect_write_hold_s})
+        except Exception:  # noqa: BLE001 — an audit failure must not fail the poll
+            log.exception("[%s] could not record reconnect_hold", self.cfg.id)
 
-    def _require_not_reconnecting(self) -> None:
+    def _require_not_reconnecting(self, source: str, *, exempt: bool = False) -> None:
+        if exempt or source in RECONNECT_HOLD_EXEMPT_SOURCES:
+            return
         left = self._writes_held_until - time.monotonic()
         if left > 0:
             raise GuardrailError(
@@ -677,7 +701,7 @@ class PumpPoller:
         # is 1degC resolution — rounding silently would violate "never clamp silently".
         try:
             self._require_identity()
-            self._require_not_reconnecting()
+            self._require_not_reconnecting(source)
             if float(value) != int(value):
                 raise GuardrailError(
                     f"setpoint must be a whole number of °C (got {value}) — the pump "
@@ -789,7 +813,9 @@ class PumpPoller:
 
         try:
             self._require_identity()
-            self._require_not_reconnecting()
+            # powering ON is always toward heat — never held
+            self._require_not_reconnecting(
+                source, exempt=register == R.REG_ON_OFF and raw == 1)
             self.guard.validate(rate_key, raw, online=self.online,
                                 write_enabled=self.cfg.write_enabled,
                                 min_c=float("-inf"), max_c=float("inf"))

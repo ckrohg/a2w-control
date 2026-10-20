@@ -28,7 +28,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-async def _make_rig(tmp_path, hold_s=HOLD_S):
+async def _make_rig(tmp_path, hold_s=HOLD_S, **guardrails):
     port = free_port()
     pump = FakePump(1, port)
     await pump.start()
@@ -38,7 +38,7 @@ async def _make_rig(tmp_path, hold_s=HOLD_S):
                           poll_interval_s=1, write_enabled=True)],
         guardrails=GuardrailConfig(min_write_interval_s=0.0,
                                    reconnect_min_outage_s=MIN_OUTAGE_S,
-                                   reconnect_write_hold_s=hold_s),
+                                   reconnect_write_hold_s=hold_s, **guardrails),
         db_path=str(tmp_path / "test.db"),
     )
     store = Store(cfg.db_path)
@@ -101,8 +101,8 @@ async def test_long_outage_holds_writes_then_releases(rig):
                 if e["type"] == "setpoint_write" and e["code"] == "rejected"]
     assert rejected, "a held write must be audited like any other refusal"
 
-    with pytest.raises(GuardrailError):            # power/mode/param writes too
-        await poller.write_power(True, source="ui")
+    with pytest.raises(GuardrailError):            # mode/param/power-off writes too
+        await poller.write_mode("heating", source="hub:phase-b")
 
     await asyncio.sleep(HOLD_S + 0.05)
     result = await poller.write_setpoint(48, source="hub:phase-b")
@@ -125,7 +125,7 @@ async def test_short_blip_does_not_hold_writes(rig):
 
 async def test_first_polls_after_outage_are_paced(rig, monkeypatch):
     pump, poller, store = rig
-    monkeypatch.setattr(poller_mod, "RECONNECT_BLOCK_GAP_S", 0.05)
+    monkeypatch.setattr(poller_mod, "RECONNECT_BLOCK_GAP_S", 0.2)
     sw = _outage_switch(poller)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
@@ -134,13 +134,97 @@ async def test_first_polls_after_outage_are_paced(rig, monkeypatch):
     await poller.poll_once()                       # the reconnect poll
     paced = sw["reads"]
     assert len(paced) >= 2
-    assert all(b - a >= 0.045 for a, b in zip(paced, paced[1:]))
+    assert all(b - a >= 0.15 for a, b in zip(paced, paced[1:]))
 
     await asyncio.sleep(HOLD_S + 0.05)
     sw["reads"].clear()
     await poller.poll_once()                       # quarantine over: back to a tight burst
     healthy = sw["reads"]
-    assert all(b - a < 0.045 for a, b in zip(healthy, healthy[1:]))
+    assert all(b - a < 0.15 for a, b in zip(healthy, healthy[1:]))
+
+
+async def test_safety_and_owner_writes_are_never_held(rig, monkeypatch):
+    pump, poller, store = rig
+    monkeypatch.setattr(poller_mod, "RECONNECT_BLOCK_GAP_S", 0.0)  # keep the hold window
+    sw = _outage_switch(poller)
+    await poller.poll_once()
+    await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+    await poller.poll_once()
+    assert "reconnect_hold" in await _codes(store)
+
+    for source, value in (("ui", 47), ("hub:dashboard", 49), ("hub:armed-dashboard", 50)):
+        result = await poller.write_setpoint(value, source=source)
+        assert result["setpoint_c"] == value
+    await poller.write_power(True, source="hub:phase-b")   # toward heat: never held
+    with pytest.raises(GuardrailError) as exc:
+        await poller.write_setpoint(51, source="hub:phase-b")
+    assert "reconnect quarantine" in str(exc.value)
+
+
+async def test_baseline_revert_lands_during_a_hold(tmp_path):
+    """FINDING-1 is armed on the Pi: a lapsed lease must revert to the warm baseline even
+    if it lapses inside a reconnect hold."""
+    pump, poller, store = await _make_rig(tmp_path, baseline_setpoint_c=52)
+    try:
+        sw = _outage_switch(poller)
+        await poller.poll_once()
+        await poller.write_setpoint(60, source="hub:phase-b", unattended=True,
+                                    lease_minutes=90)
+        await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+        await poller.poll_once()
+        assert "reconnect_hold" in await _codes(store)
+
+        poller._lease["until"] = time.time() - 1          # the planner went silent
+        await poller.check_lease(time.time())
+        assert poller._lease is None and poller._reverted is True
+        assert poller.snapshot["setpoint_c"] == 52
+    finally:
+        poller.client.close()
+        await pump.server.shutdown()
+        await store.close()
+
+
+async def test_flapping_gateway_gets_one_hold_per_window(rig, monkeypatch):
+    """Down >= the minimum, back, down again: the second return must not restart the
+    hold, or a flapping link would keep every planner write out indefinitely."""
+    pump, poller, store = rig
+    sw = _outage_switch(poller)
+    await poller.poll_once()
+    await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+    await poller.poll_once()                       # hold #1
+    await asyncio.sleep(HOLD_S + 0.05)
+    await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+    await poller.poll_once()                       # inside the spacing window: no hold
+    assert (await _codes(store)).count("reconnect_hold") == 1
+    result = await poller.write_setpoint(48, source="hub:phase-b")
+    assert result["verified"] is True
+
+    monkeypatch.setattr(poller_mod, "RECONNECT_HOLD_MIN_SPACING_S", 0.1)
+    await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+    await poller.poll_once()                       # spacing elapsed: holds again
+    assert (await _codes(store)).count("reconnect_hold") == 2
+
+
+async def test_audit_failure_does_not_fail_the_reconnect_poll(rig, monkeypatch):
+    pump, poller, store = rig
+    sw = _outage_switch(poller)
+    await poller.poll_once()
+    await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
+    real_add_event = store.add_event
+
+    async def flaky_add_event(pump_id, type_, **kw):
+        if kw.get("code") == "reconnect_hold":
+            raise RuntimeError("disk full")
+        return await real_add_event(pump_id, type_, **kw)
+
+    monkeypatch.setattr(store, "add_event", flaky_add_event)
+    errors = poller.client.stats.error_polls
+    await poller.poll_once()
+    assert poller.online is True
+    assert poller.client.stats.error_polls == errors   # still a good poll
+    assert poller._failing_since is None
+    with pytest.raises(GuardrailError):                 # and the hold still started
+        await poller.write_setpoint(48, source="hub:phase-b")
 
 
 async def test_hold_zero_disables_quarantine(tmp_path):

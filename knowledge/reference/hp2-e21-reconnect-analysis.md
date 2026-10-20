@@ -47,21 +47,24 @@ would land in those windows by chance, given the share of E21-free time the wind
 | Both unreachable, longest outage ≥ 5 min | 24 | 2 | **22** | 0.54 | 0.09 |
 | **Pi-side** (the Pi lost the hub too) | 31 | 3 | **28** | 0.34 | 0.002 |
 | ↳ of which ≥ 5 min | 20 | 2 | **18** | — | — |
-| **Gateway-side** (Pi online, both gateways down) | 53 | 0 | **53** | 0.36 | — |
-| pump2-only outages (its own W610 dropped) | 48 | 0 | **48** | 0.41 | — |
+| **Gateway-side** (Pi online, both gateways down) | 53 | 0 | **53** | 0.36 | P(0) ≈ 0.70 |
+| pump2-only outages (its own W610 dropped) | 48 | 0 | **48** | 0.41 | P(0) ≈ 0.65 |
 | pump2 setpoint writes **accepted** (clusters) | 225 | 0 | 225 | — | — |
 | pump2 setpoint writes **failed** (clusters) | 214 | 3 | 211 | 0.62 | 0.01 |
 
+**Oct 11 is counted as a hit in every row.** Its onset was first seen at the reconnect, which
+falls inside the episode's window, even though the true start time is unknown (§1).
+
 Per-event, not clustered: 722 pump2 reconnects in all, 4 followed by E21 within 60 min.
-There were 29 both-unreachable outages of ≥ 5 min while E21 was clear, and 1 was followed by
-E21 (Oct 14). Oct 11 is excluded from that count because its onset was only seen at reconnect.
+There were 30 both-unreachable outages of ≥ 5 min while E21 was clear (Oct 11 counted the same
+way), and 2 were followed by E21 (Oct 11 and Oct 14).
 
 **Reading it:**
-- **Pi-side outages are the only reconnect kind that E21 follows.** Gateway-side and
-  pump2-only outages (101 at-risk episodes between them) were never followed by E21. The
-  bridge resumes in exactly the same way after every kind: same three block reads every
-  20 s, and the same planner writes on its next replan. Bridge behaviour after a reconnect
-  therefore can't explain why only Pi-side outages are followed by E21.
+- **Every E21 that followed an outage followed a Pi-side one.** Gateway-side and pump2-only
+  outages (101 at-risk episodes) were never followed by E21. But with only 4 onsets, 0 hits
+  is what chance predicts there anyway (P ≈ 0.70 and 0.65), so those zeros are **no evidence
+  either way**. They don't show that bridge behaviour after a reconnect is innocent; the
+  three points below do the work.
 - **Writes are not the trigger.** There were 545 accepted writes to HP2 with no E21 after
   any of them. The "failed write" correlation is a marker of a disturbed period, not a
   cause. A *connect*-failed write never reaches the bus. A write whose pre-read *timed out*
@@ -115,11 +118,35 @@ dead session open after a Pi Wi-Fi drop and accepts the new one alongside it.
      then see which reconnects were quarantined.
 
    Set `reconnect_write_hold_s: 0` in `~/bridge-data/config.yaml` under `guardrails:` to turn it
-   off without a release. A process restart doesn't start a hold, because the outage has to be
-   seen by the running process.
-3. Tests: `heatpump-bridge/tests/test_reconnect_quarantine.py`. They cover hold and release,
-   no hold after a short blip, pacing, `0` disabling it, and a real socket proving the peer
-   sees an RST. The RST test fails against the old graceful close.
+   off without a release.
+
+   **Writes the hold never blocks.** FINDING-1 has been armed on the Pi since 2026-10-18
+   (`baseline_setpoint_c: 52`), so the hold must not be able to stop a lease revert.
+   - Source `baseline-revert`, the lease's revert to the warm baseline.
+   - Power-ON, which is always toward heat.
+   - Person-initiated writes: the local UI (`ui`) and the owner's dashboard via the hub
+     (`hub:dashboard`, `hub:armed-dashboard`).
+
+   The hold only defers the planner's routine traffic (`hub:phase-b`).
+
+   **At most one hold per 10 min**, counted from the end of the previous hold. A gateway that
+   keeps dropping for ≥ 60 s and coming back would otherwise restart the hold every time, and
+   no planner write would ever land.
+
+   **No hold after a bridge restart or reboot.** The outage has to be seen by the running
+   process. A startup hold would nack the planner's first command after every deploy, and the
+   evidence doesn't implicate writes. The case it would cover, the watchdog reboot after a
+   2-hour Wi-Fi wedge, hasn't recurred since Wi-Fi power-save was turned off.
+3. Tests: `heatpump-bridge/tests/test_reconnect_quarantine.py` (9). They cover:
+   - hold and release, and no hold after a short blip;
+   - pacing, and `0` disabling it;
+   - exempt sources and power-ON;
+   - a baseline revert landing during a hold;
+   - one hold per window under flapping;
+   - an audit-write failure not failing the poll;
+   - a real socket proving the peer sees an RST.
+
+   The RST, revert and flapping tests each fail when their guard is removed.
 
 **What it buys:** the next time E21 follows a Pi-side outage with this release live, our
 traffic is ruled out as the trigger, both writes and stale frames. If E21 stops following
