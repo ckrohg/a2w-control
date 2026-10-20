@@ -465,17 +465,34 @@ export class Store {
 
   /** Per-day inputs for the realized-savings engine: real outdoor + current buffer target from
    *  slx_readings, joined to quality-filtered measured COP sessions from tempiq_cop_points. One row
-   *  per operating day from the cutover forward (or the lookback window, whichever is later). */
+   *  per operating day from the cutover forward (or the lookback window, whichever is later).
+   *  `cutover` is a YYYY-MM-DD LOCAL (America/New_York) day; `lookbackDays` counts whole local days back from today. */
   async getRealizedDayInputs(cutover: string, lookbackDays: number): Promise<{
     day: string; avgOutdoorF: number; nowBufferF: number; coverage: number; spanKwh: number | null;
     measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
   }[]> {
     const res = await this.pool.query(
-      `WITH days AS (
+      `WITH win AS (
+         -- The window starts at a LOCAL (America/New_York) MIDNIGHT, never at a moving instant. Every CTE below
+         -- buckets rows by local day, so a cutoff of now() − N days sliced the day it fell in: computeAndStore runs
+         -- hourly, and a day's LAST recompute was the one in the hour it slid out of the window, with only its final
+         -- minutes of rows left (coverage ≈ 0.02, no span row → 0.2 kWh, modeled, energy_metered=false) — and that
+         -- is what the ledger kept forever (2026-08-28 … 09-03 in the 2026-10-20 restore, one such row per night).
+         -- Starting at the local midnight N days before today's means a day is either complete or absent: it leaves
+         -- the window when the next local day begins, after its last full recompute. The cutover is a local day
+         -- too — cast as timestamptz it was midnight in the SESSION zone (UTC on Railway), 20:00 EDT the evening
+         -- before, which produced the ledger's 4-hour "2026-07-15" row. Proof: scripts/realized-window-local-check.ts.
+         SELECT GREATEST(
+                  ($1::timestamp) AT TIME ZONE 'America/New_York',
+                  (date_trunc('day', now() AT TIME ZONE 'America/New_York') - ($2 || ' days')::interval)
+                    AT TIME ZONE 'America/New_York'
+                ) AS start
+       ),
+       days AS (
          SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
                 avg(outdoor_f) AS out_f, avg(tank_target_f) AS now_buf, count(*) AS n
          FROM slx_readings
-         WHERE ts >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE ts >= (SELECT start FROM win)
          GROUP BY 1
        ),
        cop AS (
@@ -485,7 +502,7 @@ export class Store {
                 sum(electrical_kwh) AS e, sum(thermal_kwh) AS q,
                 sum(thermal_kwh) / NULLIF(sum(electrical_kwh), 0) AS cop, avg(sink_temp_f) AS sink, count(*) AS sess
          FROM tempiq_cop_points
-         WHERE measured_at >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE measured_at >= (SELECT start FROM win)
            AND cop BETWEEN 1 AND 6 AND thermal_kwh > 0 AND electrical_kwh > 0
            AND sink_temp_f BETWEEN 110 AND 175 AND outdoor_temp_f IS NOT NULL
            AND outdoor_temp_f < sink_temp_f - 20
@@ -503,7 +520,7 @@ export class Store {
          SELECT to_char(date_trunc('day', hour AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
                 max(kwh) AS span_kwh
          FROM span_energy
-         WHERE hour >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE hour >= (SELECT start FROM win)
          GROUP BY 1
        )
        SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess, s.span_kwh
