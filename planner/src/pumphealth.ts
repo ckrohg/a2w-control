@@ -10,7 +10,8 @@
  *   idle_draw        — reports idle/off ≥ 10 min, SPAN 9-min mean > 1 kW (stuck contactor, internal heater)
  *   defrost_overlong — reports defrost continuously > 20 min (the unit's own max defrost setting caps at 20): stagewatch
  *                      SUSPENDS its clock in defrost, so a stuck "defrost" while called was invisible (Oct 18, 83 min)
- *   called_tank_flat — stage called + its pump heating ≥ 90 % of 45 min, tank net rise + standby loss ≤ 2 °F (PROVISIONAL)
+ *   called_tank_flat — stage called + its pump engaged (heating/defrost) ≥ 90 % of 45 min, tank net rise + standby loss
+ *                      ≤ 2 °F AND the unit's mean ΔT over it < 1.5 °C, for 30 min (a flat tank ALONE is house load — measured)
  * Thresholds are MEASURED: knowledge/reference/pump-health-baseline-20261019.md. A window whose data is stale or gappy is
  * "unknown" and moves nothing — the stagewatch rule: a blind spell never opens or closes an episode.
  * The daily rollup (rollupDay) and trend (trend) feed /health.pump_health and the daily digest. Pure — no I/O.
@@ -29,14 +30,17 @@ export const PH = {
   IDLE_DRAW_W: 1000,            // measured idle 4-min mean maximum 672 W; >1 kW idle samples last ≤ 0.8 min
   DEFROST_OVERLONG_S: 20 * 60,  // measured normal 4.0–9.4 min
   TANK_FLAT_WINDOW_S: 45 * 60,
-  TANK_FLAT_HEATING_SHARE: 0.9,
-  TANK_FLAT_RISE_F: 2.0,        // PROVISIONAL — net of standby loss; ~5 % of one pump's no-load ~40 °F/45 min (doc §5)
+  TANK_FLAT_ENGAGED_SHARE: 0.9,  // heating or defrost
+  TANK_FLAT_PERSIST_S: 30 * 60, // every 45-min window ending in the last 30 min must be flat (doc §5)
+  TANK_FLAT_STEP_S: 10 * 60,
+  TANK_FLAT_RISE_F: 2.0,        // net of standby loss; ~5 % of one pump's no-load ~40 °F/45 min (doc §5)
+  TANK_FLAT_ENGAGED_DT_C: 1.5,  // AND the unit's mean ΔT over heating+defrost below this: healthy min 2.1 °C, stuck defrost ≤ 1.1 (doc §5)
   FRESH_S: 180,                 // newest mirror reading must be this fresh (Pi clock corrected)
   MAX_READING_GAP_S: 150,       // readings arrive ~60 s; a skipped push is tolerated, two are not
   MAX_SPAN_GAP_S: 120,          // span samples ~25 s
   MAX_SLX_GAP_S: 450,           // HBX poll 5 min (+ jitter) — stagewatch MAX_STEP_MS
   /** how far back index.ts must read for every window above */
-  LOOKBACK_S: 50 * 60,
+  LOOKBACK_S: 80 * 60,          // called_tank_flat: 45-min window + 30-min persistence + margin
 } as const;
 
 export const TREND = { CUR_DAYS: 7, BASE_DAYS: 14, MIN_RUN_H: 2, DRIFT_PCT: 20, SHORT_CYCLE_STARTS_60: 6, BIN_C: 5 } as const;
@@ -161,39 +165,66 @@ export function evaluatePump(pumpId: string, readings: PumpReading[], span: Span
 }
 
 /**
- * called_tank_flat for one stage → pump, at `nowPi`. Tank readings are converted to the Pi clock by index.ts. PROVISIONAL
- * threshold: house load can legitimately hold the tank flat on a cold night (doc §5) — the detail carries the pump's own
- * ΔT and draw, so a reader can tell a load problem (pump healthy) from a pump problem.
+ * called_tank_flat for one stage → pump, at `nowPi`. Tank readings are converted to the Pi clock by index.ts. Measured on
+ * the 2026-10-20 restore (doc §5): a flat or falling tank is ROUTINE for a healthy single pump at ≤ 45 °F outdoor (house
+ * load ≥ its output), so the tank only corroborates — the trip also needs the unit's own lift over the window (heating +
+ * defrost samples) under 1.5 °C, held for 30 min. In 97 days that leaves exactly pump1's 83-min stuck defrost.
  */
-export function evaluateTankFlat(stage: string, pumpId: string, readings: PumpReading[], span: SpanSample[], tank: TankReading[], nowPi: number, tankUa: number): Verdict {
+export function evaluateTankFlat(stage: string, pumpId: string, readings: PumpReading[], span: SpanSample[], tank: TankReading[], nowPi: number, tankUa: number,
+  persistS: number = PH.TANK_FLAT_PERSIST_S): Verdict {
   const v = (state: VerdictState, reason: string, metrics: Record<string, number | null> = {}): Verdict => ({ kind: "called_tank_flat", pumpId, state, reason, metrics });
-  const from = nowPi - PH.TANK_FLAT_WINDOW_S;
   const newest = readings.length ? readings[readings.length - 1].ts : null;
   if (newest == null || nowPi - newest > PH.FRESH_S) return v("unknown", "mirror readings stale");
-  const t = covered(tank.filter((x) => x.tank_f != null && x.stages_called != null), from, nowPi, PH.MAX_SLX_GAP_S);
-  if (!t || t.length < 8) return v("unknown", "HBX readings do not cover 45 min");
   const idx = Number(stage) - 1;
-  if (!t.every((x) => x.stages_called![idx] === true)) return v("ok", `stage ${stage} not called for 45 min`);
-  const pr = covered(readings, from, nowPi, PH.MAX_READING_GAP_S);
-  if (!pr) return v("unknown", "pump readings do not cover 45 min");
-  if (pr.some((r) => !r.online)) return v("unknown", "pump offline in the window");
-  const share = pr.filter(heating).length / pr.length;
-  if (share < PH.TANK_FLAT_HEATING_SHARE) return v("ok", `pump heating only ${Math.round(share * 100)} % of the window`);
-  const t0 = ((t[0].tank_f as number) + (t[1].tank_f as number)) / 2;
-  const t1 = ((t[t.length - 1].tank_f as number) + (t[t.length - 2].tank_f as number)) / 2;
-  const rise = t1 - t0;
-  const credit = Math.max(0, tankUa * (t0 - 65) * ((t[t.length - 1].ts - t[0].ts) / 3600));
-  const hot = pr.filter((r) => heating(r) && r.inlet_c != null && r.outlet_c != null);
-  const dT = mean(hot.map((r) => (r.outlet_c as number) - (r.inlet_c as number)));
-  const d = drawMean(span, from, nowPi);
-  const other = t[t.length - 1].stages_called!.some((c, i) => c && i !== idx);
-  const m = { tank_rise_f: r1(rise), standby_credit_f: r1(credit), tank_f: r1(t1), heating_pct: Math.round(share * 100),
-    pump_mean_dt_c: r1(dT), pump_draw_w: d?.w != null ? Math.round(d.w) : null, other_stage_called: other ? 1 : 0 };
-  if (rise + credit <= PH.TANK_FLAT_RISE_F) {
-    return v("tripped", `stage ${stage} called 45 min with its pump heating ${Math.round(share * 100)} % of it, but the tank moved ${r1(rise)} °F ` +
-      `(standby loss ${r1(credit)} °F) — pump ΔT ${r1(dT) ?? "?"} °C at ${m.pump_draw_w ?? "?"} W${other ? "; the other stage is called too (heavy load?)" : ""}`, m);
+  const slx = tank.filter((x) => x.tank_f != null && x.stages_called != null);
+  /** one 45-min window ending at `end` */
+  const judge = (end: number): Verdict => {
+    const from = end - PH.TANK_FLAT_WINDOW_S;
+    const t = covered(slx, from, end, PH.MAX_SLX_GAP_S);
+    if (!t || t.length < 8) return v("unknown", "HBX readings do not cover 45 min");
+    if (!t.every((x) => x.stages_called![idx] === true)) return v("ok", `stage ${stage} not called for 45 min`);
+    const pr = covered(readings, from, end, PH.MAX_READING_GAP_S);
+    if (!pr) return v("unknown", "pump readings do not cover 45 min");
+    if (pr.some((r) => !r.online)) return v("unknown", "pump offline in the window");
+    // engaged = heating OR defrost: a healthy unit below 0 °C defrosts every ~50 min (doc §3), so a heating-only share
+    // would never judge a cold-weather call — and a stuck "defrost" while called is exactly a pump not delivering
+    const share = pr.filter((r) => heating(r) || defrosting(r)).length / pr.length;
+    if (share < PH.TANK_FLAT_ENGAGED_SHARE) return v("ok", `pump engaged only ${Math.round(share * 100)} % of the window`);
+    const t0 = ((t[0].tank_f as number) + (t[1].tank_f as number)) / 2;
+    const t1 = ((t[t.length - 1].tank_f as number) + (t[t.length - 2].tank_f as number)) / 2;
+    const rise = t1 - t0;
+    const credit = Math.max(0, tankUa * (t0 - 65) * ((t[t.length - 1].ts - t[0].ts) / 3600));
+    const hot = pr.filter((r) => heating(r) && r.inlet_c != null && r.outlet_c != null);
+    const dT = mean(hot.map((r) => (r.outlet_c as number) - (r.inlet_c as number)));
+    const d = drawMean(span, from, end);
+    // the lift over everything the unit was engaged in — a defrost pulls heat OUT of the water (negative ΔT)
+    const eng = pr.filter((r) => (heating(r) || defrosting(r)) && r.inlet_c != null && r.outlet_c != null);
+    const engagedDt = mean(eng.map((r) => (r.outlet_c as number) - (r.inlet_c as number)));
+    const other = t[t.length - 1].stages_called!.some((c, i) => c && i !== idx);
+    const m = { tank_rise_f: r1(rise), standby_credit_f: r1(credit), net_f: r1(rise + credit), tank_f: r1(t1), engaged_pct: Math.round(share * 100),
+      defrost_pct: Math.round((pr.filter(defrosting).length / pr.length) * 100), pump_mean_dt_c: r1(dT), engaged_dt_c: r1(engagedDt), pump_draw_w: d?.w != null ? Math.round(d.w) : null,
+      other_stage_called: other ? 1 : 0 };
+    if (rise + credit <= PH.TANK_FLAT_RISE_F && (engagedDt == null || engagedDt >= PH.TANK_FLAT_ENGAGED_DT_C)) {
+      // measured: a HEALTHY single pump at ≤ 45 °F outdoor routinely holds the tank flat or loses ground (net p50 +2 °F,
+      // p25 −2.9 °F) while lifting 2.1–4.3 °C — that is house load ≥ one pump's output, not a pump failure
+      return v("ok", `tank flat (net ${r1(rise + credit)} °F) but the pump lifts ${r1(engagedDt) ?? "?"} °C — house load ≥ its output`, m);
+    }
+    if (rise + credit <= PH.TANK_FLAT_RISE_F) {
+      return v("tripped", `stage ${stage} called with its pump engaged ${Math.round(share * 100)} % (defrost ${m.defrost_pct} %), but the tank moved ${r1(rise)} °F ` +
+        `in 45 min (standby loss ${r1(credit)} °F) and the pump lifts only ${r1(engagedDt)} °C over it — ${m.pump_draw_w ?? "?"} W${other ? "; the other stage is called too (heavy load?)" : ""}`, m);
+    }
+    return v("ok", `tank rose ${r1(rise)} °F net ${r1(rise + credit)} °F`, m);
+  };
+  const latest = judge(nowPi);
+  if (latest.state !== "tripped") return latest;
+  // persistence (measured): the one healthy-pump trip in 97 d was a 15-min load event (Oct 17, tank −15 °F at ΔT 4.2 °C,
+  // 4.4 kW). Every 45-min window ending in the last persistS must be flat too.
+  for (let back = PH.TANK_FLAT_STEP_S; back <= persistS; back += PH.TANK_FLAT_STEP_S) {
+    const w = judge(nowPi - back);
+    if (w.state === "unknown") return v("unknown", `flat now, but the window ${back / 60} min ago is unknown (${w.reason})`, latest.metrics);
+    if (w.state === "ok") return v("ok", `flat for < ${persistS / 60} min (a load surge can do that)`, latest.metrics);
   }
-  return v("ok", `tank rose ${r1(rise)} °F`, m);
+  return v("tripped", `${latest.reason}; flat for ≥ ${persistS / 60} min`, latest.metrics);
 }
 
 // ── episodes ──────────────────────────────────────────────────────────────────────────────────────────────────────────

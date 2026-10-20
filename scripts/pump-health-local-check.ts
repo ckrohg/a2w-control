@@ -57,7 +57,7 @@ async function main(): Promise<void> {
   const rd = await store.pumpReadingsWindow(["pump1", "pump2"], nowPi - PH.LOOKBACK_S, nowPi + 60);
   const sp = await store.spanWindow(["Air-Water 1", "Air-Water 2"], nowPi - PH.LOOKBACK_S, nowPi + 60);
   assert.ok(rd && sp);
-  assert.ok(rd!.pump1.length >= 45 && rd!.pump1.length <= 55, `pump1 readings in 50 min: ${rd!.pump1.length}`);
+  assert.ok(rd!.pump1.length >= 75 && rd!.pump1.length <= 85, `pump1 readings in the 80-min lookback: ${rd!.pump1.length}`);
   assert.ok(rd!.pump1.every((r, i, a) => i === 0 || a[i - 1].ts <= r.ts), "ascending");
   assert.ok(sp!["Air-Water 1"].some((s) => (s.power_w ?? 0) < 0) || sp!["Air-Water 1"].every((s) => Math.abs(s.power_w ?? 0) < 20), "raw sign preserved");
   const direct = (p: string, n: string): [PumpReading[], SpanSample[]] => [

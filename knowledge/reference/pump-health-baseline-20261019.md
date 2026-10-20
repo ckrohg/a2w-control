@@ -4,17 +4,20 @@ Owner ask (2026-10-19): detect a heat pump that runs, or draws power, **without 
 no fault code, and track each pump's daily performance so a slow decline shows up. Everything below was measured
 before any threshold was chosen. The checks ship in **shadow** (`planner/src/pumphealth.ts`).
 
-## Data source, and why it is not `analyze-local.sh`
+## Data sources
 
-`scripts/analyze-local.sh` could not run on this Mac: the backup passphrase is not in its Keychain
-(`a2w-backup-passphrase` is missing), so the Postgres dump cannot be decrypted. The numbers instead come from the
-**Pi's own nightly SQLite backup**, `~/bridge-data/backups/bridge-20261019.db`, written 03:30 ET. It was copied with `scp`
+**§1–§4 and §6** come from the **Pi's own nightly SQLite backup**. On 2026-10-19 `scripts/analyze-local.sh` could
+not run: the passphrase was missing, and the `db-backups` dumps had been frozen on the old Neon URL since Aug 24.
+**§5 is measured on the Postgres restore** `a2w-db-2026-10-20T014442Z`, the first dump after the repoint (#203),
+restored locally into `a2w_local` by `analyze-local.sh`. It holds 224 407 readings and 26 865 slx rows up to
+2026-10-19 21:44 ET.
+
+The Pi backup is, `~/bridge-data/backups/bridge-20261019.db`, written 03:30 ET. It was copied with `scp`
 and opened locally with `immutable=1`. The live `bridge.db` and the production database were never queried.
 
-That backup has more detail than the mirror. It holds 20 s pump samples with the raw status word (compressor,
+The Pi backup has more detail than the mirror. It holds 20 s pump samples with the raw status word (compressor,
 four-way valve, electric heater bits), 25 s SPAN-local samples, and the remote-contact (HBX call) edges. It does
-**not** hold the HBX tank temperature (`slx_readings` lives only in Postgres). §5 is therefore a proxy, and it
-says so.
+**not** hold the HBX tank temperature (`slx_readings` lives only in Postgres), which is why §5 uses the restore.
 
 Window: 97 days (2026-07-13 → 2026-10-19), with headline numbers on the last 60. Pump samples: 377 838 (pump1)
 and 374 944 (pump2). SPAN: 287 992 per circuit. Gaps: Oct 7–11 (Pi offline) and Aug 20–23.
@@ -110,21 +113,53 @@ shoulder season with DHW-sized calls. The most starts in any trailing 60 min was
 On the cold days (Oct 16–18) pump1 had 15–17 starts/day. The HBX call → compressor start lag is p99 4.3 min and
 max 8.3 min.
 
-## 5. Tank response while a stage is called — proxy only
+## 5. Tank response while a stage is called — measured on the Postgres restore
 
-`slx_readings` (tank_f, stages_called) is Postgres-only, so this could not be measured directly. The proxy is the
-pump's **inlet (return ≈ tank) temperature** over 40-min windows that were ≥ 90 % heating inside a remote-contact
-call. On the first cold night (2026-10-17 20:36Z, 6 °C outdoor), inlet fell **13 °C** in 40 min while pump1 heated
-normally (ΔT 4–5 °C at 5+ kW). House load can exceed one pump's output, so a flat or falling tank is **not**
-evidence of a sick pump by itself.
+Method: `scripts/pump-health-tank-measure.ts` replays the planner's own `evaluateTankFlat` every 5 min over the
+97-day restore, using mirror `readings`, `span_readings` and `slx_readings`, exactly the inputs `index.ts` feeds it.
+It judges only windows where the stage is called on every HBX reading for 45 min and its pump is engaged ≥ 90 %.
+"Net" means the tank's 45-min rise plus the standby-loss credit (`tank_ua` 0.017 × (T − 65) × h).
+
+**Stage map confirmed.** When only stage 1 was called, pump1 heated in 71 % of HBX readings and pump2 in 0 %. When
+only stage 2 was called, pump2 heated in 36 % and pump1 in 0 % (pump2's share is low because of the E21 period).
+`STAGE_PUMP_MAP` = {1: pump1, 2: pump2} matches the wiring.
+
+**Most calls are short.** Only 112 windows over 4 days (Oct 16–19) qualify. Both stages were never called together
+in a judged window: the HBX waits lagT (180 min) before adding the lag stage.
+
+**Engaged = heating *or* defrost.** On a heating-only share, a healthy unit below 0 °C (one defrost every ~50 min)
+would almost never be judged. Defrost is part of normal operation, and a stuck "defrost" is precisely a unit that
+is engaged and not delivering.
+
+| 45-min windows, healthy pumps | net °F p0 / p10 / p25 / p50 / p75 |
+|---|---|
+| all judged (n = 112) | −15.8 / −7.9 / −2.9 / +2.0 / +8.3 |
+| outdoor < 32 °F (n = 26) | −7.9 / −6.9 / −3.7 / +0.8 / +4.6 |
+| outdoor 32–45 °F (n = 78) | −15.8 / −10.8 / −3.0 / +1.4 / +5.9 |
+| outdoor 45–60 °F (n = 8) | +16.4 / … / +20.1 / … |
+
+**A flat or falling tank is routine for a healthy single pump at ≤ 45 °F.** The low windows are all pumps lifting
+normally: Oct 18 11:45Z, stage 2, tank −16 °F in 45 min at 34 °F outdoor, while pump2 lifted 4.2 °C at 3.6 kW; and
+Oct 17 21:25Z, stage 1, −15 °F at 43 °F while pump1 lifted 4.2 °C at 4.4 kW. That is house load at or above one
+pump's output while the lag stage waits. It is a capacity and staging observation, not a pump fault.
+
+A tank-only rule (net ≤ 2 °F) trips 57 of the 112 windows. Even with 30-min persistence it still leaves two
+healthy-pump episodes (Oct 18 07:55Z and 12:00Z) next to the one true positive. **The tank cannot separate "pump not
+delivering" from "load ≥ output". The unit's own lift can:**
+
+| engaged ΔT (mean outlet − inlet over heating + defrost samples) | p0 / p10 / p50 / p90 |
+|---|---|
+| windows with defrost ≤ 50 % (n = 97, all healthy) | **2.1** / 2.5 / 3.3 / 4.0 °C |
+| windows with defrost > 50 % (n = 15, the Oct 18 stuck defrost) | −0.7 / −0.7 / −0.5 / **1.1** °C |
+
+**Rule chosen:** net ≤ **2 °F** (about 5 % of one pump's ~40 °F no-load rise in 45 min) **and** engaged ΔT
+< **1.5 °C**, held for **30 min** (every 45-min window ending in the last 30 min, stepped at 10 min). Replayed over
+97 days it trips **exactly once**: pump1, Oct 18 03:10–03:40Z, the stuck defrost (tank −3.7 °F, engaged ΔT −0.6 °C,
+216 W). `defrost_overlong` had opened 40 min earlier. `called_tank_flat` is the tank-side confirmation and also
+covers a unit whose time is split between short heating and long defrosts that no single per-pump check catches.
 
 Physics: C_eff = 110 gal × 8.34 = 917 BTU/°F. One pump at ~5.3 kW electric and COP ~2.5–3 delivers ~45–55 kBTU/h,
 about +50–60 °F/h with no load. Standby loss is `tank_ua` × (T − 65) °F/h, ≈ 0.6 °F/h at 100 °F.
-
-The threshold for `called_tank_flat` is **provisional**: net rise ≤ +2 °F over 45 min of called + heating, after
-adding back standby loss (≈ 0.75 °F at 118 °F). That is ~5 % of one pump's no-load rise (~40 °F in 45 min). The check also records the pump's own ΔT and draw, so a reader can tell a load problem
-(pump healthy) from a pump problem. It stays shadow until the slx distribution has been measured with the query in
-the appendix.
 
 ## 6. Degradation index and its noise
 
@@ -159,7 +194,7 @@ A **20 %** flag sits ~1.6× above the worst week-over-baseline swing seen.
 | `heating_no_draw` | reported heating ≥ 7 min, trailing 5-min SPAN mean **< 1 000 W** | observed min 2 851 W |
 | `idle_draw` | reported idle/off ≥ 10 min, trailing 9-min SPAN mean **> 1 000 W** | observed max 672 W; isolated > 1 kW samples last ≤ 0.8 min |
 | `defrost_overlong` | continuous `defrost` **> 20 min** (the unit's own max defrost setting caps at 20) | normal 4–9.4 min; the two real anomalies were 31 and 83 min |
-| `called_tank_flat` | stage called + mapped pump heating ≥ 90 % of 45 min; tank net rise + standby loss **≤ 2 °F** | **provisional** (§5): ~5 % of one pump's no-load capacity |
+| `called_tank_flat` | stage called + mapped pump engaged (heating/defrost) ≥ 90 % of 45 min; tank net rise + standby loss **≤ 2 °F** **and** engaged ΔT **< 1.5 °C**; held **30 min** | measured (§5): healthy engaged ΔT min 2.1 °C; 1 trip in 97 d, the stuck defrost |
 | daily `lift_drift` | 7-d pooled lift index vs own prior 14 d, same 5 °C bin (≥ 2 run-h each), **≤ −20 %** | noise max 12.7 % |
 | daily `twin_drift` | p1/p2 index ratio vs its own 14-d baseline, same bin, **≥ 20 %** change | 1 comparison so far |
 | daily `short_cycling` | **> 6** starts in any trailing 60 min | observed max 4 |
@@ -171,23 +206,12 @@ an episode.
 
 ## Re-measure
 
-- Two things must happen first: the backup passphrase must be on this Mac, **and** the weekly dump must be current
-  again. Since 2026-08-24 every `db-backups` dump is the same 6.54 MB, because the workflow's `DATABASE_URL` secret
-  still points at the pre-migration Neon database, so a restore today would return August data. Once a post-repoint
-  dump exists, run `scripts/analyze-local.sh` and the appendix query, then replace §5's proxy.
-- After ≥ 2 weeks below 0 °C, re-run `rolling.py` and `defrost.py` on a fresh Pi backup. The −5…0 °C bins hold
-  < 4 run-h today.
+- After ≥ 2 weeks below 0 °C, re-run `rolling.py` and `defrost.py` on a fresh Pi backup, and
+  `scripts/pump-health-tank-measure.ts` on a fresh restore. Today the −5…0 °C bins hold < 4 run-h, and the
+  tank-flat judgement rests on 112 windows from 4 days.
+- `scripts/pump-health-tank-measure.ts` only reads a local restore (`LOCAL_DATABASE_URL` must be loopback):
 
-## Appendix — called_tank_flat on a restored backup (run locally only)
-
-```sql
--- 45-min windows in which a stage was called on every slx reading: tank rise + standby credit (tank_ua 0.017)
-SELECT percentile_cont(array[0.01, 0.05, 0.1, 0.5]) WITHIN GROUP (ORDER BY (a.tank_f - w.t0) + 0.017 * (w.t0 - 65) * 0.75)
-FROM slx_readings a
-CROSS JOIN LATERAL (
-  SELECT (array_agg(tank_f ORDER BY ts))[1] AS t0, count(*) AS n,
-         bool_and(coalesce(stages_called[1], false) OR coalesce(stages_called[2], false)) AS called
-  FROM slx_readings b WHERE b.ts BETWEEN a.ts - interval '45 minutes' AND a.ts
-) w
-WHERE a.ts > now() - interval '60 days' AND w.called AND w.n >= 8;
-```
+  ```
+  scripts/analyze-local.sh            # restores the newest db-backups dump into a2w_local
+  cd planner && LOCAL_DATABASE_URL=postgres://localhost:5432/a2w_local npx tsx ../scripts/pump-health-tank-measure.ts 97
+  ```

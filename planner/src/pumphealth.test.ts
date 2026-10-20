@@ -134,26 +134,38 @@ const verdict = (v: Verdict[], k: string) => v.find((x) => x.kind === k)!;
   assert.deepEqual(w.status().pump1.defrost_overlong.state, "ok");
 }
 
-// ── 4. called_tank_flat (PROVISIONAL threshold) ────────────────────────────────────────────────────────────────────────
+// ── 4. called_tank_flat (measured on the 2026-10-20 restore, doc §5) ───────────────────────────────────────────────────
 {
-  const now = steady[1];
-  const tankSeries = (f: (k: number) => number, called = [true, false]): TankReading[] =>
-    Array.from({ length: 11 }, (_, k) => ({ ts: now - (10 - k) * 300 + 7, tank_f: f(k), stages_called: called }));
-  const rd = p1.filter((r) => r.ts <= now), sp = s1.filter((s) => s.ts <= now);
-  assert.ok(rd.filter((r) => r.ts >= now - 2700).filter((r) => r.state === "heating").length / rd.filter((r) => r.ts >= now - 2700).length >= 0.9, "fixture premise: ≥ 90 % heating 06:25–07:10 (the 06:21 defrost ends 06:29)");
-  const flat = evaluateTankFlat("1", "pump1", rd, sp, tankSeries(() => 118), now, 0.017);
-  assert.equal(flat.state, "tripped", flat.reason);
-  assert.match(flat.reason, /pump ΔT 3\.\d °C at [3-6]\d{3} W/, "the detail carries the pump's own ΔT and draw (load vs pump)");
-  assert.equal(evaluateTankFlat("1", "pump1", rd, sp, tankSeries((k) => 110 + k), now, 0.017).state, "ok", "rising 10 °F → ok");
-  assert.equal(evaluateTankFlat("1", "pump1", rd, sp, tankSeries(() => 118, [false, true]), now, 0.017).state, "ok", "stage 1 not called → ok");
-  const holey = tankSeries(() => 118).filter((_, k) => k < 3 || k > 5);
-  assert.equal(evaluateTankFlat("1", "pump1", rd, sp, holey, now, 0.017).state, "unknown", "a 20-min HBX gap → unknown");
-  // the pump idle most of the window (stage_unserved's case) → ok here
-  const idleNow = at("13:50");
-  assert.equal(evaluateTankFlat("1", "pump1", p1.filter((r) => r.ts <= idleNow), s1, tankSeries(() => 118).map((t) => ({ ...t, ts: t.ts - now + idleNow })), idleNow, 0.017).state, "ok");
-  // a slowly falling tank still trips: standby credit (~0.8 °F) does not lift a −0.2 °F move past the 2 °F bar
-  const fall = evaluateTankFlat("1", "pump1", rd, sp, tankSeries((k) => 120 - 0.02 * k), now, 0.017);
-  assert.equal(fall.state, "tripped"); assert.ok((fall.metrics.standby_credit_f as number) > 0);
+  // a 5-min HBX series ending at `now` (planner clock = Pi clock here), stage 1 called throughout
+  const tankSeries = (now: number, f: (k: number) => number, called = [true, false], n = 17): TankReading[] =>
+    Array.from({ length: n }, (_, k) => ({ ts: now - (n - 1 - k) * 300 + 7, tank_f: f(k), stages_called: called }));
+  const flatAt = (now: number, f: (k: number) => number, called?: boolean[]) =>
+    evaluateTankFlat("1", "pump1", p1.filter((r) => r.ts <= now), s1.filter((s) => s.ts <= now), tankSeries(now, f, called), now, 0.017);
+
+  // the REAL stuck defrost (02:07–03:29Z): the tank falls while pump1 "defrosts" at ~216 W → trips once 30 min persist
+  const stuck = flatAt(at("03:20"), (k) => 120 - 0.25 * k);
+  assert.equal(stuck.state, "tripped", stuck.reason);
+  assert.match(stuck.reason, /engaged 100 % \(defrost 100 %\).*lifts only -?\d\.\d °C.*flat for ≥ 30 min/);
+  assert.ok((stuck.metrics.engaged_dt_c as number) < PH.TANK_FLAT_ENGAGED_DT_C);
+  // …but not before 30 min of flat windows: at 02:55 the window 30 min back still holds healthy heating
+  const early = flatAt(at("02:55"), (k) => 120 - 0.25 * k);
+  assert.equal(early.state, "ok", early.reason); assert.match(early.reason, /flat for < 30 min/);
+
+  // a HEALTHY pump losing ground to house load (real data: pump1 06:29–07:13Z at −2…0 °C, lifting ~3.5 °C) → ok
+  const load = flatAt(at("07:10"), (k) => 118 - 0.5 * k);
+  assert.equal(load.state, "ok", load.reason);
+  assert.match(load.reason, /tank flat \(net -?\d+(\.\d)? °F\) but the pump lifts \d\.\d °C — house load ≥ its output/);
+  assert.ok((load.metrics.engaged_dt_c as number) >= 2, `real engaged ΔT ${load.metrics.engaged_dt_c} (measured healthy min 2.1)`);
+
+  assert.equal(flatAt(at("03:20"), (k) => 110 + k).state, "ok", "rising tank → ok, even in a stuck defrost");
+  assert.equal(flatAt(at("03:20"), () => 118, [false, true]).state, "ok", "stage 1 not called → ok");
+  const holey = tankSeries(at("03:20"), () => 118).filter((_, k) => k < 12 || k > 14);
+  assert.equal(evaluateTankFlat("1", "pump1", p1.filter((r) => r.ts <= at("03:20")), s1, holey, at("03:20"), 0.017).state, "unknown", "a 20-min HBX gap → unknown");
+  // pump idle most of the window (stage_unserved's case) → ok here
+  assert.equal(flatAt(at("13:50"), () => 118).state, "ok");
+  // a slowly falling tank in the stuck defrost trips: standby credit (~0.8 °F) does not lift a −0.2 °F move past the 2 °F bar
+  const slow = flatAt(at("03:20"), (k) => 120 - 0.0125 * k);
+  assert.equal(slow.state, "tripped"); assert.ok((slow.metrics.standby_credit_f as number) > 0);
 }
 
 // ── 5. Daily rollup on the real 18 h ───────────────────────────────────────────────────────────────────────────────────
