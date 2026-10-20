@@ -109,7 +109,7 @@ export class SpanWatch {
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });
       const panels: any[] = d?.data?.building?.multiPanels ?? [];
       let hit: { name: string; kwh: number; unit: string } | null = null;
-      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' current-hour energy
+      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' day-to-date energy (see below)
       for (const p of panels) for (const s of p.spaces ?? []) {
         const name = (s.name ?? "").toLowerCase();
         if (name.includes(this.circuitMatch.toLowerCase())) {
@@ -121,8 +121,11 @@ export class SpanWatch {
           if (Number.isFinite(v)) pumpKwh += v;
         }
       }
-      // Accumulate the pumps' metered energy for the current hour (SPAN's per-hour value grows then
-      // resets; upsertSpanEnergyHour keeps the MAX seen). Never fails the alarm path.
+      // Record the pumps' metered energy. HOUR_ENERGY_Q asks for duration: DAY / calendarWindows: true,
+      // so the value is SPAN's DAY-cumulative kWh (0 at local midnight, the day's total at 23:00), not
+      // the hour's energy: each span_energy row is a running total and upsertSpanEnergyHour keeps the
+      // MAX seen within the hour. Readers take a day's MAX row, never a sum (store.getRealizedDayInputs;
+      // deep dive 2026-10-19 §4.1). Never fails the alarm path.
       if (this.store && this.pumpMatch) {
         await this.store.upsertSpanEnergyHour(new Date(), pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
       }
