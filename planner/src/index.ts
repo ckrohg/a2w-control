@@ -44,6 +44,7 @@ import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type 
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import {
@@ -817,9 +818,17 @@ async function restoreAlertState(): Promise<void> {
     const ph = open.map((o) => ({ o, k: parseEpisodeKind(o.kind) }));
     const phKeep = ph.filter(({ o, k }) => k && k.live === PH_LIVE.live.has(k.check) && !(k.live ? alerts : shadowAlerts).isClosing(o.id, o.uid));
     const phStale = ph.filter(({ o, k }) => k && k.live !== PH_LIVE.live.has(k.check)).map(({ o }) => o);
-    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
-    if (stale.length || phStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale].map((o) => o.id)); // a failure → the whole restore retries
+    // backup gate: an open episode of the CURRENT mode's kind = the gate closed the breaker (virtually, in shadow); one
+    // of the other mode is closed — a shadow "would close" is not a breaker the live gate closed, and vice versa
+    const isGate = (o: { kind: string }) => o.kind === "backup_gate" || o.kind === "backup_gate_shadow";
+    const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid) && !gateShadowAlerts.isClosing(o.id, o.uid));
+    const gateKeep = gateOpen.filter((o) => o.kind === backupGateKind);
+    const gateStale = gateOpen.filter((o) => o.kind !== backupGateKind);
+    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length || phStale.length || gateStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
+    (BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts).adopt(gateKeep);
+    if (gateKeep.length) backupGate.restore({ closedByGate: true, atMs: Date.now() }); // dwell restarts now: conservative
     alerts.adopt(phKeep.filter(({ k }) => k!.live).map(({ o }) => o));
     shadowAlerts.adopt(phKeep.filter(({ k }) => !k!.live).map(({ o }) => o));
     pumpWatch.restore(phKeep.filter(({ o }) => o.pumpId != null).map(({ o, k }) => ({ check: k!.check, pumpId: o.pumpId as string })));
@@ -1008,6 +1017,100 @@ async function checkPumpHealthDaily(): Promise<void> {
     await store.releasePumpDigest(yesterday).catch(() => {});
     throw e;
   }
+}
+
+/**
+ * The backup element's DYNAMIC gate (backupgate.ts; owner rule 2026-10-19): close the Buffer Tank breaker when a pump has
+ * failed and the rest cannot hold the tank, or every available pump runs and the tank stays below the floor; re-open it
+ * once recovered. SHADOW by default (BACKUP_GATE): pages "would close / would open" through the alert outbox (episode
+ * kind backup_gate_shadow — open = the gate's virtual breaker is closed) and switches nothing. BACKUP_GATE=live sends the
+ * close through the hub (needs HUB_ARM_TOKEN) to the Pi's guarded BreakerController; re-opening a live breaker also needs
+ * BACKUP_GATE_REOPEN=1 here and span.backup_reopen on the Pi (both off; owner OK). Runs on the writer only, every poll.
+ * Thresholds: knowledge/reference/backup-gate-thresholds.md. The Pi-local fallback (both pumps down, no cloud) is the
+ * bridge's backup_fallback.py; its status rides the hub state frame and is shown beside this one on /health.
+ */
+const BACKUP_GATE_CFG = parseGateConfig(process.env);
+for (const e of BACKUP_GATE_CFG.errors) console.warn(e);
+const BACKUP_CIRCUIT = "Buffer Tank";
+const HUB_ARM_TOKEN = process.env.HUB_ARM_TOKEN ?? "";
+const backupGate = new BackupGate(BACKUP_GATE_CFG.mode, BACKUP_GATE_CFG.reopen, BACKUP_GATE_CFG.t);
+const backupGateKind = BACKUP_GATE_CFG.mode === "live" ? "backup_gate" : "backup_gate_shadow";
+let backupGateBlind: string | null = "not evaluated yet";
+let backupGateError: string | null = null;
+let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback: Record<string, unknown> | null } = { relay: null, element_w: null, pi_fallback: null };
+let backupGateEpisodes7d: number | null = null;
+// shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
+// every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
+// The would-open is a log line + /health + the dashboard: no second email.
+const gateShadowAlerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "default", { email: true }));
+
+async function checkBackupGate(reading: SlxReading): Promise<void> {
+  if (BACKUP_GATE_CFG.mode === "off") { backupGateBlind = "disabled (BACKUP_GATE=off)"; return; }
+  if (!hub) { backupGateBlind = "no hub configured"; return; }
+  // one gate per house: a second instance mid-handover only reports (it would page / command twice)
+  if (WRITER_LEASE_ENABLED && !(writerLeaseState?.held ?? false)) { backupGateBlind = "not the writer-lease holder"; return; }
+  let state: HubState | null = null;
+  backupGateError = null; // a failed live command stays visible as backup_gate.retry_at
+  try { state = await hub.getState(); } catch (e) { state = null; backupGateError = `hub unreachable: ${(e as Error).message}`; }
+  const blind = state ? piStateUnverifiable(state) : "hub unreachable";
+  const bt = state?.span?.circuits?.find((c) => c.name === BACKUP_CIRCUIT) ?? null;
+  const relay = bt?.relay_state === "OPEN" || bt?.relay_state === "CLOSED" ? bt.relay_state : null;
+  backupGateHub = {
+    relay, element_w: typeof bt?.power_w === "number" ? Math.abs(bt.power_w) : null,
+    pi_fallback: (state?.span?.backup_fallback as Record<string, unknown> | undefined) ?? null,
+  };
+  // per-stage episodes (stagewatch, stepped just before this in the same poll) mark the pump wired to that stage
+  const stages = stageWatch.status();
+  const pumps: GatePump[] | null = state && !blind
+    ? state.pumps.map((p) => ({
+        id: p.id, name: p.name, online: p.online, state: p.online ? p.state ?? null : "offline",
+        stageEpisode: Object.values(stages).some((s) => s.pump === p.id && (s.unserved_open || s.fault_open)),
+      }))
+    : null;
+  backupGateBlind = blind;
+  const events = backupGate.step({
+    nowMs: Date.now(), tankF: reading.tankF, tankTargetF: reading.tankTargetF, stagesCalled: reading.stagesCalled,
+    pumps, relay: blind ? null : relay,
+  });
+  const outbox = BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts;
+  for (const e of events) {
+    console.warn(`[backupgate][${BACKUP_GATE_CFG.mode}] ${e.title}: ${e.body}`);
+    if (e.kind === "confirmed") {
+      // a live command whose hub answer was lost, now seen done on the relay: record it as the gate's own
+      if (e.confirms === "close") await openAlert(backupGateKind, "buffer_tank", null, e.title, e.body);
+      else { await alerts.close(backupGateKind, "buffer_tank"); await ntfyDelivered(e.title, e.body, "default", { resolved: true }); }
+      continue;
+    }
+    if (e.kind !== "close" && e.kind !== "open") { await ntfyDelivered(e.title, e.body, e.priority); continue; }
+    if (BACKUP_GATE_CFG.mode === "live") {
+      // the Pi's BreakerController verifies the relay read-back; the gate (and its episode) changes only on a verified
+      // answer. A refusal (a bridge guard said no) stands the gate down for the episode; no Pi / no answer retries after
+      // BG.RETRY_MS, and a late landing is confirmed from the relay. Either way the failure pages ONCE per episode.
+      const fresh = !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS));
+      const r = !HUB_ARM_TOKEN ? { ok: false, refused: true, detail: "HUB_ARM_TOKEN is not set on the planner" }
+        : !fresh ? { ok: false, refused: false, detail: "lost the writer lease" }
+        : await hub.sendBreaker(BACKUP_CIRCUIT, e.kind, HUB_ARM_TOKEN, "backup-gate");
+      const { page } = backupGate.applied(r.ok, Date.now(), r.refused);
+      backupGateError = r.ok ? null : `${e.kind} ${r.refused ? "refused" : "failed"}: ${r.detail}`;
+      if (!r.ok) {
+        if (page) {
+          await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,
+            `${r.detail}. ` + (r.refused ? "A bridge guard refused it; A2W will not retry until the condition ends. "
+              : `A2W retries every ${BG.RETRY_MS / 60_000} min while the condition holds (no further pages). `) +
+            (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high");
+        }
+        continue;
+      }
+    }
+    if (e.kind === "close") await outbox.open(backupGateKind, "buffer_tank", null, e.title, e.body);
+    else if (BACKUP_GATE_CFG.mode === "live") {
+      await alerts.close(backupGateKind, "buffer_tank");
+      await ntfyDelivered(e.title, e.body, "default", { resolved: true });
+    } else {
+      await gateShadowAlerts.close(backupGateKind, "buffer_tank"); // log + /health + dashboard only: no second email
+    }
+  }
+  backupGateEpisodes7d = await store.alertEpisodesSince(backupGateKind, 7 * 24).catch(() => backupGateEpisodes7d);
 }
 
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
@@ -2015,6 +2118,9 @@ async function pollOnce(): Promise<void> {
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
+  // after the stage watch, so this poll's stage episodes feed the gate
+  await checkBackupGate(reading)
+    .catch((e) => { backupGateError = `gate: ${(e as Error).message}`; console.error("backup gate failed:", backupGateError); });
 
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
@@ -2124,9 +2230,12 @@ async function loopBody(): Promise<void> {
   await checkPumpHealth().then(() => { pumpHealthError = null; })
     .catch((e) => { pumpHealthError = (e as Error).message; console.error("pump health check failed:", pumpHealthError); });
   await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
+    : kind === "backup_gate_shadow" ? false // its own outbox (default priority, email) re-sends it, never the high one
+    : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
     : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
+  await gateShadowAlerts.retry((kind) => kind === "backup_gate_shadow").catch((e) => console.error("backup-gate shadow re-send failed:", (e as Error).message));
   // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)
   await shadowAlerts.retry(() => false).catch((e) => console.error("shadow episode flush failed:", (e as Error).message));
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
@@ -2297,6 +2406,17 @@ async function main(): Promise<void> {
                 error: pumpDailyError,
               },
               digest: { enabled: PUMP_HEALTH_DIGEST, hour_et: PUMP_HEALTH_DIGEST_HOUR, last: pumpDigestLast },
+            },
+            // the backup element's dynamic gate (backupgate.ts). mode shadow = gate_state is VIRTUAL (what it would have
+            // done); relay / element_w are the REAL Buffer Tank breaker from the Pi's SPAN snapshot; pi_fallback is the
+            // bridge's cloud-free "both pumps down" fallback. blind = why this poll judged nothing (null = judged).
+            backup_gate: {
+              ...backupGate.status(Date.now()),
+              circuit: BACKUP_CIRCUIT, blind: backupGateBlind, error: backupGateError,
+              relay: backupGateHub.relay, element_w: backupGateHub.element_w,
+              episodes_7d: backupGateEpisodes7d, config_errors: BACKUP_GATE_CFG.errors,
+              live_ready: BACKUP_GATE_CFG.mode !== "live" || !!HUB_ARM_TOKEN,
+              pi_fallback: backupGateHub.pi_fallback,
             },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
