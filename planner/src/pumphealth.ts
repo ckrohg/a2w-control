@@ -16,6 +16,7 @@
  * "unknown" and moves nothing — the stagewatch rule: a blind spell never opens or closes an episode.
  * The daily rollup (rollupDay) and trend (trend) feed /health.pump_health and the daily digest. Pure — no I/O.
  */
+import { C, esc, shell, footer } from "./alertemail";
 
 export const PH = {
   NO_LIFT_WINDOW_S: 15 * 60,
@@ -458,7 +459,7 @@ export function etDayStart(day: string): number {
 export interface EpisodeLine { kind: string; pumpId: string | null; title: string; started_at: string; cleared_at: string | null }
 /** The daily digest email: yesterday per pump, drift flags, shadow episodes of the last 24 h, current check states. */
 export function digest(day: string, rows: DayRow[], t: TrendOut, episodes: EpisodeLine[], status: ReturnType<PumpHealthWatch["status"]>,
-  names: Record<string, string>, live: Set<CheckKind>): { title: string; body: string } {
+  names: Record<string, string>, live: Set<CheckKind>): { title: string; body: string; html: string } {
   const lines: string[] = [];
   const flagged = Object.values(t.pumps).some((p) => p.flags.length) || t.twin_flag;
   const opened = episodes.length;
@@ -481,5 +482,73 @@ export function digest(day: string, rows: DayRow[], t: TrendOut, episodes: Episo
   if (openNow.length) lines.push("", `Open right now: ${openNow.join(", ")}.`);
   lines.push("", "Thresholds and the data behind them: knowledge/reference/pump-health-baseline-20261019.md. Promote a check with PUMP_HEALTH_LIVE.");
   const title = `A2W pump health ${day}: ${flagged ? "drift flagged" : opened ? `${opened} shadow episode(s)` : "normal"}`;
-  return { title, body: lines.join("\n") };
+  return { title, body: lines.join("\n"), html: digestHtml(day, rows.filter((x) => x.day === day), t, episodes, openNow, names, flagged) };
+}
+
+/**
+ * The digest as a skimmable email (owner 2026-10-20: the text version was "really hard to skim"): a verdict banner,
+ * one plain-English sentence, then the pumps side by side with the numbers that matter. Technical notes go last.
+ */
+function digestHtml(day: string, rows: DayRow[], t: TrendOut, episodes: EpisodeLine[], openNow: string[],
+                    names: Record<string, string>, flagged: boolean): string {
+  const nm = (id: string) => names[id] ?? id;
+  const when = new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+  const issues: string[] = [];
+  for (const r of rows) {
+    const tr = t.pumps[r.pumpId];
+    if (tr?.flags.includes("lift_drift") && tr.lift_drift) issues.push(`${nm(r.pumpId)} is getting ${Math.abs(tr.lift_drift.pct)} % ${tr.lift_drift.pct < 0 ? "less" : "more"} heat per kWh than its own two-week baseline.`);
+    if (tr?.flags.includes("short_cycling")) issues.push(`${nm(r.pumpId)} started ${r.m.max_starts_60min} times in one hour (normal is 4 or fewer).`);
+  }
+  if (t.twin_flag && t.twin) issues.push(`The two pumps' efficiency has moved ${Math.abs(t.twin.pct)} % apart relative to each other.`);
+  if (openNow.length) issues.push(`Still open: ${openNow.join(", ")}.`);
+  const b = flagged ? { label: "NEEDS A LOOK · efficiency drift", ...C.attention }
+    : episodes.length ? { label: `FYI · ${episodes.length} test-mode episode${episodes.length === 1 ? "" : "s"}`, ...C.info }
+    : { label: "✅ ALL NORMAL", ...C.resolved };
+  const share = rows.length === 2 && rows[0].m.run_h + rows[1].m.run_h > 0
+    ? (() => { const [a, c] = rows[0].m.run_h >= rows[1].m.run_h ? [rows[0], rows[1]] : [rows[1], rows[0]];
+               return a.m.run_h > c.m.run_h * 1.25 ? ` ${nm(a.pumpId)} did more of the work (${a.m.run_h.toFixed(1)} h vs ${c.m.run_h.toFixed(1)} h).` : ""; })()
+    : "";
+  const sentence = issues.length ? issues.join(" ") : `Both pumps ran normally.${share}`;
+
+  const n = (v: number | null | undefined, d = 1) => (v == null ? "—" : v.toFixed(d));
+  const trend = (id: string) => {
+    const d = t.pumps[id]?.lift_drift;
+    if (!d) return "—";
+    const warn = t.pumps[id]?.flags.includes("lift_drift");
+    return `${d.pct > 0 ? "+" : ""}${d.pct} %${warn ? " ⚠" : ""}`;
+  };
+  const metrics: [string, (r: DayRow) => string][] = [
+    ["Electricity", (r) => `${n(r.m.kwh)} kWh`],
+    ["Run time", (r) => `${n(r.m.run_h)} h`],
+    ["Starts", (r) => `${r.m.starts}`],
+    ["Most starts in 1 h", (r) => `${r.m.max_starts_60min}`],
+    ["Defrosts", (r) => r.m.defrosts ? `${r.m.defrosts} · ${Math.round(r.m.defrost_min)} min` : "none"],
+    ["Avg outdoor", (r) => r.m.mean_ambient_c == null ? "—" : `${Math.round(r.m.mean_ambient_c * 9 / 5 + 32)} °F`],
+    ["Efficiency trend", (r) => trend(r.pumpId)],
+  ];
+  const th = (x: string, al = "right") => `<th style="text-align:${al};font-size:12px;color:${C.ink2};font-weight:600;padding:6px 0 6px 10px;border-bottom:2px solid ${C.rule}">${esc(x)}</th>`;
+  const td = (x: string, al = "right", bold = false) => `<td style="text-align:${al};font-size:14px;padding:7px 0 7px 10px;border-bottom:1px solid ${C.rule};${bold ? "font-weight:600;" : ""}color:${al === "left" ? C.ink2 : C.ink}">${esc(x)}</td>`;
+  const table = rows.length
+    ? `<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;margin:0 0 16px">` +
+      `<tr>${th("", "left")}${rows.map((r) => th(nm(r.pumpId).replace(/^Heat Pump\s*/i, "HP "))).join("")}</tr>` +
+      metrics.map(([label, f]) => `<tr>${td(label, "left")}${rows.map((r) => td(f(r), "right", true)).join("")}</tr>`).join("") +
+      `</table>`
+    : "";
+  const eps = episodes.length
+    ? `<div style="font-size:12px;font-weight:700;letter-spacing:.04em;color:${C.muted};margin:0 0 4px">EPISODES (LAST 24 H)</div><ul style="margin:0 0 14px;padding-left:18px;font-size:13px;line-height:1.45;color:${C.ink2}">` +
+      episodes.map((e) => `<li>${esc(e.title)}${e.cleared_at ? " · cleared" : " · <b>still open</b>"}${e.kind.startsWith("shadow_") ? " · test mode" : ""}</li>`).join("") + `</ul>`
+    : "";
+  const tech = `<p style="margin:0;font-size:12px;line-height:1.45;color:${C.muted}">Efficiency trend: heat delivered per kWh over the last ` +
+    `7 days vs the pump's own 2-week baseline, at the same outdoor temperature (— = not enough run time yet). Normal starts: 4 or fewer per hour. Checks run in test mode until promoted with PUMP_HEALTH_LIVE; thresholds in ` +
+    `knowledge/reference/pump-health-baseline-20261019.md.</p>`;
+  return shell(
+    `<div style="display:inline-block;background:${b.bg};color:${b.fg};font-size:12px;font-weight:700;letter-spacing:.04em;padding:5px 9px;border-radius:4px;margin:4px 0 10px">${esc(b.label)}</div>` +
+    `<h1 style="font-size:21px;line-height:1.25;margin:0 0 8px;font-weight:700">Heat pump health · ${esc(when)}</h1>` +
+    `<p style="font-size:16px;line-height:1.45;margin:0 0 16px">${esc(sentence)}</p>` +
+    (flagged ? `<div style="border-left:4px solid #c98a00;background:${C.tile};padding:10px 12px;margin:0 0 16px;border-radius:0 6px 6px 0">` +
+      `<div style="font-size:12px;font-weight:700;letter-spacing:.04em;color:${C.ink2};margin-bottom:3px">WHAT TO DO</div>` +
+      `<div style="font-size:16px;line-height:1.4">Nothing today. If it is still flagged after a week, ask the installer to check the outdoor coil, ` +
+      `the water flow and the refrigerant charge.</div></div>` : "") +
+    table + eps + tech +
+    footer("A2W planner", new Date(), flagged ? "You got this because a pump's efficiency has drifted from its own baseline." : "Daily pump report."));
 }

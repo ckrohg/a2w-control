@@ -235,6 +235,9 @@ class BackupFallback:
         # by itself is worth an email; both pumps down with the element still unavailable is a page
         task = asyncio.create_task(notify.alert(
             self.notify_cfg, tier=tier, title=title or "A2W backup fallback", message=message, priority=priority,
-            tags="rotating_light" if priority == "urgent" else "fire", tag="a2w-pi-backup-fallback"))
+            tags="rotating_light" if priority == "urgent" else "fire", tag="a2w-pi-backup-fallback",
+            action=("Switch the 'Buffer Tank' (backup element) breaker ON at the SPAN panel, then check both heat pumps."
+                    if tier == "page" else "Nothing right now: the element is covering. Check why both heat pumps are down."
+                    if tier == "attention" else None)))
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)

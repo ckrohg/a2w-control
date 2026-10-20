@@ -459,7 +459,8 @@ export async function handlePolledConfig(
       "high",
       // two writers fighting over the reset curve: a human has to find and stop the other one. Latched, so a writer
       // that keeps at it pages once a day, not on every write.
-      { tier: "page", key: "foreign-hbx-writer" },
+      { tier: "page", key: "foreign-hbx-writer",
+        action: "Find and stop whatever else is writing to the HBX: a second planner deployment in Railway, or a script or app talking to SensorLinx directly." },
     );
   }
   return { kind: "curve", config: finalConfig, device: finalDev, changes: finalChanges, diagnosis, delivered: ack !== false };

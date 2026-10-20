@@ -27,6 +27,12 @@ COMM_SNAPSHOT_INTERVAL_S = 900  # heartbeat row; errors also force a row
 FAULT_PAGE_AFTER_S = 30 * 60
 FAULT_PATTERN_COUNT = 3
 FAULT_PATTERN_DAYS = 7
+# What the owner can do about a fault that has stuck (the email's WHAT TO DO). Anything else gets a generic line.
+FAULT_ACTIONS = {
+    "E21": "Power-cycle the pump at its breaker (off 60 s, then on): E21 is the wall display losing touch with the unit.",
+    "R02": "Call the installer: the compressor is failing to start (possible phase loss).",
+    "P15": "Check the water circulator is running and the strainer isn't blocked: water flow is too low.",
+}
 # Codes that are the weather, not the equipment: logged, never paged.
 WEATHER_FAULT_CODES = frozenset({"PC"})
 
@@ -446,7 +452,8 @@ class PumpPoller:
                 self._push(title=f"⚠ {self.cfg.name} offline",
                            message=f"No response for {failures} polls ({exc.category}). "
                                    f"Check the gateway / WiFi.", priority="high", tags="warning",
-                           tier="attention")
+                           tier="attention",
+                           action="Check the pump's W610 gateway has power and WiFi, and that its RS-485 cable to the pump is connected.")
             else:
                 self._note_offline_edge(exc.category)
         else:
@@ -477,7 +484,10 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name} offline {hrs:.1f} h — prolonged outage",
                        message=f"Still no response after {hrs:.1f} hours ({exc.category}). "
                                f"This needs a look: gateway power/WiFi, or the pump's comm board.",
-                       priority="high", tags="rotating_light", tier="attention")
+                       priority="high", tags="rotating_light", tier="attention",
+                       action="Power-cycle the pump's W610 gateway. If that doesn't bring it back, power-cycle the pump "
+                              "itself at its breaker. The pump keeps heating on its own controller meanwhile.",
+                       facts=[("Offline for", f"{hrs:.1f} h"), ("Problem", self._link_status()[1] or exc.category)])
         if not self.snapshot.get("online"):
             link, detail = self._link_status()
             self.snapshot["link"] = link
@@ -549,7 +559,9 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name}: gateway identity mismatch",
                        message=f"{self.cfg.host} answers with the wrong MAC — writes "
                                f"blocked. Check DHCP reservations.",
-                       priority="urgent", tags="rotating_light", tier="attention")
+                       priority="urgent", tags="rotating_light", tier="attention",
+                       action="Fix the DHCP reservation so each W610 gateway keeps its own IP. Writes to this pump are blocked until then.",
+                       facts=[("Address", self.cfg.host), ("Answers as", str(actual)), ("Expected", str(self.cfg.mac))])
             log.error("[%s] identity mismatch at %s: %s != %s",
                       self.cfg.id, self.cfg.host, actual, self.cfg.mac)
         else:
@@ -634,13 +646,14 @@ class PumpPoller:
                 "severity": fdef.severity, "since": since}
 
     def _push(self, title: str, message: str, priority: str = "default", tags: str = "", *,
-              tier: str, resolved: bool = False, tag: str = "") -> None:
+              tier: str, resolved: bool = False, tag: str = "", action: str | None = None,
+              facts: list[tuple[str, str]] | None = None) -> None:
         """Fire-and-forget alert; safe if unconfigured. The TIER picks the owner's channels
         (notify.alert, knowledge/reference/alert-policy.md); priority only tunes ntfy loudness."""
         notify.route(tier, resolved)  # validate now: a bad tier must fail loudly here, not in a background task
         asyncio.create_task(notify.alert(
             self.app_cfg.notifications, tier=tier, title=title, message=message,
-            priority=priority, tags=tags, resolved=resolved, tag=tag))
+            priority=priority, tags=tags, resolved=resolved, tag=tag, action=action, facts=facts))
 
     async def _update_faults(self, current: dict[str, FaultDef]) -> None:
         """Edge detection: log fault_on for new bits, fault_off for cleared bits."""
@@ -695,7 +708,11 @@ class PumpPoller:
                                f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(f['since']))} and not clearing "
                                f"on its own. A2W will tell you when it clears.",
                        priority="urgent" if f["severity"] == Severity.CRITICAL else "high",
-                       tags="rotating_light", tier="page", tag=f"a2w-pi-fault-{self.cfg.id}-{key}")
+                       tags="rotating_light", tier="page", tag=f"a2w-pi-fault-{self.cfg.id}-{key}",
+                       action=FAULT_ACTIONS.get(f["code"], "Read the code on the pump's wall controller and call the installer. "
+                                                           "Power-cycling the pump at its breaker sometimes clears it."),
+                       facts=[("Pump", self.cfg.name), ("Code", f"{f['code']} · {f['message'].split(' — ')[0]}"),
+                              ("Active for", f"{mins} min")])
 
     async def _check_fault_pattern(self, fdef: FaultDef) -> None:
         """ATTENTION once per FAULT_PATTERN_DAYS when the same code keeps coming back — the
@@ -713,7 +730,10 @@ class PumpPoller:
                    message=f"{fdef.message}\n\nIt has set {n} times in the last {FAULT_PATTERN_DAYS} days. "
                            f"Each one cleared or may clear on its own, but a code that keeps coming back is "
                            f"worth a service call. History: the dashboard's Events tab for {self.cfg.name}.",
-                   priority="high", tags="warning", tier="attention")
+                   priority="high", tags="warning", tier="attention",
+                   action="Book a service visit and mention the code: it keeps coming back even though it clears on its own.",
+                   facts=[("Pump", self.cfg.name), ("Code", f"{fdef.code} · {fdef.message.split(' — ')[0]}"),
+                          (f"Times in {FAULT_PATTERN_DAYS} days", str(n))])
 
     async def _maybe_comm_row(self, force: bool = False) -> None:
         now = time.monotonic()

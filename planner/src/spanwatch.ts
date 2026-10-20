@@ -203,7 +203,9 @@ export class SpanWatch {
           `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today, ≈$${(hit.kwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
           "high",
           // costs money, never endangers the house (the element IS the heat): worth a look, at most daily
-          { tier: "attention", key: "backup-element-power" },
+          { tier: "attention", key: "backup-element-power",
+            action: "If it isn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
+            facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${hit.kwh.toFixed(2)} kWh ≈ $${(hit.kwh * 0.3).toFixed(2)}`]] },
         );
       } else if (hourKwh <= this.alarmKwh && this.alarmed) {
         this.alarmed = false;

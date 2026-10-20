@@ -26,6 +26,12 @@ export type NotifyOpts = {
   resolved?: boolean;
   /** latch key (notify_latches): suppresses a redeploy's re-fire and replaces the 6bb push on resolve */
   key?: string;
+  /** email only (alertemail.ts): what the owner should do — boxed at the top. Required in spirit for page/attention. */
+  action?: string;
+  /** email only: a short label/value table under the action */
+  facts?: [string, string][];
+  /** email only: a complete custom HTML body (the pump-health digest) instead of the standard layout */
+  html?: string;
 };
 export type Notify = (title: string, body: string, priority: string, opts: NotifyOpts) => Promise<unknown>;
 
@@ -37,7 +43,7 @@ export function route(tier: Tier, resolved = false): Route {
 /** Subject lines carry the tier, so the inbox reads at a glance. */
 export function tierSubject(title: string, tier: Tier, resolved = false): string {
   const t = title.trim();
-  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\uFE0F\s]+/u, "").trim() || t;
+  const core = t.replace(/^[\u26A0\u2705\u2713\u{1F6A8}\uFE0F\s]+/u, "").replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t;
   if (resolved) return `✅ A2W RESOLVED — ${core}`;
   if (tier === "page") return `🚨 A2W — ${core}`;
   if (tier === "attention") return `A2W needs a look — ${core}`;

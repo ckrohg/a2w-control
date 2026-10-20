@@ -187,7 +187,8 @@ class BreakerController:
             self._alert("URGENT: check the Air-Water breakers",
                         "A bridge restart found an interrupted power cycle but can't read its record "
                         f"({exc}). A2W keeps retrying; check that the Air-Water 1 and Air-Water 2 "
-                        "circuits are ON at the SPAN panel.", "urgent", tier="page")
+                        "circuits are ON at the SPAN panel.", "urgent", tier="page",
+                        action="Check that the Air-Water 1 and Air-Water 2 breakers are ON at the SPAN panel.")
             self._record_task = asyncio.create_task(self._retry_record(), name="span-breaker-record")
             return
         await self._recover_from(rec)
@@ -222,7 +223,8 @@ class BreakerController:
             self._alert("URGENT: check the Air-Water breakers",
                         "A bridge restart interrupted a power cycle and its record is unreadable. "
                         "Check that the Air-Water 1 and Air-Water 2 circuits are ON at the SPAN panel.",
-                        "urgent", tier="page")
+                        "urgent", tier="page",
+                        action="Check that the Air-Water 1 and Air-Water 2 breakers are ON at the SPAN panel.")
             return
         try:
             hold = max(float(rec.get("off_s") or 0), float(self.cfg.min_off_s))
@@ -411,7 +413,7 @@ class BreakerController:
         self._alert(f"A2W breaker: {name} {'ON' if ok else 'NOT confirmed ON'}",
                     f"{name}: switch ON ({source}) → {result['detail']}.",
                     "default" if ok else "high", tier="record" if ok else "page",
-                    tag=f"a2w-pi-breaker-{name}")
+                    tag=f"a2w-pi-breaker-{name}", action=f"Check the '{name}' breaker is ON at the SPAN panel.")
         return result
 
     async def _do_open(self, spec, circ, source: str, guard=None) -> dict:
@@ -698,7 +700,8 @@ class BreakerController:
                     f"ON ({detail}). Turn the '{name}' breaker ON at the SPAN panel now "
                     f"(physical switch in the panel, or the SPAN app if it works). A2W keeps "
                     f"retrying every {self.cfg.reclose_interval_s:g} s.", "urgent",
-                    tier="page", tag=f"a2w-pi-breaker-{name}")
+                    tier="page", tag=f"a2w-pi-breaker-{name}",
+                    action=f"Turn the '{name}' breaker ON at the SPAN panel now (the physical switch, or the SPAN app).")
 
     async def _refused(self, name: str, action, source: str, reason: str) -> None:
         msg = f"{name}: {action} refused ({source}) — {reason}"
@@ -721,13 +724,14 @@ class BreakerController:
             log.warning("span breaker audit failed: %s", exc)
 
     def _alert(self, title: str, message: str, priority: str, *, tier: str, resolved: bool = False,
-               tag: str = "") -> None:
+               tag: str = "", action: str | None = None) -> None:
         """One short line through the owner alert policy (fire-and-forget; never blocks the relay path).
         Every action is already in the events table; only a circuit that may be left OFF is a page."""
         notify.route(tier, resolved)  # validate synchronously: a bad tier must not die in a background task
         tags = "rotating_light" if tier == "page" else "electric_plug"
         t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
-                                             priority=priority, tags=tags, resolved=resolved, tag=tag))
+                                             priority=priority, tags=tags, resolved=resolved, tag=tag,
+                                             action=action))
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
 

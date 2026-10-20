@@ -171,3 +171,29 @@ async def test_6bb_failure_never_raises_and_ntfy_still_sends(monkeypatch):
                        sixbb_alert_url="http://6bb.invalid/x", sixbb_alert_key="k")
     await notify.alert(cfg, tier="page", title="Heat Pump 1 offline", message="x", priority="high", tags="warning")
     assert sent == ["http://ntfy.invalid/a2w-test"]
+
+
+def test_email_layout_reads_top_down():
+    """render_html (owner 2026-10-20: "really hard to skim"): tier banner in words, the action boxed first, facts as a
+    table, the technical body last and escaped — the same layout as planner/src/alertemail.ts."""
+    html = notify.render_html(tier="page", title="⚠ Heat Pump 2: E21 for 31 min", message="Display <lost> & comm",
+                              action="Power-cycle the pump at its breaker.",
+                              facts=[("Pump", "Heat Pump 2"), ("Active for", "31 min")])
+    order = [html.index(s) for s in ("URGENT · act now", "WHAT TO DO", "Active for", "DETAILS", "Dashboard")]
+    assert order == sorted(order)
+    assert ">Heat Pump 2: E21 for 31 min</h1>" in html
+    assert "Display &lt;lost&gt; &amp; comm" in html
+    done = notify.render_html(tier="page", resolved=True, title="✓ Heat Pump 2: E21 cleared", message="",
+                              action="ignored on an all-clear")
+    assert "RESOLVED · no action needed" in done and "WHAT TO DO" not in done and "DETAILS" not in done
+    assert "NEEDS A LOOK · this week" in notify.render_html(tier="attention", title="x", message="y")
+
+
+async def test_alert_email_carries_html(monkeypatch):
+    import json as _json
+    sent = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=8: sent.append(req) or _FakeResp())
+    cfg = NotifyConfig(resend_api_key="re_x", resend_to="owner@example.invalid")
+    await notify.alert(cfg, tier="attention", title="Pi disk almost full", message="5% free", action="Free space.")
+    body = _json.loads(next(r for r in sent if "resend" in r.full_url).data)
+    assert body["text"] == "5% free" and "WHAT TO DO" in body["html"] and "Free space." in body["html"]

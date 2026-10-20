@@ -702,7 +702,9 @@ class SelfHealer:
         tags = "rotating_light" if priority == "urgent" else "wrench"
         tier = "attention" if code in SELF_HEAL_ATTENTION else "record"
         t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
-                                             priority=priority, tags=tags))
+                                             priority=priority, tags=tags,
+                                             action="Self-heal can't run as configured. Check the self_heal section of the "
+                                                    "Pi's config and the circuit map." if tier == "attention" else None))
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
 

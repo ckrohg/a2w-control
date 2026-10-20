@@ -47,6 +47,7 @@ import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from 
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
+import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, piUnreachablePageAfterS, type Tier, type NotifyOpts } from "./alertpolicy";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
@@ -382,6 +383,9 @@ function describeFetchError(err: unknown): string {
  *
  * So the tier leads, in the one place with room for it. Only a page gets the siren; if everything shouts, nothing does.
  */
+/** °F for an email fact ("?" when unknown). */
+const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.round(v)} °F`);
+
 async function ntfy(title: string, body: string, priority: string, opts: NotifyOpts): Promise<void> {
   await ntfyDelivered(title, body, priority, opts);
 }
@@ -490,7 +494,10 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
           // bridge's urllib silently failed for weeks on this, 2026-08-06) — honest UA.
           "User-Agent": "a2w-planner/1.0",
         },
-        body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject: tierSubject(title, tier, resolved), text: body }),
+        body: JSON.stringify({
+          from: RESEND_FROM, to: [RESEND_TO], subject: tierSubject(title, tier, resolved), text: body,
+          html: opts.html ?? renderAlertEmail({ tier, resolved, title, body, action: opts.action, facts: opts.facts, source: "A2W planner" }),
+        }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!r.ok) console.error("resend email failed:", r.status);
@@ -748,7 +755,10 @@ async function checkI8(): Promise<void> {
         `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in ${I8_ATTENTION_H}h`,
         `The DHW coil has gone ${I8_ATTENTION_H}h without a pasteurizing soak (≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min), so the planner's automatic sanitize is not landing. Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card) and check why the scheduled soak didn't run.`,
         "high",
-        { tier: "attention", key: "i8-72h" },
+        { tier: "attention", key: "i8-72h",
+          action: `Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for about 2 hours (Control page → HBX card).`,
+          facts: [["Last soak", i8HoursSinceDwell == null ? `more than ${I8_ATTENTION_H} h ago` : `${Math.round(i8HoursSinceDwell)} h ago`],
+                  ["Needed", `${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min`]] },
       );
     }
   }
@@ -1046,9 +1056,9 @@ async function checkPumpHealthDaily(): Promise<void> {
   if (!(await store.claimPumpDigest(yesterday))) { pumpDigestDoneFor = yesterday; return; } // sent already (or by a peer)
   try {
     const eps = await store.pumpHealthEpisodes24h().catch(() => []);
-    const { title, body } = digest(yesterday, pumpDays, pumpTrend, eps, pumpWatch.status(), pumpNames, PH_LIVE.live);
+    const { title, body, html } = digest(yesterday, pumpDays, pumpTrend, eps, pumpWatch.status(), pumpNames, PH_LIVE.live);
     // a normal day is record-only (dashboard + Monday digest); a flagged drift is worth an email
-    if (await ntfyDelivered(title, body, "default", { tier: /drift flagged/.test(title) ? "attention" : "record" })) {
+    if (await ntfyDelivered(title, body, "default", { tier: /drift flagged/.test(title) ? "attention" : "record", html })) {
       await store.markPumpDigestSent(yesterday);
       pumpDigestDoneFor = yesterday;
       pumpDigestLast = { day: yesterday, sent_at: new Date().toISOString() };
@@ -1142,7 +1152,9 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
               : `A2W retries every ${BG.RETRY_MS / 60_000} min while the condition holds (no further pages). `) +
             (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high",
             // a close that didn't land needs a hand at the panel; an open that didn't is only cost
-            { tier: e.kind === "close" ? "page" : "attention" });
+            { tier: e.kind === "close" ? "page" : "attention",
+              action: e.kind === "close" ? "Switch the Buffer Tank breaker ON at the SPAN panel if the house is losing heat."
+                                         : "Switch the Buffer Tank breaker OFF at the SPAN panel when convenient (it is only costing money)." });
         }
         continue;
       }
@@ -1198,7 +1210,11 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
       `${detail}. Causes: pump powered off, failure-to-start (the HP2 winter pattern), or a write-disabled/faulted unit. The tank is falling while HBX waits.`,
       "high",
       // THE "no heat" incident: the per-stage unserved/fault-called episodes are its record-only symptoms
-      { tier: "page", key: "no-heat" },
+      { tier: "page", key: "no-heat",
+        action: "Check both heat pumps: is each one powered on, and is either showing a fault code? Power-cycling a faulted pump's breaker at the SPAN panel often clears it.",
+        facts: [["No heat for", `${unservedStreak * 5} min`], ["Tank", `${f0(reading.tankF)} (target ${f0(reading.tankTargetF)})`],
+                ["Outdoor", f0(reading.outdoorF)],
+                ["Pumps", st.pumps.map((p) => `${p.name ?? p.id}: ${p.online ? p.state ?? "?" : "offline"}`).join(" · ")]] },
     );
   }
 }
@@ -1253,7 +1269,9 @@ async function checkDHWShortfall(reading: SlxReading): Promise<void> {
       "⚠ DHW comfort shortfall — buffer running cold",
       `Buffer ${reading.tankF.toFixed(0)}°F, below the ${Math.round(DEFAULT_OPTS.dhwFloorF)}°F DHW-ready floor for ~${dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
       "high",
-      { tier, key: "dhw-shortfall" },
+      { tier, key: "dhw-shortfall",
+        action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
+        facts: [["Tank", `${f0(reading.tankF)} for ${dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(DEFAULT_OPTS.dhwFloorF)]] },
     );
   }
 }
@@ -1286,7 +1304,9 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
       "⚠ Freeze-risk advisory",
       `Outdoor ${reading.outdoorF.toFixed(0)}°F with the buffer only ${reading.tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
       "urgent",
-      { tier: "page", key: "freeze-risk" }, // house-threatening, intervene now
+      { tier: "page", key: "freeze-risk", // house-threatening, intervene now
+        action: "Make sure both heat pumps are running and the backup element breaker is ON at the SPAN panel.",
+        facts: [["Outdoor", f0(reading.outdoorF)], ["Tank", f0(reading.tankF)]] },
     );
   } else if (!risk && freezeRiskAlerted) {
     freezeRiskAlerted = false;
@@ -1403,7 +1423,8 @@ async function checkSingleWriter(): Promise<void> {
              && Date.now() - multiInstanceSince >= MULTI_INSTANCE_ATTENTION_MS) {
     multiInstanceEscalated = true;
     await ntfy("Second planner instance still running after 30 min", body(sustained), "high",
-               { tier: "attention", key: "planner-multi-instance" });
+               { tier: "attention", key: "planner-multi-instance",
+                 action: "In Railway, make sure only one a2w-planner deployment is running." });
   } else if (multiInstanceAlerted && !peerSet.size) {
     multiInstanceAlerted = false;
     multiInstanceSince = null;
@@ -1483,7 +1504,9 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
       "HBX target not adopting",
       `Commanded ${commanded.toFixed(1)}°F but operative is ${operative.toFixed(1)}°F — ${why}. The cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
       "high",
-      { tier: "attention", key: "hbx-adoption" }, // the device keeps heating on its last curve: savings, not safety
+      { tier: "attention", key: "hbx-adoption", // the device keeps heating on its last curve: savings, not safety
+        action: "Check the HBX in the SensorLinx app is online. The house keeps heating on the curve it has.",
+        facts: [["Commanded", f0(commanded)], ["On the device", f0(operative)]] },
     );
   }
 }
@@ -1875,7 +1898,8 @@ async function shadowOnce(): Promise<void> {
             "Winter cap check: tonight is predicted to need more than 135°F",
             `If ${risk.zoneName} is calling around ${new Date(risk.start).toLocaleString("en-US", { timeZone: "America/New_York" })} it will need ~${Math.round(risk.requiredSupplyF)}°F supply (tank ${risk.tankTargetF}°F), above the ${opts.strictCapF}°F everyday cap — this is a capacity warning at the forecast outdoor, NOT a prediction that the zone will call. If rooms run cold tonight, the seasonal cap needs a deliberate raise (see winter-dp-commissioning.md).`,
             "urgent",
-          { tier: "attention", key: "cap-predicted" }, // an owner decision on the cap, not an emergency
+          { tier: "attention", key: "cap-predicted", // an owner decision on the cap, not an emergency
+            action: "Decide whether to allow a higher water temperature tonight (Control page), or accept that this zone may run a little cool." },
           );
         } else if (!risk) {
           predictedCapLatched = false;
@@ -1910,7 +1934,8 @@ async function shadowOnce(): Promise<void> {
           "Winter cap check: zones may need more than 135°F",
           `${names} ${persistent.length === 1 ? "has" : "have"} been calling for ~${CAP_WATCH_STREAK}+ hours at ${Math.round(nowBlock.outdoor_f)}°F outdoor with the plan pinned at the ${DEFAULT_OPTS.strictCapF}°F cap. The as-found system ran hotter on days like this — if rooms are cold, the seasonal cap needs a deliberate raise (issue #59).`,
           "urgent",
-          { tier: "attention", key: "cap-watch" }, // an owner decision on the cap, not an emergency
+          { tier: "attention", key: "cap-watch", // an owner decision on the cap, not an emergency
+            action: "Decide whether to allow a higher water temperature (Control page), or accept that these zones may run a little cool." },
         );
       }
     } else {
@@ -2093,7 +2118,8 @@ async function checkLeaseAndPi(): Promise<void> {
           `The planner is up and healthy but is NOT driving the pumps, so the tank is running on whatever ` +
           `was last written. Check /health writer_lease and whether a second instance is contending.`,
         "high",
-        { tier: "attention", key: "writer-lease" }, // the pumps hold (or lease-revert to) a safe setpoint meanwhile
+        { tier: "attention", key: "writer-lease", // the pumps hold (or lease-revert to) a safe setpoint meanwhile
+          action: "Open the planner's /health page and check writer_lease; restart the a2w-planner service in Railway if it stays stuck." },
       );
     }
   }
@@ -2131,7 +2157,9 @@ async function checkLeaseAndPi(): Promise<void> {
             `lease-reverted setpoints and the HBX keeps heating on its own curve, but A2W cannot see or optimize the plant. ` +
             `Check the Pi's power and the house internet/WiFi (the Pi is 6bb-a2w-control at 192.168.184.197).`,
           "high",
-          { tier: "page", key: "pi-unreachable" },
+          { tier: "page", key: "pi-unreachable",
+            action: "Check the Pi (6bb-a2w-control) has power, and that the house internet and WiFi are up. Unplugging and replugging the Pi is safe.",
+            facts: [["Silent for", `${(downS / 3600).toFixed(1)} h`], ["Outdoor", f0(lastOutdoorF)]] },
         );
       }
     } else {
@@ -2308,7 +2336,8 @@ async function loopBody(): Promise<void> {
       await ntfy("SensorLinx reader offline for 6 h",
         `${consecutiveFailures} consecutive poll failures; last success: ${lastPollAt ?? "never"}. The HBX keeps heating on its ` +
           `own curve, but the planner is blind and not optimizing. Check the SensorLinx app and the HBX's internet connection.`,
-        "high", { tier: "attention", key: "sensorlinx-offline" });
+        "high", { tier: "attention", key: "sensorlinx-offline",
+                  action: "Check the HBX shows online in the SensorLinx app, and that its network cable or WiFi is connected." });
     }
   }
 

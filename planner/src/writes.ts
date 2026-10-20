@@ -232,7 +232,8 @@ export class HbxWriter {
       this.retirePendingBefore = this.retirePendingBefore && this.retirePendingBefore > landedAt ? this.retirePendingBefore : landedAt;
       const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
       console.error(`[boost] ${msg}`);
-      await this.notify("Boost cancel incomplete", msg, "high", { tier: "attention", key: "boost-cancel-incomplete" }).catch(() => {});
+      await this.notify("Boost cancel incomplete", msg, "high", { tier: "attention", key: "boost-cancel-incomplete",
+        action: "Check the planner's database connection (Railway); the tank may stay boosted until this clears." }).catch(() => {});
       return false;
     }
   }

@@ -211,7 +211,8 @@ export class PhaseB {
                 : "Lease will lapse to baseline — house safe, savings paused."),
             "high",
             // a lapsed lease reverts to baseline on its own: record. Only with no lease armed is a human needed.
-            { tier: this.leaseArmed[d.pump_id] === false ? "attention" : "record", key: `phaseb-failing-${d.pump_id}` },
+            { tier: this.leaseArmed[d.pump_id] === false ? "attention" : "record", key: `phaseb-failing-${d.pump_id}`,
+              action: "Check the Pi is online (dashboard), then follow the FINDING-1 runbook to set baseline_setpoint_c on the Pi." },
           );
         }
       }
@@ -270,7 +271,8 @@ export class PhaseB {
               "recovery from a dead planner. See the FINDING-1 runbook.",
             "high",
             // latched in the DB: this used to re-send for each pump on every planner redeploy (60 emails in a month)
-            { tier: "attention", key: `phaseb-nolease-${id}` },
+            { tier: "attention", key: `phaseb-nolease-${id}`,
+              action: "Follow the FINDING-1 runbook: set baseline_setpoint_c in the Pi's config so the safety revert can work." },
           );
         }
       }

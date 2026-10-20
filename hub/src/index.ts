@@ -18,6 +18,7 @@
  * correlates acks to pending commands by command_id (never resolving twice).
  */
 
+import { renderAlertEmail, type Tier as AlertTier } from "./alertemail";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import express, { type Request, type Response } from "express";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
@@ -177,7 +178,7 @@ async function notifyNtfy(title: string, message: string,
  * An all-clear carries the tier of the alert it resolves; only a page gets one. Subjects lead with the tier, because
  * the 2026-08-20 bridge-offline email read like the job-alert mail from the same Resend sender and was never opened.
  */
-type Tier = "page" | "attention" | "record";
+type Tier = AlertTier;
 
 function tierSubject(title: string, tier: Tier, resolved: boolean): string {
   const t = title.trim();
@@ -188,8 +189,8 @@ function tierSubject(title: string, tier: Tier, resolved: boolean): string {
   return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
 }
 
-/** Fire-and-forget email via Resend. No-op when RESEND_API_KEY/RESEND_TO unset; never throws. */
-async function notifyEmail(subject: string, body: string): Promise<void> {
+/** Fire-and-forget email via Resend (text + the alertemail.ts HTML). No-op when RESEND_API_KEY/RESEND_TO unset; never throws. */
+async function notifyEmail(subject: string, body: string, html?: string): Promise<void> {
   if (!RESEND_API_KEY || !RESEND_TO) return;
   try {
     await fetch(RESEND_API_URL, {
@@ -198,7 +199,7 @@ async function notifyEmail(subject: string, body: string): Promise<void> {
       // (the bridge's urllib failed silently for weeks on this — 2026-08-06 lesson).
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json",
                  "User-Agent": "a2w-hub/1.0" },
-      body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body }),
+      body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body, ...(html ? { html } : {}) }),
     });
   } catch (err) {
     console.warn(`[hub] resend email failed: ${(err as Error).message}`);
@@ -207,7 +208,8 @@ async function notifyEmail(subject: string, body: string): Promise<void> {
 
 /** Every hub notification goes through here: ntfy always (the log), then the owner channels its tier earns. */
 function alert(tier: Tier, title: string, body: string,
-               opts: { resolved?: boolean; tag: string; priority?: string; ntfyTags?: string }): void {
+               opts: { resolved?: boolean; tag: string; priority?: string; ntfyTags?: string; action?: string;
+                       facts?: [string, string][] }): void {
   const resolved = !!opts.resolved;
   void notifyNtfy(title, body, { priority: opts.priority ?? (resolved ? "default" : "high"), tags: opts.ntfyTags });
   const push = tier === "page";
@@ -215,7 +217,8 @@ function alert(tier: Tier, title: string, body: string,
   console.log(`[hub] alert ${tier}${resolved ? " resolved" : ""}: ${title} (push ${push}, email ${email})`);
   // the tag is per incident, so the all-clear replaces its alert on the phone
   if (push) void sixbbPush("a2w-hub", title, body, resolved ? "default" : "high", opts.tag);
-  if (email) void notifyEmail(tierSubject(title, tier, resolved), body);
+  if (email) void notifyEmail(tierSubject(title, tier, resolved), body,
+                              renderAlertEmail({ tier, resolved, title, body, action: opts.action, facts: opts.facts, source: "A2W hub" }));
 }
 
 // ---------------------------------------------------------------------------
@@ -700,7 +703,9 @@ setInterval(() => {
         "While it is down there is no autopilot, no Phase B, no hygiene soak scheduling, " +
         "and no SPAN backup-element alarm. Heating still runs on the wall controllers + HBX. " +
         "Check: https://a2w-planner-production.up.railway.app/health";
-      alert("page", title, body, { tag: "a2w-hub-planner-down", ntfyTags: "rotating_light" });
+      alert("page", title, body, { tag: "a2w-hub-planner-down", ntfyTags: "rotating_light",
+        action: "Open the a2w-planner service in Railway: restart it if it has crashed, and check its database (Neon) is up.",
+        facts: [["Down for", `${mins} min`], ["Last error", lastPlannerDetail || "unknown"]] });
     } else if (!down && plannerAlerted) {
       plannerAlerted = false;
       alert("page", "A2W: planner back online", "The planner is healthy and polling again.",

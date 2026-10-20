@@ -273,7 +273,7 @@ def _capture_pushes(monkeypatch) -> list[dict]:
     async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
         pushes.append({"ch": "ntfy", "title": title, "priority": priority})
 
-    async def fake_email(cfg, *, subject, body):
+    async def fake_email(cfg, *, subject, body, html=None):
         pushes.append({"ch": "email", "title": subject})
 
     async def fake_sixbb(cfg, *, title, message, priority, tag=""):

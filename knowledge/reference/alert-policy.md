@@ -116,6 +116,23 @@ The 9 pages are all real heat or invariant events:
 8 of the 12 attention emails are FINDING-1's "no lease armed", which is fixed (armed 2026-10-18, #216), so the run
 rate going forward is lower.
 
+## Email format
+
+Every email has the same layout, readable on a phone in a few seconds (owner, 2026-10-20: "really hard to skim").
+From top to bottom:
+1. a tier banner in words: URGENT · act now / NEEDS A LOOK · this week / RESOLVED;
+2. the headline;
+3. a boxed **What to do**;
+4. a short facts table;
+5. the technical details, small and grey;
+6. a footer: time, source, dashboard link, and why this reached you.
+
+Where the code lives:
+- Planner `alertemail.ts`; `hub/src/alertemail.ts` is a byte-for-byte copy (a hub test enforces it). The bridge
+  has the same layout in `notify.render_html`.
+- Call sites pass `action` and `facts`. The plain-text body is still sent alongside.
+- The daily pump-health digest (email only when drift is flagged) is a side-by-side table per pump.
+
 ## Where events live
 
 - **Planner:** `notifications` records every decision, including what was suppressed and why. `notify_latches`

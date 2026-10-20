@@ -76,7 +76,7 @@ def alerts(monkeypatch):
         sent.append(("push", title, priority))
         return True
 
-    async def email(cfg, *, subject, body):
+    async def email(cfg, *, subject, body, html=None):
         sent.append(("email", subject, body))
 
     for mod in (span_control, sh_mod):

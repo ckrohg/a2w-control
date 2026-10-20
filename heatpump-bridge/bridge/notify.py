@@ -40,9 +40,70 @@ def tier_subject(title: str, tier: str, resolved: bool = False) -> str:
     return core if core.lower().startswith("a2w") else f"A2W — {core}"
 
 
+# --- email layout: the same as planner/src/alertemail.ts (owner 2026-10-20: "really hard to skim") ------------------
+# tier banner in words → headline → WHAT TO DO box → facts table → details (small, grey) → footer. Tables and inline
+# styles only, light surface; the plain-text body is always sent alongside.
+_INK, _INK2, _MUTED, _RULE, _TILE, _LINK = "#0b0b0b", "#52514e", "#8a8984", "#e8e7e3", "#f4f5f7", "#2a78d6"
+_BANNERS = {"page": ("🚨 URGENT · act now", "#ffffff", "#b3261e"),
+            "attention": ("NEEDS A LOOK · this week", "#6b4400", "#fff1d6"),
+            "record": ("FYI", "#33322f", "#eeeeec")}
+_RESOLVED = ("✅ RESOLVED · no action needed", "#055c05", "#e6f4e6")
+_WHY = {"page": "You got this because the house may lose heat or hot water, or something needs a hand at the panel.",
+        "attention": "You got this because something should be looked at this week. Nothing is wrong right now.",
+        "record": "Informational."}
+DASH_URL = "https://a2w-analytics-mirror.vercel.app"
+
+
+def clean_title(t: str) -> str:
+    core = t.strip().lstrip("⚠✓✅🚨\ufe0f ").strip()
+    for label in ("A2W:", "A2W —", "A2W -"):
+        if core.startswith(label):
+            core = core[len(label):].strip()
+    return core or t.strip()
+
+
+def render_html(*, tier: str, title: str, message: str, resolved: bool = False, action: str | None = None,
+                facts: list[tuple[str, str]] | None = None, source: str = "A2W Pi", at: float | None = None) -> str:
+    from html import escape as e
+    import time as _t
+    label, fg, bg = _RESOLVED if resolved else _BANNERS[tier]
+    when = _t.strftime("%a, %b %-d, %-I:%M %p", _t.localtime(at or _t.time()))
+    parts = [f'<div style="display:inline-block;background:{bg};color:{fg};font-size:12px;font-weight:700;'
+             f'letter-spacing:.04em;padding:5px 9px;border-radius:4px;margin:4px 0 10px">{e(label)}</div>',
+             f'<h1 style="font-size:21px;line-height:1.25;margin:0 0 14px;font-weight:700">{e(clean_title(title))}</h1>']
+    if action and not resolved:
+        edge = "#b3261e" if tier == "page" else "#c98a00"
+        parts.append(f'<div style="border-left:4px solid {edge};background:{_TILE};padding:10px 12px;margin:0 0 16px;'
+                     f'border-radius:0 6px 6px 0"><div style="font-size:12px;font-weight:700;letter-spacing:.04em;'
+                     f'color:{_INK2};margin-bottom:3px">WHAT TO DO</div><div style="font-size:16px;line-height:1.4">'
+                     f'{e(action)}</div></div>')
+    if facts:
+        rows = "".join(
+            f'<tr><td style="padding:6px 12px 6px 0;color:{_INK2};font-size:14px;white-space:nowrap;vertical-align:top;'
+            f'border-bottom:1px solid {_RULE}">{e(k)}</td><td style="padding:6px 0;font-size:15px;font-weight:600;'
+            f'vertical-align:top;border-bottom:1px solid {_RULE}">{e(v)}</td></tr>' for k, v in facts)
+        parts.append(f'<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;'
+                     f'width:100%;margin:0 0 16px">{rows}</table>')
+    if message.strip():
+        paras = "".join(f'<p style="margin:0 0 10px;font-size:13px;line-height:1.45;color:{_INK2}">'
+                        f'{e(p).replace(chr(10), "<br>")}</p>' for p in message.strip().split("\n\n") if p.strip())
+        parts.append(f'<div style="font-size:12px;font-weight:700;letter-spacing:.04em;color:{_MUTED};margin:0 0 4px">'
+                     f'DETAILS</div>{paras}')
+    why = "This closes an alert you were sent earlier." if resolved else _WHY[tier]
+    parts.append(f'<div style="border-top:1px solid {_RULE};margin-top:18px;padding-top:10px;font-size:12px;'
+                 f'line-height:1.5;color:{_MUTED}">{e(when)} · {e(source)} · <a href="{DASH_URL}" style="color:{_LINK}">'
+                 f'Dashboard</a><br>{e(why)} Everything else is in the Monday digest.</div>')
+    return ('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,'
+            'initial-scale=1"><meta name="color-scheme" content="light"></head><body style="margin:0;padding:0;'
+            'background:#ffffff"><div style="max-width:560px;margin:0 auto;padding:12px 14px;font-family:-apple-system,'
+            f"BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:{_INK}\">" + "".join(parts) + "</div></body></html>")
+
+
 async def alert(cfg, *, tier: str, title: str, message: str, priority: str = "default", tags: str = "",
-                resolved: bool = False, tag: str = "") -> None:
-    """The one way the bridge tells anyone anything. Never raises (bad tier aside)."""
+                resolved: bool = False, tag: str = "", action: str | None = None,
+                facts: list[tuple[str, str]] | None = None) -> None:
+    """The one way the bridge tells anyone anything. Never raises (bad tier aside). `action` and `facts` shape the
+    email (render_html): what to do, boxed first, then a short label/value table."""
     push, mail = route(tier, resolved)
     log.info("alert %s%s: %s (push %s, email %s)", tier, " resolved" if resolved else "", title.strip(), push, mail)
     jobs = [ntfy(cfg, title=title, message=message, priority=priority, tags=tags)]
@@ -51,7 +112,9 @@ async def alert(cfg, *, tier: str, title: str, message: str, priority: str = "de
         jobs.append(sixbb_push(cfg, title=title, message=message,
                                priority="default" if resolved else ("urgent" if priority == "urgent" else "high"), tag=tag))
     if mail:
-        jobs.append(email(cfg, subject=tier_subject(title, tier, resolved), body=message))
+        jobs.append(email(cfg, subject=tier_subject(title, tier, resolved), body=message,
+                          html=render_html(tier=tier, title=title, message=message, resolved=resolved,
+                                           action=action, facts=facts)))
     await asyncio.gather(*jobs, return_exceptions=True)
 
 
@@ -106,7 +169,7 @@ async def _ntfy_post(cfg, *, title: str, message: str, priority: str, tags: str)
     await asyncio.to_thread(_post)
 
 
-async def email(cfg, *, subject: str, body: str) -> None:
+async def email(cfg, *, subject: str, body: str, html: str | None = None) -> None:
     """Fire-and-forget email alert via Resend. No-op unless configured. The CALLER decides
     what deserves email — this sends whenever invoked. Subject/body are JSON (UTF-8), so
     emoji are fine here."""
@@ -117,6 +180,7 @@ async def email(cfg, *, subject: str, body: str) -> None:
         "to": [cfg.resend_to],
         "subject": subject,
         "text": body,
+        **({"html": html} if html else {}),
     }).encode("utf-8")
 
     def _post():
