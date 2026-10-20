@@ -112,6 +112,41 @@ runs every loop tick, independent of the SensorLinx poll. `scripts/drift-check.s
 
 SQL proven by `scripts/incident-local-check.ts` (local Postgres only).
 
+## Pump health — running but not doing its job (SHADOW; `pumphealth.ts`)
+
+Every existing alarm keys on a fault code (`fault_called`, self-heal) or on a pump not running while called
+(`stage_unserved`, all-idle). This watches the opposite case: a pump that runs or draws power and makes no heat.
+Thresholds come from 97 days of Pi data plus the Postgres restore (for the tank), recorded in `knowledge/reference/pump-health-baseline-20261019.md`.
+
+| check | trips when |
+|---|---|
+| `running_no_lift` | 15 min of steady heating at ≥ 1 kW with mean outlet−inlet ΔT < 1.5 °C (measured minimum 3.4 °C) |
+| `heating_no_draw` | reports heating ≥ 7 min while the SPAN circuit's 5-min mean is < 1 kW (measured minimum 2.85 kW) |
+| `idle_draw` | reports idle/off ≥ 10 min while the circuit's 9-min mean is > 1 kW (measured maximum 672 W) |
+| `defrost_overlong` | reports defrost continuously for > 20 min. Normal is 4–9 min. stagewatch suspends its clock in defrost, so pump1's 83-min stuck "defrost" on 2026-10-18 paged nothing |
+| `called_tank_flat` | a stage is called and its pump is engaged (heating or defrost) ≥ 90 % of 45 min, the tank's net rise plus standby loss is ≤ 2 °F **and** the unit's mean ΔT over it is < 1.5 °C, held for 30 min. A flat tank alone is house load: a healthy single pump at ≤ 45 °F routinely loses ground (measured, doc §5) |
+
+Data comes from the mirror's `readings` and `span_readings`. SPAN consumption is negative, so the checks use its
+magnitude. Gating follows stagewatch: no live Pi frame, or no measured Pi clock offset, means nothing moves. A stale
+or gappy window is `unknown`, and `unknown` never opens or closes an episode.
+
+Episodes go to `alert_episodes` as `shadow_pump_<check>`. They are logged, never paged, and the paging outbox's
+re-send query excludes them. A daily rollup per pump goes to `pump_health_daily`: SPAN kWh, runtime, starts and max
+per hour, defrost count and minutes, mean ΔT, and a lift index (ΔT·h/kWh) per 5 °C outdoor bin. From that, the 7-day
+pool is compared with the pump's own prior 14 days in the same bin (flag at ≤ −20 %; measured noise max 12.7 %) and
+with its twin's learned ratio (the twins sit ~16 % apart). One digest email goes out per day. Everything is on
+`/health.pump_health` and the dashboard's Pump health card.
+
+| env | default | |
+|---|---|---|
+| `PUMP_HEALTH_ENABLED` | on | `0` turns the checks and rollup off |
+| `PUMP_HEALTH_LIVE` | empty | comma list of checks to **promote to paging** (owner decision, per check) |
+| `PUMP_SPAN_CIRCUITS` | `{"pump1":"Air-Water 1","pump2":"Air-Water 2"}` | pump → SPAN circuit (the owner-confirmed self-heal map) |
+| `PUMP_HEALTH_DIGEST` / `PUMP_HEALTH_DIGEST_HOUR` | on / `7` | the daily email, sent after this America/New_York hour |
+
+SQL proof on a local Postgres: `LOCAL_DATABASE_URL=postgres://localhost:5432/a2w_pumphealth npx tsx ../scripts/pump-health-local-check.ts`.
+Re-measure the tank check on a local restore: `LOCAL_DATABASE_URL=postgres://localhost:5432/a2w_local npx tsx ../scripts/pump-health-tank-measure.ts 97`.
+
 ## Pi link — `/health.pi` (#165)
 
 Answers "which failure was that dropout?" from tables the planner already shares with the analytics

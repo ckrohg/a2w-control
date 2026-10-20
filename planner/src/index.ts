@@ -46,6 +46,10 @@ import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWrites
 import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
+import {
+  PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
+  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
+} from "./pumphealth";
 import { PhaseB } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
@@ -527,6 +531,7 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
       .catch((e) => console.error("pi clock observation failed:", (e as Error).message))
       .finally(() => { piClockWriteBusy = false; });
   }
+  healthHubState = { state, atMs: Date.now(), offsetS: piClockOffsetS }; // pump health rides this read (no extra hub traffic)
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );
@@ -775,9 +780,17 @@ async function restoreAlertState(): Promise<void> {
     const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called";
     // an episode the outbox is already closing (opened and recovered while restore was failing) is never re-adopted —
     // re-adopting it would latch the watch "open" over rows being closed and silence a recurrence (codex pass 11)
-    const { keep, stale } = partitionRestore(open.filter((o) => !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
-    if (stale.length) await store.closeAlertEpisodeIds(stale.map((o) => o.id)); // a failure → the whole restore retries
+    // pump health: a shadow episode belongs to the shadow outbox, a live one to the paging outbox; one whose check was
+    // promoted or demoted since it opened is closed — the watch re-evaluates and re-opens it under the current mode
+    const ph = open.map((o) => ({ o, k: parseEpisodeKind(o.kind) }));
+    const phKeep = ph.filter(({ o, k }) => k && k.live === PH_LIVE.live.has(k.check) && !(k.live ? alerts : shadowAlerts).isClosing(o.id, o.uid));
+    const phStale = ph.filter(({ o, k }) => k && k.live !== PH_LIVE.live.has(k.check)).map(({ o }) => o);
+    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length || phStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
+    alerts.adopt(phKeep.filter(({ k }) => k!.live).map(({ o }) => o));
+    shadowAlerts.adopt(phKeep.filter(({ k }) => !k!.live).map(({ o }) => o));
+    pumpWatch.restore(phKeep.filter(({ o }) => o.pumpId != null).map(({ o, k }) => ({ check: k!.check, pumpId: o.pumpId as string })));
     stageWatch.restore(keep.filter(isStage)
       .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
     if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
@@ -811,6 +824,157 @@ async function checkSpanLocal(): Promise<void> {
   else if (n) {
     await alerts.close("span_local_stale", "span");
     await ntfy(n.title, n.body, n.priority, { resolved: true });
+  }
+}
+
+/**
+ * Pump health (pumphealth.ts; owner ask 2026-10-19): the "running but not doing its job, no fault code" checks, every
+ * tick, independent of SensorLinx. SHADOW by default: an episode is written to alert_episodes as shadow_pump_<check>,
+ * logged, shown on /health.pump_health and in the daily digest — never paged. PUMP_HEALTH_LIVE=<check,…> promotes a
+ * check to the paging outbox (kind pump_<check>). Thresholds: knowledge/reference/pump-health-baseline-20261019.md.
+ * Gated like stagewatch: no live Pi frame (#167 piStateUnverifiable) or no measured Pi clock offset → nothing moves.
+ */
+const PUMP_HEALTH_ENABLED = process.env.PUMP_HEALTH_ENABLED !== "0";
+const PUMP_HEALTH_DIGEST = process.env.PUMP_HEALTH_DIGEST !== "0";
+const PUMP_HEALTH_DIGEST_HOUR = Number(process.env.PUMP_HEALTH_DIGEST_HOUR ?? "7"); // America/New_York
+const PH_LIVE = parseLiveChecks(process.env.PUMP_HEALTH_LIVE);
+if (PH_LIVE.error) console.warn(PH_LIVE.error);
+/** pump id → SPAN circuit name. The default is the map the owner confirmed for self-heal (Pi config, 2026-10-19). */
+const PUMP_SPAN_CIRCUITS: Record<string, string> = (() => {
+  const dflt = { pump1: "Air-Water 1", pump2: "Air-Water 2" };
+  const raw = process.env.PUMP_SPAN_CIRCUITS;
+  if (!raw?.trim()) return dflt;
+  try {
+    const v = JSON.parse(raw) as Record<string, unknown>;
+    const ok = v && typeof v === "object" && !Array.isArray(v) && Object.values(v).every((x) => typeof x === "string" && x.trim());
+    if (!ok || !Object.keys(v).length) throw new Error("not a {pump: circuit} object");
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, String(x).trim()]));
+  } catch (e) {
+    console.warn(`PUMP_SPAN_CIRCUITS ignored (${(e as Error).message}) — using the default`);
+    return dflt;
+  }
+})();
+let healthHubState: { state: HubState; atMs: number; offsetS: number | null } | null = null;
+const pumpWatch = new PumpHealthWatch();
+let pumpNames: Record<string, string> = {};
+let pumpHealthGate: string | null = "not evaluated yet";
+let pumpHealthError: string | null = null;
+let pumpDailyError: string | null = null;
+let pumpHealthAt: string | null = null;
+let pumpEvaluatedSinceRestore = false;
+// shadow episodes: same outbox machinery, but the "channel" is the log line — never ntfy, never email
+const shadowAlerts = new AlertOutbox(store, async (title, body) => { console.warn(`[pumphealth][shadow] ${title}: ${body}`); return true; });
+
+async function checkPumpHealth(): Promise<void> {
+  if (!PUMP_HEALTH_ENABLED) { pumpHealthGate = "disabled (PUMP_HEALTH_ENABLED=0)"; return; }
+  if (!hub) { pumpHealthGate = "no hub configured"; return; }
+  // ride checkI1's read when it is from this tick; otherwise (SensorLinx down, no tank target) read the hub ourselves
+  if (!healthHubState || Date.now() - healthHubState.atMs > 4 * 60_000) {
+    try {
+      const state = await hub.getState();
+      const offsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
+        ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
+      healthHubState = { state, atMs: Date.now(), offsetS };
+    } catch (e) {
+      pumpHealthGate = `hub unreachable: ${(e as Error).message}`;
+      return;
+    }
+  }
+  const { state, offsetS } = healthHubState;
+  const blind = piStateUnverifiable(state) ?? (offsetS == null ? "Pi clock offset unknown" : null);
+  if (blind) { pumpHealthGate = blind; return; } // a blind spell never opens or closes an episode
+  pumpNames = Object.fromEntries(state.pumps.map((p) => [p.id, p.name?.trim() || p.id]));
+  const ids = state.pumps.map((p) => p.id).filter((id) => PUMP_SPAN_CIRCUITS[id]);
+  const nowS = Date.now() / 1000;
+  const nowPi = nowS - (offsetS as number);
+  const from = nowPi - PH.LOOKBACK_S;
+  const readings = await store.pumpReadingsWindow(ids, from, nowPi + 60);
+  const span = await store.spanWindow(ids.map((id) => PUMP_SPAN_CIRCUITS[id]), from, nowPi + 60);
+  if (!readings || !span) { pumpHealthGate = "mirror tables absent (readings / span_readings)"; return; }
+  const tank = (await store.tankWindow(new Date((nowS - PH.LOOKBACK_S) * 1000)))
+    .map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
+  const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
+  const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
+  const verdicts: Verdict[] = [];
+  for (const id of ids) verdicts.push(...evaluatePump(id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], nowPi));
+  for (const [stage, id] of Object.entries(STAGE_MAP.map)) {
+    if (!PUMP_SPAN_CIRCUITS[id]) continue;
+    verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
+  }
+  pumpHealthGate = null;
+  pumpHealthAt = new Date().toISOString();
+  if (alertStateRestored && verdicts.some((v) => v.state !== "unknown")) pumpEvaluatedSinceRestore = true;
+  pumpWatch.setNames(pumpNames);
+  for (const e of pumpWatch.step(verdicts)) {
+    const live = PH_LIVE.live.has(e.check);
+    const kind = episodeKind(e.check, live);
+    const title = e.title;
+    if (e.kind === "open") {
+      if (live) await openAlert(kind, e.pumpId, e.pumpId, `⚠ ${title}`, e.body);
+      else await shadowAlerts.open(kind, e.pumpId, e.pumpId, `${title} (shadow)`, e.body);
+    } else if (live) {
+      await alerts.close(kind, e.pumpId);
+      await ntfy(title, e.body, "default", { resolved: true });
+    } else {
+      await shadowAlerts.close(kind, e.pumpId);
+      console.log(`[pumphealth][shadow] ${title}: ${e.body}`);
+    }
+  }
+}
+
+/** The daily rollup: one missing day per tick (yesterday first, then back-fill to the trend's 21 days), then the trend. */
+let pumpDays: DayRow[] = [];
+let pumpDaysLoaded = false;
+let pumpTrend: TrendOut | null = null;
+let pumpDigestDoneFor: string | null = null;
+let pumpDigestLast: { day: string; sent_at: string } | null = null;
+const TREND_SPAN_DAYS = TREND.CUR_DAYS + TREND.BASE_DAYS;
+const dayAdd = (day: string, n: number) => new Date(Date.parse(`${day}T12:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+async function checkPumpHealthDaily(): Promise<void> {
+  if (!PUMP_HEALTH_ENABLED) return;
+  const nowS = Date.now() / 1000;
+  const today = etDay(nowS);
+  const yesterday = dayAdd(today, -1);
+  const since = dayAdd(today, -TREND_SPAN_DAYS);
+  if (!pumpDaysLoaded) { pumpDays = await store.pumpHealthDays(since); pumpDaysLoaded = true; }
+  const ids = Object.keys(PUMP_SPAN_CIRCUITS);
+  const have = new Set(pumpDays.map((r) => `${r.day}\u0000${r.pumpId}`));
+  // a day is rolled up once it has been over for 30 min (the mirror's push lag), newest first
+  for (let d = yesterday; d >= since; d = dayAdd(d, -1)) {
+    const missing = ids.filter((id) => !have.has(`${d}\u0000${id}`));
+    if (!missing.length) continue;
+    const fromS = etDayStart(d), toS = etDayStart(dayAdd(d, 1));
+    if (nowS < toS + 30 * 60) continue;
+    const readings = await store.pumpReadingsWindow(missing, fromS - 300, toS);
+    const span = await store.spanWindow(missing.map((id) => PUMP_SPAN_CIRCUITS[id]), fromS, toS);
+    if (!readings || !span) return; // rehearsal DB without the mirror tables
+    for (const id of missing) {
+      const m = rollupDay(readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], fromS, toS);
+      await store.upsertPumpHealthDay(d, id, m);
+      pumpDays.push({ day: d, pumpId: id, m });
+    }
+    break; // one day per tick: the back-fill never puts a burst of reads on the production database
+  }
+  pumpDays = pumpDays.filter((r) => r.day >= since);
+  pumpTrend = trend(pumpDays, ids, yesterday);
+
+  // the digest: once per day after PUMP_HEALTH_DIGEST_HOUR, when yesterday is rolled up for every pump
+  if (!PUMP_HEALTH_DIGEST || pumpDigestDoneFor === yesterday || etHour(nowS) < PUMP_HEALTH_DIGEST_HOUR) return;
+  if (!ids.every((id) => pumpDays.some((r) => r.day === yesterday && r.pumpId === id))) return;
+  if (!(await store.claimPumpDigest(yesterday))) { pumpDigestDoneFor = yesterday; return; } // sent already (or by a peer)
+  try {
+    const eps = await store.pumpHealthEpisodes24h().catch(() => []);
+    const { title, body } = digest(yesterday, pumpDays, pumpTrend, eps, pumpWatch.status(), pumpNames, PH_LIVE.live);
+    if (await ntfyDelivered(title, body, "default", { email: true })) {
+      await store.markPumpDigestSent(yesterday);
+      pumpDigestDoneFor = yesterday;
+      pumpDigestLast = { day: yesterday, sent_at: new Date().toISOString() };
+    } else {
+      await store.releasePumpDigest(yesterday); // no channel heard it — the next tick retries
+    }
+  } catch (e) {
+    await store.releasePumpDigest(yesterday).catch(() => {});
+    throw e;
   }
 }
 
@@ -1925,8 +2089,16 @@ async function loopBody(): Promise<void> {
   await checkSpanLocal().catch((e) => { spanLocalError = (e as Error).message; console.error("span-local check failed:", spanLocalError); });
   // a DB row is re-sent only once its watch has evaluated the condition since the restore that adopted it — a resolved
   // incident is closed by that evaluation instead of paged (codex pass 5)
-  await alerts.retry((kind) => (kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
+  await checkPumpHealth().then(() => { pumpHealthError = null; })
+    .catch((e) => { pumpHealthError = (e as Error).message; console.error("pump health check failed:", pumpHealthError); });
+  await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
+    : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
+    : kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
+  // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)
+  await shadowAlerts.retry(() => false).catch((e) => console.error("shadow episode flush failed:", (e as Error).message));
+  await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
+    .catch((e) => { pumpDailyError = (e as Error).message; console.error("pump health daily failed:", pumpDailyError); });
 
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
@@ -2074,6 +2246,26 @@ async function main(): Promise<void> {
             // #187: the SPAN LOCAL stream (the Pi's LAN poller → span_readings) beside spanwatch's cloud state. Pages
             // when local is older than 15 min; the cloud failing alone only shows here.
             span: spanLocal ? { ...spanLocal, refresh_error: spanLocalError } : { pending: true, refresh_error: spanLocalError },
+            // pump health (pumphealth.ts): "running but not doing its job" with no fault code, per pump, SHADOW unless
+            // promoted in PUMP_HEALTH_LIVE. checks = the latest verdict per check (ok | tripped | unknown) and whether an
+            // episode is open; gate = why nothing was evaluated this tick (null = evaluated). daily = the SPAN-metered rollup
+            // for the newest complete day + the 7-d vs 14-d drift trend. Thresholds: pump-health-baseline-20261019.md.
+            pump_health: {
+              enabled: PUMP_HEALTH_ENABLED,
+              live_checks: [...PH_LIVE.live], live_error: PH_LIVE.error,
+              span_circuits: PUMP_SPAN_CIRCUITS,
+              evaluated_at: pumpHealthAt, gate: pumpHealthGate, error: pumpHealthError,
+              checks: pumpWatch.status(),
+              thresholds: PH,
+              daily: {
+                through_day: pumpTrend?.through_day ?? null,
+                days: pumpTrend ? pumpDays.filter((r) => r.day === pumpTrend!.through_day).map((r) => ({ pump: r.pumpId, ...r.m })) : [],
+                days_stored: pumpDays.length,
+                trend: pumpTrend ? { pumps: pumpTrend.pumps, twin: pumpTrend.twin, twin_flag: pumpTrend.twin_flag } : null,
+                error: pumpDailyError,
+              },
+              digest: { enabled: PUMP_HEALTH_DIGEST, hour_et: PUMP_HEALTH_DIGEST_HOUR, last: pumpDigestLast },
+            },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
               : { pending: true, refresh_error: piLinkError },

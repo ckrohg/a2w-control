@@ -36,3 +36,22 @@ export async function fetchPlannerStorm(): Promise<{ storm: HealthStorm | null; 
     return { storm: null, status: 502, error: `planner unreachable: ${String(e)}` };
   }
 }
+
+/** The planner's /health `pump_health` block (pumphealth.ts), raw — lib/pump-health.ts normalizes it. Same auth + timeout. */
+export async function fetchPlannerPumpHealth(): Promise<{ pumpHealth: unknown; status: number; error?: string }> {
+  const base = process.env.PLANNER_URL;
+  const token = process.env.PLANNER_API_TOKEN;
+  if (!base || !token) return { pumpHealth: null, status: 503, error: "planner not configured" };
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, "")}/health`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const out: { pump_health?: unknown } = await res.json().catch(() => ({}));
+    return out.pump_health ? { pumpHealth: out.pump_health, status: 200 }
+      : { pumpHealth: null, status: 502, error: `planner health gave no pump_health (${res.status})` };
+  } catch (e) {
+    return { pumpHealth: null, status: 502, error: `planner unreachable: ${String(e)}` };
+  }
+}

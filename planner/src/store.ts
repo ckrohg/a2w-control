@@ -13,6 +13,7 @@ import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-window
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 import type { PiLinkInputs } from "./pilink";
+import type { PumpReading, SpanSample, TankReading, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
 
 export interface SlxReading {
   ts: Date;
@@ -163,6 +164,21 @@ export class Store {
         notified_at timestamptz
       );
       ALTER TABLE alert_episodes ADD COLUMN IF NOT EXISTS uid text UNIQUE;
+      -- pump health (pumphealth.ts): one row per pump per America/New_York day — the SPAN-metered rollup and the 5 °C
+      -- outdoor-bin sums the drift trend pools. Shadow episodes of the window checks live in alert_episodes
+      -- (kind shadow_pump_<check>, never paged); the daily digest claims its day here before it sends.
+      CREATE TABLE IF NOT EXISTS pump_health_daily (
+        day         date NOT NULL,
+        pump_id     text NOT NULL,
+        metrics     jsonb NOT NULL,
+        computed_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (day, pump_id)
+      );
+      CREATE TABLE IF NOT EXISTS pump_health_digests (
+        day        date PRIMARY KEY,
+        claimed_at timestamptz NOT NULL DEFAULT now(),
+        sent_at    timestamptz
+      );
       CREATE TABLE IF NOT EXISTS hbx_boosts (
         id         serial PRIMARY KEY,
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -915,7 +931,9 @@ export class Store {
   /** Open episodes whose page no channel has acknowledged yet — re-sent every poll. */
   async undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]> {
     const r = await this.locked.query(
-      `SELECT id, uid, kind, title, detail FROM alert_episodes WHERE cleared_at IS NULL AND notified_at IS NULL ORDER BY id LIMIT 20`);
+      // shadow episodes (pump health, kind shadow_*) are logs, never pages: the outbox must not re-send them
+      `SELECT id, uid, kind, title, detail FROM alert_episodes
+       WHERE cleared_at IS NULL AND notified_at IS NULL AND kind NOT LIKE 'shadow\\_%' ORDER BY id LIMIT 20`);
     return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
   }
 
@@ -1803,6 +1821,89 @@ export class Store {
       [instanceId, staleMs],
     );
     return (res.rowCount ?? 0) > 0;
+  }
+
+  // ── pump health (pumphealth.ts). Window reads are small and index-backed (readings (pump_id, ts), span_readings
+  // (name, ts)); each is bounded by a per-query timeout so a slow DB costs one tick of the shadow checks, never a hang.
+  // The mirror's tables are absent in a rehearsal DB → null ("unknown"), never an error.
+  private async boundedRows(text: string, values: unknown[]): Promise<any[] | null> {
+    try {
+      const r = await this.pool.query({ text, values, query_timeout: 20_000 } as any);
+      return r.rows;
+    } catch (e) {
+      if ((e as { code?: string }).code === "42P01") return null;
+      throw e;
+    }
+  }
+
+  /** Mirror readings for these pumps in [fromS, toS] (Pi epoch seconds), ascending. */
+  async pumpReadingsWindow(pumpIds: string[], fromS: number, toS: number): Promise<Record<string, PumpReading[]> | null> {
+    const rows = await this.boundedRows(
+      `SELECT pump_id, ts::float8 AS ts, online, state, inlet_c, outlet_c, ambient_c FROM readings
+       WHERE pump_id = ANY($1::text[]) AND ts >= $2 AND ts <= $3 ORDER BY ts`, [pumpIds, fromS, toS]);
+    if (!rows) return null;
+    const out: Record<string, PumpReading[]> = Object.fromEntries(pumpIds.map((p) => [p, []]));
+    for (const x of rows) out[String(x.pump_id)]?.push({
+      ts: Number(x.ts), online: x.online === true, state: x.state == null ? null : String(x.state),
+      inlet_c: x.inlet_c == null ? null : Number(x.inlet_c), outlet_c: x.outlet_c == null ? null : Number(x.outlet_c),
+      ambient_c: x.ambient_c == null ? null : Number(x.ambient_c),
+    });
+    return out;
+  }
+
+  /** SPAN local samples for these circuit names in [fromS, toS] (Pi epoch seconds), ascending. power_w is RAW (negative = consumption). */
+  async spanWindow(names: string[], fromS: number, toS: number): Promise<Record<string, SpanSample[]> | null> {
+    const rows = await this.boundedRows(
+      `SELECT name, ts::float8 AS ts, power_w FROM span_readings WHERE name = ANY($1::text[]) AND ts >= $2 AND ts <= $3 ORDER BY ts`,
+      [names, fromS, toS]);
+    if (!rows) return null;
+    const out: Record<string, SpanSample[]> = Object.fromEntries(names.map((n) => [n, []]));
+    for (const x of rows) out[String(x.name)]?.push({ ts: Number(x.ts), power_w: x.power_w == null ? null : Number(x.power_w) });
+    return out;
+  }
+
+  /** HBX tank + stage calls since `from` (planner clock), ascending, as epoch seconds. */
+  async tankWindow(from: Date): Promise<TankReading[]> {
+    const rows = await this.boundedRows(
+      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
+    return (rows ?? []).map((x) => ({ ts: Number(x.ts), tank_f: x.tank_f == null ? null : Number(x.tank_f),
+      stages_called: Array.isArray(x.stages_called) ? x.stages_called.map((b: unknown) => b === true) : null }));
+  }
+
+  async upsertPumpHealthDay(day: string, pumpId: string, metrics: DayMetrics): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO pump_health_daily (day, pump_id, metrics) VALUES ($1, $2, $3)
+       ON CONFLICT (day, pump_id) DO UPDATE SET metrics = EXCLUDED.metrics, computed_at = now()`, [day, pumpId, JSON.stringify(metrics)]);
+  }
+
+  /** Rollup rows since `sinceDay` (inclusive). */
+  async pumpHealthDays(sinceDay: string): Promise<DayRow[]> {
+    const r = await this.pool.query(
+      `SELECT to_char(day, 'YYYY-MM-DD') AS day, pump_id, metrics FROM pump_health_daily WHERE day >= $1::date ORDER BY day, pump_id`, [sinceDay]);
+    return r.rows.map((x: any) => ({ day: String(x.day), pumpId: String(x.pump_id), m: x.metrics as DayMetrics }));
+  }
+
+  /** Claim the digest for `day`: true only for the one caller that inserted the claim (a second instance never double-sends). */
+  async claimPumpDigest(day: string): Promise<boolean> {
+    const r = await this.pool.query(`INSERT INTO pump_health_digests (day) VALUES ($1::date) ON CONFLICT (day) DO NOTHING RETURNING day`, [day]);
+    return (r.rowCount ?? 0) > 0;
+  }
+  async markPumpDigestSent(day: string): Promise<void> {
+    await this.pool.query(`UPDATE pump_health_digests SET sent_at = now() WHERE day = $1::date`, [day]);
+  }
+  /** A send that no channel acknowledged gives the claim back, so the next tick retries. */
+  async releasePumpDigest(day: string): Promise<void> {
+    await this.pool.query(`DELETE FROM pump_health_digests WHERE day = $1::date AND sent_at IS NULL`, [day]);
+  }
+
+  /** Pump-health episodes (shadow or live) opened in the last 24 h, newest first — the digest's list. */
+  async pumpHealthEpisodes24h(): Promise<EpisodeLine[]> {
+    const r = await this.locked.query(
+      `SELECT kind, pump_id, title, started_at, cleared_at FROM alert_episodes
+       WHERE (kind LIKE 'pump\\_%' OR kind LIKE 'shadow\\_pump\\_%') AND started_at > now() - interval '24 hours'
+       ORDER BY started_at DESC LIMIT 50`);
+    return r.rows.map((x: any) => ({ kind: String(x.kind), pumpId: x.pump_id == null ? null : String(x.pump_id), title: String(x.title),
+      started_at: new Date(x.started_at).toISOString(), cleared_at: x.cleared_at == null ? null : new Date(x.cleared_at).toISOString() }));
   }
 
   async close(): Promise<void> {
