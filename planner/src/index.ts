@@ -228,7 +228,7 @@ const phaseB = PHASE_B_ENABLED && hub
 const SPAN_USERNAME = process.env.SPAN_USERNAME;
 const SPAN_PASSWORD = process.env.SPAN_PASSWORD ?? "";
 const SPAN_BACKUP_CIRCUIT = process.env.SPAN_BACKUP_CIRCUIT ?? "backup";
-const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // 16.5kW hits 0.3kWh in ~65s
+const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // drawn in the trailing 60 min; 16.5 kW hits 0.3 kWh in ~65 s
 const SPAN_BUILDING_ID = process.env.SPAN_BUILDING_ID; // optional; auto-discovered if unset
 const SPAN_POLL_SECONDS = Number(process.env.SPAN_POLL_SECONDS ?? "60");
 // The pump (compressor) circuits on the SPAN panel — summed each poll into span_energy so the
@@ -237,7 +237,7 @@ const SPAN_PUMP_CIRCUITS = process.env.SPAN_PUMP_CIRCUITS ?? "air-water";
 const spanWatch = SPAN_USERNAME
   ? new SpanWatch(SPAN_USERNAME, SPAN_PASSWORD, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_KWH, ntfy, SPAN_BUILDING_ID, store, SPAN_PUMP_CIRCUITS)
   : null;
-if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH}kWh/hr; pump-energy circuits "${SPAN_PUMP_CIRCUITS}" → span_energy, every ${SPAN_POLL_SECONDS}s`);
+if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH} kWh in 60 min; pump-energy circuits "${SPAN_PUMP_CIRCUITS}" → span_energy, every ${SPAN_POLL_SECONDS}s`);
 else console.log("SPAN backup watch OFF (set SPAN_USERNAME to enable the element power alarm)");
 
 // TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.
@@ -861,6 +861,10 @@ async function checkSpanLocal(): Promise<void> {
   const cloud = {
     enabled: !!spanWatch, last_ok_at: spanWatch?.lastOkAt ?? null,
     fail_streak: spanWatch?.failStreak ?? 0, last_error: spanWatch?.lastError ?? null,
+    // the backup-element alarm's inputs: energy the element drew in the trailing 60 min (what pages at
+    // SPAN_BACKUP_ALARM_KWH) and SPAN's day-cumulative reading it is differenced from.
+    backup_kwh_last_hour: spanWatch?.lastHourKwh ?? null, backup_kwh_today: spanWatch?.lastDayKwh ?? null,
+    backup_alarmed: spanWatch?.alarmed ?? false,
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   spanLocalError = null;

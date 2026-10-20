@@ -14,6 +14,11 @@ export interface SpanCloudState {
   last_ok_at: string | null;
   fail_streak: number;
   last_error: string | null;
+  /** the backup-element alarm (spanwatch.ts): kWh the element circuit drew in the trailing 60 min — what is compared
+   *  to SPAN_BACKUP_ALARM_KWH — the day-cumulative SPAN reading it is derived from, and whether a page is open */
+  backup_kwh_last_hour?: number | null;
+  backup_kwh_today?: number | null;
+  backup_alarmed?: boolean;
 }
 
 export interface SpanHealth {
