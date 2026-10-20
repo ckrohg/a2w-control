@@ -12,7 +12,15 @@ const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ok   ${n
 
 t("valid power_cycle defaults off_s to the 60 s floor and trims the circuit", () => {
   assert.deepEqual(validateBreakerBody({ circuit: " Air-Water 2 ", action: "power_cycle" }),
-    { ok: true, cmd: { circuit: "Air-Water 2", op: "power_cycle", off_s: 60 } });
+    { ok: true, cmd: { circuit: "Air-Water 2", op: "power_cycle", off_s: 60, source: "armed-dashboard" } });
+});
+
+t("source: an audit label — defaults to the dashboard, the backup gate names itself, junk is refused", () => {
+  const v = validateBreakerBody({ circuit: "Buffer Tank", action: "close", source: "backup-gate" });
+  assert.ok(v.ok && v.cmd.source === "backup-gate");
+  for (const source of ["", "Backup", "a b", "x".repeat(33), 7, "hub:x"]) {
+    assert.equal(validateBreakerBody({ circuit: "Buffer Tank", action: "close", source }).ok, false, `source ${String(source)}`);
+  }
 });
 
 t("off_s below 60, above 600, or non-numeric is refused", () => {
@@ -33,7 +41,7 @@ t("unknown action / missing or empty circuit is refused", () => {
 });
 
 t("ack deadline: power_cycle waits off_s + grace; close/open only the grace", () => {
-  const pc = { circuit: "Air-Water 2", op: "power_cycle" as const, off_s: 60 };
+  const pc = { circuit: "Air-Water 2", op: "power_cycle" as const, off_s: 60, source: "armed-dashboard" };
   assert.equal(breakerAckTimeoutMs(pc, 30_000), 90_000);
   assert.equal(breakerAckTimeoutMs({ ...pc, off_s: 180 }, 30_000), 210_000);
   assert.equal(breakerAckTimeoutMs({ ...pc, op: "close" }, 30_000), 30_000);
