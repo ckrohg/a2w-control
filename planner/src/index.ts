@@ -19,7 +19,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient, type HubState } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H, priorExcursionsFromPlans } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -1479,7 +1479,11 @@ async function shadowOnce(): Promise<void> {
   const preBoosts = sags.map((w) => ({ windowStart: w.windowStart, windowEnd: w.windowEnd, boostF: Math.max(0, Math.round(w.sagP75F)), sagP75F: w.sagP75F, n: w.n }));
   dhwPreBoosts = sags;
   learnedWindowsForHealth = learned ? learned.windows : null;
-  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F };
+  // Rolling-horizon fix: the bank / soak blocks this plan's own history already placed at hours that have started,
+  // so the bank is chosen once per local day (shadow.ts priorExcursionsFromPlans) instead of re-landing on the
+  // current hour every recompute. A history read failure means no memory — the pre-fix plan — never a skipped plan.
+  const priorExcursions = priorExcursionsFromPlans(await store.recentPlans(26).catch(() => []), Date.now());
+  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F, priorExcursions };
 
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
   let demandFloor: DemandFloor | null = null;
@@ -1804,6 +1808,7 @@ async function shadowOnce(): Promise<void> {
     learn_days: learned?.days ?? 0,
     draw_events: learned?.drawEvents ?? 0,
     bank_f: BANK_F,
+    prior_excursions: priorExcursions, // what the bank remembered (spent / pinned) when this plan was computed
     ...(dpMeta ? { winter_dp: dpMeta } : {}),
     ...(preheatMeta ? { preheat: preheatMeta } : {}),
   });
