@@ -7,7 +7,9 @@
 #                  urgent with the manual instruction and keeps retrying in the background.
 #   open         — turn a circuit OFF and leave it off. Only circuits with allow_open — never a
 #                  heat-pump circuit (config refuses it), so nothing here can leave a heat pump
-#                  off indefinitely.
+#                  off indefinitely. The backup element ("Buffer Tank") is close-only unless
+#                  span.backup_reopen (default OFF, owner OK required) — then an OPEN is allowed
+#                  only while the element is idle and the owner's arm intent is not ARMED.
 # Guards: allowlist, isUserControllable, an unambiguous panel name, ONE action at a time (global
 # lock, background re-closes included), never two heat-pump circuits off at once, read-back of
 # relayState after every write. Every attempt — accepted or refused — is an audit event
@@ -31,7 +33,7 @@ from pathlib import Path
 
 from . import notify
 from .config import BACKUP_ELEMENT_CIRCUIT, HEAT_PUMP_CIRCUITS
-from .span_local import OpenAborted, OpenPermit
+from .span_local import OpenAborted, OpenPermit, read_arm_intent
 
 log = logging.getLogger(__name__)
 
@@ -272,9 +274,13 @@ class BreakerController:
             raise BreakerRefused(f"'{name}' is not on the breaker allowlist", 403)
         if action == "power_cycle" and not spec.allow_cycle:
             raise BreakerRefused(f"power cycle is not allowed for '{name}'", 403)
-        if action in ("open", "power_cycle") and name in (BACKUP_ELEMENT_CIRCUIT, self.cfg.arm_circuit):
-            raise BreakerRefused(f"'{name}' is the backup element — close-only", 403)
-        if action == "open" and (not spec.allow_open or spec.heat_pump or name in HEAT_PUMP_CIRCUITS):
+        backup = self._is_backup(name)
+        if backup and action == "power_cycle":
+            raise BreakerRefused(f"'{name}' is the backup element — never power-cycled", 403)
+        if backup and action == "open" and not self.cfg.backup_reopen:
+            raise BreakerRefused(f"'{name}' is the backup element — close-only (re-open is disabled: "
+                                 "span.backup_reopen, owner OK required)", 403)
+        if action == "open" and not backup and (not spec.allow_open or spec.heat_pump or name in HEAT_PUMP_CIRCUITS):
             raise BreakerRefused(
                 f"'{name}' may not be switched off and left off "
                 f"({'power cycle only' if spec.allow_cycle else 'close-only'})", 403)
@@ -290,6 +296,32 @@ class BreakerController:
             if hold > self.cfg.max_off_s:
                 raise BreakerRefused(f"off_s {hold:g} exceeds max_off_s {self.cfg.max_off_s:g}", 422)
         return spec, hold
+
+    def _is_backup(self, name: str) -> bool:
+        return name in (BACKUP_ELEMENT_CIRCUIT, self.cfg.arm_circuit)
+
+    def _backup_open_refusal(self, name: str, circuits: dict) -> str | None:
+        """span.backup_reopen's own guards, judged on a raw panel read (the decision's, and a fresh one at dispatch).
+        An unknown draw is refused, never read as 0 W."""
+        try:
+            c = find_circuit(circuits, name)
+        except BreakerRefused as exc:
+            return str(exc)
+        if c is None:
+            return f"'{name}' was not found on the panel"
+        if c["relay_state"] != "CLOSED":
+            return f"'{name}' is already {c['relay_state'] or 'in an unknown state'}"
+        raw = next((x.get("instantPowerW") for x in circuits.values() if (x.get("name") or "").strip() == name), None)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+            return f"the element's draw is unknown ({raw!r}) — not switching it off blind"
+        draw = abs(float(raw))
+        if draw >= self.cfg.backup_open_max_w:
+            return (f"the element is drawing {draw:.0f} W — never switch a live 16.5 kW load off "
+                    f"(limit {self.cfg.backup_open_max_w:g} W)")
+        armed = read_arm_intent(getattr(self.cache, "arm_state_path", None), bool(self.cfg.arm))
+        if armed:
+            return "the owner's arm intent is ARMED (keep the element available) — disarm first"
+        return None
 
     async def _read_panel(self) -> dict:
         circuits = await self.client.fetch_circuits()
@@ -333,6 +365,20 @@ class BreakerController:
                 if why:
                     raise BreakerRefused(f"precheck: {why}", 409)
                 guard = lambda: precheck(circ)   # noqa: E731 — re-run at the dispatch boundary
+            if action == "open" and self._is_backup(spec.name):
+                why = self._backup_open_refusal(spec.name, circuits)
+                if why:
+                    raise BreakerRefused(f"precheck: {why}", 409)
+                caller_guard = guard
+
+                def guard(_g=caller_guard):
+                    # In the worker, under the client lock, immediately before EVERY OPEN POST: a FRESH panel read,
+                    # never the one the decision was made on (the element may have started meanwhile).
+                    try:
+                        fresh = self.client._fetch_locked()
+                    except Exception as exc:  # noqa: BLE001 — no fresh read, no OPEN
+                        return f"could not re-read the panel before the OPEN ({exc})"
+                    return self._backup_open_refusal(spec.name, fresh) or (_g() if _g else None)
             if action == "open":
                 return await self._do_open(spec, circ, source, guard)
             return await self._do_cycle(spec, circ, hold, source, guard)

@@ -191,6 +191,13 @@ async function test(name: string, fn: () => Promise<void>) {
       assert.equal(cmd.source, "armed-dashboard");
     });
 
+    await test("the backup gate's source label reaches the Pi (the bridge audits it as hub:backup-gate)", async () => {
+      const r = await hub.post({ circuit: "Air-Water 2", action: "close", source: "backup-gate" }, AUTH);
+      assert.equal(r.status, 200);
+      assert.equal(pi.commands.at(-1)!.source, "backup-gate");
+      assert.equal((await hub.post({ circuit: "Air-Water 2", action: "close", source: "Not OK" }, AUTH)).status, 400);
+    });
+
     await test("bridge refusal → 502 with its detail and result", async () => {
       const r = await hub.post({ circuit: "Buffer Tank", action: "open" }, AUTH);
       assert.equal(r.status, 502);

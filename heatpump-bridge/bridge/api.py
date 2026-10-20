@@ -423,6 +423,9 @@ async def health(request: Request, response: Response):
         # #189: shadow/live mode, per-pump status, attempts in the window, last outcome
         "self_heal": (request.app.state.self_heal.status()
                       if getattr(request.app.state, "self_heal", None) is not None else None),
+        # the backup-element gate's Pi-local fallback (both pumps down → close the element breaker)
+        "backup_fallback": (request.app.state.backup_fallback.status()
+                            if getattr(request.app.state, "backup_fallback", None) is not None else None),
     }
 
 

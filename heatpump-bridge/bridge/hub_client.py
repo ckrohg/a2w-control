@@ -36,6 +36,7 @@ class HubClient:
         self.cfg = cfg
         self.pollers = pollers
         self.span = None   # span_control.BreakerController when SPAN local is configured
+        self.backup_fallback = None   # backup_fallback.BackupFallback — its status rides frame["span"]
         self._task: asyncio.Task | None = None
         self._breaker_tasks: set[asyncio.Task] = set()
 
@@ -277,6 +278,11 @@ class HubClient:
             # bridge predates it, instead of waiting out an ack that will never come.
             frame["capabilities"] = ["breaker"]
             frame["span"] = self.span.snapshot()
+            if self.backup_fallback is not None:
+                try:
+                    frame["span"]["backup_fallback"] = self.backup_fallback.status()
+                except Exception as exc:  # noqa: BLE001 — a status bug never costs the state frame
+                    log.warning("hub: backup fallback status failed: %s", exc)
         return frame
 
     async def _send_state(self, ws) -> None:
