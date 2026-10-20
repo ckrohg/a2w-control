@@ -98,6 +98,11 @@ const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
 const ELECTRIC_RATE_USD_KWH = Number(process.env.ELECTRIC_RATE_USD_KWH ?? "0.30");
 const DAILY_KWH_BASELINE = Number(process.env.DAILY_KWH_BASELINE ?? "11.8");
 const STANDBY_UA_BTU = Number(process.env.STANDBY_UA_BTU ?? "25");
+// Local days the realized ledger recomputes every hour (the SQL caps the window at the 2026-07-16 cutover, so a large
+// value is harmless). Default 45. One-off repair after the window-edge fix: set REALIZED_LOOKBACK_DAYS=120 on Railway,
+// let the startup run rewrite every day back to the cutover ("realized-savings: recomputed N days" in the log), and
+// drop the variable at the next deploy.
+const REALIZED_LOOKBACK_DAYS = Number(process.env.REALIZED_LOOKBACK_DAYS ?? "45") || 45;
 
 const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
 
@@ -2192,7 +2197,7 @@ async function main(): Promise<void> {
     await once("shadow", shadowOnce);
     await once("score", scoreOnce);
     await once("decay scan", () => decayScanOnce(store));
-    await once("realized-savings", () => realized.computeAndStore());
+    await once("realized-savings", () => realized.computeAndStore(REALIZED_LOOKBACK_DAYS));
     await once("pi-link", refreshPiLink);
     await once("span-local", checkSpanLocal);
     await once("alert re-send", () => alerts.retry());
@@ -2659,7 +2664,7 @@ async function main(): Promise<void> {
       await step("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     }
     await step("i8", checkI8);
-    await step("realized-savings", () => realized.computeAndStore());
+    await step("realized-savings", () => realized.computeAndStore(REALIZED_LOOKBACK_DAYS));
   };
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);
