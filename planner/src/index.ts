@@ -821,13 +821,13 @@ async function restoreAlertState(): Promise<void> {
     // backup gate: an open episode of the CURRENT mode's kind = the gate closed the breaker (virtually, in shadow); one
     // of the other mode is closed — a shadow "would close" is not a breaker the live gate closed, and vice versa
     const isGate = (o: { kind: string }) => o.kind === "backup_gate" || o.kind === "backup_gate_shadow";
-    const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid));
+    const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid) && !gateShadowAlerts.isClosing(o.id, o.uid));
     const gateKeep = gateOpen.filter((o) => o.kind === backupGateKind);
     const gateStale = gateOpen.filter((o) => o.kind !== backupGateKind);
     const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
     if (stale.length || phStale.length || gateStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
-    alerts.adopt(gateKeep);
+    (BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts).adopt(gateKeep);
     if (gateKeep.length) backupGate.restore({ closedByGate: true, atMs: Date.now() }); // dwell restarts now: conservative
     alerts.adopt(phKeep.filter(({ k }) => k!.live).map(({ o }) => o));
     shadowAlerts.adopt(phKeep.filter(({ k }) => !k!.live).map(({ o }) => o));
@@ -1039,6 +1039,10 @@ let backupGateBlind: string | null = "not evaluated yet";
 let backupGateError: string | null = null;
 let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback: Record<string, unknown> | null } = { relay: null, element_w: null, pi_fallback: null };
 let backupGateEpisodes7d: number | null = null;
+// shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
+// every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
+// The would-open is a log line + /health + the dashboard: no second email.
+const gateShadowAlerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "default", { email: true }));
 
 async function checkBackupGate(reading: SlxReading): Promise<void> {
   if (BACKUP_GATE_CFG.mode === "off") { backupGateBlind = "disabled (BACKUP_GATE=off)"; return; }
@@ -1068,29 +1072,42 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
     nowMs: Date.now(), tankF: reading.tankF, tankTargetF: reading.tankTargetF, stagesCalled: reading.stagesCalled,
     pumps, relay: blind ? null : relay,
   });
+  const outbox = BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts;
   for (const e of events) {
     console.warn(`[backupgate][${BACKUP_GATE_CFG.mode}] ${e.title}: ${e.body}`);
+    if (e.kind === "confirmed") {
+      // a live command whose hub answer was lost, now seen done on the relay: record it as the gate's own
+      if (e.confirms === "close") await openAlert(backupGateKind, "buffer_tank", null, e.title, e.body);
+      else { await alerts.close(backupGateKind, "buffer_tank"); await ntfyDelivered(e.title, e.body, "default", { resolved: true }); }
+      continue;
+    }
     if (e.kind !== "close" && e.kind !== "open") { await ntfyDelivered(e.title, e.body, e.priority); continue; }
     if (BACKUP_GATE_CFG.mode === "live") {
       // the Pi's BreakerController verifies the relay read-back; the gate (and its episode) changes only on a verified
-      // answer — a refused or unanswered command pages the failure and is retried after BG.RETRY_MS
+      // answer. A refusal (a bridge guard said no) stands the gate down for the episode; no Pi / no answer retries after
+      // BG.RETRY_MS, and a late landing is confirmed from the relay. Either way the failure pages ONCE per episode.
       const fresh = !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS));
-      const r = !HUB_ARM_TOKEN ? { ok: false, detail: "HUB_ARM_TOKEN is not set on the planner" }
-        : !fresh ? { ok: false, detail: "lost the writer lease" }
+      const r = !HUB_ARM_TOKEN ? { ok: false, refused: true, detail: "HUB_ARM_TOKEN is not set on the planner" }
+        : !fresh ? { ok: false, refused: false, detail: "lost the writer lease" }
         : await hub.sendBreaker(BACKUP_CIRCUIT, e.kind, HUB_ARM_TOKEN, "backup-gate");
-      backupGate.applied(r.ok, Date.now());
-      backupGateError = r.ok ? null : `${e.kind} failed: ${r.detail}`;
+      const { page } = backupGate.applied(r.ok, Date.now(), r.refused);
+      backupGateError = r.ok ? null : `${e.kind} ${r.refused ? "refused" : "failed"}: ${r.detail}`;
       if (!r.ok) {
-        await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,
-          `${r.detail}. A2W retries in ${BG.RETRY_MS / 60_000} min while the condition holds. ` +
-          (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high");
+        if (page) {
+          await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,
+            `${r.detail}. ` + (r.refused ? "A bridge guard refused it; A2W will not retry until the condition ends. "
+              : `A2W retries every ${BG.RETRY_MS / 60_000} min while the condition holds (no further pages). `) +
+            (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high");
+        }
         continue;
       }
     }
-    if (e.kind === "close") await openAlert(backupGateKind, "buffer_tank", null, e.title, e.body);
-    else {
+    if (e.kind === "close") await outbox.open(backupGateKind, "buffer_tank", null, e.title, e.body);
+    else if (BACKUP_GATE_CFG.mode === "live") {
       await alerts.close(backupGateKind, "buffer_tank");
       await ntfyDelivered(e.title, e.body, "default", { resolved: true });
+    } else {
+      await gateShadowAlerts.close(backupGateKind, "buffer_tank"); // log + /health + dashboard only: no second email
     }
   }
   backupGateEpisodes7d = await store.alertEpisodesSince(backupGateKind, 7 * 24).catch(() => backupGateEpisodes7d);
@@ -2213,10 +2230,12 @@ async function loopBody(): Promise<void> {
   await checkPumpHealth().then(() => { pumpHealthError = null; })
     .catch((e) => { pumpHealthError = (e as Error).message; console.error("pump health check failed:", pumpHealthError); });
   await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
-    : kind.startsWith("backup_gate") ? true // open = the breaker is (virtually) closed until the gate re-opens it
+    : kind === "backup_gate_shadow" ? false // its own outbox (default priority, email) re-sends it, never the high one
+    : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
     : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
+  await gateShadowAlerts.retry((kind) => kind === "backup_gate_shadow").catch((e) => console.error("backup-gate shadow re-send failed:", (e as Error).message));
   // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)
   await shadowAlerts.retry(() => false).catch((e) => console.error("shadow episode flush failed:", (e as Error).message));
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })

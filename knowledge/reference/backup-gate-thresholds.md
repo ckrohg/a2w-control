@@ -19,17 +19,28 @@ shower sags, and the gate must never close it for a normal heavy load.
 
 | Rule | Closes when | Held for |
 |---|---|---|
-| **failed_not_recovering** | a pump has FAILED (offline in a live frame, the bridge's `fault` state, or its stage's `stage_unserved` / `fault_called` open) **and** the HBX is calling **and** the tank is ≥ 8 °F below target **and** it has risen < 3 °F over the last 20 min | 90 min |
+| **failed_not_recovering** | a pump has FAILED (offline in a live frame, the bridge's `fault` state, or its stage's `stage_unserved` / `fault_called` open) **and** the HBX is calling **and** the tank is ≥ 10 °F below target **and** it has risen < 3 °F over the last 20 min | 90 min |
 | **floor** | the HBX is calling **and** every *available* pump is engaged (heating or defrost) **and** the tank is < 100 °F **and** it has risen < 3 °F over 20 min | 30 min |
 | **recovered** (re-open) | the gate closed it **and** every pump is healthy **and** tank ≥ target − 5 °F (or the HBX is satisfied) | 60 min, and ≥ 120 min after the close |
 
 Clocks work like `stagewatch.ts`. Time is credited only between consecutive qualifying polls ≤ 7.5 min apart. A
 non-qualifying poll resets the clock. A blind poll (no live Pi frame, a missing SensorLinx field, no tank sample 20 min
-back) neither credits nor resets. Every action is at least 120 min after the previous one, so the gate cannot flap.
+back) neither credits nor resets. **A rise of ≥ 3 °F over 20 min pauses the clock; it does not reset it.** In a real
+failure, the surviving pump's defrost sawtooth (dip, partial recovery, dip) would otherwise restart the 90 min every
+cycle, so only the floor would ever catch it (`backupgate.test.ts` §7b). A genuine recovery still resets the clock: the
+call ends or the deficit closes. Every action is at least 120 min after the previous one, so the gate cannot flap.
 
 The **Pi-local fallback** needs no cloud. It closes the breaker (it never opens it) when **every** pump has been down
-for 30 min. Down means a fresh blocking fault while not running, switched off, its circuit OPEN at the panel, or
-Modbus-stale while SPAN shows no compressor draw on its circuit. It makes at most one decision per 6 h.
+for 30 min. Down means a fresh blocking fault while not running, or Modbus-stale while a fresh SPAN read shows no
+compressor draw on its circuit. A deliberate off (switched off on the unit or from 6bb, or its circuit OPEN at the
+panel) is never "down". A pump that is stale with no fresh panel read is **unknown**, and unknown resets the episode:
+a Pi Wi-Fi/LAN drop loses Modbus and SPAN together and must not read as "every pump down". It makes at most one
+decision per 6 h.
+
+**Shadow pages are never phone pushes.** #211 pushes every high/urgent alert and every all-clear to the owner's phone
+via 6bb. In shadow, the planner's would-close goes out at default priority through its own outbox, as one email per
+episode. The would-open is a log line, `/health` and the dashboard only. The Pi fallback's shadow would-close is email
+only.
 
 ## 2 · Data
 
@@ -53,8 +64,8 @@ Modbus-stale while SPAN shows no compressor draw on its circuit. It makes at mos
 
 | Window | What | Tank | Replay (defaults) |
 |---|---|---|---|
-| **Oct 15 12:00 → Oct 16 02:10** (14.2 h) | stage 2 called continuously; HP2 E21 (fault); HP1 idle and never called (lagT 180). Pi blind 14:35–16:40. | 103 °F by 12:15, then 99–104 flat against 119.5 for 12 h; a shower took it to 77 °F at 01:00 | **would close at 13:30**, 90 min into the call. **Would re-open at 03:10** after HP2 heated again |
-| **Aug 12 12:08 → Aug 13 08:10** (20.1 h) | stage 2 called; HP2 fault; HP1 never called; 70–90 °F outdoor | slow decay 118 → 101 °F, about 0.5 °F per 30 min | **would close at 17:43**. The deficit first reached 8 °F at 16:13 (summer: slow) |
+| **Oct 15 12:00 → Oct 16 02:10** (14.2 h) | stage 2 called continuously; HP2 E21 (fault); HP1 idle and never called (lagT 180). Pi blind 14:35–16:40. | 103 °F by 12:15, then 99–104 flat against 119.5 for 12 h; a shower took it to 77 °F at 01:00 | **would close at 13:35**, 95 min into the call. **Would re-open at 03:10** after HP2 heated again |
+| **Aug 12 12:08 → Aug 13 08:10** (20.1 h) | stage 2 called; HP2 fault; HP1 never called; 70–90 °F outdoor | slow decay 118 → 101 °F, about 0.5 °F per 30 min | **would close at 19:18**. The deficit stayed under 10 °F until late afternoon (summer: slow decay, nothing urgent) |
 | **Jul 22 – Aug 7**, 12 calls with HP2 faulted in the lead (lagT 60) | HP1 joined as the lag stage with the HBX backup call about 60 min in, and recovered the tank within 15–25 min | dips to 96–117 °F | **no close.** Longest failed-rule clock 60 min (Jul 23 03:40, Aug 5 08:51), against the 90-min hold |
 | Oct 11 15:15 → 19:30 | stage 2 called 4.3 h, tank 118 → 97 °F, recovered at once when the HBX switched to stage 1 | | **blind**: the mirror has no pump data that afternoon. Neither layer could attribute it. See §8 |
 
@@ -89,26 +100,30 @@ call. Below the floor with an idle healthy pump means the HBX still has capacity
 "available", so the floor rule covers "one pump died and the survivor runs flat out but cannot hold 100 °F". With no
 pump available, it fires on the floor alone.
 
-## 5 · The failure rule: 8 °F, < 3 °F per 20 min, 90 min
+## 5 · The failure rule: 10 °F, < 3 °F per 20 min, 90 min
 
-**Margin 8 °F.** On healthy data, the longest spell of "called, ≥ M °F below target, not rising":
+**Margin 10 °F.** On healthy data, the longest clock of "called, ≥ M °F below target, not rising", with a rise pausing
+the clock (the shipped rule):
 
-| M | Longest healthy spell | Incident close | Aug 12 close |
+| M | Longest healthy clock | Incident close | Aug 12 close |
 |---|---|---|---|
-| 5 °F | 70 min (Oct 18 03:35), too close to 90 | 13:30 | 17:18 |
-| **8 °F** | **30 min** (Oct 18 02:55) | **13:30** | **17:43** |
-| 10 °F | 25 min | 13:35 | 19:18 |
+| 5 °F | 85 min (Oct 18), too close to 90 | 13:30 | 17:18 |
+| 8 °F | 50 min (Oct 18 08:40), 1.8× | 13:30 | 17:43 |
+| **10 °F** | **25 min**, 3.6× | **13:35** | **19:18** |
 
-8 °F is twice the HBX differential (`htDif` 4) and 3× the healthy maximum. The incident sat at 16–20 °F.
+The first cut used 8 °F, when a rise still *reset* the clock (healthy maximum 30 min). Pausing lets a healthy single
+pump's sawtooth accumulate across dips, so the margin at 8 °F fell to 1.8×. 10 °F restores it, at a cost of 5 min on the
+incident. The incident sat at 16–20 °F.
 
-**Hold 90 min, not 60.** This is the measured reason. With lagT 60 the HBX adds the lag pump about 60 min into a call,
+**Hold 90 min, not 60.** This is the measured reason, unchanged under the pause rule. With lagT 60 the HBX adds the lag pump about 60 min into a call,
 and that pump needs 15–25 min to show a lift. A 60-min hold **false-closes on Jul 23 04:40**, while HP1 was about to
 recover the tank (`backupgate.test.ts` pins this). The longest such spell is 60 min, so 90 leaves 30 min of margin.
 90 min also covers the self-heal (10-min grace + 60 s power cycle + 15-min verify): if self-heal clears an E21, the gate
 never closes.
 
 **Not rising: < 3 °F over 20 min.** A working pump lifts the tank 1–4 °F per 5 min. With a 15-min window and a 2 °F
-threshold, a +1.9 °F blip at 17:00 on Oct 15 split the incident's spell in two. 20 min / 3 °F does not.
+threshold, a +1.9 °F blip at 17:00 on Oct 15 split the incident's spell in two. 20 min / 3 °F does not. A rise pauses
+the clock (§1).
 
 **"Failed" includes `stage_unserved` / `fault_called`** from `stagewatch.ts`. That catches a pump that is called, not
 heating, and shows no fault code. A pump that faults while idle, with the other pump carrying the house, does not close
@@ -132,7 +147,10 @@ the guards, relay read-back, audit, and a page. It has two guards of its own:
 - never while the owner's arm intent is ARMED.
 
 Live, a breaker the gate closed that someone switches OFF by hand makes the gate stand down for 12 h. It never fights
-a human.
+a human. A command a bridge guard refuses stands the gate down for the rest of that episode. A command with no answer
+(no Pi, hub timeout) retries every 15 min, and if it landed anyway, the relay read confirms it as the gate's own. Either
+failure pages once per episode. The element-open guard refuses when the element's draw is unknown, and it re-reads the
+panel immediately before the OPEN.
 
 ## 7 · Pi-local fallback: 30 min
 
@@ -143,15 +161,15 @@ contacts. Measured on the Pi's own samples:
   can act anyway.
 - **One gateway stale: up to 41 min** (pump2, Aug 6). That is why the fallback needs **every** pump down.
 - **SPAN idle draw** on Air-Water 1/2 is 5–9 W (median 8). Running is ≥ 5 kW. A stale pump whose circuit draws ≥ 500 W
-  counts as running.
+  counts as running. A stale pump with no fresh panel read is unknown, never down (a Pi network drop loses both).
 
 30 min is more than 8× the longest both-stale spell. A 30-min-old total loss of heat is also well inside the incident's
 lesson: 14 h passed with nothing restoring heat.
 
 ## 8 · What to watch in shadow, and before going live
 
-- **Pages:** "Backup element gate (shadow): WOULD close / re-open", and "Backup fallback (shadow): WOULD close". Each
-  is a real ntfy and email page. `/health.backup_gate` and the dashboard's **Backup element gate** card show the clocks,
+- **Pages:** "Backup element gate (shadow): WOULD close" (one email per episode; the would-open is not emailed), and
+  "Backup fallback (shadow): WOULD close" (email). Neither is a phone push. `/health.backup_gate` and the dashboard's **Backup element gate** card show the clocks,
   the inputs and the **real** breaker separately from the gate's virtual state.
 - **Re-validate after the first design-cold week**, with `BACKUP_GATE_*` overrides on a fresh restore. At ≤ 10 °F two
   pumps may legitimately run flat out with the tank in the low 100s. That is the owner's "massive load" case and must

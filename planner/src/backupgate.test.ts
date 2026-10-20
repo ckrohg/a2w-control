@@ -2,7 +2,7 @@
  * @purpose Assertions for the backup-element gate (backupgate.ts) on REAL data — four windows of the restored history at
  * the planner's 5-min poll cadence (slx_readings + the mirror's pump states, null = no live Pi frame), replayed the way
  * index.ts feeds it (a StageWatch stepped on the same rows supplies the per-stage episodes). Pins:
- *   - the Oct 15–16 incident (HP2 E21 lead, 14.2 h with no heat): ONE would-close, 90 min into the call; one would-open
+ *   - the Oct 15–16 incident (HP2 E21 lead, 14.2 h with no heat): ONE would-close, 95 min into the call; one would-open
  *     once HP2 heated again; nothing else;
  *   - Oct 17–19, the first cold nights with every pump healthy, shower sags to ~101 °F and a stuck 83-min defrost: NOTHING;
  *   - Jul 22 – Aug 7 (lagT 60, HP2 faulted for weeks, HP1 joining as lag stage with the HBX backup call ~60 min in): NOTHING
@@ -69,7 +69,7 @@ function replay(rows: FxRow[], gate = new BackupGate("shadow", true)): { at: num
   assert.equal(c.e.rule, "failed_not_recovering");
   const into = (c.at - callStart) / 60;
   assert.ok(into >= 90 && into <= 100, `would-close 90–100 min into the call (at ${into.toFixed(0)} min, ${et(c.at)})`);
-  assert.equal(c.e.priority, "high");
+  assert.equal(c.e.priority, "default", "shadow is never a phone push (#211 pushes high/urgent)");
   assert.match(c.e.title, /shadow.*WOULD close/i);
   assert.match(c.e.body, /SHADOW — nothing was switched/);
   assert.match(c.e.body, /pump2 is fault/);
@@ -158,7 +158,7 @@ function run(g: BackupGate, from: number, to: number, f: (m: number) => Partial<
   const ev = run(new BackupGate(), 0, 200, failed);
   assert.equal(ev.length, 1); assert.equal(ev[0].e.rule, "failed_not_recovering");
   assert.equal(ev[0].m, 105, `closes 90 min after the first judged poll (m=15) → m=105 (at ${ev[0].m})`);
-  // a 3 °F rise in 20 min resets the clock (the partner pump is lifting the tank)
+  // a 3 °F rise in 20 min PAUSES the clock (the partner pump is lifting the tank) — it closes later, not sooner
   const g = new BackupGate();
   const ev2 = run(g, 0, 200, (m) => ({ ...failed(), tankF: m >= 80 && m <= 100 ? 105 + (m - 80) / 5 * 1.5 : 105 }));
   assert.ok(!ev2.length || ev2[0].m > 105, "a recovery resets the hold");
@@ -177,6 +177,23 @@ function run(g: BackupGate, from: number, to: number, f: (m: number) => Partial<
   assert.equal(run(new BackupGate(), 0, 200, () => ({ ...failed(), pumps: [P("pump1", "idle"), P("pump2", "idle", { stageEpisode: true })] })).length, 1);
   // no failed pump: the same tank never closes by this rule
   assert.equal(run(new BackupGate(), 0, 400, () => ({ ...failed(), pumps: both("idle", "heating") })).length, 0);
+}
+
+// ── 7b. the survivor's defrost sawtooth in a real failure: dips and partial recoveries with a net decline must not
+//        restart the 90 min every cycle (a rise pauses the clock, it does not reset it) ─────────────────────────────
+{
+  // 40-min cycle: 20 min of decline −6 °F (defrost / draw), 20 min of recovery +5 °F (a rise ≥ 3 every cycle) — net
+  // −1 °F per cycle, always above the 100 °F floor, while the HBX calls, HP2 is faulted and HP1 heats
+  const saw = (m: number) => { const k = Math.floor(m / 40), t = m % 40; const base = 122 - k; return t < 20 ? base - (6 * t) / 20 : base - 6 + (5 * (t - 20)) / 20; };
+  const input = (m: number) => ({ tankF: saw(m), tankTargetF: 132, stagesCalled: [true, true], pumps: [P("pump1", "heating"), P("pump2", "fault")] });
+  const ev = run(new BackupGate(), 0, 600, input);
+  assert.ok(Array.from({ length: 121 }, (_, i) => saw(i * 5)).every((f) => f > 100), "fixture: never under the floor");
+  assert.equal(ev.length, 1, "a sawtooth with a net decline still closes");
+  assert.equal(ev[0].e.rule, "failed_not_recovering", "by the failure rule, not the floor");
+  assert.ok(ev[0].m <= 300, `closed at ${ev[0].m} min`);
+  // ... while a steady climb (+1 °F / 5 min from 100) never does: it pauses, then the deficit closes and resets it
+  assert.equal(run(new BackupGate(), 0, 400, (m) => ({ tankF: Math.min(125, 100 + m / 5), tankTargetF: 120, stagesCalled: [true, true],
+    pumps: [P("pump1", "heating"), P("pump2", "fault")] })).length, 0);
 }
 
 // ── 8. recovery, dwell and restore (shadow: the state is virtual) ──────────────────────────────────────────────────────
@@ -238,6 +255,32 @@ function run(g: BackupGate, from: number, to: number, f: (m: number) => Partial<
   assert.deepEqual(ro.map((x) => x.e.kind), ["open"]);
   g4.applied(true, at(300));
   assert.equal(g4.breakerState, "open");
+}
+
+// ── 9b. LIVE failures: a refusal stands down for the episode; a timeout retries; either pages ONCE; a lost ack is
+//        confirmed from the relay ─────────────────────────────────────────────────────────────────────────────────
+{
+  const low = () => ({ tankF: 97, tankTargetF: 120, relay: "OPEN" as const });
+  const g = new BackupGate("live", true);
+  assert.equal(run(g, 0, 45, low).length, 1);
+  assert.deepEqual(g.applied(false, at(45), true), { page: true }, "first refusal pages");
+  assert.equal(run(g, 50, 300, low).length, 0, "refused: no retry while the condition holds");
+  assert.equal((g.status(at(300)) as Record<string, unknown>).stand_down, "close");
+  // the condition ends (tank recovers above the floor, call ends) → the stand-down ends with it; a new episode acts again
+  run(g, 305, 310, () => ({ tankF: 120, tankTargetF: 120, stagesCalled: [false, false], relay: "OPEN" as const }));
+  assert.equal((g.status(at(310)) as Record<string, unknown>).stand_down, null);
+  const again = run(g, 315, 400, low);
+  assert.equal(again.length, 1, "the next episode tries again");
+  // a timeout: retried every 15 min, paged once
+  const g2 = new BackupGate("live", true);
+  run(g2, 0, 45, low);
+  assert.deepEqual(g2.applied(false, at(45)), { page: true });
+  const r1 = run(g2, 50, 60, low); assert.equal(r1.length, 1, "retried after 15 min");
+  assert.deepEqual(g2.applied(false, at(60)), { page: false }, "the retry's failure does not page again");
+  // the lost command actually landed: the relay reads CLOSED → the gate's own close, confirmed (not "someone else")
+  const c = run(g2, 65, 65, () => ({ ...low(), relay: "CLOSED" as const }));
+  assert.deepEqual(c.map((x) => [x.e.kind, x.e.confirms]), [["confirmed", "close"]]);
+  assert.equal(g2.breakerState, "closed"); assert.equal(g2.closedByGate, true, "so it may re-open it later");
 }
 
 // ── 10. status() is what /health serves ───────────────────────────────────────────────────────────────────────────────

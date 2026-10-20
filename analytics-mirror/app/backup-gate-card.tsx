@@ -54,7 +54,7 @@ export async function BackupGateCard() {
         </div>
       ) : null}
       <div className="meta" style={{ marginTop: 6 }}>
-        Closes when a pump has failed and the tank sits 8°+ below target without recovering for 90 min, or every
+        Closes when a pump has failed and the tank sits {v.deficitF ?? 10}°+ below target without recovering for {v.failHoldMin ?? 90} min, or every
         available pump runs and the tank stays under {v.floorF ?? 100}°F for {v.floorHoldMin ?? 30} min.
         {v.episodes7d != null ? ` ${v.episodes7d} episode${v.episodes7d === 1 ? "" : "s"} in 7 days.` : ""}
         {v.error ? ` Error: ${v.error}` : ""}

@@ -18,7 +18,9 @@
  *
  * Clocks follow stagewatch.ts: time is credited only between two consecutive qualifying observations ≤ MAX_STEP apart;
  * a non-qualifying observation resets the clock; a BLIND observation (hub/Pi state unverifiable, SensorLinx field
- * missing, no tank sample RISE_WINDOW ago) neither credits nor resets.
+ * missing, no tank sample RISE_WINDOW ago) neither credits nor resets. A RISE (≥ RISE_F over RISE_WINDOW) PAUSES the
+ * clock rather than resetting it: in a real failure the surviving pump's defrost sawtooth (dip, recover, dip) must not
+ * restart the 90 min every cycle, while a genuine recovery ends the call or closes the deficit — and that resets it.
  *
  * Pure (no I/O). index.ts feeds it every SensorLinx poll and executes what it decides: SHADOW (default) pages "would
  * close / would open" and switches nothing — the gate's state is then VIRTUAL; LIVE sends the close through the hub to
@@ -27,7 +29,7 @@
  */
 
 export const BG = {
-  DEFICIT_F: 8,
+  DEFICIT_F: 10,
   RISE_F: 3,
   RISE_WINDOW_MS: 20 * 60_000,
   FAIL_HOLD_MS: 90 * 60_000,
@@ -59,7 +61,7 @@ export type GateMode = "off" | "shadow" | "live";
 /**
  * BACKUP_GATE (off | shadow | live; default shadow), BACKUP_GATE_REOPEN (1 = a live gate may re-open; default off),
  * BACKUP_GATE_FLOOR_F (90–115, default 100), BACKUP_GATE_FLOOR_MIN (10–120, default 30), BACKUP_GATE_DEFICIT_F (4–20,
- * default 8), BACKUP_GATE_FAIL_HOLD_MIN (60–240, default 90). An invalid value falls back to its default, with the reason.
+ * default 10), BACKUP_GATE_FAIL_HOLD_MIN (60–240, default 90). An invalid value falls back to its default, with the reason.
  * The floor may not go below 90 °F: that is the HBX's own bkTemp floor, where it fires the element itself.
  */
 export function parseGateConfig(env: Record<string, string | undefined>): { mode: GateMode; reopen: boolean; t: GateThresholds; errors: string[] } {
@@ -111,7 +113,9 @@ export type GateRule = "failed_not_recovering" | "floor" | "recovered";
 export interface GateEvent {
   /** close / open = act (shadow: "would"; live: index.ts pages it only after the Pi verified the switch); reopen_blocked = live, re-open wanted but disabled; override = live, a human
    *  opened the breaker the gate closed — the gate stands down for OVERRIDE_MS */
-  kind: "close" | "open" | "reopen_blocked" | "override";
+  kind: "close" | "open" | "reopen_blocked" | "override" | "confirmed";
+  /** kind "confirmed": a live command whose answer was lost (hub timeout) is now seen done on the relay */
+  confirms?: "close" | "open";
   rule: GateRule | null;
   title: string;
   body: string;
@@ -141,6 +145,8 @@ export interface GateConditions {
   target_f: number | null;
   deficit_f: number | null;
   rise_f: number | null;
+  /** rose ≥ RISE_F over RISE_WINDOW: the close clocks are PAUSED (not reset) */
+  rising: boolean | null;
   failed: { id: string; why: string }[] | null;
   available: string[] | null;
   all_available_engaged: boolean | null;
@@ -156,6 +162,12 @@ export class BackupGate {
   private overrideUntilMs: number | null = null;
   private pending: { kind: "close" | "open"; rule: GateRule; atMs: number } | null = null;
   private retryAtMs: number | null = null;
+  /** live: a refused command (a bridge guard said no) is not retried until its condition ends */
+  private standDown: "close" | "open" | null = null;
+  /** live: one failure page per episode */
+  private failPaged = false;
+  /** live: a command with no definite answer (timeout): it may still land — the relay read decides */
+  private unconfirmed: { kind: "close" | "open"; atMs: number } | null = null;
   private reopenBlockedPaged = false;
   private readonly failC = clock();
   private readonly floorC = clock();
@@ -199,27 +211,29 @@ export class BackupGate {
     const failed = i.pumps ? i.pumps.map((p) => ({ id: p.id, why: failedReason(p) })).filter((x): x is { id: string; why: string } => x.why != null) : null;
     const avail = i.pumps ? i.pumps.filter((p) => failedReason(p) == null) : null;
     const allEngaged = avail ? avail.every(engaged) : null;
-    // each rule is null (blind) when an input it needs is unknown; false when a known input rules it out
+    // each rule is true (credit), false when a known input rules it out (reset), null when an input it needs is unknown
+    // OR the tank is rising (pause — see the header)
+    const rising = rise == null ? null : rise >= BG.RISE_F;
     const a = called === false ? false
       : called == null || failed == null ? null
       : !failed.length ? false
       : deficit == null ? null
       : deficit < this.t.deficitF ? false
-      : rise == null ? null
-      : rise < BG.RISE_F;
+      : rising == null || rising ? null
+      : true;
     // "still below": a tank climbing back out of a deep hole (Oct 16 01:00, 77 → 97 °F in 35 min) is being kept up with
     const b = called === false ? false
       : called == null || tank == null || allEngaged == null ? null
       : !(tank < this.t.floorF && allEngaged) ? false
-      : rise == null ? null
-      : rise < BG.RISE_F;
+      : rising == null || rising ? null
+      : true;
     const healthy = i.pumps == null ? null : i.pumps.length > 0 && i.pumps.every((p) => failedReason(p) == null);
     const satisfied = called === false ? true
       : called == null || tank == null || tgt == null ? null
       : tank >= tgt - BG.OPEN_MARGIN_F;
     const rec = healthy === false || satisfied === false ? false : healthy == null || satisfied == null ? null : true;
     return {
-      called, tank_f: r1(tank), target_f: r1(tgt), deficit_f: r1(deficit), rise_f: r1(rise),
+      called, tank_f: r1(tank), target_f: r1(tgt), deficit_f: r1(deficit), rise_f: r1(rise), rising,
       failed, available: avail ? avail.map((p) => p.id) : null, all_available_engaged: allEngaged,
       failed_not_recovering: a, floor: b, recovered: rec,
     };
@@ -236,6 +250,22 @@ export class BackupGate {
     const out: GateEvent[] = [];
     const pumps = i.pumps ?? [];
 
+    // LIVE: a command whose answer was lost and that the relay now shows done is the gate's own action
+    if (this.mode === "live" && i.relay && !this.pending && this.unconfirmed) {
+      const u = this.unconfirmed;
+      if (now - u.atMs > 2 * BG.RETRY_MS) this.unconfirmed = null;
+      else if ((u.kind === "close" && i.relay === "CLOSED" && this.state === "open")
+        || (u.kind === "open" && i.relay === "OPEN" && this.state === "closed")) {
+        this.unconfirmed = null;
+        this.transition(u.atMs, u.kind);
+        this.retryAtMs = null;
+        out.push(this.ev(now, {
+          kind: "confirmed", confirms: u.kind, rule: null, priority: "default",
+          title: u.kind === "close" ? "A2W closed the backup element breaker (confirmed late)" : "A2W re-opened the backup element breaker (confirmed late)",
+          body: `The hub did not answer in time, but the Buffer Tank breaker now reads ${i.relay} — A2W's ${u.kind} landed.`,
+        }));
+      }
+    }
     // LIVE: the real relay is the truth. A breaker someone else switched is never fought.
     if (this.mode === "live" && i.relay && !this.pending) {
       if (i.relay === "CLOSED" && this.state === "open") { this.state = "closed"; this.byGate = false; } // owner / arm
@@ -259,13 +289,22 @@ export class BackupGate {
     tickClock(this.floorC, c.floor, now);
     tickClock(this.openC, this.state === "closed" ? c.recovered : false, now);
 
+    // an episode ends when its clock is back at zero: a stand-down and its one failure page end with it
+    if (this.state === "open" && this.failC.ms === 0 && this.floorC.ms === 0 && this.failC.last == null && this.floorC.last == null) {
+      if (this.standDown === "close") this.standDown = null;
+      this.failPaged = false;
+    }
+    if (this.state === "closed" && this.openC.ms === 0 && this.openC.last == null) {
+      if (this.standDown === "open") this.standDown = null;
+      this.failPaged = false;
+    }
     if (this.pending) return out; // live: a command is in flight — applied() resolves it
     if (this.retryAtMs != null && now < this.retryAtMs) return out;
     const dwellOk = this.lastActionMs == null || now - this.lastActionMs >= BG.MIN_DWELL_MS;
     const ctx = this.context(i, c);
 
     if (this.state === "open") {
-      if (!dwellOk || (this.overrideUntilMs != null && now < this.overrideUntilMs)) return out;
+      if (!dwellOk || this.standDown === "close" || (this.overrideUntilMs != null && now < this.overrideUntilMs)) return out;
       let rule: GateRule | null = null;
       if (this.failC.ms >= this.t.failHoldMs) rule = "failed_not_recovering";
       else if (this.floorC.ms >= this.t.floorHoldMs) rule = "floor";
@@ -276,7 +315,7 @@ export class BackupGate {
         : `${(c.failed ?? []).map((f) => `${label(pumps.find((p) => p.id === f.id) ?? { id: f.id, online: false })} is ${f.why}`).join("; ")}, ` +
           `and for ${Math.round(this.failC.ms / 60_000)} min the tank has sat ≥ ${this.t.deficitF} °F below target without recovering while the HBX calls.`;
       out.push(this.act(now, "close", rule, why, ctx));
-    } else if (this.byGate && this.openC.ms >= BG.OPEN_HOLD_MS && dwellOk) {
+    } else if (this.byGate && this.openC.ms >= BG.OPEN_HOLD_MS && dwellOk && this.standDown !== "open") {
       const why = `every pump has been healthy and the tank back within ${BG.OPEN_MARGIN_F} °F of target (or the HBX satisfied) for ` +
         `${Math.round(this.openC.ms / 60_000)} min.`;
       if (this.mode === "live" && !this.reopen) {
@@ -309,7 +348,8 @@ export class BackupGate {
     const shadow = this.mode !== "live";
     const e: GateEvent = kind === "close"
       ? {
-          kind, rule, priority: "high",
+          // shadow is never a phone push (#211 pushes high/urgent): default priority, one email per episode (index.ts)
+          kind, rule, priority: shadow ? "default" : "high",
           title: shadow ? "Backup element gate (shadow): WOULD close the breaker" : "A2W closed the backup element breaker",
           body: `${shadow ? "SHADOW — nothing was switched. " : ""}Rule ${rule}: ${why} ` +
             `${shadow ? "Live, A2W would close" : "A2W closed (relay read-back verified)"} the Buffer Tank breaker so the HBX can fire the 16.5 kW element on its own backup call. ${ctx}`,
@@ -325,13 +365,22 @@ export class BackupGate {
     return this.ev(now, e);
   }
 
-  /** LIVE: the hub/Pi answer for the pending command. ok = the Pi verified the relay read-back. */
-  applied(ok: boolean, nowMs: number): void {
+  /**
+   * LIVE: the hub/Pi answer for the pending command. ok = the Pi verified the relay read-back. refused = a guard said no
+   * (nothing was switched; retrying cannot help): the gate stands down until the condition ends. Otherwise (no Pi,
+   * timeout) it retries after RETRY_MS and, should the command land late, the relay read confirms it. Returns whether
+   * to page the failure — once per episode.
+   */
+  applied(ok: boolean, nowMs: number, refused = false): { page: boolean } {
     const p = this.pending;
-    if (!p) return;
+    if (!p) return { page: false };
     this.pending = null;
-    if (ok) { this.transition(nowMs, p.kind); this.retryAtMs = null; }
-    else this.retryAtMs = nowMs + BG.RETRY_MS;
+    if (ok) { this.transition(nowMs, p.kind); this.retryAtMs = null; this.unconfirmed = null; return { page: false }; }
+    if (refused) { this.standDown = p.kind; this.unconfirmed = null; }
+    else { this.retryAtMs = nowMs + BG.RETRY_MS; this.unconfirmed = { kind: p.kind, atMs: nowMs }; }
+    const page = !this.failPaged;
+    this.failPaged = true;
+    return { page };
   }
 
   private transition(now: number, kind: "close" | "open"): void {
@@ -341,6 +390,8 @@ export class BackupGate {
     this.failC.ms = 0; this.floorC.ms = 0; this.openC.ms = 0;
     this.failC.last = this.floorC.last = this.openC.last = null;
     this.reopenBlockedPaged = false;
+    this.standDown = null;
+    this.failPaged = false;
   }
 
   private ev(now: number, e: GateEvent): GateEvent {
@@ -370,6 +421,8 @@ export class BackupGate {
       pending: this.pending?.kind ?? null,
       last_action_at: this.lastActionMs == null ? null : new Date(this.lastActionMs).toISOString(),
       retry_at: this.retryAtMs != null && this.retryAtMs > nowMs ? new Date(this.retryAtMs).toISOString() : null,
+      stand_down: this.standDown,
+      unconfirmed: this.unconfirmed ? { kind: this.unconfirmed.kind, at: new Date(this.unconfirmed.atMs).toISOString() } : null,
       override_until: this.overrideUntilMs != null && this.overrideUntilMs > nowMs ? new Date(this.overrideUntilMs).toISOString() : null,
       clocks: {
         failed_not_recovering_min: min(this.failC.ms), floor_min: min(this.floorC.ms), recovered_min: min(this.openC.ms),

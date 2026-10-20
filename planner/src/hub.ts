@@ -102,7 +102,7 @@ export class HubClient {
 
   /** LIVE backup gate only: one breaker action through the hub → Pi BreakerController. ok = the Pi VERIFIED the relay
    *  read-back. Never throws; a refusal / timeout is a normal outcome the caller retries later. */
-  async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string): Promise<{ ok: boolean; detail: string }> {
+  async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string): Promise<{ ok: boolean; refused: boolean; detail: string }> {
     try {
       const res = await fetch(`${this.baseUrl}/api/breaker`, {
         method: "POST",
@@ -110,10 +110,15 @@ export class HubClient {
         body: JSON.stringify({ circuit, action, source }),
         signal: AbortSignal.timeout(60_000),
       });
-      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string };
-      return { ok: res.ok && body.ok === true, detail: body.detail || `HTTP ${res.status}` };
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string; result?: { refused?: boolean } | null };
+      const ok = res.ok && body.ok === true;
+      // refused = definitely nothing switched and a retry cannot help: a bridge guard (result.refused), or the hub
+      // rejecting the request itself (auth, validation, a bridge without breaker control). 502 without `refused` is
+      // "switched but not verified"; 503 / 504 are no Pi / no answer — those retry.
+      const refused = !ok && (body.result?.refused === true || [400, 401, 403, 404, 422, 501].includes(res.status));
+      return { ok, refused, detail: body.detail || `HTTP ${res.status}` };
     } catch (e) {
-      return { ok: false, detail: (e as Error).message };
+      return { ok: false, refused: false, detail: (e as Error).message };
     }
   }
 }

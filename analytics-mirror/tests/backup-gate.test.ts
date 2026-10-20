@@ -10,7 +10,7 @@ let n = 0;
 const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ✓ ${name}`); };
 const sample = {
   mode: "shadow", reopen_enabled: false,
-  thresholds: { deficit_f: 8, rise_f: 3, rise_window_min: 20, fail_hold_min: 90, floor_f: 100, floor_hold_min: 30, open_margin_f: 5, open_hold_min: 60, min_dwell_min: 120 },
+  thresholds: { deficit_f: 10, rise_f: 3, rise_window_min: 20, fail_hold_min: 90, floor_f: 100, floor_hold_min: 30, open_margin_f: 5, open_hold_min: 60, min_dwell_min: 120 },
   gate_state: "closed", gate_state_virtual: true, closed_by_gate: true, relay: "OPEN", pending: null,
   last_action_at: "2026-10-15T17:30:00.000Z", retry_at: null, override_until: null,
   clocks: { failed_not_recovering_min: 0, floor_min: 0, recovered_min: 0 },
@@ -32,6 +32,7 @@ t("a shadow would-close reads as shadow, and the real breaker stays OFF on its o
   assert.equal(v.rules.failedNotRecovering, true);
   assert.equal(v.lastEvent?.kind, "close");
   assert.equal(v.clocks.length, 3, "a closed gate shows its recovery clock too");
+  assert.equal(v.deficitF, 10); assert.equal(v.failHoldMin, 90);
   assert.deepEqual(v.piFallback?.down, ["pump2 is faulted (E21)"]);
 });
 

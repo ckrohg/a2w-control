@@ -22,6 +22,8 @@ export interface BackupGateView {
   conditions: { tankF: number | null; targetF: number | null; riseF: number | null; called: boolean | null; failed: string[] };
   floorF: number | null;
   floorHoldMin: number | null;
+  deficitF: number | null;
+  failHoldMin: number | null;
   lastEvent: { at: string; kind: string; title: string } | null;
   episodes7d: number | null;
   overrideUntil: string | null;
@@ -39,6 +41,7 @@ export function backupGateView(raw: unknown): BackupGateView {
     available: false, mode: "unknown", reopenEnabled: false, relay: null, elementW: null, gateState: null, virtual: true,
     blind: null, error: null, clocks: [], rules: { failedNotRecovering: null, floor: null, recovered: null },
     conditions: { tankF: null, targetF: null, riseF: null, called: null, failed: [] }, floorF: null, floorHoldMin: null,
+    deficitF: null, failHoldMin: null,
     lastEvent: null, episodes7d: null, overrideUntil: null, piFallback: null,
   };
   if (!g) return empty;
@@ -71,6 +74,8 @@ export function backupGateView(raw: unknown): BackupGateView {
     conditions: { tankF: num(cond.tank_f), targetF: num(cond.target_f), riseF: num(cond.rise_f), called: bool(cond.called), failed },
     floorF: num(t.floor_f),
     floorHoldMin: num(t.floor_hold_min),
+    deficitF: num(t.deficit_f),
+    failHoldMin: num(t.fail_hold_min),
     lastEvent: ev && str(ev.at) ? { at: str(ev.at)!, kind: str(ev.kind) ?? "?", title: str(ev.title) ?? "" } : null,
     episodes7d: num(g.episodes_7d),
     overrideUntil: str(g.override_until),
