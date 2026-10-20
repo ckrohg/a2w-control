@@ -4,10 +4,14 @@
 # needs neither: when EVERY heat pump has been down continuously for hold_min (30 min), it CLOSES the "Buffer Tank"
 # breaker so the HBX can fire the 16.5 kW element on its own backup call. It never opens anything (close-only by
 # construction: it only calls BreakerController.execute(..., "close")).
-# "Down" (per pump): a fresh snapshot with a blocking fault while not running, switched off, its circuit not ON at the
-# panel, or Modbus-stale while the panel shows no compressor draw on its circuit (a gateway outage with the pump still
-# heating is NOT down — measured 2026-10-19: both gateways stale with SPAN reachable never lasted > 3.5 min in 97 d).
-# Default SHADOW: audit + page "would close" once per cooldown and switch nothing until backup_fallback.live = true.
+# Per pump, one of: DOWN — a fresh snapshot with a blocking fault while not running, or Modbus-stale while a FRESH panel
+# read shows no compressor draw on its circuit (a gateway outage with the pump still heating is NOT down — measured
+# 2026-10-19: both gateways stale with SPAN reachable never lasted > 3.5 min in 97 d); OFF — switched off on purpose (on
+# the unit, from 6bb, or its circuit OPEN at the panel), never a failure; UNKNOWN — stale with no fresh panel read, or no
+# draw reading: a Pi Wi-Fi/LAN drop loses Modbus AND SPAN together, so it must never read as "every pump down" — any
+# UNKNOWN pump resets the episode; UP — anything else.
+# Default SHADOW: audit + EMAIL "would close" once per cooldown (never a phone push) and switch nothing until
+# backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
 from __future__ import annotations
 
@@ -49,7 +53,8 @@ class BackupFallback:
         self._next_ok: float | None = None        # monotonic: no decision before this (cooldown / retry)
         self._decided = False                     # one decision per all-down episode
         self._refusal_paged = False
-        self.down: dict[str, str | None] = {}
+        self.down: dict[str, str | None] = {}      # pump -> why it is DOWN (None: not down)
+        self.pumps: dict[str, dict] = {}            # pump -> {state: down|off|unknown|up, why}
         self.last: dict | None = None
 
     # --- lifecycle --------------------------------------------------------------
@@ -81,7 +86,7 @@ class BackupFallback:
             "mode": "off" if not self.cfg.enabled else "live" if self.cfg.live else "shadow",
             "hold_min": self.cfg.hold_min, "circuit": BACKUP_ELEMENT_CIRCUIT,
             "breaker_control": self.breakers is not None,
-            "down": dict(self.down), "all_down_min": held,
+            "down": dict(self.down), "pumps": dict(self.pumps), "all_down_min": held,
             "all_down_since": self._since_wall,
             "relay": (self._backup() or {}).get("relay_state"),
             "last": self.last,
@@ -118,38 +123,43 @@ class BackupFallback:
             return False
         return 0 <= age < FRESH_POLL_S
 
-    def pump_down(self, pid: str, span: dict | None) -> str | None:
+    def pump_state(self, pid: str, span: dict | None) -> tuple[str, str]:
+        """(down | off | unknown | up, why) — see the header."""
         poller = self.pollers.get(pid)
         if poller is None:
-            return "has no telemetry on this bridge"
+            return "unknown", "has no telemetry on this bridge"
         circ = None
         if span is not None and self.circuits.get(pid):
             circ = next((c for c in span["circuits"] if c["name"] == self.circuits[pid]), None)
         if circ is not None and circ.get("relay_state") == "OPEN":
-            return "is not ON at the panel"
+            return "off", "is switched off at the panel (deliberate, or a self-heal power cycle)"
         s = poller.snapshot
         if self._fresh(s):
             if s.get("on") is False or s.get("state") == "off":
-                return "is switched off"
+                return "off", "is switched off (deliberate)"
             bad = [str(f.get("code")) for f in s.get("active_faults", []) if _is_blocking(f)]
             if bad and not s.get("running"):
-                return f"is faulted ({', '.join(bad)})"
-            return None
-        # Modbus-stale: the panel says whether the compressor still runs
+                return "down", f"is faulted ({', '.join(bad)})"
+            return "up", "is up"
+        # Modbus-stale: only a FRESH panel read can say whether the compressor still runs
         if circ is None:
-            return "is offline (no panel read to tell whether it runs)"
+            return "unknown", "is offline and there is no fresh panel read (Pi network?)"
         draw = _draw_w(circ.get("power_w"))
-        if draw is not None and draw >= self.cfg.running_power_w:
-            return None
-        return f"is offline and its circuit draws {0 if draw is None else draw:.0f} W (not running)"
+        if draw is None:
+            return "unknown", "is offline and its circuit draw is unknown"
+        if draw >= self.cfg.running_power_w:
+            return "up", f"is offline but its circuit draws {draw:.0f} W (running)"
+        return "down", f"is offline and its circuit draws {draw:.0f} W (not running)"
 
     # --- the decision -----------------------------------------------------------
     async def tick(self) -> None:
         if not self.cfg.enabled:
             return
         span = self._span()
-        self.down = {pid: self.pump_down(pid, span) for pid in self.pollers}
-        if not self.down or not all(self.down.values()):
+        states = {pid: self.pump_state(pid, span) for pid in self.pollers}
+        self.pumps = {pid: {"state": st, "why": why} for pid, (st, why) in states.items()}
+        self.down = {pid: (why if st == "down" else None) for pid, (st, why) in states.items()}
+        if not states or not all(st == "down" for st, _ in states.values()):
             if self._since is not None and self._decided:
                 log.info("backup fallback: a heat pump is back — episode over")
             self._since = self._since_wall = None
@@ -181,7 +191,7 @@ class BackupFallback:
                                f"({why}). Live, A2W would close the '{BACKUP_ELEMENT_CIRCUIT}' breaker (now "
                                f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element. This runs on the Pi, "
                                "with no cloud.", relay,
-                               title="Backup fallback (shadow): WOULD close the element breaker")
+                               title="Backup fallback (shadow): WOULD close the element breaker", push=False)
             return
         if self.breakers is None:
             await self._decide("unavailable", "critical",
@@ -213,7 +223,7 @@ class BackupFallback:
             self._refusal_paged = True
 
     async def _decide(self, code: str, severity: str, message: str, relay, *, title: str | None = None,
-                      priority: str = "high", page: bool = True) -> None:
+                      priority: str = "high", page: bool = True, push: bool = True) -> None:
         self.last = {"at": self._clock(), "outcome": code, "message": message, "relay_state": relay}
         log.warning("backup fallback %s: %s", code, message)
         try:
@@ -222,10 +232,13 @@ class BackupFallback:
         except Exception as exc:  # noqa: BLE001 — an audit failure never blocks the decision
             log.warning("backup fallback audit failed: %s", exc)
         if page:
+            # shadow (push=False) is an email only: ntfy high/urgent reaches the owner's phone via 6bb (#211)
             t = title or "A2W backup fallback"
-            for coro in (notify.ntfy(self.notify_cfg, title=t, message=message, priority=priority,
-                                     tags="rotating_light" if priority == "urgent" else "fire"),
-                         notify.email(self.notify_cfg, subject=t, body=message)):
+            coros = [notify.email(self.notify_cfg, subject=t, body=message)]
+            if push:
+                coros.append(notify.ntfy(self.notify_cfg, title=t, message=message, priority=priority,
+                                         tags="rotating_light" if priority == "urgent" else "fire"))
+            for coro in coros:
                 task = asyncio.create_task(coro)
                 self._bg.add(task)
                 task.add_done_callback(self._bg.discard)

@@ -300,9 +300,21 @@ class BreakerController:
     def _is_backup(self, name: str) -> bool:
         return name in (BACKUP_ELEMENT_CIRCUIT, self.cfg.arm_circuit)
 
-    def _backup_open_refusal(self, circ: dict) -> str | None:
-        """span.backup_reopen's own guards, judged on the fresh panel read (and again at dispatch)."""
-        draw = abs(float(circ.get("power_w") or 0.0))
+    def _backup_open_refusal(self, name: str, circuits: dict) -> str | None:
+        """span.backup_reopen's own guards, judged on a raw panel read (the decision's, and a fresh one at dispatch).
+        An unknown draw is refused, never read as 0 W."""
+        try:
+            c = find_circuit(circuits, name)
+        except BreakerRefused as exc:
+            return str(exc)
+        if c is None:
+            return f"'{name}' was not found on the panel"
+        if c["relay_state"] != "CLOSED":
+            return f"'{name}' is already {c['relay_state'] or 'in an unknown state'}"
+        raw = next((x.get("instantPowerW") for x in circuits.values() if (x.get("name") or "").strip() == name), None)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+            return f"the element's draw is unknown ({raw!r}) — not switching it off blind"
+        draw = abs(float(raw))
         if draw >= self.cfg.backup_open_max_w:
             return (f"the element is drawing {draw:.0f} W — never switch a live 16.5 kW load off "
                     f"(limit {self.cfg.backup_open_max_w:g} W)")
@@ -347,16 +359,26 @@ class BreakerController:
                 raise BreakerRefused(
                     f"'{spec.name}' is already {circ['relay_state'] or 'in an unknown state'} — "
                     "use On to restore it", 409)
-            if action == "open" and self._is_backup(spec.name):
-                outer = precheck
-                def precheck(c, _outer=outer):   # noqa: E306 — the backup guards ride the permit's guard
-                    return self._backup_open_refusal(c) or (_outer(c) if _outer else None)
             guard = None
             if precheck is not None:
                 why = precheck(circ)
                 if why:
                     raise BreakerRefused(f"precheck: {why}", 409)
                 guard = lambda: precheck(circ)   # noqa: E731 — re-run at the dispatch boundary
+            if action == "open" and self._is_backup(spec.name):
+                why = self._backup_open_refusal(spec.name, circuits)
+                if why:
+                    raise BreakerRefused(f"precheck: {why}", 409)
+                caller_guard = guard
+
+                def guard(_g=caller_guard):
+                    # In the worker, under the client lock, immediately before EVERY OPEN POST: a FRESH panel read,
+                    # never the one the decision was made on (the element may have started meanwhile).
+                    try:
+                        fresh = self.client._fetch_locked()
+                    except Exception as exc:  # noqa: BLE001 — no fresh read, no OPEN
+                        return f"could not re-read the panel before the OPEN ({exc})"
+                    return self._backup_open_refusal(spec.name, fresh) or (_g() if _g else None)
             if action == "open":
                 return await self._do_open(spec, circ, source, guard)
             return await self._do_cycle(spec, circ, hold, source, guard)

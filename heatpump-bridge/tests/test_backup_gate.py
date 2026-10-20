@@ -100,12 +100,13 @@ async def rig(tmp_path, alerts):
         return BackupFallback(BackupFallbackConfig(**cfg), {"pump1": p1, "pump2": p2}, c or ctl, store,
                               clock=ft.clock, mono=ft.clock)
 
-    async def step(fb, seconds=60.0, *, stale=()):
+    async def step(fb, seconds=60.0, *, stale=(), span=True):
         ft.t += seconds
         for p in (p1, p2):
             if p.cfg.id not in stale:
                 p.fresh()
-        await prime()
+        if span:
+            await prime()
         await fb.tick()
 
     yield SimpleNamespace(panel=panel, ctl=ctl, poller=poller, ft=ft, store=store, alerts=alerts, p1=p1, p2=p2,
@@ -183,7 +184,8 @@ async def test_fallback_shadow_pages_once_and_switches_nothing(rig):
     await rig.step(fb)
     await settle()
     assert await fb_events(rig.store) == ["would_close"]
-    assert any("WOULD close" in a[1] and a[2] == "high" for a in rig.alerts if a[0] == "push")
+    assert any(a[0] == "email" and "WOULD close" in a[1] for a in rig.alerts), "shadow: one email"
+    assert not any(a[0] == "push" for a in rig.alerts), "shadow is never a phone push (#211: high/urgent push via 6bb)"
     assert rig.panel.writes == []
     for _ in range(60):
         await rig.step(fb)
@@ -284,6 +286,64 @@ async def test_fallback_unexpected_error_is_retried_not_latched(rig, monkeypatch
     for _ in range(36):
         await rig.step(fb)
     assert len(calls) == 2 and rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_fallback_a_deliberate_off_is_never_down(rig):
+    fb = rig.fallback(live=True)
+    for p in (rig.p1, rig.p2):                       # the owner switches both units off (maintenance / summer / 6bb)
+        p.snapshot.update(on=False, state="off")
+    for _ in range(90):
+        await rig.step(fb)
+    assert rig.panel.writes == [] and await fb_events(rig.store) == []
+    assert {v["state"] for v in fb.status()["pumps"].values()} == {"off"}
+    # both Air-Water breakers switched OFF at the panel, Modbus gone with them: still deliberate, still nothing
+    for p in (rig.p1, rig.p2):
+        p.snapshot.update(on=True, state="idle")
+    rig.panel.set("Air-Water 1", relayState="OPEN", instantPowerW=0.0)
+    rig.panel.set("Air-Water 2", relayState="OPEN", instantPowerW=0.0)
+    for _ in range(90):
+        await rig.step(fb, stale=("pump1", "pump2"))
+    assert rig.panel.writes == []
+
+
+async def test_fallback_pi_network_drop_is_unknown_not_down(rig):
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(20):                               # 20 min of a real both-down...
+        await rig.step(fb)
+    assert fb.status()["all_down_min"] is not None
+    for _ in range(90):                               # ...then the Pi's Wi-Fi drops: Modbus AND the panel go stale
+        await rig.step(fb, stale=("pump1", "pump2"), span=False)
+    st = fb.status()
+    assert st["all_down_min"] is None, "unknown resets the episode"
+    assert {v["state"] for v in st["pumps"].values()} == {"unknown"}
+    assert rig.panel.writes == [] and await fb_events(rig.store) == []
+    # stale Modbus with a fresh panel that reports no draw at all is unknown too
+    rig.panel.set("Air-Water 1", instantPowerW=None)
+    await rig.step(fb, stale=("pump1",))
+    assert fb.status()["pumps"]["pump1"]["state"] == "unknown"
+
+
+async def test_reopen_refuses_an_unknown_draw_and_rereads_at_dispatch(rig, monkeypatch):
+    poller, ctl = rig.controller(backup_reopen=True)
+    rig.panel.set("Buffer Tank", relayState="CLOSED", instantPowerW=None)
+    with pytest.raises(BreakerRefused, match="draw is unknown"):
+        await ctl.execute("Buffer Tank", "open")
+    # idle at the decision, but the HBX fires the element before the OPEN goes out: the fresh read refuses it
+    rig.panel.set("Buffer Tank", instantPowerW=0.0)
+    real = ctl.client._fetch_locked
+    reads = []
+
+    def fetch_then_fire():
+        reads.append(1)
+        if len(reads) == 2:                            # 1st: the decision's read; 2nd: the dispatch guard's
+            rig.panel.set("Buffer Tank", instantPowerW=-16_400.0)
+        return real()
+    monkeypatch.setattr(ctl.client, "_fetch_locked", fetch_then_fire)
+    with pytest.raises(BreakerRefused, match="drawing 16400 W"):
+        await ctl.execute("Buffer Tank", "open")
+    assert rig.panel.writes == [] and len(reads) >= 2
+    await ctl.stop()
 
 
 async def test_fallback_status_rides_the_hub_state_frame(rig):
