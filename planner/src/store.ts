@@ -335,9 +335,10 @@ export class Store {
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS fixed_saved_usd   real;
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS smart_premium_usd real;
       ALTER TABLE realized_savings ADD COLUMN IF NOT EXISTS energy_metered    boolean;
-      -- Per-hour metered pump electricity from SPAN (Air-Water 1 + 2 circuits), accumulated by the
-      -- spanwatch poll. Lets the realized engine use REAL daily energy instead of the SPAN daily avg.
-      -- Value is the hour's cumulative kWh (SPAN resets it each hour) — we keep the max seen per hour.
+      -- Hourly samples of SPAN's DAY-CUMULATIVE pump electricity (Air-Water 1 + 2 circuits), written
+      -- by the spanwatch poll. Lets the realized engine use REAL daily energy instead of the SPAN daily
+      -- avg. Each row is "kWh so far today" as of the last poll in that hour (the max seen per hour):
+      -- 0 at local midnight, the day's total at 23:00. A day's energy is max(kwh), NEVER sum(kwh).
       CREATE TABLE IF NOT EXISTS span_energy (
         hour timestamptz PRIMARY KEY,
         kwh  real NOT NULL,
@@ -492,9 +493,15 @@ export class Store {
          GROUP BY 1
        ),
        span AS (
-         -- REAL metered pump electricity per day (SPAN Air-Water circuits), summed from the hourly rows.
+         -- REAL metered pump electricity per day (SPAN Air-Water circuits). span_energy holds SPAN's
+         -- DAY-CUMULATIVE counter, not per-hour energy: spanwatch.ts polls measurementAggregation with
+         -- duration: DAY / calendarWindows: true, so each hourly row is "kWh so far today" at the last
+         -- poll of that hour (0 at local midnight, the day's total at 23:00; upsertSpanEnergyHour keeps
+         -- the max per hour). A day's energy is therefore its MAX row. sum() here added up 24 running
+         -- totals and inflated every metered day ~14x (686.1 kWh stored for 49.9 on 2026-10-18 —
+         -- knowledge/reference/tempiq-data-deep-dive-2026-10-19.md §4.1). Never sum this table.
          SELECT to_char(date_trunc('day', hour AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
-                sum(kwh) AS span_kwh
+                max(kwh) AS span_kwh
          FROM span_energy
          WHERE hour >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
          GROUP BY 1
