@@ -118,3 +118,37 @@ means a setting changed.
 | When did HP2 actually stop heating? When did the HBX rotate HP2 into the lead? | mirror `readings` (pump state per minute), `slx_readings.stages_called`, `pump_events` | sign in to the dashboard in the browser pane (Activity + History pages), or restore Monday's backup locally (needs the backup passphrase in this Mac's Keychain) |
 | Did SPAN's local API answer during the cloud outage? | mirror `span_readings` | same |
 | Did the unserved-call alarm open an episode? | planner `unserved_episodes` | same |
+
+## 6 · Correction and closure (2026-10-19, measured on the restored 2026-10-20 backup)
+
+**§1.1 was wrong about the timing.** The HBX did not "wait three hours" before adding HP1. With `lagT=180` it
+**never added a second stage at all**. `slx_readings`, 5-min samples:
+
+| period | both stages called | backup called | single-stage samples |
+|---|---|---|---|
+| lagT=60 (Jul 13 – Aug 7) | 34 | 34 | 379 |
+| lagT=180 (Aug 7 – Oct 19) | **0** | **0** | 1,884 |
+
+On the incident night, stage 2 (HP2, faulted) was called continuously from **Oct 15 12:00 to Oct 16 02:10 ET (14.2 h)**,
+with the tank at 104–111 °F against 119.5 °F, and stage 1 never came on. The same thing happened Aug 12–13 for 20.1 h.
+The old all-idle alarm opened `unserved_call_episodes` #52 at 12:05 ET Oct 15 and held it until 01:00 Oct 16.
+
+**Fix (F2):** `lagT` 180 → 60, written 2026-10-19 22:34 ET. It was a guarded one-off write: it went ahead only if the
+HBX read 180, was echoed back, and a fresh read confirmed that `lagT` was the only field changed. It is asserted
+by drift-check [9]. The element stays gated by its SPAN breaker (OPEN), with a dynamic A2W close rule building in shadow.
+
+**Status of every failure:**
+
+| | Failure | Status |
+|---|---|---|
+| F1 | HP2 E21 trigger | Hardware hypothesis (enclosure supply/ground) is **open**; needs an on-site check. Mitigated by self-heal, live since 2026-10-19 (#201/#202). |
+| F2 | No failover to HP1 | **Fixed**: lagT 60 (above); per-stage unserved alarm (#185 via #196); self-heal. |
+| F3 | Backup off and shown green | (a) **Fixed**: the card reads the breaker (#184). (b) Element gate: dynamic rule **building in shadow**. |
+| F4 | No self-healing power cycle | **Fixed, live** (#201/#202). The 60 s cycle was proven on Air-Water 2; not yet exercised by a real E21. |
+| F5 | SPAN unreachable | **Fixed**: local API with the nested relay body (#200), SPAN-local heartbeat (#187). The SPAN *app's* cloud command channel is a SPAN-side fault (owner ticket). |
+| F6 | Comfort override stub | **Fixed**: real boost with read-back, plus Heat now (#186/#192); the auto-pilot holds during a boost (#197). |
+| F7 | Storm banner stale | **Fixed** (#183 via #192/#196); 0 open storm rows. |
+| — | dmd noise | **Fixed** (#182 via #196). |
+| — | Pi WiFi stall | Power-save off; no 2-hour wedge since. **Open**: −79 dBm signal across 3 mesh APs and no Ethernet, so the link still drops for minutes. Physical fix. |
+| — | Silent failures (no fault code) | **New**: pump-health checks in shadow (#204). They caught a stuck 83-min defrost on pump1 (Oct 17 22:07 ET), which the all-idle alarm saw as `unserved_call_episodes` #57. |
+
