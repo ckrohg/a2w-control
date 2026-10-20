@@ -65,6 +65,13 @@ class GuardrailConfig(BaseModel):
     baseline_setpoint_c: float | None = None   # warm default reverted to when a lease lapses
     lease_max_minutes: float = 180             # clamp on any single lease
     lease_warn_minutes: float = 15             # warn this long before a lease would revert
+    # Reconnect quarantine (knowledge/reference/hp2-e21-reconnect-analysis.md): after a
+    # pump has been unreachable for >= reconnect_min_outage_s, every write to it is refused
+    # for reconnect_write_hold_s once polls succeed again, and those first polls are paced.
+    # HP2's E21 onsets cluster after the Pi's own WiFi outages; the evidence doesn't show
+    # our traffic as the cause, but this takes it off the table for ~2 min. 0 disables.
+    reconnect_min_outage_s: float = 60.0
+    reconnect_write_hold_s: float = 120.0
 
     @model_validator(mode="after")
     def _sane_bounds(self):

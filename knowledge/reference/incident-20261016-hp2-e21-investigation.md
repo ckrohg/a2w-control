@@ -141,7 +141,7 @@ by drift-check [9]. The element stays gated by its SPAN breaker (OPEN), with a d
 
 | | Failure | Status |
 |---|---|---|
-| F1 | HP2 E21 trigger | Hardware hypothesis (enclosure supply/ground) is **open**; needs an on-site check. Mitigated by self-heal, live since 2026-10-19 (#201/#202). |
+| F1 | HP2 E21 trigger | Hardware hypothesis (enclosure supply/ground) is **open**; needs an on-site check. Mitigated by self-heal, live since 2026-10-19 (#201/#202). The "Pi reconnect traffic" theory was tested in `hp2-e21-reconnect-analysis.md`: **weak** (E21 follows Pi-side Wi-Fi outages, but not our traffic). That doc has the on-site checklist. |
 | F2 | No failover to HP1 | **Fixed**: lagT 60 (above); per-stage unserved alarm (#185 via #196); self-heal. |
 | F3 | Backup off and shown green | (a) **Fixed**: the card reads the breaker (#184). (b) Element gate: dynamic rule **building in shadow**. |
 | F4 | No self-healing power cycle | **Fixed, live** (#201/#202). The 60 s cycle was proven on Air-Water 2; not yet exercised by a real E21. |
