@@ -154,6 +154,8 @@ const capWatchStreaks = new Map<string, number>();
 // #136: unbroken calling MINUTES per zone (was cycles) — advanced on every sample from the elapsed time.
 const zoneCallMinutes = new Map<string, number>();
 let lastCallSampleAt: number | null = null;
+/** zone_call_samples' 60-day prune rides the insert once an hour (same shape as the Pi-clock prune). */
+let zoneCallPrunedAt = 0;
 /** #136: the demand floor is re-checked every poll and the current plan block raised in place when it lags. */
 const FLOOR_CADENCE_ENABLED = process.env.FLOOR_CADENCE !== "0";
 const floorCadence = { lastCheckAt: null as string | null, lastFloorF: null as number | null, lastBlockF: null as number | null, lastDecision: null as string | null, raises: [] as { at: string; ts: string; from: number; to: number }[] };
@@ -1393,6 +1395,14 @@ async function stormTick(): Promise<void> {
 async function sampleDemandFloor(outdoorHint: number | null): Promise<{ floor: ReturnType<DemandFeed["proposeFloor"]>; outdoorF: number | null }> {
   if (!demandFeed) return { floor: null, outdoorF: null };
   await demandFeed.refresh(); // never throws
+  // Persist the calling set this refresh observed (zone_call_samples, ~5 min). Observation only,
+  // fire-and-forget on the bounded pool: it can neither delay nor fail the floor path.
+  {
+    const prune = Date.now() - zoneCallPrunedAt > 3_600_000;
+    if (prune) zoneCallPrunedAt = Date.now();
+    void store.insertZoneCallSample(new Date(), demandFeed.callSample(), prune)
+      .catch((e) => console.error("zone call sample failed:", (e as Error).message));
+  }
   const latest = await store.getLatestSlx().catch(() => null);
   const outdoorF = latest?.outdoorF ?? outdoorHint;
   const now = Date.now();
