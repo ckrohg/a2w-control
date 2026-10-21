@@ -11,6 +11,7 @@
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { ZoneCallSample } from "./demand";
+import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT_F } from "./stale-target";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 import type { PiLinkInputs } from "./pilink";
@@ -108,6 +109,13 @@ export class Store {
         gap_f            real,
         plan_computed_at timestamptz
       );
+      -- stale-slx-target-2026-10-19.md: actual_target_f is the REPORTED target (SensorLinx temp1.target), which
+      -- freezes while the device is idle and sat 20 °F above the curve in force for 7 h after the Oct 19 soak.
+      -- commanded_target_f is the curve in force (its output at each sample's outdoor), reported_stale says the
+      -- hour's samples PROVE the report frozen (tank below its call threshold, demand present, no call), and gap_f
+      -- is scored on the operative basis: commanded when stale, reported otherwise. NULL on rows before this.
+      ALTER TABLE plan_scores ADD COLUMN IF NOT EXISTS commanded_target_f real;
+      ALTER TABLE plan_scores ADD COLUMN IF NOT EXISTS reported_stale boolean;
       CREATE TABLE IF NOT EXISTS hbx_writes (
         id         serial PRIMARY KEY,
         ts         timestamptz NOT NULL DEFAULT now(),
@@ -477,17 +485,34 @@ export class Store {
 
   /** Per-day inputs for the realized-savings engine: real outdoor + current buffer target from
    *  slx_readings, joined to quality-filtered measured COP sessions from tempiq_cop_points. One row
-   *  per operating day from the cutover forward (or the lookback window, whichever is later). */
+   *  per operating day from the cutover forward (or the lookback window, whichever is later).
+   *  `cutover` is a YYYY-MM-DD LOCAL (America/New_York) day; `lookbackDays` counts whole local days back from today. */
   async getRealizedDayInputs(cutover: string, lookbackDays: number): Promise<{
     day: string; avgOutdoorF: number; nowBufferF: number; coverage: number; spanKwh: number | null;
     measured: { elecKwh: number; thermalKwh: number; cop: number; sinkF: number; sessions: number } | null;
   }[]> {
     const res = await this.pool.query(
-      `WITH days AS (
+      `WITH win AS (
+         -- The window starts at a LOCAL (America/New_York) MIDNIGHT, never at a moving instant. Every CTE below
+         -- buckets rows by local day, so a cutoff of now() − N days sliced the day it fell in: computeAndStore runs
+         -- hourly, and a day's LAST recompute was the one in the hour it slid out of the window, with only its final
+         -- minutes of rows left (coverage ≈ 0.02, no span row → 0.2 kWh, modeled, energy_metered=false) — and that
+         -- is what the ledger kept forever (2026-08-28 … 09-03 in the 2026-10-20 restore, one such row per night).
+         -- Starting at the local midnight N days before today's means a day is either complete or absent: it leaves
+         -- the window when the next local day begins, after its last full recompute. The cutover is a local day
+         -- too — cast as timestamptz it was midnight in the SESSION zone (UTC on Railway), 20:00 EDT the evening
+         -- before, which produced the ledger's 4-hour "2026-07-15" row. Proof: scripts/realized-window-local-check.ts.
+         SELECT GREATEST(
+                  ($1::timestamp) AT TIME ZONE 'America/New_York',
+                  (date_trunc('day', now() AT TIME ZONE 'America/New_York') - ($2 || ' days')::interval)
+                    AT TIME ZONE 'America/New_York'
+                ) AS start
+       ),
+       days AS (
          SELECT to_char(date_trunc('day', ts AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
                 avg(outdoor_f) AS out_f, avg(tank_target_f) AS now_buf, count(*) AS n
          FROM slx_readings
-         WHERE ts >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE ts >= (SELECT start FROM win)
          GROUP BY 1
        ),
        cop AS (
@@ -497,7 +522,7 @@ export class Store {
                 sum(electrical_kwh) AS e, sum(thermal_kwh) AS q,
                 sum(thermal_kwh) / NULLIF(sum(electrical_kwh), 0) AS cop, avg(sink_temp_f) AS sink, count(*) AS sess
          FROM tempiq_cop_points
-         WHERE measured_at >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE measured_at >= (SELECT start FROM win)
            AND cop BETWEEN 1 AND 6 AND thermal_kwh > 0 AND electrical_kwh > 0
            AND sink_temp_f BETWEEN 110 AND 175 AND outdoor_temp_f IS NOT NULL
            AND outdoor_temp_f < sink_temp_f - 20
@@ -515,7 +540,7 @@ export class Store {
          SELECT to_char(date_trunc('day', hour AT TIME ZONE 'America/New_York'), 'YYYY-MM-DD') AS day,
                 max(kwh) AS span_kwh
          FROM span_energy
-         WHERE hour >= GREATEST($1::timestamptz, now() - ($2 || ' days')::interval)
+         WHERE hour >= (SELECT start FROM win)
          GROUP BY 1
        )
        SELECT d.day, d.out_f, d.now_buf, d.n, c.e, c.q, c.cop, c.sink, c.sess, s.span_kwh
@@ -811,10 +836,10 @@ export class Store {
     }));
   }
   async getRecentSeries(hours: number): Promise<
-    { ts: Date; tankF: number | null; anyCall: boolean }[]
+    { ts: Date; tankF: number | null; anyCall: boolean; hdActive: boolean | null }[]
   > {
     const res = await this.pool.query(
-      `SELECT ts, tank_f,
+      `SELECT ts, tank_f, hd_active,
               (backup_called OR EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s)) AS any_call
        FROM slx_readings
        WHERE ts >= now() - ($1 || ' hours')::interval
@@ -825,6 +850,8 @@ export class Store {
       ts: new Date(r.ts),
       tankF: r.tank_f == null ? null : Number(r.tank_f),
       anyCall: r.any_call === true,
+      // stale-target.ts: the stale-report proof needs heat demand present (an idle device with no demand proves nothing)
+      hdActive: typeof r.hd_active === "boolean" ? r.hd_active : null,
     }));
   }
 
@@ -954,6 +981,13 @@ export class Store {
       `SELECT id, uid, kind, title, detail FROM alert_episodes
        WHERE cleared_at IS NULL AND notified_at IS NULL AND kind NOT LIKE 'shadow\\_%' ORDER BY id LIMIT 20`);
     return r.rows.map((x: any) => ({ id: Number(x.id), uid: x.uid == null ? null : String(x.uid), kind: String(x.kind), title: String(x.title), detail: x.detail == null ? null : String(x.detail) }));
+  }
+
+  /** Episodes of one kind opened in the last `hours` (/health.backup_gate.episodes_7d). */
+  async alertEpisodesSince(kind: string, hours: number): Promise<number> {
+    const r = await this.locked.query(
+      `SELECT count(*)::int AS n FROM alert_episodes WHERE kind = $1 AND started_at > now() - make_interval(hours => $2)`, [kind, hours]);
+    return Number(r.rows[0]?.n ?? 0);
   }
 
   /** Episodes opened in the last 24 h, by kind (/health.unserved). */
@@ -1400,7 +1434,10 @@ export class Store {
   }
 
   /** a2w#137: the dose actually delivered over a window — mean tank temp, adoption compliance
-   *  (operative target within 3 °F of the commanded one), outdoor band. `to` null = until now. */
+   *  (operative target within 3 °F of the commanded one), outdoor band. `to` null = until now.
+   *  A sample whose REPORTED target sits above the command while the device is provably not driving to it
+   *  (tank below the report's call threshold and at or above the command's, demand present, no call) is
+   *  compliant too: the report is frozen, the device is on the command (stale-target.ts). */
   async windowStats(from: Date, to: Date | null, commandedTargetF: number | null): Promise<WindowStats> {
     const res = await this.pool.query(
       `SELECT avg(tank_f)::float8 AS achieved_awt_f,
@@ -1408,11 +1445,16 @@ export class Store {
               max(outdoor_f)::float8 AS outdoor_high_f,
               CASE WHEN $3::real IS NULL THEN NULL
                    ELSE avg(CASE WHEN tank_target_f IS NULL THEN NULL
-                                 WHEN abs(tank_target_f - $3::real) <= 3 THEN 1.0 ELSE 0.0 END)::float8 END AS compliance,
+                                 WHEN abs(tank_target_f - $3::real) <= $4::real THEN 1.0
+                                 WHEN tank_target_f > $3::real + $4::real AND tank_f IS NOT NULL
+                                      AND tank_f < tank_target_f - $5::real AND tank_f >= $3::real - $5::real
+                                      AND hd_active IS NOT FALSE AND NOT coalesce(backup_called, false)
+                                      AND NOT EXISTS (SELECT 1 FROM unnest(stages_called) s WHERE s) THEN 1.0
+                                 ELSE 0.0 END)::float8 END AS compliance,
               count(*)::int AS samples
        FROM slx_readings
        WHERE ts >= $1 AND ts < COALESCE($2::timestamptz, now())`,
-      [from, to, commandedTargetF],
+      [from, to, commandedTargetF, ADOPTION_TOLERANCE_F, STALE_TANK_MARGIN_DEFAULT_F],
     );
     const r = res.rows[0] ?? {};
     const num = (v: unknown): number | null => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
@@ -1713,36 +1755,73 @@ export class Store {
     return res.rows.map((r) => ({ computedAt: new Date(r.computed_at), plan: r.plan }));
   }
 
-  /** Hourly averages of actual HBX target + tank for completed hours (ascending). */
-  async hourlyActuals(hours: number): Promise<{ hour: Date; targetF: number | null; tankF: number | null }[]> {
+  /**
+   * Hourly averages for completed hours (ascending): the REPORTED HBX target (temp1.target) and tank, plus the
+   * target the curve in force COMMANDED at each sample (the newest hbx_config_versions row at or before the sample,
+   * evaluated at the sample's outdoor exactly as shadow.ts curveTargetF does — the midpoint when the curve fields
+   * are incomplete) and whether the hour PROVES the report stale (stale-target.ts): every sample idle, demand
+   * present, tank below the report's call threshold and not below the command's own. The report freezes while the
+   * device is idle, so after a soak/bank it reads the OLD target for hours (stale-slx-target-2026-10-19.md).
+   */
+  async hourlyActuals(hours: number): Promise<{ hour: Date; targetF: number | null; tankF: number | null; commandedF: number | null; reportedStale: boolean; samples: number }[]> {
     const res = await this.pool.query(
-      `SELECT date_trunc('hour', ts) AS h, avg(tank_target_f) AS target_f, avg(tank_f) AS tank_f
-       FROM slx_readings
-       WHERE ts >= now() - ($1 || ' hours')::interval AND ts < date_trunc('hour', now())
+      `SELECT date_trunc('hour', r.ts) AS h, avg(r.tank_target_f) AS target_f, avg(r.tank_f) AS tank_f,
+              avg(c.cmd_f) AS commanded_f, count(*)::int AS samples,
+              bool_and(r.tank_target_f IS NOT NULL AND r.tank_f IS NOT NULL AND c.cmd_f IS NOT NULL
+                       AND r.tank_f < r.tank_target_f - $2::real AND r.tank_f >= c.cmd_f - $2::real
+                       AND r.hd_active IS NOT FALSE AND NOT coalesce(r.backup_called, false)
+                       AND NOT EXISTS (SELECT 1 FROM unnest(r.stages_called) s WHERE s)) AS all_idle_below
+       FROM slx_readings r
+       LEFT JOIN LATERAL (
+         SELECT CASE
+                  WHEN (v.config->>'dbt') IS NULL OR (v.config->>'mbt') IS NULL THEN NULL
+                  WHEN (v.config->>'dot') IS NULL OR (v.config->>'wwsd') IS NULL OR r.outdoor_f IS NULL
+                       OR (v.config->>'wwsd')::float8 = (v.config->>'dot')::float8
+                    THEN ((v.config->>'dbt')::float8 + (v.config->>'mbt')::float8) / 2
+                  ELSE GREATEST(LEAST((v.config->>'dbt')::float8, (v.config->>'mbt')::float8),
+                         LEAST(GREATEST((v.config->>'dbt')::float8, (v.config->>'mbt')::float8),
+                           (v.config->>'dbt')::float8 + (r.outdoor_f - (v.config->>'dot')::float8)
+                             * ((v.config->>'mbt')::float8 - (v.config->>'dbt')::float8)
+                             / ((v.config->>'wwsd')::float8 - (v.config->>'dot')::float8)))
+                END AS cmd_f
+         FROM hbx_config_versions v WHERE v.observed_at <= r.ts ORDER BY v.id DESC LIMIT 1) c ON true
+       WHERE r.ts >= now() - ($1 || ' hours')::interval AND r.ts < date_trunc('hour', now())
        GROUP BY 1 ORDER BY 1 ASC`,
-      [hours],
+      [hours, STALE_TANK_MARGIN_DEFAULT_F],
     );
-    return res.rows.map((r) => ({
-      hour: new Date(r.h),
-      targetF: r.target_f == null ? null : Number(r.target_f),
-      tankF: r.tank_f == null ? null : Number(r.tank_f),
-    }));
+    return res.rows.map((r) => {
+      const targetF = r.target_f == null ? null : Number(r.target_f);
+      const commandedF = r.commanded_f == null ? null : Number(r.commanded_f);
+      const samples = Number(r.samples ?? 0);
+      return {
+        hour: new Date(r.h),
+        targetF,
+        tankF: r.tank_f == null ? null : Number(r.tank_f),
+        commandedF,
+        samples,
+        reportedStale: r.all_idle_below === true && samples >= STALE_REPORT_MIN_POLLS
+          && targetF != null && commandedF != null && targetF - commandedF > ADOPTION_TOLERANCE_F,
+      };
+    });
   }
 
   async upsertPlanScore(s: {
     hourTs: Date; shadowTargetF: number; actualTargetF: number | null;
     actualTankF: number | null; gapF: number | null; planComputedAt: Date;
+    commandedTargetF?: number | null; reportedStale?: boolean | null;
   }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO plan_scores (hour_ts, shadow_target_f, actual_target_f, actual_tank_f, gap_f, plan_computed_at)
-       VALUES ($1,$2,$3,$4,$5,$6)
+      `INSERT INTO plan_scores (hour_ts, shadow_target_f, actual_target_f, actual_tank_f, gap_f, plan_computed_at, commanded_target_f, reported_stale)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (hour_ts) DO UPDATE SET
          shadow_target_f = EXCLUDED.shadow_target_f,
          actual_target_f = EXCLUDED.actual_target_f,
          actual_tank_f   = EXCLUDED.actual_tank_f,
          gap_f           = EXCLUDED.gap_f,
-         plan_computed_at = EXCLUDED.plan_computed_at`,
-      [s.hourTs, s.shadowTargetF, s.actualTargetF, s.actualTankF, s.gapF, s.planComputedAt],
+         plan_computed_at = EXCLUDED.plan_computed_at,
+         commanded_target_f = EXCLUDED.commanded_target_f,
+         reported_stale  = EXCLUDED.reported_stale`,
+      [s.hourTs, s.shadowTargetF, s.actualTargetF, s.actualTankF, s.gapF, s.planComputedAt, s.commandedTargetF ?? null, s.reportedStale ?? null],
     );
   }
 

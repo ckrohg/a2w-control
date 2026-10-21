@@ -177,6 +177,8 @@ export class RealizedSavings {
     }
     this.lastRunAt = new Date().toISOString();
     this.lastDays = inputs.length;
+    // one line per hourly run — the only way to confirm a REALIZED_LOOKBACK_DAYS repair ran without querying production
+    console.log(`realized-savings: recomputed ${inputs.length} days (lookback ${lookbackDays} d, from ${CUTOVER})`);
   }
 }
 

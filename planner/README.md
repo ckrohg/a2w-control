@@ -104,7 +104,7 @@ mirror banner is driven separately.)
 
 **SPAN-local heartbeat (#187, `spanlocal.ts`).** `/health.span {local_table,
 local_last_reading_age_s, circuits_seen, local_stale, cloud{enabled, last_ok_at, fail_streak,
-last_error}}` — the newest `span_readings` sample per circuit (the Pi's LAN poller, the path every
+last_error, backup_kwh_last_hour, backup_kwh_today, backup_alarmed}}` — the newest `span_readings` sample per circuit (the Pi's LAN poller, the path every
 SPAN safety action depends on), at any age, beside `spanwatch.ts`'s cloud state, with `computed_at`
 and `refresh_error`. A **high** page, edge-triggered (same outbox), when the local stream is older than
 **15 min**, and a resolved notice on recovery; the cloud failing alone shows here but never pages. It
@@ -366,13 +366,19 @@ the **SPAN cloud API** (SRP login — same path TempIQ uses, **no tunnel**). **D
 | `SPAN_USERNAME` | SPAN app login (email). Unset = alarm off. |
 | `SPAN_PASSWORD` | SPAN app password. SRP auth via `amazon-cognito-identity-js`. |
 | `SPAN_BACKUP_CIRCUIT` | case-insensitive name substring of the element's circuit (default `backup`); if it doesn't match, the first poll logs the available circuit names |
-| `SPAN_BACKUP_ALARM_KWH` | this-hour energy above which it pages (default `0.3`; a 16.5 kW element hits 0.3 kWh in ~65 s, an idle circuit reads ~0) |
+| `SPAN_BACKUP_ALARM_KWH` | energy drawn in the trailing 60 min above which it pages (default `0.3`; a 16.5 kW element hits 0.3 kWh in ~65 s, an idle circuit adds ~0) |
 | `SPAN_BUILDING_ID` | optional; auto-discovered from the account if unset |
 | `SPAN_POLL_SECONDS` | poll cadence, own timer (default `60`) |
 
-Auths with Cognito, polls each circuit's current-hour energy (`GET_CURRENT_HOUR_ENERGY`), edge-alerts
-when the backup circuit's this-hour kWh exceeds the threshold. **~1 h detection latency** (SPAN's
-hourly energy aggregation) — fine here: the element runs for hours, and `backup_called` is the instant
+Auths with Cognito and polls each circuit's **day-cumulative** energy (the query asks
+`measurementAggregation` for `duration: DAY / calendarWindows: true`, so the value is kWh so far
+today — 0 at local midnight, the day's total at 23:00; #207). The alarm differences that running total
+poll to poll and sums the increments of the trailing 60 minutes: it edge-alerts when the backup circuit
+drew more than the threshold in any 60-minute window and clears once the trailing hour is back under
+it (so a continuously running element pages once, not every hour). A drop in the counter is the
+local-midnight rollover and is not an increment. `/health.span.cloud.backup_kwh_last_hour` is the
+number compared; `backup_kwh_today` is the raw reading. Detection lags SPAN's cloud aggregation by
+however often it refreshes — fine here: the element runs for hours, and `backup_called` is the instant
 signal. A read/auth failure never alarms (transient); `backup_called` is the redundant net. This is
 what makes re-energizing the breaker safe. Standalone — A2W's own SPAN login (pattern copied from
 TempIQ's `span-cloud.ts`, no runtime coupling).

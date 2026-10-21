@@ -21,7 +21,13 @@ export interface BreakerCommand {
   circuit: string;
   op: BreakerAction;
   off_s: number;
+  /** audit label the bridge records ("hub:<source>"): the dashboard by default, "backup-gate" for the planner's live
+   *  backup-element gate. A label, not a permission — every caller needs the client bearer AND the arm token. */
+  source: string;
 }
+
+export const DEFAULT_BREAKER_SOURCE = "armed-dashboard";
+const SOURCE_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
 export type Validated = { ok: true; cmd: BreakerCommand } | { ok: false; detail: string };
 
@@ -43,7 +49,14 @@ export function validateBreakerBody(body: unknown): Validated {
     }
     offS = b.off_s;
   }
-  return { ok: true, cmd: { circuit: b.circuit.trim(), op: b.action as BreakerAction, off_s: offS } };
+  let source = DEFAULT_BREAKER_SOURCE;
+  if (b.source !== undefined && b.source !== null) {
+    if (typeof b.source !== "string" || !SOURCE_RE.test(b.source)) {
+      return { ok: false, detail: "source must be a short lowercase label ([a-z][a-z0-9-]{0,31}) when provided" };
+    }
+    source = b.source;
+  }
+  return { ok: true, cmd: { circuit: b.circuit.trim(), op: b.action as BreakerAction, off_s: offS, source } };
 }
 
 /** How long to wait for the Pi's ack: a power cycle holds off_s before it can answer. */

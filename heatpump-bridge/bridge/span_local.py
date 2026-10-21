@@ -296,14 +296,22 @@ def extract_powers(circuits: dict, names: list[str]) -> list[dict]:
     return out
 
 
+def _power_or_none(v) -> float | None:
+    """instantPowerW as reported, or None when the panel gave none: an unknown draw is not 0 W (the backup fallback and
+    the element-open guard must be able to tell them apart). Every consumer of power_w is None-safe."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
 def extract_relay(circuits: dict, name: str) -> dict | None:
-    """Find the named circuit's relay state → {circuit_id, name, relay_state, controllable, power_w}."""
+    """Find the named circuit's relay state → {circuit_id, name, relay_state, controllable, power_w (None = unknown)}."""
     for c in circuits.values():
         if (c.get("name") or "").strip() == name:
             return {"circuit_id": c.get("id"), "name": name,
                     "relay_state": c.get("relayState"),  # "OPEN" (off) | "CLOSED" (available)
                     "controllable": bool(c.get("isUserControllable")),
-                    "power_w": float(c.get("instantPowerW") or 0.0)}
+                    "power_w": _power_or_none(c.get("instantPowerW"))}
     return None
 
 

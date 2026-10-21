@@ -19,7 +19,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader } from "./tempiq-read";
 import { HubClient, type HubState } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H, priorExcursionsFromPlans } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -44,6 +44,7 @@ import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type 
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import {
@@ -98,6 +99,11 @@ const SHADOW_EVERY_MIN = Number(process.env.SHADOW_EVERY_MIN ?? "60");
 const ELECTRIC_RATE_USD_KWH = Number(process.env.ELECTRIC_RATE_USD_KWH ?? "0.30");
 const DAILY_KWH_BASELINE = Number(process.env.DAILY_KWH_BASELINE ?? "11.8");
 const STANDBY_UA_BTU = Number(process.env.STANDBY_UA_BTU ?? "25");
+// Local days the realized ledger recomputes every hour (the SQL caps the window at the 2026-07-16 cutover, so a large
+// value is harmless). Default 45. One-off repair after the window-edge fix: set REALIZED_LOOKBACK_DAYS=120 on Railway,
+// let the startup run rewrite every day back to the cutover ("realized-savings: recomputed N days" in the log), and
+// drop the variable at the next deploy.
+const REALIZED_LOOKBACK_DAYS = Number(process.env.REALIZED_LOOKBACK_DAYS ?? "45") || 45;
 
 const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
 
@@ -224,7 +230,7 @@ const phaseB = PHASE_B_ENABLED && hub
 const SPAN_USERNAME = process.env.SPAN_USERNAME;
 const SPAN_PASSWORD = process.env.SPAN_PASSWORD ?? "";
 const SPAN_BACKUP_CIRCUIT = process.env.SPAN_BACKUP_CIRCUIT ?? "backup";
-const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // 16.5kW hits 0.3kWh in ~65s
+const SPAN_BACKUP_ALARM_KWH = Number(process.env.SPAN_BACKUP_ALARM_KWH ?? "0.3"); // drawn in the trailing 60 min; 16.5 kW hits 0.3 kWh in ~65 s
 const SPAN_BUILDING_ID = process.env.SPAN_BUILDING_ID; // optional; auto-discovered if unset
 const SPAN_POLL_SECONDS = Number(process.env.SPAN_POLL_SECONDS ?? "60");
 // The pump (compressor) circuits on the SPAN panel — summed each poll into span_energy so the
@@ -233,7 +239,7 @@ const SPAN_PUMP_CIRCUITS = process.env.SPAN_PUMP_CIRCUITS ?? "air-water";
 const spanWatch = SPAN_USERNAME
   ? new SpanWatch(SPAN_USERNAME, SPAN_PASSWORD, SPAN_BACKUP_CIRCUIT, SPAN_BACKUP_ALARM_KWH, ntfy, SPAN_BUILDING_ID, store, SPAN_PUMP_CIRCUITS)
   : null;
-if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH}kWh/hr; pump-energy circuits "${SPAN_PUMP_CIRCUITS}" → span_energy, every ${SPAN_POLL_SECONDS}s`);
+if (spanWatch) console.log(`SPAN backup watch ON — circuit "${SPAN_BACKUP_CIRCUIT}", alarm >${SPAN_BACKUP_ALARM_KWH} kWh in 60 min; pump-energy circuits "${SPAN_PUMP_CIRCUITS}" → span_energy, every ${SPAN_POLL_SECONDS}s`);
 else console.log("SPAN backup watch OFF (set SPAN_USERNAME to enable the element power alarm)");
 
 // TempIQ push seam (§A-7, TempIQ#1480 — live 2026-07-14). Inert without the flag+token.
@@ -819,9 +825,17 @@ async function restoreAlertState(): Promise<void> {
     const ph = open.map((o) => ({ o, k: parseEpisodeKind(o.kind) }));
     const phKeep = ph.filter(({ o, k }) => k && k.live === PH_LIVE.live.has(k.check) && !(k.live ? alerts : shadowAlerts).isClosing(o.id, o.uid));
     const phStale = ph.filter(({ o, k }) => k && k.live !== PH_LIVE.live.has(k.check)).map(({ o }) => o);
-    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
-    if (stale.length || phStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale].map((o) => o.id)); // a failure → the whole restore retries
+    // backup gate: an open episode of the CURRENT mode's kind = the gate closed the breaker (virtually, in shadow); one
+    // of the other mode is closed — a shadow "would close" is not a breaker the live gate closed, and vice versa
+    const isGate = (o: { kind: string }) => o.kind === "backup_gate" || o.kind === "backup_gate_shadow";
+    const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid) && !gateShadowAlerts.isClosing(o.id, o.uid));
+    const gateKeep = gateOpen.filter((o) => o.kind === backupGateKind);
+    const gateStale = gateOpen.filter((o) => o.kind !== backupGateKind);
+    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length || phStale.length || gateStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
+    (BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts).adopt(gateKeep);
+    if (gateKeep.length) backupGate.restore({ closedByGate: true, atMs: Date.now() }); // dwell restarts now: conservative
     alerts.adopt(phKeep.filter(({ k }) => k!.live).map(({ o }) => o));
     shadowAlerts.adopt(phKeep.filter(({ k }) => !k!.live).map(({ o }) => o));
     pumpWatch.restore(phKeep.filter(({ o }) => o.pumpId != null).map(({ o, k }) => ({ check: k!.check, pumpId: o.pumpId as string })));
@@ -849,6 +863,10 @@ async function checkSpanLocal(): Promise<void> {
   const cloud = {
     enabled: !!spanWatch, last_ok_at: spanWatch?.lastOkAt ?? null,
     fail_streak: spanWatch?.failStreak ?? 0, last_error: spanWatch?.lastError ?? null,
+    // the backup-element alarm's inputs: energy the element drew in the trailing 60 min (what pages at
+    // SPAN_BACKUP_ALARM_KWH) and SPAN's day-cumulative reading it is differenced from.
+    backup_kwh_last_hour: spanWatch?.lastHourKwh ?? null, backup_kwh_today: spanWatch?.lastDayKwh ?? null,
+    backup_alarmed: spanWatch?.alarmed ?? false,
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   spanLocalError = null;
@@ -1010,6 +1028,100 @@ async function checkPumpHealthDaily(): Promise<void> {
     await store.releasePumpDigest(yesterday).catch(() => {});
     throw e;
   }
+}
+
+/**
+ * The backup element's DYNAMIC gate (backupgate.ts; owner rule 2026-10-19): close the Buffer Tank breaker when a pump has
+ * failed and the rest cannot hold the tank, or every available pump runs and the tank stays below the floor; re-open it
+ * once recovered. SHADOW by default (BACKUP_GATE): pages "would close / would open" through the alert outbox (episode
+ * kind backup_gate_shadow — open = the gate's virtual breaker is closed) and switches nothing. BACKUP_GATE=live sends the
+ * close through the hub (needs HUB_ARM_TOKEN) to the Pi's guarded BreakerController; re-opening a live breaker also needs
+ * BACKUP_GATE_REOPEN=1 here and span.backup_reopen on the Pi (both off; owner OK). Runs on the writer only, every poll.
+ * Thresholds: knowledge/reference/backup-gate-thresholds.md. The Pi-local fallback (both pumps down, no cloud) is the
+ * bridge's backup_fallback.py; its status rides the hub state frame and is shown beside this one on /health.
+ */
+const BACKUP_GATE_CFG = parseGateConfig(process.env);
+for (const e of BACKUP_GATE_CFG.errors) console.warn(e);
+const BACKUP_CIRCUIT = "Buffer Tank";
+const HUB_ARM_TOKEN = process.env.HUB_ARM_TOKEN ?? "";
+const backupGate = new BackupGate(BACKUP_GATE_CFG.mode, BACKUP_GATE_CFG.reopen, BACKUP_GATE_CFG.t);
+const backupGateKind = BACKUP_GATE_CFG.mode === "live" ? "backup_gate" : "backup_gate_shadow";
+let backupGateBlind: string | null = "not evaluated yet";
+let backupGateError: string | null = null;
+let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback: Record<string, unknown> | null } = { relay: null, element_w: null, pi_fallback: null };
+let backupGateEpisodes7d: number | null = null;
+// shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
+// every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
+// The would-open is a log line + /health + the dashboard: no second email.
+const gateShadowAlerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "default", { email: true }));
+
+async function checkBackupGate(reading: SlxReading): Promise<void> {
+  if (BACKUP_GATE_CFG.mode === "off") { backupGateBlind = "disabled (BACKUP_GATE=off)"; return; }
+  if (!hub) { backupGateBlind = "no hub configured"; return; }
+  // one gate per house: a second instance mid-handover only reports (it would page / command twice)
+  if (WRITER_LEASE_ENABLED && !(writerLeaseState?.held ?? false)) { backupGateBlind = "not the writer-lease holder"; return; }
+  let state: HubState | null = null;
+  backupGateError = null; // a failed live command stays visible as backup_gate.retry_at
+  try { state = await hub.getState(); } catch (e) { state = null; backupGateError = `hub unreachable: ${(e as Error).message}`; }
+  const blind = state ? piStateUnverifiable(state) : "hub unreachable";
+  const bt = state?.span?.circuits?.find((c) => c.name === BACKUP_CIRCUIT) ?? null;
+  const relay = bt?.relay_state === "OPEN" || bt?.relay_state === "CLOSED" ? bt.relay_state : null;
+  backupGateHub = {
+    relay, element_w: typeof bt?.power_w === "number" ? Math.abs(bt.power_w) : null,
+    pi_fallback: (state?.span?.backup_fallback as Record<string, unknown> | undefined) ?? null,
+  };
+  // per-stage episodes (stagewatch, stepped just before this in the same poll) mark the pump wired to that stage
+  const stages = stageWatch.status();
+  const pumps: GatePump[] | null = state && !blind
+    ? state.pumps.map((p) => ({
+        id: p.id, name: p.name, online: p.online, state: p.online ? p.state ?? null : "offline",
+        stageEpisode: Object.values(stages).some((s) => s.pump === p.id && (s.unserved_open || s.fault_open)),
+      }))
+    : null;
+  backupGateBlind = blind;
+  const events = backupGate.step({
+    nowMs: Date.now(), tankF: reading.tankF, tankTargetF: reading.tankTargetF, stagesCalled: reading.stagesCalled,
+    pumps, relay: blind ? null : relay,
+  });
+  const outbox = BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts;
+  for (const e of events) {
+    console.warn(`[backupgate][${BACKUP_GATE_CFG.mode}] ${e.title}: ${e.body}`);
+    if (e.kind === "confirmed") {
+      // a live command whose hub answer was lost, now seen done on the relay: record it as the gate's own
+      if (e.confirms === "close") await openAlert(backupGateKind, "buffer_tank", null, e.title, e.body);
+      else { await alerts.close(backupGateKind, "buffer_tank"); await ntfyDelivered(e.title, e.body, "default", { resolved: true }); }
+      continue;
+    }
+    if (e.kind !== "close" && e.kind !== "open") { await ntfyDelivered(e.title, e.body, e.priority); continue; }
+    if (BACKUP_GATE_CFG.mode === "live") {
+      // the Pi's BreakerController verifies the relay read-back; the gate (and its episode) changes only on a verified
+      // answer. A refusal (a bridge guard said no) stands the gate down for the episode; no Pi / no answer retries after
+      // BG.RETRY_MS, and a late landing is confirmed from the relay. Either way the failure pages ONCE per episode.
+      const fresh = !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS));
+      const r = !HUB_ARM_TOKEN ? { ok: false, refused: true, detail: "HUB_ARM_TOKEN is not set on the planner" }
+        : !fresh ? { ok: false, refused: false, detail: "lost the writer lease" }
+        : await hub.sendBreaker(BACKUP_CIRCUIT, e.kind, HUB_ARM_TOKEN, "backup-gate");
+      const { page } = backupGate.applied(r.ok, Date.now(), r.refused);
+      backupGateError = r.ok ? null : `${e.kind} ${r.refused ? "refused" : "failed"}: ${r.detail}`;
+      if (!r.ok) {
+        if (page) {
+          await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,
+            `${r.detail}. ` + (r.refused ? "A bridge guard refused it; A2W will not retry until the condition ends. "
+              : `A2W retries every ${BG.RETRY_MS / 60_000} min while the condition holds (no further pages). `) +
+            (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high");
+        }
+        continue;
+      }
+    }
+    if (e.kind === "close") await outbox.open(backupGateKind, "buffer_tank", null, e.title, e.body);
+    else if (BACKUP_GATE_CFG.mode === "live") {
+      await alerts.close(backupGateKind, "buffer_tank");
+      await ntfyDelivered(e.title, e.body, "default", { resolved: true });
+    } else {
+      await gateShadowAlerts.close(backupGateKind, "buffer_tank"); // log + /health + dashboard only: no second email
+    }
+  }
+  backupGateEpisodes7d = await store.alertEpisodesSince(backupGateKind, 7 * 24).catch(() => backupGateEpisodes7d);
 }
 
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
@@ -1489,7 +1601,11 @@ async function shadowOnce(): Promise<void> {
   const preBoosts = sags.map((w) => ({ windowStart: w.windowStart, windowEnd: w.windowEnd, boostF: Math.max(0, Math.round(w.sagP75F)), sagP75F: w.sagP75F, n: w.n }));
   dhwPreBoosts = sags;
   learnedWindowsForHealth = learned ? learned.windows : null;
-  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F };
+  // Rolling-horizon fix: the bank / soak blocks this plan's own history already placed at hours that have started,
+  // so the bank is chosen once per local day (shadow.ts priorExcursionsFromPlans) instead of re-landing on the
+  // current hour every recompute. A history read failure means no memory — the pre-fix plan — never a skipped plan.
+  const priorExcursions = priorExcursionsFromPlans(await store.recentPlans(26).catch(() => []), Date.now());
+  const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F, priorExcursions };
 
   // §6.9 demand floor: degraded feed → null floor → winter blocks keep the curve mimic.
   let demandFloor: DemandFloor | null = null;
@@ -1814,6 +1930,7 @@ async function shadowOnce(): Promise<void> {
     learn_days: learned?.days ?? 0,
     draw_events: learned?.drawEvents ?? 0,
     bank_f: BANK_F,
+    prior_excursions: priorExcursions, // what the bank remembered (spent / pinned) when this plan was computed
     ...(dpMeta ? { winter_dp: dpMeta } : {}),
     ...(preheatMeta ? { preheat: preheatMeta } : {}),
   });
@@ -1832,6 +1949,10 @@ async function shadowOnce(): Promise<void> {
  * Plan-vs-actual: for each completed hour, score the shadow block from the most recent
  * plan computed BEFORE that hour against what HBX actually targeted. gap_f > 0 = the
  * as-found system ran hotter than the shadow plan wanted — the opportunity, in °F-hours.
+ * "Actually targeted" is the OPERATIVE target: the reported temp1.target freezes while the device is idle and
+ * read 139.9 °F for 7 h after the 2026-10-19 soak with the 120 °F curve in force (gap +19.9 all evening), so an
+ * hour whose samples prove the report stale (store.hourlyActuals reportedStale) scores against the curve in
+ * force instead. Both values are recorded (stale-slx-target-2026-10-19.md).
  */
 async function scoreOnce(): Promise<void> {
   const [plans, actuals] = await Promise.all([store.recentPlans(30), store.hourlyActuals(26)]);
@@ -1846,7 +1967,8 @@ async function scoreOnce(): Promise<void> {
       (b: { ts: string }) => new Date(b.ts).getTime() === a.hour.getTime(),
     );
     if (!block) continue;
-    const gap = a.targetF == null ? null : a.targetF - block.tank_target_f;
+    const operativeF = a.reportedStale && a.commandedF != null ? a.commandedF : a.targetF;
+    const gap = operativeF == null ? null : operativeF - block.tank_target_f;
     await store.upsertPlanScore({
       hourTs: a.hour,
       shadowTargetF: block.tank_target_f,
@@ -1854,6 +1976,8 @@ async function scoreOnce(): Promise<void> {
       actualTankF: a.tankF,
       gapF: gap,
       planComputedAt: plan.computedAt,
+      commandedTargetF: a.commandedF,
+      reportedStale: a.reportedStale,
     });
     scored++;
     if (gap != null) gaps.push(gap);
@@ -2025,6 +2149,9 @@ async function pollOnce(): Promise<void> {
   await checkI1(reading.tankTargetF);
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
+  // after the stage watch, so this poll's stage episodes feed the gate
+  await checkBackupGate(reading)
+    .catch((e) => { backupGateError = `gate: ${(e as Error).message}`; console.error("backup gate failed:", backupGateError); });
 
   await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
   await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
@@ -2134,9 +2261,12 @@ async function loopBody(): Promise<void> {
   await checkPumpHealth().then(() => { pumpHealthError = null; })
     .catch((e) => { pumpHealthError = (e as Error).message; console.error("pump health check failed:", pumpHealthError); });
   await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
+    : kind === "backup_gate_shadow" ? false // its own outbox (default priority, email) re-sends it, never the high one
+    : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
     : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
+  await gateShadowAlerts.retry((kind) => kind === "backup_gate_shadow").catch((e) => console.error("backup-gate shadow re-send failed:", (e as Error).message));
   // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)
   await shadowAlerts.retry(() => false).catch((e) => console.error("shadow episode flush failed:", (e as Error).message));
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
@@ -2234,7 +2364,7 @@ async function main(): Promise<void> {
     await once("shadow", shadowOnce);
     await once("score", scoreOnce);
     await once("decay scan", () => decayScanOnce(store));
-    await once("realized-savings", () => realized.computeAndStore());
+    await once("realized-savings", () => realized.computeAndStore(REALIZED_LOOKBACK_DAYS));
     await once("pi-link", refreshPiLink);
     await once("span-local", checkSpanLocal);
     await once("alert re-send", () => alerts.retry());
@@ -2307,6 +2437,17 @@ async function main(): Promise<void> {
                 error: pumpDailyError,
               },
               digest: { enabled: PUMP_HEALTH_DIGEST, hour_et: PUMP_HEALTH_DIGEST_HOUR, last: pumpDigestLast },
+            },
+            // the backup element's dynamic gate (backupgate.ts). mode shadow = gate_state is VIRTUAL (what it would have
+            // done); relay / element_w are the REAL Buffer Tank breaker from the Pi's SPAN snapshot; pi_fallback is the
+            // bridge's cloud-free "both pumps down" fallback. blind = why this poll judged nothing (null = judged).
+            backup_gate: {
+              ...backupGate.status(Date.now()),
+              circuit: BACKUP_CIRCUIT, blind: backupGateBlind, error: backupGateError,
+              relay: backupGateHub.relay, element_w: backupGateHub.element_w,
+              episodes_7d: backupGateEpisodes7d, config_errors: BACKUP_GATE_CFG.errors,
+              live_ready: BACKUP_GATE_CFG.mode !== "live" || !!HUB_ARM_TOKEN,
+              pi_fallback: backupGateHub.pi_fallback,
             },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }
@@ -2701,7 +2842,7 @@ async function main(): Promise<void> {
       await step("tempiq-reheat-push", () => pushTankReheat(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN));
     }
     await step("i8", checkI8);
-    await step("realized-savings", () => realized.computeAndStore());
+    await step("realized-savings", () => realized.computeAndStore(REALIZED_LOOKBACK_DAYS));
   };
   await shadowLoop();
   setInterval(shadowLoop, SHADOW_EVERY_MIN * 60 * 1000);

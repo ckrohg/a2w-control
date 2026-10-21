@@ -65,6 +65,17 @@ class GuardrailConfig(BaseModel):
     baseline_setpoint_c: float | None = None   # warm default reverted to when a lease lapses
     lease_max_minutes: float = 180             # clamp on any single lease
     lease_warn_minutes: float = 15             # warn this long before a lease would revert
+    # Reconnect quarantine (knowledge/reference/hp2-e21-reconnect-analysis.md): after a
+    # pump has been unreachable for >= reconnect_min_outage_s, every write to it is refused
+    # for reconnect_write_hold_s once polls succeed again, and those first polls are paced.
+    # HP2's E21 onsets cluster after the Pi's own WiFi outages; the evidence doesn't show
+    # our traffic as the cause, but this takes it off the table for ~2 min. 0 disables.
+    # Never held: the baseline revert, power-ON, and person-initiated writes (ui, dashboard);
+    # at most one hold per 10 min, so a flapping gateway can't starve the planner. No hold
+    # after a bridge restart: every deploy would nack the planner's first command, and the
+    # evidence doesn't implicate writes — the restart's first poll is not paced either.
+    reconnect_min_outage_s: float = 60.0
+    reconnect_write_hold_s: float = 120.0
 
     @model_validator(mode="after")
     def _sane_bounds(self):
@@ -257,6 +268,13 @@ class SpanConfig(BaseModel):
     breakers: list[BreakerCircuit] = Field(default_factory=_default_breakers)
     min_off_s: float = MIN_OFF_FLOOR_S     # floor for any toggle-off (power_cycle hold, open->close)
     max_off_s: float = 600.0               # ceiling on a single power_cycle hold
+    # Re-opening the BACKUP ELEMENT (owner rule 2026-10-19; the planner's backup gate, backupgate.ts). Default OFF: the
+    # element breaker is close-only until the owner explicitly OKs re-opening. When true, a bare OPEN of the Buffer Tank
+    # circuit is allowed with the Air-Water guards (OpenPermit minted after the guards, relay read-back, audit, page)
+    # plus its own: never while the element draws >= backup_open_max_w (never switch a live 16.5 kW load off), never
+    # while the owner's arm intent is ARMED. allow_open stays forbidden on it — this flag is the only way.
+    backup_reopen: bool = False
+    backup_open_max_w: float = Field(default=300.0, gt=0)
     close_attempts: int = Field(default=4, ge=1, le=20)     # CLOSE tries inside the cycle
     close_retry_delay_s: float = Field(default=5.0, ge=0)   # gap between those tries
     reclose_interval_s: float = Field(default=60.0, gt=0)   # background re-close after they all fail
@@ -326,6 +344,19 @@ class SelfHealConfig(BaseModel):
         return self
 
 
+class BackupFallbackConfig(BaseModel):
+    # The Pi-local fallback of the backup-element gate (bridge/backup_fallback.py; owner rule 2026-10-19): when EVERY
+    # heat pump has been down for hold_min, CLOSE the Buffer Tank breaker so the HBX can fire the element — with no
+    # cloud in the loop (the planner's gate needs SensorLinx + the hub). Close-only by construction. "Down" = a fresh
+    # blocking fault (not running), switched off, off at the panel, or Modbus-stale while SPAN shows no compressor draw.
+    # Default SHADOW: `live: false` logs + pages "would close" and switches nothing until the owner flips it.
+    enabled: bool = True
+    live: bool = False
+    hold_min: float = Field(default=30.0, ge=10, le=240)       # measured: both-stale with SPAN up never > 3.5 min
+    running_power_w: float = Field(default=500.0, gt=0)        # SPAN draw that means "the compressor runs"
+    cooldown_h: float = Field(default=6.0, ge=1, le=48)        # one decision (page / close) per this
+
+
 class AppConfig(BaseModel):
     pumps: list[PumpConfig] = Field(min_length=1)
     guardrails: GuardrailConfig = GuardrailConfig()
@@ -335,12 +366,13 @@ class AppConfig(BaseModel):
     hub: HubConfig = HubConfig()
     span: SpanConfig = SpanConfig()
     self_heal: SelfHealConfig = SelfHealConfig()
+    backup_fallback: BackupFallbackConfig = BackupFallbackConfig()
     db_path: str = "bridge.db"
     ui_dir: str = "ui"
     modbus_timeout_s: float = 5.0  # generous: 2400 baud multi-register reads are slow
 
     @field_validator("guardrails", "auth", "notifications", "analytics", "hub", "span", "self_heal",
-                     mode="before")
+                     "backup_fallback", mode="before")
     @classmethod
     def _empty_section_to_default(cls, v):
         # a YAML section present but with everything commented out parses to null;

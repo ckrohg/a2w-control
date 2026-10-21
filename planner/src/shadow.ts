@@ -3,8 +3,9 @@
  * hour by hour for the next 24 h: tank target + HP1 setpoint + a human-readable reason
  * per block. SHADOW ONLY: results go to the shadow_plans table and the dashboard, never
  * to a device. Summer logic = DHW-ready floor + one optional afternoon bank in the day's
- * warmest hour (flat electricity rate → COP timing is the only timing lever, plan §6.2, #58).
- * Hours whose
+ * warmest hour (flat electricity rate → COP timing is the only timing lever, plan §6.2, #58),
+ * chosen ONCE per local day — the plan history is the memory (priorExcursionsFromPlans), so the
+ * hourly recompute cannot re-bank the current hour on a falling afternoon. Hours whose
  * forecast drops below WINTER_GUARD_F fall back to mimicking the HBX reset curve, so
  * plan-vs-actual stays meaningful into the season the winter solver isn't built for yet.
  */
@@ -62,6 +63,45 @@ export interface ShadowOpts {
   bankF: number; // #58: one block/day at the warmest hour raised to dhwFloorF + bankF (0 = off; env BANK_F)
   /** #135: per learned window, the sag-sized pre-boost (absent / empty = no pre-boost, the pre-#135 plan). */
   preBoosts?: PreBoost[];
+  /**
+   * Rolling-horizon fix (2026-10-20): the bank / soak blocks the plan HISTORY already placed at hours that have
+   * started (priorExcursionsFromPlans). The bank is chosen once per local day: a past bank or soak on a day means
+   * its deliberate charge is spent; a bank on the current hour stays where it is. Absent / empty = no memory —
+   * the pre-fix plan, which re-banked the current hour every recompute on a falling afternoon.
+   */
+  priorExcursions?: PriorExcursion[];
+}
+
+/** A bank / soak block the plan history placed at an hour that has started (ts ≤ now). */
+export interface PriorExcursion {
+  ts: string; // ISO hour start, as stored in the plan block
+  bank?: boolean;
+  sani?: boolean;
+}
+
+/** Local-day key (the TZ env makes the Date getters local) — the unit the bank and the soak are planned per. */
+const dayKeyOf = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/**
+ * The excursions the plan history has already placed at hours that have started — what computeShadowPlan's bank
+ * remembers across the hourly recompute. The NEWEST plan covering an hour decides that hour (a bank an older plan
+ * placed and a newer plan moved never happened: the newer plan was the one in force); blocks whose hour has not
+ * started yet are ignored (the recompute may still move them). Plans are taken oldest → newest (by `computedAt`
+ * when present, else in the given order, which store.recentPlans already guarantees).
+ */
+export function priorExcursionsFromPlans(plans: { computedAt?: Date; plan: unknown }[], nowMs: number): PriorExcursion[] {
+  const ordered = [...plans].sort((a, b) => (a.computedAt?.getTime() ?? 0) - (b.computedAt?.getTime() ?? 0));
+  const byHour = new Map<number, PriorExcursion>();
+  for (const p of ordered) {
+    if (!Array.isArray(p.plan)) continue;
+    for (const b of p.plan as { ts?: unknown; bank?: unknown; sani?: unknown }[]) {
+      const ts = typeof b?.ts === "string" ? b.ts : null;
+      const t = ts == null ? NaN : new Date(ts).getTime();
+      if (ts == null || !Number.isFinite(t) || t > nowMs) continue;
+      byHour.set(t, { ts, bank: b.bank === true, sani: b.sani === true });
+    }
+  }
+  return [...byHour.values()].filter((e) => e.bank || e.sani);
 }
 
 /** #135: a pre-boost below this is noise (one sample of standby drift) and is not planned. */
@@ -167,7 +207,7 @@ export function computeShadowPlan(
 
   const byDay = new Map<string, Draft[]>();
   for (const d of draft) {
-    const day = `${d.f.ts.getFullYear()}-${d.f.ts.getMonth()}-${d.f.ts.getDate()}`;
+    const day = dayKeyOf(d.f.ts);
     if (!byDay.has(day)) byDay.set(day, []);
     byDay.get(day)!.push(d);
   }
@@ -205,7 +245,29 @@ export function computeShadowPlan(
   // setpoints off this block (max(operative, plan)), so the raise clears I1 like the soak does.
   if (opts.bankF > 0) {
     const bankTo = Math.min(opts.dhwFloorF + opts.bankF, opts.strictCapF);
-    for (const [, ds] of byDay) {
+    const prior = opts.priorExcursions ?? [];
+    for (const [day, ds] of byDay) {
+      // Rolling-horizon fix (root-caused 2026-08-08, measured again 2026-10-19: 101 of the 145 bank writes since
+      // Sep 1 were the SECOND write in their hour). The forecast starts at the current hour, so on a falling
+      // afternoon "the warmest remaining hour" is always NOW and every hourly recompute re-banked the current hour:
+      // the auto-pilot wrote the floor at :04 from the old plan and the bank at :19 from the new one, every hour
+      // until <6 h of day remained. The plan HISTORY is the memory — the bank is chosen ONCE per local day:
+      //  - a bank the history placed at a PAST hour of this day, or a soak at any started hour ("soak day IS the
+      //    bank" must still hold after the soak hour has left the horizon), means the day's charge is spent;
+      //  - a bank it placed on the CURRENT hour is kept there (the auto-pilot has already commanded it), not
+      //    re-derived — even with <6 h of day left, so the hour the bank was written in cannot drop it.
+      const priorToday = prior.filter((p) => dayKeyOf(new Date(p.ts)) === day);
+      const dayStartMs = ds[0].f.ts.getTime();
+      if (priorToday.some((p) => p.sani || (p.bank && new Date(p.ts).getTime() < dayStartMs))) continue; // spent
+      const pinned = ds.find((d) => priorToday.some((p) => p.bank && new Date(p.ts).getTime() === d.f.ts.getTime()));
+      if (pinned) {
+        if (!pinned.sani && bankTo > pinned.target) {
+          pinned.target = bankTo;
+          pinned.bank = true;
+          pinned.reason = `afternoon bank to ${bankTo}°F (warmest hour, ${pinned.f.outdoorF.toFixed(0)}°F outdoor; kept from the previous plan)`;
+        }
+        continue;
+      }
       if (ds.length < 6) continue; // too little day left for a deliberate charge to pay back
       if (ds.some((d) => d.sani || d.target >= opts.sanitizeF)) continue; // soak day IS the bank
       const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));

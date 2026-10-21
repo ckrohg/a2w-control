@@ -277,6 +277,9 @@ export class HbxWriter {
       target_f: operative,
       commanded_target_f: commanded,
       adoption_pending: adoptionPending,
+      // The HBX hot-tank differential in force: the identification driver's stale-report proof sizes its tank
+      // margin from it (stale-target.ts staleTankMarginF). null until the first config version is recorded.
+      ht_dif_f: typeof cfg?.htDif === "number" && Number.isFinite(cfg.htDif) ? cfg.htDif : null,
       outdoor_f: outdoor,
       band: band ? { lo: Math.round(band.lo), hi: Math.round(band.hi) } : null,
       curve_overridden: overridden,

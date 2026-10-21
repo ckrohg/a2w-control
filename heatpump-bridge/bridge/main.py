@@ -96,10 +96,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("self-heal failed to start")
         app.state.self_heal = self_healer
+        from .backup_fallback import BackupFallback
+        backup_fallback = None
+        try:  # likewise: the fallback must never stop the bridge booting
+            backup_fallback = BackupFallback(cfg.backup_fallback, pollers, span_breakers, store,
+                                             notify_cfg=cfg.notifications, circuits=cfg.self_heal.circuits)
+            backup_fallback.start()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("backup fallback failed to start")
+        app.state.backup_fallback = backup_fallback
+        hub_client.backup_fallback = backup_fallback
 
         yield
         if self_healer is not None:
             await self_healer.stop()     # no new self-heal decisions during shutdown
+        if backup_fallback is not None:
+            await backup_fallback.stop()
         await hub_client.stop()          # stop command intake first...
         if span_breakers is not None:
             await span_breakers.stop()   # ...then let a running power cycle finish its hold + CLOSE
