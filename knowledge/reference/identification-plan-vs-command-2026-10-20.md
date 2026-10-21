@@ -144,8 +144,8 @@ so `SHAPED_CURVE=shadow` — stamped but written flat — resolves flat, as it s
 4. **`autopilot_log.target_f` on a `set-curve` row is the declared target**, not the command (1886: 135,
    set-curve). The ledger reads correctly only beside `hbx_writes`; recording the curve's output there would make
    the dashboard honest on its own.
-5. **Phase B's operative term was the raw report — done in the next follow-up PR (stacked on #222; deploys the
-   planner).** `runOnce()` tracked `getLatestSlx().targetF` as reported, so the frozen post-soak report
+5. **Phase B's operative term was the raw report — done in the follow-up PR (a2w-control#223, after #222; deploys
+   the planner).** `runOnce()` tracked `getLatestSlx().targetF` as reported, so the frozen post-soak report
    (`stale-slx-target-2026-10-19.md`) led both pumps to 63 °C for 7–16 h after every soak: 39 of the 78 floor hours
    since Oct 15 had the report ≥ 3 °F above the curve (Phase B's setpoint on floor hours averaged 55.6 °C, max 63),
    and it set the setpoint on 7 of the 20 winter-guard hours in item 1. Now `operativeLeadF()` runs the #215 proof
