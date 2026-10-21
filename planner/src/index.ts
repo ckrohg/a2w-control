@@ -58,6 +58,7 @@ import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
 import { pushTankReheat } from "./tank-reheat-push";
 import { RealizedSavings } from "./realized";
+import { observePeers, peerLiveMs, type PeerHeartbeat } from "./singlewriter";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -1397,25 +1398,29 @@ function scheduleLeaseClaimRetry(): void {
   }, 20_000);
   leaseRetryTimer.unref?.();
 }
-let instancePrevPeers = new Set<string>();
+let instancePrevPeers = new Map<string, number>(); // peer id → its last heartbeat_at (ms), see singlewriter.ts
 let multiInstanceAlerted = false;
 // All 34 second-instance alerts in Sept–Oct 2026 came within 3 h of a planner deploy: Railway's old and new containers
 // overlap for ~10–22 min. Record the overlap; only one that outlives a deploy reaches the owner.
 const MULTI_INSTANCE_ATTENTION_MS = 30 * 60_000;
 let multiInstanceSince: number | null = null;
 let multiInstanceEscalated = false;
+// A live peer heartbeats every poll; a row older than ~1.5 polls is a dead container's leftover (singlewriter.ts).
+const PEER_LIVE_MS = peerLiveMs(POLL_SECONDS);
 async function checkSingleWriter(): Promise<void> {
-  let peers: string[];
+  // a shutting-down instance must not re-insert the heartbeat row cleanup() just dropped
+  if (shuttingDown) return;
+  let rows: PeerHeartbeat[];
   try {
-    peers = await store.heartbeatInstance(INSTANCE_ID, INSTANCE_FRESH_MS);
+    rows = await store.heartbeatInstance(INSTANCE_ID, INSTANCE_FRESH_MS);
   } catch (e) {
     console.error("single-writer heartbeat failed:", (e as Error).message);
     return;
   }
-  const peerSet = new Set(peers);
-  // Count only peers seen on BOTH this poll and the last — filters a redeploy's brief overlap.
-  const sustained = peers.filter((id) => instancePrevPeers.has(id));
-  instancePrevPeers = peerSet;
+  // Count only peers seen on BOTH this poll and the last, heartbeating in between — filters a redeploy's overlap and a dead row.
+  const { sustained, next } = observePeers(instancePrevPeers, rows, PEER_LIVE_MS);
+  const peerSet = next;
+  instancePrevPeers = next;
   const body = (ids: string[]) => `This planner (${INSTANCE_ID}) sees another live instance: ${ids.join(", ")}. Only ONE planner may write the HBX (README §Single-writer invariant, #36) — a second writer bypasses the guardrails and can collide. Shut the extra instance down, or set its AUTOPILOT_DRY_RUN=1 / PHASE_B_DRY_RUN=1.`;
   if (sustained.length && !multiInstanceAlerted) {
     multiInstanceAlerted = true;
@@ -2435,6 +2440,11 @@ async function main(): Promise<void> {
     raiseWriteBarrier();
     const hardExit = setTimeout(() => { console.error(`[shutdown] ${reason}: forced exit (in-flight work did not finish in time)`); process.exit(0); }, 12_000);
     hardExit.unref?.();
+    // Drop the heartbeat row FIRST, right after the barrier: a barred, shutting-down instance is no longer a writer, and
+    // the lease is a separate row. Done last, the 12 s hard exit could beat it and the successor counted this dead
+    // container as a second planner for INSTANCE_FRESH_MS (every deploy, 2026-10). Not awaited here, so a slow DB cannot
+    // eat the loop-settle budget; the drop near the end is the retry.
+    void store.dropInstance(INSTANCE_ID).catch((e) => console.error("[shutdown] heartbeat row drop failed:", (e as Error).message));
     if (leaseRetryTimer) { clearInterval(leaseRetryTimer); leaseRetryTimer = null; }
     const loopsDone = await settleAll(activeLoops, 9_000);
     const leaseOpsDone = await settleAll(pendingLeaseOps, 1_500);
@@ -2449,7 +2459,7 @@ async function main(): Promise<void> {
     } else {
       console.log(`[shutdown] ${reason}: exiting (writer lease disabled)`);
     }
-    await store.dropInstance(INSTANCE_ID).catch(() => {});
+    await store.dropInstance(INSTANCE_ID).catch(() => {}); // retry of the early drop (and undoes a heartbeat that raced it)
     // A renew/claim that landed between the wait and here could have re-claimed the row — undo it (conditional, safe),
     // but ONLY when every lease op has settled: an op still pending could land after this release too, and its own
     // compensating release needs the pool. So: give pending ops one more bounded chance, then release if quiet.
@@ -2575,7 +2585,7 @@ async function main(): Promise<void> {
             // Which forecast the latest plan was built from — "cached" means open-meteo failed this hour
             // and the last good forecast (≤ 6 h old) stood in, so the plan + demand floor still refreshed.
             forecast: lastForecast,
-            instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers] },
+            instance: { id: INSTANCE_ID, multi_instance: multiInstanceAlerted, peers: [...instancePrevPeers.keys()] },
             // #121: storm windows and shadow.ts's DHW windows are both correct ONLY because this
             // process runs with TZ set to Eastern — shadow.ts:120 relies on getHours() being local,
             // and storm.ts parses OpenMeteo's naive local timestamps against the process TZ. That

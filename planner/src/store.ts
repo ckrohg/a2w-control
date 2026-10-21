@@ -1922,9 +1922,10 @@ export class Store {
    * Heartbeat THIS planner instance and return the ids of OTHER instances seen alive within
    * freshMs. Non-blocking single-writer guard (#36): a non-empty result means a second planner
    * is running against the shared DB and could collide on writes. Prunes rows dead > 1 h so the
-   * table can't grow across redeploys.
+   * table can't grow across redeploys. Each peer comes with its heartbeat time and age on the DB clock, so the caller can
+   * tell a dead container's leftover row (heartbeat never advances) from a live peer (singlewriter.ts).
    */
-  async heartbeatInstance(instanceId: string, freshMs: number): Promise<string[]> {
+  async heartbeatInstance(instanceId: string, freshMs: number): Promise<{ instanceId: string; ageMs: number; heartbeatAtMs: number }[]> {
     await this.pool.query(
       `INSERT INTO planner_instances (instance_id, heartbeat_at) VALUES ($1, now())
        ON CONFLICT (instance_id) DO UPDATE SET heartbeat_at = now()`,
@@ -1932,10 +1933,12 @@ export class Store {
     );
     await this.pool.query(`DELETE FROM planner_instances WHERE heartbeat_at < now() - interval '1 hour'`);
     const res = await this.pool.query(
-      `SELECT instance_id FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2`,
+      `SELECT instance_id, EXTRACT(EPOCH FROM (now() - heartbeat_at)) * 1000 AS age_ms,
+              EXTRACT(EPOCH FROM heartbeat_at) * 1000 AS heartbeat_at_ms
+       FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2`,
       [instanceId, new Date(Date.now() - freshMs)],
     );
-    return res.rows.map((r) => r.instance_id as string);
+    return res.rows.map((r) => ({ instanceId: r.instance_id as string, ageMs: Number(r.age_ms), heartbeatAtMs: Number(r.heartbeat_at_ms) }));
   }
 
   /**
