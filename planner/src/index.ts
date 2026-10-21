@@ -2611,7 +2611,9 @@ async function main(): Promise<void> {
               } : null,
             },
             phase_b: phaseB
-              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults, fail_streak: phaseB.streaks() }
+              // lead: the terms of the last cycle's max() — the plan term is the auto-pilot's COMMAND for the block in force
+              // (plan_basis curve / flat), beside the declared tank_target_f it led before (phaseb.ts planLeadF).
+              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults, fail_streak: phaseB.streaks(), lead: phaseB.lastLead }
               : "disabled",
             // #136: the per-poll floor re-check — last decision and the raises it made in the past 24 h.
             demand_floor_cadence: (() => {
