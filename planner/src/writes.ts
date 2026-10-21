@@ -16,6 +16,7 @@
  */
 
 import { SensorLinxClient } from "./sensorlinx";
+import type { Notify } from "./alertpolicy";
 import { Store } from "./store";
 import { HubClient, type HubState } from "./hub";
 import { bandFor, DEFAULT_OPTS } from "./shadow";
@@ -231,7 +232,8 @@ export class HbxWriter {
       this.retirePendingBefore = this.retirePendingBefore && this.retirePendingBefore > landedAt ? this.retirePendingBefore : landedAt;
       const msg = `${source} ${action} landed but the cancelled boost's row was not retired (${(e as Error).message}) — retrying each poll; the boost expiry restore is held until it succeeds`;
       console.error(`[boost] ${msg}`);
-      await this.notify("Boost cancel incomplete", msg, "high").catch(() => {});
+      await this.notify("Boost cancel incomplete", msg, "high", { tier: "attention", key: "boost-cancel-incomplete",
+        action: "Check the planner's database connection (Railway); the tank may stay boosted until this clears." }).catch(() => {});
       return false;
     }
   }
@@ -243,7 +245,7 @@ export class HbxWriter {
     private readonly hub: HubClient | null,
     private readonly buildingId: string,
     private readonly syncCode: string,
-    private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    private readonly notify: Notify,
     // Phase 3 v2: surfaced in status() so the Optimize UI knows whether the daily auto-sanitize is
     // live. Mutable so the dashboard toggle (controller_flags) keeps it live. Does NOT change any
     // write path — it only gates whether checkI8 auto-actuates the soak.
@@ -623,7 +625,7 @@ export class HbxWriter {
         return this.recordWrite(dev, fields, source, action, summary);
       });
       release();
-      await this.notify(`HBX ${action} (${source})`, summary); // outside the lock and the count: a slow ntfy holds neither
+      await this.notify(`HBX ${action} (${source})`, summary, "default", { tier: "record" }); // outside the lock and the count: a slow ntfy holds neither
       return out;
     } finally {
       release();

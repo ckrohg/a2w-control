@@ -68,15 +68,21 @@ class FakePoller:
 def alerts(monkeypatch):
     sent: list[tuple[str, str, str]] = []
 
+    # "push" = the owner's phone (6bb), "email" = their inbox, "log" = ntfy (reaches nobody: the record tier)
     async def ntfy(cfg, *, title, message, priority="default", tags=""):
-        sent.append(("push", title, priority))
+        sent.append(("log", title, priority, message))
 
-    async def email(cfg, *, subject, body):
+    async def sixbb_push(cfg, *, title, message, priority, tag=""):
+        sent.append(("push", title, priority))
+        return True
+
+    async def email(cfg, *, subject, body, html=None):
         sent.append(("email", subject, body))
 
     for mod in (span_control, sh_mod):
         monkeypatch.setattr(mod.notify, "ntfy", ntfy)
         monkeypatch.setattr(mod.notify, "email", email)
+        monkeypatch.setattr(mod.notify, "sixbb_push", sixbb_push)
     return sent
 
 
@@ -149,14 +155,14 @@ async def test_shadow_is_the_default_and_switches_nothing(rig):
     await settle()
     assert r.panel.writes == []
     assert await codes(r.store) == ["would_cycle"]
-    assert any("would cycle" in a[1] for a in r.alerts if a[0] == "push")
+    assert any("would cycle" in a[1] for a in r.alerts if a[0] == "log")
+    assert not any(a[0] in ("push", "email") for a in r.alerts), "shadow self-heal never reaches the owner"
     for _ in range(31):                        # the shadow verification window ends
         await r.step(heal)
     await settle()
     assert "shadow_verify" in await codes(r.store)
-    assert any("(shadow)" in a[1] and "still active" in a[1] for a in r.alerts if a[0] == "push")
-    assert any("(shadow)" in a[1] and "still active" in a[1] for a in r.alerts if a[0] == "email")
-    assert any(a[0] == "email" for a in r.alerts)
+    assert any("(shadow)" in a[1] and "still active" in a[1] for a in r.alerts if a[0] == "log")
+    assert not any(a[0] in ("push", "email") for a in r.alerts), "shadow verification is record-only too"
     st = heal.status()["pumps"]["pump2"]
     assert st["attempts_in_window"] == 2 and "SHADOW" in st["status"]   # the second "would cycle"
     assert (await codes(r.store)).count("would_cycle") == 2
@@ -214,7 +220,7 @@ async def test_live_cycle_then_recovery_verified(rig):
     await settle()
     assert "recovered" in await codes(r.store)
     assert heal.status()["pumps"]["pump2"]["last_outcome"]["outcome"] == "recovered"
-    assert any("recovered" in a[1] for a in r.alerts if a[0] == "push")
+    assert any("recovered" in a[1] for a in r.alerts if a[0] == "log")
 
 
 async def test_recovery_is_verified_while_heating_with_the_panels_negative_watts(rig):
@@ -412,7 +418,7 @@ async def test_two_failures_escalate_instead_of_looping(rig):
     c = await codes(r.store)
     assert c.count("cycle_start") == 2 and c.count("not_recovered") == 2
     assert c.count("escalated") == 1
-    assert any(a[2] == "urgent" for a in r.alerts if a[0] == "push")
+    assert any(a[2] == "urgent" for a in r.alerts if a[0] == "log")
     assert "escalated" in heal.status()["pumps"]["pump2"]["status"]
 
 
@@ -467,7 +473,7 @@ async def test_other_pump_down_pages_once_and_does_not_cycle(rig):
     await settle()
     assert r.panel.writes == []
     assert (await all_codes(r.store)).count("both_down") == 1
-    assert any("both heat pumps" in a[1] for a in r.alerts if a[0] == "push")
+    assert any("both heat pumps" in a[1] for a in r.alerts if a[0] == "log")
     # a faulted (not just offline) other pump counts too
     r.p1.snapshot["online"] = True
     r.p1.fault(code="E18", severity="high")
@@ -514,8 +520,9 @@ async def test_both_down_pages_even_during_verification(rig):
         await r.step(heal)
     await settle()
     assert (await all_codes(r.store)).count("both_down") == 1
-    assert len([a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]) == 1
-    assert len([a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1]]) == 1
+    assert len([a for a in r.alerts if a[0] == "log" and "both heat pumps" in a[1]]) == 1
+    # record: the planner's one "no heat" page is the incident the owner hears about
+    assert not [a for a in r.alerts if a[0] in ("push", "email") and "both heat pumps" in a[1]]
 
 
 async def test_disagreeing_states_page_exactly_once(rig):
@@ -539,9 +546,9 @@ async def test_disagreeing_states_page_exactly_once(rig):
     for _ in range(40):
         await r.step(heal2)
     await settle()
-    pushes = [a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]
-    mails = [a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1]]
-    assert len(pushes) == 1 and len(mails) == 1
+    logged = [a for a in r.alerts if a[0] == "log" and "both heat pumps" in a[1]]
+    owner = [a for a in r.alerts if a[0] in ("push", "email") and "both heat pumps" in a[1]]
+    assert len(logged) == 1 and owner == []
 
 
 async def test_a_bridge_restart_does_not_page_both_down(rig):
@@ -627,9 +634,9 @@ async def test_repeated_aborts_cool_down_dedupe_and_page_manual(rig, monkeypatch
     c = await codes(r.store)
     assert r.panel.writes == []
     assert 3 <= c.count("cycle_aborted") <= 8        # ~one per 5 min cooldown, not every tick
-    aborted_push = [a for a in r.alerts if a[0] == "push" and "cycle aborted" in a[1]]
+    aborted_push = [a for a in r.alerts if a[0] == "log" and "cycle aborted" in a[1]]
     assert len(aborted_push) == 1                    # notified once per episode
-    starts = [a for a in r.alerts if a[0] == "push" and "power-cycling" in a[1]]
+    starts = [a for a in r.alerts if a[0] == "log" and "power-cycling" in a[1]]
     assert len(starts) == 1                          # retries are not re-announced
     assert c.count("cycle_refused") == 1             # the manual-step page after 3 aborts
 
@@ -774,8 +781,8 @@ async def test_span_unreachable_pages_the_manual_step(rig):
     await settle()
     assert opens(r.panel) == []
     assert "cycle_refused" in await codes(r.store)
-    mail = [a for a in r.alerts if a[0] == "email" and "manual" in a[1]]
-    assert mail and "SPAN panel" in mail[0][2]
+    logged = [a for a in r.alerts if a[0] == "log" and "manual" in a[1]]
+    assert logged and "SPAN panel" in logged[0][3]
 
 
 @pytest.mark.parametrize("watts", [2600.0, -2600.0])   # the real panel reports draw as NEGATIVE

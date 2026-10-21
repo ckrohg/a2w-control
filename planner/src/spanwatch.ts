@@ -14,6 +14,7 @@
  * circuits' day-cumulative value into span_energy for the realized-savings ledger (#207).
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
+import type { Notify } from "./alertpolicy";
 import type { Store } from "./store";
 
 // Public app identifiers (not secrets) — from TempIQ's HAR extraction.
@@ -66,7 +67,7 @@ export class SpanWatch {
     private readonly password: string,
     private readonly circuitMatch: string, // case-insensitive circuit-name substring
     private readonly alarmKwh: number,      // page when the trailing 60 minutes' energy exceeds this (kWh)
-    private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    private readonly notify: Notify,
     private readonly fixedBuildingId?: string,
     private readonly store?: Store,         // when set, accumulate pump energy → span_energy
     private readonly pumpMatch?: string,    // case-insensitive substring for the pump circuits (Air-Water)
@@ -201,10 +202,15 @@ export class SpanWatch {
           "16.5 kW backup element DREW POWER",
           `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today, ≈$${(hit.kwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
           "high",
+          // costs money, never endangers the house (the element IS the heat): worth a look, at most daily
+          { tier: "attention", key: "backup-element-power",
+            action: "If it isn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
+            facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${hit.kwh.toFixed(2)} kWh ≈ $${(hit.kwh * 0.3).toFixed(2)}`]] },
         );
       } else if (hourKwh <= this.alarmKwh && this.alarmed) {
         this.alarmed = false;
-        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today).`);
+        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today).`, "default",
+          { tier: "attention", resolved: true, key: "backup-element-power" });
       }
     } catch (e) {
       // Never alarm on a read/auth failure (transient) — backup_called is the redundant net. Just log.

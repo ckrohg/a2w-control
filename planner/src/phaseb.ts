@@ -15,6 +15,7 @@
  */
 
 import { HubClient } from "./hub";
+import type { Notify } from "./alertpolicy";
 import { Store } from "./store";
 import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
@@ -96,7 +97,7 @@ export class PhaseB {
     private readonly hub: HubClient,
     private readonly pumpIds: string[],
     private dryRun: boolean,
-    private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    private readonly notify: Notify,
     /** #133 (b): lead the shaped curve's output (SHAPED_CURVE=1). Off = the pre-#133 tracking, byte-identical. */
     private readonly shapedCurve = false,
     /** Graceful handover (2026-10-01): the pump setpoint goes through the hub, not writes.ts, so Phase B asks this
@@ -190,7 +191,8 @@ export class PhaseB {
         this.alerted[d.pump_id] = false;
         if (this.recoveryPending[d.pump_id]) {
           this.recoveryPending[d.pump_id] = false;
-          await this.notify("Phase B recovered", `${d.pump_id} tracking again (${d.value_c}°C).`);
+          await this.notify("Phase B recovered", `${d.pump_id} tracking again (${d.value_c}°C).`, "default",
+            { tier: "attention", resolved: true, key: `phaseb-failing-${d.pump_id}` });
         }
       } else {
         this.failStreak[d.pump_id] = (this.failStreak[d.pump_id] ?? 0) + 1;
@@ -208,6 +210,9 @@ export class PhaseB {
                   "it will stay where it is. See FINDING-1."
                 : "Lease will lapse to baseline — house safe, savings paused."),
             "high",
+            // a lapsed lease reverts to baseline on its own: record. Only with no lease armed is a human needed.
+            { tier: this.leaseArmed[d.pump_id] === false ? "attention" : "record", key: `phaseb-failing-${d.pump_id}`,
+              action: "Check the Pi is online (dashboard), then follow the FINDING-1 runbook to set baseline_setpoint_c on the Pi." },
           );
         }
       }
@@ -249,7 +254,8 @@ export class PhaseB {
         this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} (lease ${mins}m armed)`;
         if (this.leaseAlerted[id]) {
           this.leaseAlerted[id] = false;
-          await this.notify("Phase B lease armed", `${id}: the Pi is now holding a lease again.`);
+          await this.notify("Phase B lease armed", `${id}: the Pi is now holding a lease again.`, "default",
+            { tier: "attention", resolved: true, key: `phaseb-nolease-${id}` });
         }
       } else {
         this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} — ⚠ NO LEASE ARMED`;
@@ -264,6 +270,9 @@ export class PhaseB {
               "immediate risk (it holds the last warm setpoint) but there is no automatic " +
               "recovery from a dead planner. See the FINDING-1 runbook.",
             "high",
+            // latched in the DB: this used to re-send for each pump on every planner redeploy (60 emails in a month)
+            { tier: "attention", key: `phaseb-nolease-${id}`,
+              action: "Follow the FINDING-1 runbook: set baseline_setpoint_c in the Pi's config so the safety revert can work." },
           );
         }
       }

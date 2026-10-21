@@ -384,7 +384,7 @@ class SpanLocalPoller:
         if self._down_alerted:
             self._down_alerted = False
             if self.notify:
-                await self.notify("SPAN local recovered", "Instant circuit power logging is back.")
+                await self.notify("SPAN local recovered", "Instant circuit power logging is back.", tier="attention", resolved=True)
         return rows
 
     def note_circuits(self, circuits: dict, ts: float, mono: float | None = None) -> None:
@@ -439,7 +439,8 @@ class SpanLocalPoller:
                 await self.notify(
                     "A2W armed the backup element",
                     "Closed the SPAN backup-element relay — the element is now AVAILABLE (the HBX still "
-                    "decides when it runs). Disarm in the a2w portal if you meant to keep it off.", "high")
+                    "decides when it runs). Disarm in the a2w portal if you meant to keep it off.", "high", tier="attention",
+                    action="Nothing, if it is cold enough to need the element. Otherwise disarm it in the A2W portal.")
         except Exception as e:  # noqa: BLE001 — an arm failure must never break the poller
             await self.store.add_span_arm_event(
                 ts, circ["circuit_id"], circ["relay_state"], armed, True, "arm_failed", f"set_relay failed: {e}")
@@ -467,4 +468,6 @@ class SpanLocalPoller:
                     "SPAN local link down",
                     f"Instant circuit-power logging has been down "
                     f"{'>' + format(hrs, '.1f') + 'h' if self._last_ok else 'since startup'} "
-                    f"({detail}). Hourly-cloud energy is unaffected.", "high")
+                    f"({detail}). Hourly-cloud energy is unaffected. Until it is back A2W cannot switch the "
+                    f"Air-Water or backup breakers itself.", "high", tier="attention",
+                    action="Check the SPAN panel is online in the SPAN app. If it asks, re-pair it with the Pi (door proximity button).")

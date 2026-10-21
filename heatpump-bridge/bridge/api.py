@@ -339,7 +339,7 @@ async def set_write_enabled(request: Request, pump_id: str, body: WriteEnableReq
                 title=f"⚠ {poller.cfg.name}: remote control enabled",
                 message=f"Writes are now allowed ({principal.source}). Guardrails "
                         f"(clamp, rate limit, read-back verify) remain active.",
-                priority="high", tags="warning")
+                priority="high", tags="warning", tier="record")  # the owner's own action
     return {"id": pump_id, "write_enabled": body.enabled}
 
 

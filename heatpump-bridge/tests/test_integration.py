@@ -93,20 +93,59 @@ async def test_p17_is_info_and_does_not_set_fault_state(rig):
     assert poller.snapshot["state"] != "fault"  # anti-freeze never alarms the chip
 
 
-async def test_warning_fault_pushes_and_emails(rig, monkeypatch):
-    """WARNING faults (degraded-but-heating: failed sensors, E21 display comm loss) page
-    AND email — equipment fault codes are the 'requires intervention' class, the one thing
-    the owner always wants in the inbox. An E21 once sat unnoticed for two weeks. INFO
-    (P17) keeps its never-page guarantee above."""
+async def test_fault_onset_is_record_and_a_stuck_fault_pages_once(rig, monkeypatch):
+    """Owner alert policy (alert-policy.md): a fault ONSET is record-only — R02 on HP1 sets and
+    clears itself in ~3 min, and paging each onset buried an E21 that sat for 2 days. A fault
+    still active after FAULT_PAGE_AFTER_S pages (phone + email) once, and its clear closes the
+    loop on both. INFO (P17) keeps its never-page guarantee above."""
+    from bridge import poller as poller_mod
     pushes = _capture_pushes(monkeypatch)
     pump, poller, store = rig
     await pump.inject_fault("E21", on=True)
     await poller.poll_once()
     await asyncio.sleep(0.01)  # let the fire-and-forget notify tasks run
+    assert {p["ch"] for p in pushes} == {"ntfy"}, "onset: logged, nobody told"
 
-    assert {p["ch"] for p in pushes} == {"ntfy", "email"}
-    assert all("E21" in p["title"] for p in pushes)
-    assert [p["priority"] for p in pushes if p["ch"] == "ntfy"] == ["high"]
+    # 31 minutes later and still set: one page
+    for f in poller.active_faults.values():
+        f["since"] -= poller_mod.FAULT_PAGE_AFTER_S + 60
+    await poller.poll_once()
+    await poller.poll_once()
+    await asyncio.sleep(0.01)
+    paged = [p for p in pushes if p["ch"] in ("phone", "email")]
+    assert {p["ch"] for p in paged} == {"phone", "email"} and len(paged) == 2, "exactly one page"
+    assert all("E21" in p["title"] for p in paged)
+    ev = await store.get_events("p1", 1)
+    assert any(e["type"] == "alert" and e["code"] == "fault_sustained" for e in ev), "the page is recorded"
+
+    # a restart re-adopts the page instead of sending it again
+    restarted = poller_mod.PumpPoller(poller.cfg, poller.app_cfg, store, poller.guard)
+    await restarted.start()
+    restarted._task.cancel()
+    assert set(restarted._fault_paged) == set(poller._fault_paged)
+
+    pushes.clear()
+    await pump.inject_fault("E21", on=False)
+    await poller.poll_once()
+    await asyncio.sleep(0.01)
+    cleared = [p for p in pushes if p["ch"] in ("phone", "email")]
+    assert {p["ch"] for p in cleared} == {"phone", "email"} and all("cleared" in p["title"].lower() for p in cleared)
+
+
+async def test_a_fault_that_keeps_coming_back_emails_once(rig, monkeypatch):
+    """The same code FAULT_PATTERN_COUNT times in FAULT_PATTERN_DAYS: one email (attention), no phone."""
+    from bridge import poller as poller_mod
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    for _ in range(poller_mod.FAULT_PATTERN_COUNT + 1):
+        await pump.inject_fault("E21", on=True)
+        await poller.poll_once()
+        await pump.inject_fault("E21", on=False)
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert not [p for p in pushes if p["ch"] == "phone"]
+    mails = [p for p in pushes if p["ch"] == "email"]
+    assert len(mails) == 1 and "E21" in mails[0]["title"] and "needs a look" in mails[0]["title"]
 
 
 async def test_guarded_write_with_readback(rig):
@@ -234,11 +273,16 @@ def _capture_pushes(monkeypatch) -> list[dict]:
     async def fake_ntfy(cfg, *, title, message, priority="default", tags=""):
         pushes.append({"ch": "ntfy", "title": title, "priority": priority})
 
-    async def fake_email(cfg, *, subject, body):
+    async def fake_email(cfg, *, subject, body, html=None):
         pushes.append({"ch": "email", "title": subject})
+
+    async def fake_sixbb(cfg, *, title, message, priority, tag=""):
+        pushes.append({"ch": "phone", "title": title, "priority": priority})
+        return True
 
     monkeypatch.setattr(notify, "ntfy", fake_ntfy)
     monkeypatch.setattr(notify, "email", fake_email)
+    monkeypatch.setattr(notify, "sixbb_push", fake_sixbb)
     return pushes
 
 
@@ -338,7 +382,7 @@ async def test_prolonged_offline_emails_and_recovery_closes_by_email(rig, monkey
     await poller.poll_once()
     await asyncio.sleep(0.01)
     recovery = [p for p in pushes if "back online" in p["title"]]
-    assert {p["ch"] for p in recovery} == {"ntfy", "email"}
+    assert {p["ch"] for p in recovery} == {"ntfy"}, "an attention all-clear is record-only"
 
 
 async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):

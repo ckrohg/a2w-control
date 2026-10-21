@@ -187,7 +187,8 @@ class BreakerController:
             self._alert("URGENT: check the Air-Water breakers",
                         "A bridge restart found an interrupted power cycle but can't read its record "
                         f"({exc}). A2W keeps retrying; check that the Air-Water 1 and Air-Water 2 "
-                        "circuits are ON at the SPAN panel.", "urgent")
+                        "circuits are ON at the SPAN panel.", "urgent", tier="page",
+                        action="Check that the Air-Water 1 and Air-Water 2 breakers are ON at the SPAN panel.")
             self._record_task = asyncio.create_task(self._retry_record(), name="span-breaker-record")
             return
         await self._recover_from(rec)
@@ -222,7 +223,8 @@ class BreakerController:
             self._alert("URGENT: check the Air-Water breakers",
                         "A bridge restart interrupted a power cycle and its record is unreadable. "
                         "Check that the Air-Water 1 and Air-Water 2 circuits are ON at the SPAN panel.",
-                        "urgent")
+                        "urgent", tier="page",
+                        action="Check that the Air-Water 1 and Air-Water 2 breakers are ON at the SPAN panel.")
             return
         try:
             hold = max(float(rec.get("off_s") or 0), float(self.cfg.min_off_s))
@@ -410,7 +412,8 @@ class BreakerController:
         await self._audit("closed" if ok else "verify_mismatch", "info" if ok else "high", result)
         self._alert(f"A2W breaker: {name} {'ON' if ok else 'NOT confirmed ON'}",
                     f"{name}: switch ON ({source}) → {result['detail']}.",
-                    "default" if ok else "high")
+                    "default" if ok else "high", tier="record" if ok else "page",
+                    tag=f"a2w-pi-breaker-{name}", action=f"Check the '{name}' breaker is ON at the SPAN panel.")
         return result
 
     async def _do_open(self, spec, circ, source: str, guard=None) -> dict:
@@ -447,7 +450,7 @@ class BreakerController:
         await self._audit("opened" if ok else "verify_mismatch", "warning" if ok else "high", result)
         self._alert(f"A2W breaker: {name} {'OFF' if ok else 'switch-off NOT confirmed'}",
                     f"{name}: switch OFF ({source}) → {detail}. It stays off until someone turns it on.",
-                    "high")
+                    "high", tier="record")  # an OFF is always someone's (or the gate's) deliberate action
         return result
 
     async def _hold_until(self, deadline: float) -> bool:
@@ -564,7 +567,7 @@ class BreakerController:
                     self._alert(f"A2W breaker: {name} power-cycled" if ok
                                 else f"A2W breaker: {name} power cycle unconfirmed",
                                 f"{name}: power cycle ({source}) → {detail}.",
-                                "default" if ok else "high")
+                                "default" if ok else "high", tier="record")  # unconfirmed = never went OFF
                 else:
                     await self._audit("close_failed", "critical", result)
                     self._alert_close_failed(name, detail)
@@ -593,7 +596,7 @@ class BreakerController:
                 await self._audit("closed", "high", result)
                 self._alert(f"A2W breaker: {name} restored after restart",
                             f"{name}: a power cycle was interrupted by a bridge restart; the circuit "
-                            "is back ON (verified).", "high")
+                            "is back ON (verified).", "high", tier="record")
             else:
                 self._start_reclose(name, cid)
                 await self._audit("close_failed", "critical", result)
@@ -674,7 +677,8 @@ class BreakerController:
                                       f"back ON (verified) after {tries} background retries")
                 await self._audit("reclosed", "high", result)
                 self._alert(f"A2W breaker: {name} back ON",
-                            f"{name} is back ON (verified) after {tries} background retries.", "high")
+                            f"{name} is back ON (verified) after {tries} background retries.", "high",
+                            tier="page", resolved=True, tag=f"a2w-pi-breaker-{name}")
                 return
 
     def _finish_pending(self, name: str) -> None:
@@ -695,14 +699,16 @@ class BreakerController:
                     f"A2W switched '{name}' OFF for a power cycle and could NOT switch it back "
                     f"ON ({detail}). Turn the '{name}' breaker ON at the SPAN panel now "
                     f"(physical switch in the panel, or the SPAN app if it works). A2W keeps "
-                    f"retrying every {self.cfg.reclose_interval_s:g} s.", "urgent")
+                    f"retrying every {self.cfg.reclose_interval_s:g} s.", "urgent",
+                    tier="page", tag=f"a2w-pi-breaker-{name}",
+                    action=f"Turn the '{name}' breaker ON at the SPAN panel now (the physical switch, or the SPAN app).")
 
     async def _refused(self, name: str, action, source: str, reason: str) -> None:
         msg = f"{name}: {action} refused ({source}) — {reason}"
         log.warning("span breaker %s", msg)
         await self._audit_raw("refused", "warning", msg,
                               {"circuit": name, "action": action, "source": source, "reason": reason})
-        self._alert(f"A2W breaker: {action} refused", msg, "default")
+        self._alert(f"A2W breaker: {action} refused", msg, "default", tier="record")
 
     async def _audit(self, code: str, severity: str, result: dict) -> None:
         self.last = result
@@ -717,15 +723,17 @@ class BreakerController:
         except Exception as exc:  # noqa: BLE001
             log.warning("span breaker audit failed: %s", exc)
 
-    def _alert(self, title: str, message: str, priority: str) -> None:
-        """Push + email one short line (fire-and-forget; never blocks the relay path)."""
-        tags = "rotating_light" if priority == "urgent" else "electric_plug"
-        for coro in (notify.ntfy(self.notify_cfg, title=title, message=message,
-                                 priority=priority, tags=tags),
-                     notify.email(self.notify_cfg, subject=title, body=message)):
-            t = asyncio.create_task(coro)
-            self._bg.add(t)
-            t.add_done_callback(self._bg.discard)
+    def _alert(self, title: str, message: str, priority: str, *, tier: str, resolved: bool = False,
+               tag: str = "", action: str | None = None) -> None:
+        """One short line through the owner alert policy (fire-and-forget; never blocks the relay path).
+        Every action is already in the events table; only a circuit that may be left OFF is a page."""
+        notify.route(tier, resolved)  # validate synchronously: a bad tier must not die in a background task
+        tags = "rotating_light" if tier == "page" else "electric_plug"
+        t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
+                                             priority=priority, tags=tags, resolved=resolved, tag=tag,
+                                             action=action))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
 
     # --- crash-recovery record ------------------------------------------------
     def _write_cycle_file(self, rec: dict) -> bool:

@@ -18,6 +18,7 @@
  * correlates acks to pending commands by command_id (never resolving twice).
  */
 
+import { renderAlertEmail, type Tier as AlertTier } from "./alertemail";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import express, { type Request, type Response } from "express";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
@@ -112,8 +113,8 @@ function describeFetchError(err: unknown): string {
 
 // ── 6bb push (owner 2026-10-19) ─────────────────────────────────────────────────────────────────────────────
 // ntfy had no subscriber (the owner never installed it — 2026-08-23: "emails are plenty"), so no A2W push ever
-// reached a phone. High/urgent alerts and their all-clears now also go to the 6bb app's token-protected
-// /api/external/alert, which pushes to the owner's devices. Email is untouched. No-op unless both vars are set.
+// reached a phone. PAGE-tier alerts and their all-clears go to the 6bb app's token-protected /api/external/alert,
+// which pushes to the owner's devices. No-op unless both vars are set.
 const SIXBB_ALERT_URL = process.env.SIXBB_ALERT_URL ?? "";
 const SIXBB_ALERT_KEY = process.env.SIXBB_ALERT_KEY ?? "";
 async function sixbbPush(source: string, title: string, body: string, priority: string, tag: string): Promise<boolean> {
@@ -145,11 +146,6 @@ const pushTag = (t: string) => t.replace(/[^A-Za-z0-9 ]/g, "").trim().toLowerCas
  *  response is NOT retried (the server answered; hammering a 429 makes it worse). */
 async function notifyNtfy(title: string, message: string,
                           opts: { priority?: string; tags?: string } = {}): Promise<void> {
-  // high/urgent alerts and their all-clears (white_check_mark) also reach the owner's phone via 6bb; same tag so
-  // the all-clear replaces the alert on the device
-  if (opts.priority === "high" || opts.priority === "urgent" || opts.tags === "white_check_mark") {
-    void sixbbPush("a2w-hub", title, message, opts.priority ?? "default", "a2w-hub-pi-link");
-  }
   if (!NTFY_TOPIC) return;
   // HTTP headers are ByteStrings (Latin-1) — strip anything above U+00FF so a stray emoji in
   // a title can never throw and silently kill the alert. Emoji belong in `tags`, which ntfy
@@ -174,43 +170,28 @@ async function notifyNtfy(title: string, message: string,
   }
 }
 
-/** Fire-and-forget email via Resend. No-op when RESEND_API_KEY/RESEND_TO unset; never throws.
- * Subject/body are JSON (UTF-8), so emoji are fine (unlike the ntfy header title). */
 /**
- * Build the EMAIL subject. Deliberately not the ntfy title — ntfy titles are HTTP headers
- * and must stay ASCII.
- *
- * The 2026-08-20 bridge-offline alert was delivered and never opened. Not a plumbing
- * failure: it read as "A2W: heat-pump bridge offline" in an inbox that also receives
- * twice-daily job alerts from `tenet-job <onboarding@resend.dev>` — the SAME sender
- * address, because both projects use Resend's shared onboarding domain. Identical sender
- * plus an unremarkable subject made a real emergency look like routine mail.
- *
- * Severity leads instead, in the one field with room for it. Three tiers, because the owner
- * reads email only (2026-08-23: "I dont want to do ntfy... emails are plenty") and every
- * tier has to survive on its subject line alone:
- *
- *   🚨 CRITICAL  something needs attention now
- *   ✅ RESOLVED  the all-clear — the owner asked to be told a problem is OVER, not just
- *                that it started, so an alert is never left hanging
- *      plain     informational
- *
- * Only the first tier gets the siren; if everything shouts, nothing does.
+ * Owner alert policy (knowledge/reference/alert-policy.md, 2026-10-20) — the same tiers as planner/src/alertpolicy.ts:
+ *   page       6bb phone push + email   the house is at risk, or a human must act soon
+ *   attention  email only               worth a look this week
+ *   record     ntfy log only            everything else
+ * An all-clear carries the tier of the alert it resolves; only a page gets one. Subjects lead with the tier, because
+ * the 2026-08-20 bridge-offline email read like the job-alert mail from the same Resend sender and was never opened.
  */
-function alertSubject(title: string, tier: "critical" | "resolved" | "info"): string {
+type Tier = AlertTier;
+
+function tierSubject(title: string, tier: Tier, resolved: boolean): string {
   const t = title.trim();
-  const core = () => t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\s]+/, "").trim() || t;
-  if (tier === "critical") return `🚨 A2W CRITICAL — ${core()}`;
-  if (tier === "resolved") return `✅ A2W RESOLVED — ${core()}`;
-  // Informational: only label it if it isn't already self-labelled, so the weekly digest
-  // doesn't become "A2W — A2W weekly: …".
+  const core = t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\uFE0F\s]+/u, "").trim() || t;
+  if (resolved) return `✅ A2W RESOLVED — ${core}`;
+  if (tier === "page") return `🚨 A2W — ${core}`;
+  if (tier === "attention") return `A2W needs a look — ${core}`;
   return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
 }
 
-async function notifyEmail(subject: string, body: string,
-                           tier: "critical" | "resolved" | "info" = "info"): Promise<void> {
+/** Fire-and-forget email via Resend (text + the alertemail.ts HTML). No-op when RESEND_API_KEY/RESEND_TO unset; never throws. */
+async function notifyEmail(subject: string, body: string, html?: string): Promise<void> {
   if (!RESEND_API_KEY || !RESEND_TO) return;
-  subject = alertSubject(subject, tier);
   try {
     await fetch(RESEND_API_URL, {
       method: "POST",
@@ -218,11 +199,26 @@ async function notifyEmail(subject: string, body: string,
       // (the bridge's urllib failed silently for weeks on this — 2026-08-06 lesson).
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json",
                  "User-Agent": "a2w-hub/1.0" },
-      body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body }),
+      body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO], subject, text: body, ...(html ? { html } : {}) }),
     });
   } catch (err) {
     console.warn(`[hub] resend email failed: ${(err as Error).message}`);
   }
+}
+
+/** Every hub notification goes through here: ntfy always (the log), then the owner channels its tier earns. */
+function alert(tier: Tier, title: string, body: string,
+               opts: { resolved?: boolean; tag: string; priority?: string; ntfyTags?: string; action?: string;
+                       facts?: [string, string][] }): void {
+  const resolved = !!opts.resolved;
+  void notifyNtfy(title, body, { priority: opts.priority ?? (resolved ? "default" : "high"), tags: opts.ntfyTags });
+  const push = tier === "page";
+  const email = resolved ? tier === "page" : tier !== "record";
+  console.log(`[hub] alert ${tier}${resolved ? " resolved" : ""}: ${title} (push ${push}, email ${email})`);
+  // the tag is per incident, so the all-clear replaces its alert on the phone
+  if (push) void sixbbPush("a2w-hub", title, body, resolved ? "default" : "high", opts.tag);
+  if (email) void notifyEmail(tierSubject(title, tier, resolved), body,
+                              renderAlertEmail({ tier, resolved, title, body, action: opts.action, facts: opts.facts, source: "A2W hub" }));
 }
 
 // ---------------------------------------------------------------------------
@@ -594,8 +590,8 @@ const server = app.listen(PORT, () => {
   console.log(`[hub] HTTP + WS listening on :${PORT}`);
   // ntfy channel self-test on every boot (kanban #66: the dead-man's ntfy leg failed in
   // the 2026-08-06 drill with its cause swallowed; the email leg delivered). "min"
-  // priority = silent app-list breadcrumb, per the owner's noise policy — its presence
-  // after each deploy is the channel's health record; a failure logs its cause above.
+  // priority = silent app-list breadcrumb, record tier — it never reaches the owner's phone
+  // or inbox; its presence after each deploy is the channel's health record.
   void notifyNtfy("A2W hub online", `hub started (node ${process.version}) — ntfy self-test`,
                   { priority: "min", tags: "white_check_mark" });
   // Comparative boot probe (#66): ntfy.sh unreachable while api.resend.com works from the
@@ -613,15 +609,14 @@ const server = app.listen(PORT, () => {
   }
 });
 
-if (!NTFY_TOPIC) {
-  console.warn("[hub] NTFY_TOPIC not set — Pi-offline dead-man alerts are disabled.");
-}
-
-// Dead-man watchdog: alert once when the Pi goes silent past the grace window, and once when
+// Dead-man watchdog: record once when the Pi goes silent past the grace window, and once when
 // it returns. Silence is measured from the last frame we heard (lastPiSeenAt), so a brief
 // reconnect (WiFi blip / redeploy) inside the window never fires a false alarm.
+// RECORD tier (alert-policy.md): the planner owns the one "Pi unreachable" page, at 2 h when it is freezing out and
+// 12 h otherwise, because the HBX keeps heating without the Pi. If the planner is down too, its own dead-man below
+// pages. This edge stays as the hub's log of every dropout (#166 dropouts.ts counts them for drift-check).
 setInterval(() => {
-  if (!everSeenPi || !NTFY_TOPIC) return;
+  if (!everSeenPi) return;
   const silentMs = Date.now() - lastPiSeenAt;
   const silent = silentMs > PI_SILENCE_ALERT_MS;
   if (silent && !piSilenceAlerted) {
@@ -631,14 +626,11 @@ setInterval(() => {
     const title = "A2W: heat-pump bridge offline";
     const body = `The Pi hasn't checked in for ~${mins} min (power / WiFi / internet / bridge down). ` +
       "Heating still runs on the wall controllers + HBX; remote control is unavailable until it returns.";
-    void notifyNtfy(title, body, { priority: "high", tags: "warning" });
-    void notifyEmail(title, body, "critical");   // dead-man is rare + important → email too
+    alert("record", title, body, { tag: "a2w-hub-pi-link", ntfyTags: "warning" });
   } else if (!silent && piSilenceAlerted) {
     piSilenceAlerted = false;
-    const title = "A2W: heat-pump bridge back online";
-    const body = "The Pi is checking in with the hub again.";
-    void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
-    void notifyEmail(title, body, "resolved");   // closure for the offline email above
+    alert("record", "A2W: heat-pump bridge back online", "The Pi is checking in with the hub again.",
+          { resolved: true, tag: "a2w-hub-pi-link", ntfyTags: "white_check_mark" });
   }
 }, WATCHDOG_INTERVAL_MS);
 
@@ -659,7 +651,9 @@ setInterval(() => {
 // still not doing its job, so a stale lastPollAt counts as down.
 const PLANNER_HEALTH_URL =
   process.env.PLANNER_HEALTH_URL ?? "https://a2w-planner-production.up.railway.app/health";
-const PLANNER_ALERT_AFTER_MS = Number(process.env.PLANNER_ALERT_AFTER_MS ?? 900_000); // 15 min
+// 2 h (was 15 min): with the planner down the HBX and the wall controllers keep heating; what stops is optimization and
+// monitoring. A redeploy or a short crash loop recovers well inside this (alert-policy.md).
+const PLANNER_ALERT_AFTER_MS = Number(process.env.PLANNER_ALERT_AFTER_MS ?? 7_200_000);
 const PLANNER_POLL_STALE_MS = Number(process.env.PLANNER_POLL_STALE_MS ?? 1_200_000); // 20 min = 4 missed polls
 const PLANNER_WATCHDOG_INTERVAL_MS = Number(process.env.PLANNER_WATCHDOG_INTERVAL_MS ?? 60_000);
 
@@ -690,7 +684,8 @@ if (!PLANNER_HEALTH_URL) {
 }
 
 setInterval(() => {
-  if (!PLANNER_HEALTH_URL || !NTFY_TOPIC) return;
+  // NOT gated on NTFY_TOPIC: the owner's channels are 6bb + email, and a dead-man must not go quiet with the log
+  if (!PLANNER_HEALTH_URL) return;
   void checkPlannerHealth().then(({ ok, detail }) => {
     if (ok) lastPlannerOkAt = Date.now();
     else lastPlannerDetail = detail;
@@ -708,14 +703,13 @@ setInterval(() => {
         "While it is down there is no autopilot, no Phase B, no hygiene soak scheduling, " +
         "and no SPAN backup-element alarm. Heating still runs on the wall controllers + HBX. " +
         "Check: https://a2w-planner-production.up.railway.app/health";
-      void notifyNtfy(title, body, { priority: "high", tags: "rotating_light" });
-      void notifyEmail(title, body, "critical");
+      alert("page", title, body, { tag: "a2w-hub-planner-down", ntfyTags: "rotating_light",
+        action: "Open the a2w-planner service in Railway: restart it if it has crashed, and check its database (Neon) is up.",
+        facts: [["Down for", `${mins} min`], ["Last error", lastPlannerDetail || "unknown"]] });
     } else if (!down && plannerAlerted) {
       plannerAlerted = false;
-      const title = "A2W: planner back online";
-      const body = "The planner is healthy and polling again.";
-      void notifyNtfy(title, body, { priority: "default", tags: "white_check_mark" });
-      void notifyEmail(title, body, "resolved");
+      alert("page", "A2W: planner back online", "The planner is healthy and polling again.",
+            { resolved: true, tag: "a2w-hub-planner-down", ntfyTags: "white_check_mark" });
     }
   });
 }, PLANNER_WATCHDOG_INTERVAL_MS);

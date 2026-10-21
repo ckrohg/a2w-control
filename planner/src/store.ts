@@ -3,13 +3,14 @@
  * EXISTS) in the shared mirror DB: slx_readings (narrow 5-min HBX telemetry) and
  * hbx_config_versions (append-only config history; row 1 = first observation, every
  * later row = detected drift with the changed fields), plus storm_events (storm-mode
- * episodes with trigger/ceiling, §6.11) and zone_floor_snapshots (hourly winter-solver
- * zone service floors, §6.9). Planner tables are tiny and exempt from the mirror's
- * 90-day trim (plan §4.1).
+ * episodes with trigger/ceiling, §6.11), zone_floor_snapshots (hourly winter-solver
+ * zone service floors, §6.9) and zone_call_samples (5-min calling set, 60-day self-prune).
+ * Planner tables are tiny and exempt from the mirror's 90-day trim (plan §4.1).
  */
 
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
+import type { ZoneCallSample } from "./demand";
 import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT_F } from "./stale-target";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
@@ -172,6 +173,29 @@ export class Store {
         notified_at timestamptz
       );
       ALTER TABLE alert_episodes ADD COLUMN IF NOT EXISTS uid text UNIQUE;
+      -- Owner alert policy (alertpolicy.ts, 2026-10-20). notify_latches: one row per OPEN keyed alert that reached the
+      -- owner, so a redeploy never re-pages it and a still-true condition re-sends at most daily. notifications: every
+      -- notification decision (record tier included), the event history the dashboard and Monday digest read.
+      CREATE TABLE IF NOT EXISTS notify_latches (
+        key         text PRIMARY KEY,
+        tier        text NOT NULL,
+        opened_at   timestamptz NOT NULL DEFAULT now(),
+        notified_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS notifications (
+        id         serial PRIMARY KEY,
+        ts         timestamptz NOT NULL DEFAULT now(),
+        source     text NOT NULL,
+        tier       text NOT NULL,
+        resolved   boolean NOT NULL DEFAULT false,
+        key        text,
+        title      text NOT NULL,
+        body       text,
+        pushed     boolean NOT NULL DEFAULT false,
+        emailed    boolean NOT NULL DEFAULT false,
+        suppressed text
+      );
+      CREATE INDEX IF NOT EXISTS notifications_ts ON notifications (ts);
       -- pump health (pumphealth.ts): one row per pump per America/New_York day — the SPAN-metered rollup and the 5 °C
       -- outdoor-bin sums the drift trend pools. Shadow episodes of the window checks live in alert_episodes
       -- (kind shadow_pump_<check>, never paged); the daily digest claims its day here before it sends.
@@ -283,6 +307,17 @@ export class Store {
         binding_awt_f  real,
         tank_target_f  real,
         source         text
+      );
+      -- One compact row per DemandFeed refresh (every poll, ~5 min): which hydronic zones were
+      -- calling, so a later analysis can say whether a zone was drawing heat DURING a 5–20 min
+      -- charge — zone_floor_snapshots is hourly and carries the whole per-zone jsonb, which is
+      -- why it is not simply written more often. calling_zone_ids NULL = call feed unhealthy.
+      -- Observation only; nothing in the control path reads it. Pruned at 60 days.
+      CREATE TABLE IF NOT EXISTS zone_call_samples (
+        ts               timestamptz PRIMARY KEY,
+        calling_zone_ids text[],
+        n_zones          integer NOT NULL,
+        source           text NOT NULL
       );
       -- One row per live planner process (hostname:pid), heartbeated every poll. The
       -- single-writer guard (README §Single-writer invariant, #36) uses it to detect a SECOND
@@ -939,6 +974,36 @@ export class Store {
     return Number(r.rows[0].id);
   }
 
+  async getNotifyLatch(key: string): Promise<{ tier: string; notifiedAt: Date } | null> {
+    const r = await this.locked.query(`SELECT tier, notified_at FROM notify_latches WHERE key = $1`, [key]);
+    return r.rows[0] ? { tier: String(r.rows[0].tier), notifiedAt: new Date(r.rows[0].notified_at) } : null;
+  }
+
+  async upsertNotifyLatch(key: string, tier: string): Promise<void> {
+    await this.locked.query(
+      `INSERT INTO notify_latches (key, tier) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET tier = EXCLUDED.tier, notified_at = now()`, [key, tier]);
+  }
+
+  async deleteNotifyLatch(key: string): Promise<{ tier: string } | null> {
+    const r = await this.locked.query(`DELETE FROM notify_latches WHERE key = $1 RETURNING tier`, [key]);
+    return r.rows[0] ? { tier: String(r.rows[0].tier) } : null;
+  }
+
+  async logNotification(n: { source: string; tier: string; resolved: boolean; key: string | null; title: string; body: string;
+                             pushed: boolean; emailed: boolean; suppressed: string | null }): Promise<void> {
+    await this.locked.query(
+      `INSERT INTO notifications (source, tier, resolved, key, title, body, pushed, emailed, suppressed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [n.source, n.tier, n.resolved, n.key, n.title, n.body, n.pushed, n.emailed, n.suppressed]);
+  }
+
+  /** Pages sent in the last 7 days — the page budget survives a restart. */
+  async pagesLast7d(): Promise<number> {
+    const r = await this.locked.query(`SELECT count(*)::int AS n FROM notifications WHERE tier = 'page' AND NOT resolved AND pushed AND ts > now() - interval '7 days'`);
+    return Number(r.rows[0]?.n ?? 0);
+  }
+
   /** Close episodes by their client uid — for an insert whose outcome was never learned. */
   async closeAlertEpisodeUids(uids: string[]): Promise<void> {
     if (!uids.length) return;
@@ -1096,6 +1161,19 @@ export class Store {
       bindingAwtF: r.binding_awt_f == null ? null : Number(r.binding_awt_f),
       tankTargetF: r.tank_target_f == null ? null : Number(r.tank_target_f),
     };
+  }
+
+  /**
+   * One zone_call_samples row per DemandFeed refresh. Same posture as insertPiClockObservation: diagnostic,
+   * on the bounded pool, fire-and-forget at the call site, so a slow database can never hold up the floor
+   * re-check that triggers it. `prune` drops rows older than 60 days (the caller passes it hourly).
+   */
+  async insertZoneCallSample(ts: Date, s: ZoneCallSample, prune = false): Promise<void> {
+    await this.locked.query(
+      `INSERT INTO zone_call_samples (ts, calling_zone_ids, n_zones, source) VALUES ($1,$2,$3,$4) ON CONFLICT (ts) DO NOTHING`,
+      [ts, s.callingZoneIds, s.nZones, s.source],
+    );
+    if (prune) await this.locked.query(`DELETE FROM zone_call_samples WHERE ts < now() - interval '60 days'`);
   }
 
   /** Audit every write ATTEMPT — accepted or rejected — like the bridge does for reg 2003. */

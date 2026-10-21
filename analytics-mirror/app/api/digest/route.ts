@@ -12,6 +12,7 @@ import { NextResponse } from "next/server";
 import { sql } from "@/lib/sql";
 import { isAuthed } from "@/lib/auth";
 import { normalizePi, normalizeHub, esc } from "@/lib/pi-tile";
+import { summarizeAlerts, alertsHeadline, type AlertRow } from "@/lib/alerts-digest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -183,6 +184,21 @@ async function buildDigest() {
       GROUP BY pump_id) r USING (pump_id)
     ORDER BY pump_id`).rows;
 
+  // ---- alerts & events (owner alert policy 2026-10-20): what reached the owner this week, and what was only
+  // recorded. Planner decisions are in `notifications`; the bridge's sustained-fault / repeat-fault alerts are
+  // pump_events of type 'alert'. Both tables may predate the policy deploy — then the block is omitted.
+  let alertRows: AlertRow[] | null = null;
+  try {
+    const planner = (await sql<{ tier: string; resolved: boolean; title: string; ts: number }>`
+      SELECT tier, resolved, title, extract(epoch FROM ts)::float8 AS ts FROM notifications
+      WHERE ts >= now() - interval '7 days' AND source = 'planner'`).rows;
+    const bridge = (await sql<{ tier: string; title: string; ts: number }>`
+      SELECT severity AS tier, pump_id || ' ' || coalesce(message, code) AS title, ts::float8 AS ts FROM pump_events
+      WHERE type = 'alert' AND ts >= extract(epoch FROM now() - interval '7 days')`).rows;
+    alertRows = [...planner.map((r) => ({ ...r, ts: Number(r.ts) })),
+                 ...bridge.map((r) => ({ tier: r.tier, resolved: false, title: r.title, ts: Number(r.ts) }))];
+  } catch { /* notifications table not there yet — omit the block */ }
+
   // ---- demand floor: the #89 winter evidence, which until now was log-only ---------
   // The MODEL DIVERGENCE monitor writes a console.warn in the planner and nothing else,
   // and the owner is email-only — so the evidence meant to settle the emitter-sizing
@@ -339,6 +355,21 @@ async function buildDigest() {
     }
   }
 
+  // ---- alerts & events ---------------------------------------------------------------
+  let alertsBlock = "";
+  if (alertRows) {
+    const a = summarizeAlerts(alertRows);
+    const reached = a.reached.slice(0, 8).map((r) => `<li style="margin:4px 0">${r.tier === "page" ? "🚨" : "✉️"}
+      ${esc(r.title)} <span style="color:${MUTED}">· ${day(r.ts)}</span></li>`).join("");
+    const patterns = a.patterns.slice(0, 6).map((p) => `<li style="margin:4px 0">${esc(p.title)}${p.n > 1 ? ` <b>×${p.n}</b>` : ""}</li>`).join("");
+    alertsBlock = `
+    <h3 style="margin:22px 0 6px;color:${INK}">Alerts &amp; events</h3>
+    <div style="font-size:14px;line-height:1.45;margin:0 0 6px">${alertsHeadline(a)}</div>
+    ${reached ? `<ul style="padding-left:18px;margin:0 0 8px;font-size:14px;line-height:1.4">${reached}</ul>` : ""}
+    ${patterns ? `<div style="font-size:13px;color:${INK2};margin:6px 0 2px">Recorded without bothering you:</div>
+    <ul style="padding-left:18px;margin:0;font-size:13px;line-height:1.4;color:${INK2}">${patterns}</ul>` : ""}`;
+  }
+
   // ---- notes -----------------------------------------------------------------------
   const notes: string[] = [];
   notes.push(backupH > 0
@@ -447,6 +478,7 @@ async function buildDigest() {
     ${faultLines.length
       ? `<ul style="padding-left:18px;margin:0;font-size:14px;line-height:1.4">${faultLines.join("")}</ul>`
       : `<div style="font-size:14px;color:${GOOD}">✓ No faults this week.</div>`}
+    ${alertsBlock}
     ${floorBlock}
     <h3 style="margin:20px 0 6px;color:${INK}">Notes</h3>
     <ul style="padding-left:18px;margin:0;font-size:14px;line-height:1.5">
