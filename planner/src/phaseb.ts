@@ -21,6 +21,17 @@
  * curve, stamped curve 120/118) both pumps were sent 60 °C while the plant sat at 120 °F — 13 of the 20 such
  * hours Oct 15–19 (identification-plan-vs-command-2026-10-20.md §5). A COP cost, never a safety issue; the
  * change keeps every lead at or above what the auto-pilot writes (planLeadF).
+ *
+ * The operative term (2026-10-20, after #215): SensorLinx's report (temp1.target) is a frozen snapshot while the
+ * device is idle — after every soak / bank LOWERING it keeps reading the old, higher target for 7–16 h while the
+ * device sits on the new curve without calling (stale-slx-target-2026-10-19.md). When stale-target.ts PROVES the
+ * report frozen (report > command + 3 °F; three consecutive idle polls with demand present, the tank below the
+ * report's call threshold and not below the command's own) the operative term is the curve in force's output at the
+ * live outdoor — the identification driver's base since #215 (operativeLeadF). Anything short of proof and the report
+ * leads exactly as before. On the Oct 15–19 restore the frozen report sat ≥ 3 °F above the curve on 39 of 78 floor
+ * hours and set 62–63 °C on half of them; the proof clears 19 of the 39 (the rest: the tank still above the old
+ * threshold, or a call in progress) and 6 of the 10 report-dominated winter-guard hours. The device-curve term and
+ * the plan term stay in the max, so the lead never drops below what the device is actually driving to.
  */
 
 import { HubClient } from "./hub";
@@ -29,6 +40,7 @@ import { Store } from "./store";
 import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
 import { commandForBlock } from "./autopilot";
+import { staleReportedTarget, ADOPTION_TOLERANCE_F, type RecentPoll, type StaleReportVerdict } from "./stale-target";
 
 const SLX_FRESH_MS = 15 * 60 * 1000;
 const LEASE_MINUTES = 90;
@@ -81,6 +93,61 @@ const num = (v: unknown): number | null => {
   const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
   return Number.isFinite(n) ? n : null;
 };
+
+/** The operative term of the lead — operativeLeadF. Surfaced per cycle in /health.phase_b.lead and /health.i1. */
+export interface OperativeLead {
+  /** the term in the max: the report, or the curve in force's output when the report is provably frozen */
+  f: number;
+  basis: "report" | "stale→curve";
+  /** the raw SensorLinx report (temp1.target) — what led before, and still leads unless proven frozen */
+  reportedF: number;
+  /** the curve in force's midpoint — writes.ts status().commanded_target_f; null without a usable config */
+  commandedF: number | null;
+  /** the curve in force's output at the live outdoor, 0.1 °F — status().curve_in_force.output_at_live_outdoor_f */
+  curveNowF: number | null;
+  verdict: StaleReportVerdict;
+}
+
+/** The curve in force's midpoint — the command writes.ts status() reports as commanded_target_f; null without one. */
+export function commandedMidpointF(cfg: Record<string, any> | null): number | null {
+  const dbt = num(cfg?.dbt), mbt = num(cfg?.mbt);
+  return dbt != null && mbt != null ? Math.round((dbt + mbt) / 2) : null;
+}
+
+/**
+ * Can the stale-report proof apply at all — does the report sit above the command by more than the adoption
+ * tolerance (a lowering the report has not caught up with)? Callers read the last hour of polls only then; otherwise
+ * the report leads and no series query is made (the common case, and every raise).
+ */
+export function staleProofApplicable(reportedF: number, cfg: Record<string, any> | null): boolean {
+  const c = commandedMidpointF(cfg);
+  return c != null && reportedF - c > ADOPTION_TOLERANCE_F;
+}
+
+/**
+ * Pure: the operative term. The same inputs the identification driver hands stale-target.ts (identify.ts
+ * staleReportVerdict): the report, the curve in force's midpoint as the command and its output at the live outdoor
+ * (0.1 °F, as writer.status() reports it), the device's hot-tank differential, the last hour of polls. Proven stale →
+ * the curve in force's output leads (its midpoint when there is no outdoor to evaluate at). Anything less than proof —
+ * not applicable (within tolerance, or a report BELOW the command, for which no idle proof exists), or unproven for
+ * any reason — and the report leads, byte-identical to before. A report below the curve is covered by the
+ * device-curve term of the max, not here.
+ */
+export function operativeLeadF(a: { reportedF: number; cfg: Record<string, any> | null; outdoorNowF: number | null; recent: RecentPoll[]; nowMs: number }): OperativeLead {
+  const commandedF = commandedMidpointF(a.cfg);
+  const exact = curveLeadF(a.cfg, a.outdoorNowF, null);
+  const curveNowF = exact == null ? null : Math.round(exact * 10) / 10;
+  const verdict = staleReportedTarget({ reportedF: a.reportedF, commandedF, curveOutputF: curveNowF, htDifF: num(a.cfg?.htDif), recent: a.recent, nowMs: a.nowMs });
+  const stale = verdict.kind === "stale";
+  return { f: stale ? verdict.operativeF : a.reportedF, basis: stale ? "stale→curve" : "report", reportedF: a.reportedF, commandedF, curveNowF, verdict };
+}
+
+/** One line for /health and the I1 alert: what the proof found, or what it lacked. null when it did not apply. */
+export function staleProofNote(v: StaleReportVerdict): string | null {
+  if (v.kind === "stale") return `tank ${v.tankF.toFixed(1)} °F below the report's call threshold (margin ${v.marginF.toFixed(1)} °F) for ${v.polls} polls with demand and no call — the device is on the curve in force`;
+  if (v.kind === "unproven") return v.why;
+  return null;
+}
 
 /**
  * What the auto-pilot drives the plant to for `block`, as a LEAD: commandForBlock's number (#220 — the stamped
@@ -213,9 +280,27 @@ export class PhaseB {
     }
   }
 
+  /** The device's config in force (store.latestConfig). null on any read failure: no device-curve lead, no proof. */
+  private async configInForce(): Promise<Record<string, any> | null> {
+    try { return await this.store.latestConfig(); } catch { return null; }
+  }
+
+  /** The operative term — operativeLeadF on this cycle's report, the config in force and (only when the report sits
+   *  above the command by more than the adoption tolerance — the post-soak / post-bank lowering) the last hour of
+   *  polls. A failed series read leaves the proof unproven — the report leads — never an exception out of tracking. */
+  private async operativeLead(reportedF: number, cfg: Record<string, any> | null, outdoorNowF: number | null): Promise<OperativeLead> {
+    let recent: RecentPoll[] = [];
+    if (staleProofApplicable(reportedF, cfg)) { try { recent = await this.store.getRecentSeries(1); } catch { recent = []; } }
+    return operativeLeadF({ reportedF, cfg, outdoorNowF, recent, nowMs: Date.now() });
+  }
+  /** the operative basis of the previous cycle, so a flip is logged once, not every 5 min */
+  private lastBasis: OperativeLead["basis"] | null = null;
+
   /** The terms of the last cycle's lead, for /health.phase_b.lead: the setpoints track the max of them (+ margin). */
   public lastLead: {
-    at: string; effective_f: number; operative_f: number;
+    at: string; effective_f: number;
+    /** the operative term in the max — the report, or the curve in force's output when the report is provably frozen */
+    operative_f: number; operative_basis: OperativeLead["basis"]; reported_f: number; stale_proof: string | null;
     plan_f: number | null; plan_basis: PlanLead["basis"]; plan_declared_f: number | null; next_f: number | null;
     probe_f: number | null; device_curve_f: number | null;
   } | null = null;
@@ -230,17 +315,30 @@ export class PhaseB {
     // LEAD an upward move (the daily sanitize to 140°F): the pump can serve the new target the instant
     // the auto-pilot commands it, instead of a target-up / setpoint-lagging I1 deadlock. max() never
     // drops the setpoint below tracking the operative target, so I1 is only ever strengthened.
-    const opTarget = latest.targetF;
+    const reportedF = latest.targetF;
+    // the device's config in force, read once: the device-curve lead (#133 b) and the stale-report proof both read it
+    const cfg = await this.configInForce();
     const plan = await this.currentPlanLead(latest.outdoorF);
     // #133 (b): the DEVICE's commanded curve's output now and next hour — with a shaped curve the operative target
     // will climb on its own as it gets colder; the setpoints must already cover where it is going. Kept beside the
     // plan's command: the device may still be on an excursion's flat line, or on the as-found curve after a refused
     // set_curve, and the pumps must cover what the device is actually driving to.
-    const curveLead = this.shapedCurve ? curveLeadF(await this.store.latestConfig().catch(() => null), latest.outdoorF, plan.nextOutdoorF) : null;
-    const effectiveTarget = Math.max(opTarget, plan.nowF ?? -Infinity, plan.nextF ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
+    const curveLead = this.shapedCurve ? curveLeadF(cfg, latest.outdoorF, plan.nextOutdoorF) : null;
+    // The operative term: the report — or, when stale-target.ts PROVES it a frozen post-lowering snapshot, the curve
+    // in force's output, what the device is actually driving to (the identification driver's base since #215). The
+    // device-curve and plan terms stay in the max, so this only ever removes a lead to a target nobody holds.
+    const op = await this.operativeLead(reportedF, cfg, latest.outdoorF);
+    if (op.basis !== this.lastBasis && (op.basis === "stale→curve" || this.lastBasis != null)) {
+      console.log(op.basis === "stale→curve"
+        ? `[phase-b] SensorLinx reports ${reportedF} °F but the report is provably frozen (${staleProofNote(op.verdict)}) — leading the curve in force, ${op.f} °F`
+        : `[phase-b] leading the SensorLinx report again (${reportedF} °F${op.verdict.kind === "unproven" ? `; stale-report proof: ${op.verdict.why}` : ""})`);
+    }
+    this.lastBasis = op.basis;
+    const effectiveTarget = Math.max(op.f, plan.nowF ?? -Infinity, plan.nextF ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
     const r1 = (v: number | null): number | null => (v == null ? null : Math.round(v * 10) / 10);
     this.lastLead = {
-      at: new Date().toISOString(), effective_f: r1(effectiveTarget) as number, operative_f: opTarget,
+      at: new Date().toISOString(), effective_f: r1(effectiveTarget) as number,
+      operative_f: r1(op.f) as number, operative_basis: op.basis, reported_f: reportedF, stale_proof: staleProofNote(op.verdict),
       plan_f: r1(plan.nowF), plan_basis: plan.basis, plan_declared_f: plan.declaredF, next_f: r1(plan.nextF),
       probe_f: this.probeTargetF, device_curve_f: r1(curveLead),
     };

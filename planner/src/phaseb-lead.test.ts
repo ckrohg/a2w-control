@@ -31,6 +31,7 @@ function harness(opts: { plan: any[]; targetF?: number; outdoorF?: number | null
     recentPlans: async () => [{ computedAt: new Date(), plan: opts.plan }],
     insertPhaseBLog: async () => {},
     latestConfig: async () => opts.deviceCurve === undefined ? CURVE : opts.deviceCurve,
+    getRecentSeries: async () => [], // no poll series here: the stale-report proof stays unproven (phaseb-stale.test.ts has it)
   } as any;
   const hub = { sendSetpoint: async (pump: string, c: number) => { sends.push({ pump, c }); return { ok: true, detail: "" }; }, getState: async () => ({ pumps: [] }) } as any;
   const pb = new PhaseB(store, hub, ["pump1", "pump2"], false, async () => {}, opts.shaped ?? true, async () => true);
@@ -142,14 +143,15 @@ function harness(opts: { plan: any[]; targetF?: number; outdoorF?: number | null
     await later.pb.runOnce();
     assert.deepEqual(later.sends.map((x) => x.c), [63, 63], "…and in force it is led to 140 + 5 at once");
   }
-  // 10. the other terms of the max are untouched: a stale-high report (139.9 after a soak) still leads 63 °C — the
-  //     #215 class in Phase B, a follow-up, not this change; an identification probe at 130 leads 58 °C; the device's
-  //     as-found curve (a refused set_curve) still leads its own output
+  // 10. the other terms of the max are untouched: a high report (139.9 after a soak) that the stale-report proof
+  //     cannot clear (no poll series here) still leads 63 °C — the proven case is phaseb-stale.test.ts; an
+  //     identification probe at 130 leads 58 °C; the device's as-found curve (a refused set_curve) still leads its own output
   {
     const stale = harness({ plan: [guard], targetF: 139.9 });
     await stale.pb.runOnce();
     assert.deepEqual(stale.sends.map((x) => x.c), [63, 63]);
     assert.equal(stale.pb.lastLead?.operative_f, 139.9); assert.equal(stale.pb.lastLead?.effective_f, 139.9);
+    assert.equal(stale.pb.lastLead?.operative_basis, "report"); assert.equal(stale.pb.lastLead?.reported_f, 139.9);
     const probe = harness({ plan: [guard], probeF: 130 });
     await probe.pb.runOnce();
     assert.deepEqual(probe.sends.map((x) => x.c), [58, 58]);

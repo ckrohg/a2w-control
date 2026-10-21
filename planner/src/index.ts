@@ -53,7 +53,7 @@ import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
 } from "./pumphealth";
-import { PhaseB } from "./phaseb";
+import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
 import { pushTankUa } from "./tank-ua-push";
 import { pushTankReheat } from "./tank-reheat-push";
@@ -351,6 +351,8 @@ let consecutiveFailures = 0;
 let offlineAlerted = false;
 let i1Violated = false;
 let i1Detail: string | null = null;
+/** what the last I1 check compared the setpoints against (/health.i1.operative): the report, or the curve in force when stale */
+let i1Operative: { f: number; basis: OperativeLead["basis"]; reported_f: number; note: string | null } | null = null;
 
 // §6.11 storm machine state: trigger caches refreshed by the 30-min poll, the state
 // itself stepped once per 5-min loop tick (and immediately on a manual arm/disarm).
@@ -552,12 +554,29 @@ function toReading(dev: Record<string, any>): SlxReading {
 }
 
 /**
+ * The target the pumps must cover right now — phaseb.ts operativeLeadF on this poll's report and the config the
+ * drift check just recorded: the report, or the curve in force's output when stale-target.ts proves the report a
+ * frozen post-lowering snapshot. The last hour of polls is read only when the report sits above the command by
+ * more than the adoption tolerance; a failed read leaves the proof unproven and the report in charge.
+ */
+async function operativeTarget(reading: SlxReading, cfg: Record<string, unknown> | null): Promise<OperativeLead | null> {
+  if (reading.tankTargetF == null) return null;
+  const recent = staleProofApplicable(reading.tankTargetF, cfg) ? await store.getRecentSeries(1).catch(() => []) : [];
+  return operativeLeadF({ reportedF: reading.tankTargetF, cfg, outdoorNowF: reading.outdoorF, recent, nowMs: Date.now() });
+}
+
+/**
  * I1 (plan §3): every online pump's setpoint must sit above tank target + margin, or the
  * tank sensor can't terminate calls (the calls-forever deadlock → bkLag → 16.5 kW element).
  * Edge-triggered: one high-priority alert on entry, one notice on clear.
+ * The target is the OPERATIVE one (operativeTarget) — the same term Phase B leads. Checked against the raw report,
+ * a frozen 139.9 °F would be a false I1 for the 7–16 h stretch after every soak once the setpoints (rightly) cover
+ * the 120 °F curve instead, and isI1Violated() would idle the identification driver on it.
  */
-async function checkI1(tankTargetF: number | null): Promise<void> {
-  if (!hub || tankTargetF == null) return;
+async function checkI1(op: OperativeLead | null): Promise<void> {
+  i1Operative = op ? { f: Math.round(op.f * 10) / 10, basis: op.basis, reported_f: op.reportedF, note: staleProofNote(op.verdict) } : null;
+  if (!hub || op == null) return;
+  const tankTargetF = op.f;
   let state;
   try {
     state = await hub.getState();
@@ -599,7 +618,7 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
     await store.openI1Episode(i1Detail).catch(() => {});
     await ntfy(
       "I1 violation: HP setpoint below HBX target + margin",
-      `Tank target ${tankTargetF.toFixed(1)}°F.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
+      `Tank target ${tankTargetF.toFixed(1)}°F${op.basis === "stale→curve" ? ` (the curve in force — SensorLinx still reports ${op.reportedF.toFixed(1)}°F, a frozen post-lowering snapshot)` : ""}.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
       "high",
       // ~0.4/day and usually self-clearing within a cycle — the /optimize banner and the
       // i1_episodes history carry it. Record only (alert-policy.md).
@@ -2249,7 +2268,8 @@ async function pollOnce(): Promise<void> {
     lastDeviceCurve = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number")
       ? { dot: c.dot as number, wwsd: c.wwsd as number, dbt: c.dbt as number, mbt: c.mbt as number } : null;
   }
-  await checkI1(reading.tankTargetF);
+  // I1 against the OPERATIVE target — the same term Phase B leads this poll (checkI1 / phaseb.ts operativeLeadF)
+  await checkI1(await operativeTarget(reading, config));
   await checkBackupCalled(reading.backupCalled);
   await checkUnservedCall(reading).catch((e) => console.error("unserved-call check failed:", (e as Error).message));
   // after the stage watch, so this poll's stage episodes feed the gate
@@ -2583,7 +2603,7 @@ async function main(): Promise<void> {
             // with nothing asserting it. Reporting it is what lets drift-check make it loud.
             tz: { env: process.env.TZ ?? null, resolved: Intl.DateTimeFormat().resolvedOptions().timeZone },
             writer_lease: WRITER_LEASE_ENABLED ? (writerLeaseState ?? "pending") : "off",
-            i1: hub ? { violated: i1Violated, detail: i1Detail } : "disabled",
+            i1: hub ? { violated: i1Violated, detail: i1Detail, operative: i1Operative } : "disabled",
             tempiq_push: tempiq ? tempiq.status() : "disabled",
             tempiq_read: tempiqRead ? tempiqRead.status() : "disabled",
             tempiq_windows: tempiqWindows ? tempiqWindows.status() : "disabled",
