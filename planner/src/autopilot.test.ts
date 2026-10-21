@@ -4,8 +4,9 @@
  * written under the soak's ceiling. Plain node:assert script under tsx like the other planner suites.
  */
 import assert from "node:assert/strict";
-import { AutoPilot } from "./autopilot";
+import { AutoPilot, commandForBlock } from "./autopilot";
 import { DEFAULT_OPTS } from "./shadow";
+import { curveOutputF } from "./curve";
 
 type Call = { target: number; capF: number | undefined };
 function harness(block: Record<string, unknown>, commanded: number | null = 120, stormCapF?: number, shaped = false, dryRun = false) {
@@ -121,6 +122,52 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
     const h = harness({ tank_target_f: 135, storm: true, reason: "storm mode: banking heat (x)" }, 120, 120);
     await h.ap.applyLatestPlan();
     assert.deepEqual(h.calls[0], { target: 135, capF: DEFAULT_OPTS.strictCapF });
+  }
+  // 11. commandForBlock — the number the identification driver's gates compare against — agrees with what
+  //     applyLatestPlan WRITES for the same block (identification-plan-vs-command-2026-10-20.md: the 2026-10-19
+  //     19:04 ET "winter guard" block said 135 °F, the auto-pilot wrote its 120/118 curve, the driver waited for 135)
+  {
+    const curve = { dot: 29, wwsd: 125, dbt: 120, mbt: 118 };
+    const guard = { tank_target_f: 135, reason: "winter guard: mimic HBX curve", shaped_curve: curve, outdoor_f: 48.8 };
+    // shaped-curve mode: a non-excursion block is commanded as its curve → the curve's output at the live outdoor
+    assert.deepEqual(commandForBlock(guard, 49, true), { targetF: 120, basis: "curve" });
+    assert.equal(commandForBlock(guard, 49, true)!.targetF, Math.round(curveOutputF(curve, 49)));
+    assert.deepEqual(commandForBlock({ ...guard, shaped_curve: { dot: 5, wwsd: 125, dbt: 135, mbt: 118 } }, 49, true), { targetF: 129, basis: "curve" }, "a steep winter curve: 135 − 17·44/120 = 128.8");
+    assert.deepEqual(commandForBlock({ ...guard, shaped_curve: { dot: 5, wwsd: 125, dbt: 135, mbt: 118 } }, 0, true), { targetF: 135, basis: "curve" }, "below dot the device holds dbt");
+    // flat-target mode: the declared target, curve or not
+    assert.deepEqual(commandForBlock(guard, 49, false), { targetF: 135, basis: "flat" });
+    // an excursion is a flat write in shaped mode too — by flag and by the legacy reason regex
+    for (const ex of [{ bank: true }, { sani: true }, { boost: true }, { storm: true }, { reason: "afternoon bank to 128°F (warmest hour)" }, { reason: "daily sanitize to 140°F = 60°C" }, { reason: "storm mode: banking heat" }, { reason: "pre-boost to 128°F for 08:00 window" }]) {
+      assert.deepEqual(commandForBlock({ ...guard, tank_target_f: 128, ...ex }, 49, true), { targetF: 128, basis: "flat" }, JSON.stringify(ex));
+    }
+    // no curve on the block → flat; a curve hour with no outdoor to evaluate at → nothing to compare (fail closed);
+    // no finite tank_target_f → nothing (applyLatestPlan refuses such a block before classifying it)
+    assert.deepEqual(commandForBlock({ ...guard, shaped_curve: undefined }, 49, true), { targetF: 135, basis: "flat" });
+    assert.deepEqual(commandForBlock({ ...guard, shaped_curve: { dot: 29, wwsd: 125, dbt: "120", mbt: 118 } }, 49, true), { targetF: 135, basis: "flat" }, "a malformed curve is no curve (curveDecision)");
+    assert.equal(commandForBlock(guard, null, true), null);
+    assert.equal(commandForBlock(guard, NaN, true), null);
+    assert.equal(commandForBlock({ ...guard, tank_target_f: undefined }, 49, true), null);
+    assert.equal(commandForBlock({ ...guard, tank_target_f: undefined, shaped_curve: undefined }, 49, false), null);
+    assert.equal(commandForBlock(null, 49, true), null);
+    // and the INSTANCE agrees with its own writes: the live block → setCurve (the 120/118 curve) and commandForBlock 120;
+    // the bank block → setTarget 128 and commandForBlock 128; flat-target mode → setTarget 135 and commandForBlock 135
+    const shaped = harness(guard, 140, undefined, true);
+    await shaped.ap.applyLatestPlan();
+    assert.equal(shaped.calls.length, 0, "a curve hour writes no flat target");
+    assert.deepEqual(shaped.curves, [curve], "the block's shaped curve is the command");
+    assert.match(shaped.ap.lastResult, /^commanded curve 120@29→118@125/);
+    assert.deepEqual(shaped.ap.commandForBlock(guard, 49), { targetF: 120, basis: "curve" });
+    assert.equal(shaped.ap.lastTargetF, 135, "the ledger still carries the declared target beside the set-curve row (as autopilot_log 1886 did)");
+    const bankBlock = { ...guard, tank_target_f: 128, bank: true, reason: "afternoon bank to 128°F (warmest hour, 52°F outdoor)" };
+    const bank = harness(bankBlock, 120, undefined, true);
+    await bank.ap.applyLatestPlan();
+    assert.deepEqual(bank.calls, [{ target: 128, capF: DEFAULT_OPTS.strictCapF }]);
+    assert.equal(bank.curves.length, 0);
+    assert.deepEqual(bank.ap.commandForBlock(bankBlock, 49), { targetF: 128, basis: "flat" });
+    const flat = harness(guard, 120, undefined, false);
+    await flat.ap.applyLatestPlan();
+    assert.deepEqual(flat.calls, [{ target: 135, capF: DEFAULT_OPTS.strictCapF }], "flat-target mode writes the declared 135");
+    assert.deepEqual(flat.ap.commandForBlock(guard, 49), { targetF: 135, basis: "flat" });
   }
   console.log("autopilot.test.ts (#156 cap by the block's identity): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

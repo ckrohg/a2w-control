@@ -7,8 +7,9 @@
  * restore, and that a shadow window never writes or posts).
  */
 import assert from "node:assert/strict";
-import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, windowCompletion } from "./identify";
+import { pickCell, drawArm, probeTarget, abortReason, deficitZones, planConflictAhead, eligibleHoursAhead, windowPayload, probeSource, cleanupSource, IdentificationDriver, type IdentPlan, type PlanCell, type IdentWindow, type IdentStore, type IdentDeps, currentPlanTargetF, currentPlanBlock, windowCompletion } from "./identify";
 import { WriteError, BoostYieldError } from "./writes";
+import { commandForBlock } from "./autopilot";
 
 const T0 = new Date("2026-11-20T12:00:00Z");
 const cell = (over: Partial<PlanCell> & { band: [number, number] }, sug: Partial<NonNullable<PlanCell["suggest"]>> = {}): PlanCell => ({
@@ -107,7 +108,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; curveOutputF?: number | null; htDifF?: number | null; recentSeries?: Array<{ ts: Date; tankF: number | null; anyCall: boolean; hdActive?: boolean | null }>; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; curveOutputF?: number | null; htDifF?: number | null; recentSeries?: Array<{ ts: Date; tankF: number | null; anyCall: boolean; hdActive?: boolean | null }>; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void; shapedCurve?: boolean }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -176,7 +177,8 @@ async function main(): Promise<void> {
           };
         },
       } as any,
-      autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false } as any,
+      // the real resolver, in the harness's shaped-curve mode (default flat-target, as the driver tests predate #133 b)
+      autopilot: { setHold: (until, reason) => { holds.push({ until, reason }); }, isDryRun: over.autopilotDryRun ?? false, commandForBlock: (b: any, o: number | null) => commandForBlock(b, o, over.shapedCurve ?? false) } as any,
       phaseB: { setProbeTarget: (t) => { probeTargets.push(t); } } as any,
       demandFeed: { zones: () => over.zones ?? [], refresh: async () => {}, isHealthy: () => true } as any,
       // a LIVE hub frame (#167: a missing pi_connected / ts reads as a dropped Pi and is not coverage)
@@ -946,6 +948,89 @@ async function main(): Promise<void> {
     (h.driver as any).fetchImpl = async (url: any, init: any) => { seen.push(String(url)); return { ok: true, status: 200, json: async () => upPlan } as any; };
     await h.driver.tick();
     assert.ok(seen[0].includes("abortLatencyMin=35") && seen[0].includes("dhwFloorF=120") && seen[0].includes("plantCapF=135") && seen[0].includes("identificationCapF=145"), seen[0]);
+  }
+  // 11. The plan-settled gate, plan_moved and the handoff compare against what the AUTO-PILOT COMMANDS for the block
+  //     in force, not the block's declared tank_target_f (identification-plan-vs-command-2026-10-20.md). Under
+  //     SHAPED_CURVE live a non-excursion block is written as its SHAPED CURVE, so the plant goes to the curve's output
+  //     at the live outdoor: the 2026-10-19 19:04 ET "winter guard: mimic HBX curve" block said 135 °F and carried a
+  //     120/118 curve; the auto-pilot wrote the curve (119.6 °F at 49 °F) and the driver waited for 135 for good.
+  {
+    const curve = { dot: 29, wwsd: 125, dbt: 120, mbt: 118 };
+    const guard = { ts: new Date(T0.getTime() - 20 * 60_000).toISOString(), outdoor_f: 48.8, tank_target_f: 135, hp1_setpoint_f: 140, reason: "winter guard: mimic HBX curve", shaped_curve: curve };
+    // the pure pieces: the block in force, the declared target, the command
+    assert.deepEqual(currentPlanBlock([guard], T0.getTime()), guard);
+    assert.equal(currentPlanBlock([{ ...guard, ts: new Date(T0.getTime() + 60_000).toISOString() }], T0.getTime()), null);
+    assert.equal(currentPlanTargetF([guard], T0.getTime()), 135, "the default resolver is the declared target");
+    assert.equal(currentPlanTargetF([guard], T0.getTime(), (b) => commandForBlock(b, 49, true)?.targetF ?? null), 120, "the shaped-curve command is the curve's output at the live outdoor");
+    assert.equal(currentPlanTargetF([guard], T0.getTime(), (b) => commandForBlock(b, 49, false)?.targetF ?? null), 135, "flat-target mode commands the declared target");
+    // an excursion is the declared target in shaped mode too (planConflictAhead stands such a block down before the gate anyway)
+    assert.equal(currentPlanTargetF([{ ...guard, tank_target_f: 128, bank: true, reason: "afternoon bank to 128°F (warmest hour, 52°F outdoor)" }], T0.getTime(), (b) => commandForBlock(b, 49, true)?.targetF ?? null), 128);
+    // The live case: plant on the 120/118 curve (commanded 119 = its midpoint, reported 120), the block says 135.
+    const live = { plan: upPlan, commanded: 119, operative: 120, outdoorF: 40, planBlocks: [guard], pumpsCoverF: 150 }; // 40 °F: inside upPlan's [30,45) band; the 120/118 curve gives 119.8 there
+    const flat = harness({ ...live, shapedCurve: false });
+    await flat.driver.tick();
+    assert.equal(flat.rows.length, 0, "flat-target mode: the auto-pilot WOULD write 135 — the base is unsettled");
+    assert.match(flat.driver.status().lastResult ?? "", /plan wants 135 °F but the plant is at 120 °F — letting the auto-pilot settle the base first$/);
+    const shaped = harness({ ...live, shapedCurve: true });
+    await shaped.driver.tick();
+    assert.equal(shaped.rows.length, 1, "shaped-curve mode: the auto-pilot commands the 120/118 curve — the plant IS where the plan puts it");
+    assert.equal(shaped.rows[0].baseF, 120);
+    // a curve whose output is NOT where the plant sits still idles — and the status shows both numbers
+    const steep = harness({ ...live, shapedCurve: true, planBlocks: [{ ...guard, shaped_curve: { dot: 5, wwsd: 125, dbt: 135, mbt: 118 } }] }); // 135 − 17·35/120 = 130.0 → 130 at 40 °F
+    await steep.driver.tick();
+    assert.equal(steep.rows.length, 0);
+    assert.match(steep.driver.status().lastResult ?? "", /plan wants 130 °F but the plant is at 120 °F — letting the auto-pilot settle the base first \[the block says 135 °F; the auto-pilot commands its shaped curve, 130 °F at 40 °F outdoor\]$/);
+    // a block without a curve is a flat write in shaped mode as well
+    const bare = harness({ ...live, shapedCurve: true, planBlocks: [{ ...guard, shaped_curve: undefined }] });
+    await bare.driver.tick();
+    assert.equal(bare.rows.length, 0); assert.match(bare.driver.status().lastResult ?? "", /plan wants 135 °F but the plant is at 120 °F/);
+    // a block the auto-pilot would refuse (no tank_target_f) fails closed with its own reason
+    const none = harness({ ...live, shapedCurve: true, planBlocks: [{ ...guard, tank_target_f: undefined }] });
+    await none.driver.tick();
+    assert.equal(none.rows.length, 0); assert.match(none.driver.status().lastResult ?? "", /nothing the auto-pilot would command/);
+    // plan_moved follows the COMMAND: the declared target moving 135 → 140 on a curve hour moves nothing; the curve being
+    // re-shaped does (120/118 → 130/125: 130 − 5·11/96 = 129.4 → 129 at 40 °F) — and the handoff goes to the curve's output.
+    {
+      const blocks = [{ ...guard }];
+      const hold = harness({ ...live, shapedCurve: true, rng: () => 0.9, planBlocks: blocks });
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].arm, "hold"); assert.equal(hold.rows[0].state, "active"); assert.equal(hold.rows[0].baseF, 120);
+      blocks[0].tank_target_f = 140;
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "active", "the declared target is not the command — the window stays open");
+      blocks[0].shaped_curve = { dot: 29, wwsd: 125, dbt: 130, mbt: 125 };
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "ended"); assert.match(hold.rows[0].endReason ?? "", /^plan_moved:120->129$/);
+      assert.equal(hold.holds.at(-1)?.until, null, "the auto-pilot is released on the same tick");
+    }
+    {
+      const blocks = [{ ...guard }];
+      const probe = harness({ ...live, shapedCurve: true, planBlocks: blocks });
+      await probe.driver.tick(); await probe.driver.tick(); // arming → active (write accepted)
+      assert.equal(probe.rows[0].state, "active"); assert.equal(probe.writes.length, 1); assert.equal(probe.writes[0].targetF, 128);
+      blocks[0].tank_target_f = 140; // declared only — not the command
+      await probe.driver.tick();
+      assert.equal(probe.rows[0].state, "active");
+      blocks[0].shaped_curve = { dot: 29, wwsd: 125, dbt: 130, mbt: 125 };
+      await probe.driver.tick();
+      assert.equal(probe.rows[0].state, "ended"); assert.match(probe.rows[0].endReason ?? "", /^plan_moved:120->129$/);
+      assert.equal(probe.rows[0].handoffTargetF, 129);
+      assert.equal(probe.writes.at(-1)!.targetF, 129, "the handoff is the curve's output, not the declared 140");
+      assert.match(probe.rows[0].cleanupDetail ?? "", /plan's new target 129 °F \(plan moved from base 120 °F\)/);
+    }
+    // the same window under flat-target mode ends on the declared target, exactly as before
+    {
+      const blocks = [{ ...guard, tank_target_f: 120 }];
+      const hold = harness({ ...live, shapedCurve: false, rng: () => 0.9, planBlocks: blocks });
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "active");
+      blocks[0].shaped_curve = { dot: 29, wwsd: 125, dbt: 130, mbt: 125 }; // ignored in flat mode
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "active");
+      blocks[0].tank_target_f = 135;
+      await hold.driver.tick();
+      assert.equal(hold.rows[0].state, "ended"); assert.match(hold.rows[0].endReason ?? "", /^plan_moved:120->135$/);
+    }
   }
   console.log("identify.test.ts: all assertions passed");
 }

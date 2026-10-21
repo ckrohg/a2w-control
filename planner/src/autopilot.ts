@@ -15,7 +15,7 @@ import { Store } from "./store";
 import type { Notify } from "./alertpolicy";
 import { HbxWriter, WriteError, isBoostYield } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
-import { APPLY_TOLERANCE_F, curveAlreadyInForce, type ShapedCurve } from "./curve";
+import { APPLY_TOLERANCE_F, curveAlreadyInForce, curveOutputF, type ShapedCurve } from "./curve";
 // #173: curveAlreadyInForce + APPLY_TOLERANCE_F live in curve.ts now (shared with writes.ts status() and /health);
 // re-exported so existing importers keep working.
 export { curveAlreadyInForce };
@@ -46,6 +46,35 @@ export function curveDecision(block: { reason?: unknown; sani?: unknown; bank?: 
   return { kind: "curve", curve: c as ShapedCurve, reason };
 }
 
+/**
+ * The target the auto-pilot DRIVES THE PLANT TO for a plan block — the one number the identification driver's
+ * gates must agree with (its plan-settled gate, plan_moved, the handoff after plan_moved). In shaped-curve mode a
+ * non-excursion hour is commanded as the plan's SHAPED CURVE (curveDecision → setCurve below), so the plant goes to
+ * that curve's output at the live outdoor, not to block.tank_target_f: on 2026-10-19 the 19:04 ET "winter guard:
+ * mimic HBX curve" block carried tank_target_f 135 (the as-found curve's output) and a 120/118 shaped curve; the
+ * auto-pilot wrote the curve (hbx_writes 1380, 119.6 °F at 49 °F outdoor) and the driver, reading 135, waited for
+ * the plant to settle there for good (identification-plan-vs-command-2026-10-20.md). An excursion (bank / soak /
+ * pre-boost / storm, by flag or by the legacy reason regex) and a block without a curve are flat writes of
+ * tank_target_f, exactly as applyLatestPlan does. Pure. null = nothing is commanded (no finite tank_target_f —
+ * applyLatestPlan refuses such a block before classifying it — or a curve hour with no outdoor to evaluate at), so
+ * a caller comparing against it fails closed.
+ */
+export function commandForBlock(
+  block: Record<string, unknown> | null | undefined,
+  outdoorF: number | null,
+  shapedCurve: boolean,
+): { targetF: number; basis: "flat" | "curve" } | null {
+  if (!block) return null;
+  const t = Number(block.tank_target_f);
+  if (!Number.isFinite(t)) return null;
+  const d = shapedCurve ? curveDecision(block) : null;
+  if (d?.kind === "curve") {
+    if (outdoorF == null || !Number.isFinite(outdoorF)) return null;
+    return { targetF: Math.round(curveOutputF(d.curve, outdoorF)), basis: "curve" };
+  }
+  return { targetF: t, basis: "flat" };
+}
+
 export class AutoPilot {
   public lastRunAt: string | null = null;
   public lastResult = "not run yet";
@@ -73,6 +102,11 @@ export class AutoPilot {
    *  dashboard Off/Armed switch flips this via the planner's controller_flags row each poll. */
   setDryRun(v: boolean): void { this.dryRun = v; }
   get isDryRun(): boolean { return this.dryRun; }
+
+  /** What THIS auto-pilot drives the plant to for `block` (its own shaped-curve mode applied) — see commandForBlock. */
+  commandForBlock(block: Record<string, unknown> | null | undefined, outdoorF: number | null): { targetF: number; basis: "flat" | "curve" } | null {
+    return commandForBlock(block, outdoorF, this.shapedCurve);
+  }
 
   // Identification hold (identify.ts): while a randomised AWT window runs, the auto-pilot must not
   // overwrite the arm — a probe that gets re-commanded to the plan target after 10 min is not a

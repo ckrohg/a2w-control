@@ -174,7 +174,7 @@ export interface IdentStore {
 export interface IdentDeps {
   store: IdentStore;
   writer: Pick<HbxWriter, "setTarget" | "restore" | "status">;
-  autopilot: Pick<AutoPilot, "setHold" | "isDryRun">;
+  autopilot: Pick<AutoPilot, "setHold" | "isDryRun" | "commandForBlock">;
   phaseB: Pick<PhaseB, "setProbeTarget">;
   demandFeed: Pick<DemandFeed, "zones" | "refresh" | "isHealthy">;
   hub: Pick<HubClient, "getState">;
@@ -282,18 +282,31 @@ export function deficitZones(zones: InsightZone[], zoneIds: string[]): string[] 
     .map((z) => z.id);
 }
 
-/** True when a plan block flagged sanitize/bank/storm sits inside the next `hours`. */
-/** The plan block in force at `nowMs` (newest block with ts ≤ now) and its tank target, or null. */
-export function currentPlanTargetF(plan: any[] | null, nowMs: number): number | null {
+/** The plan block in force at `nowMs` (the newest block with ts ≤ now), or null. */
+export function currentPlanBlock(plan: any[] | null, nowMs: number): Record<string, any> | null {
   if (!Array.isArray(plan)) return null;
-  const block = plan
+  return plan
     .filter((b) => b && typeof b.ts === "string" && new Date(b.ts).getTime() <= nowMs)
     .sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
-    .at(-1);
-  const t = block ? Number(block.tank_target_f) : NaN;
-  return Number.isFinite(t) ? t : null;
+    .at(-1) ?? null;
 }
 
+/** A block's DECLARED target (tank_target_f) — the plan's number, which is not always what gets written. */
+const declaredTargetF = (block: Record<string, any>): number | null => { const t = Number(block.tank_target_f); return Number.isFinite(t) ? t : null; };
+
+/**
+ * The target in force at `nowMs`: `command` turns the block in force into the number the plant is driven to; the
+ * default is the block's declared tank_target_f. The driver never relies on that default — under SHAPED_CURVE live
+ * the auto-pilot writes a non-excursion block's SHAPED CURVE, so the plant goes to the curve's output at the live
+ * outdoor (120 °F on the 2026-10-19 19:04 ET "winter guard" block whose tank_target_f said 135), and every gate
+ * here resolves through autopilot.commandForBlock instead (identification-plan-vs-command-2026-10-20.md).
+ */
+export function currentPlanTargetF(plan: any[] | null, nowMs: number, command: (block: Record<string, any>) => number | null = declaredTargetF): number | null {
+  const block = currentPlanBlock(plan, nowMs);
+  return block ? command(block) : null;
+}
+
+/** True when a plan block flagged sanitize/bank/storm sits inside the next `hours`. */
 export function planConflictAhead(plan: any[] | null, nowMs: number, hours: number): boolean {
   if (!plan) return false;
   const end = nowMs + hours * 3600_000;
@@ -460,8 +473,12 @@ export class IdentificationDriver {
         // hold or a down-probe, would keep the house under its own demand floor while the auto-pilot is
         // held — the deficit abort only covers down-probes (codex on #152). End it; the auto-pilot is
         // released on the same poll and re-targets the plan.
+        // "Where the plan is" = what the auto-pilot COMMANDS for the block in force (planCommandF): on a shaped-curve
+        // hour that is the curve's output at the live outdoor, so a declared tank_target_f moving while the curve
+        // stays moves nothing, and a re-shaped curve moves the window's base even when tank_target_f is unchanged.
         const openPlans = await this.d.store.recentPlans(6);
-        const openPlanTargetF = currentPlanTargetF(openPlans.at(-1)?.plan ?? null, this.now().getTime());
+        const openSlx = await this.d.store.getLatestSlx().catch(() => null);
+        const openPlanTargetF = this.planCommandF(openPlans.at(-1)?.plan ?? null, this.now().getTime(), openSlx?.outdoorF ?? null);
         if (openPlanTargetF != null && Math.abs(openPlanTargetF - open.baseF) >= MIN_STEP_F) {
           await this.end(open, `plan_moved:${open.baseF}->${openPlanTargetF}`, { handoffTargetF: openPlanTargetF });
           return;
@@ -495,6 +512,17 @@ export class IdentificationDriver {
     const curveOutputF = typeof cif?.output_at_live_outdoor_f === "number" ? cif.output_at_live_outdoor_f : null;
     const htDifF = typeof st.ht_dif_f === "number" ? (st.ht_dif_f as number) : null;
     return staleReportedTarget({ reportedF, commandedF, curveOutputF, htDifF, recent, nowMs });
+  }
+
+  /**
+   * What the auto-pilot drives the plant to for the block in force — the ONE number the plan-settled gate, plan_moved
+   * and the plan_moved handoff compare against (autopilot.commandForBlock: the shaped curve's output on a curve hour,
+   * the declared tank_target_f on an excursion or a curve-less block). A curve hour's output is evaluated at the live
+   * SensorLinx outdoor, as the device does; the block's own forecast outdoor stands in when there is no live reading.
+   * null = no block in force, or nothing the auto-pilot would command for it — callers fail closed.
+   */
+  private planCommandF(plan: any[] | null, nowMs: number, outdoorF: number | null): number | null {
+    return currentPlanTargetF(plan, nowMs, (b) => this.d.autopilot.commandForBlock(b, outdoorF ?? (typeof b.outdoor_f === "number" ? b.outdoor_f : null))?.targetF ?? null);
   }
 
   // ── idle → arming/active ──
@@ -553,10 +581,23 @@ export class IdentificationDriver {
     // been written yet: drawing here would freeze the OLD target as a "hold" (or probe from it) and the
     // auto-pilot's hold would keep the house under its own demand floor for the whole window. Found by the
     // cold-day rehearsal (scripts/rehearsal): plan 132 °F, device 128 °F, hold arm at 128, auto-pilot held.
-    const planTargetF = currentPlanTargetF(plans.at(-1)?.plan ?? null, nowMs);
-    if (planTargetF == null) { this.lastResult = "idle: no plan block in force — the base cannot be judged settled"; return; }
+    // "Where the plan wants the plant" is what the AUTO-PILOT COMMANDS for the block in force, not the block's
+    // declared tank_target_f: under SHAPED_CURVE live a non-excursion block is written as its shaped curve, and the
+    // plant goes to the curve's output at the live outdoor. The 2026-10-19 19:04 ET "winter guard: mimic HBX curve"
+    // block said 135 °F and carried a 120/118 curve; the auto-pilot wrote the curve (119.6 °F) and this gate, reading
+    // 135, idled the driver for good (identification-plan-vs-command-2026-10-20.md). Excursions (bank / soak /
+    // pre-boost / storm) stay flat writes of tank_target_f, and planConflictAhead stands them down anyway.
+    const planBlock = currentPlanBlock(plans.at(-1)?.plan ?? null, nowMs);
+    if (!planBlock) { this.lastResult = "idle: no plan block in force — the base cannot be judged settled"; return; }
+    const planCmd = this.d.autopilot.commandForBlock(planBlock, slx.outdoorF);
+    if (!planCmd) { this.lastResult = "idle: the plan block in force carries nothing the auto-pilot would command — the base cannot be judged settled"; return; }
+    const planTargetF = planCmd.targetF;
     if (Math.abs(planTargetF - operative) >= MIN_STEP_F) {
-      this.lastResult = `idle: plan wants ${planTargetF} °F but the plant is at ${Math.round(operative)} °F — letting the auto-pilot settle the base first`;
+      const declaredF = Number(planBlock.tank_target_f);
+      const basisNote = planCmd.basis === "curve" && Math.round(declaredF) !== planTargetF
+        ? ` [the block says ${declaredF} °F; the auto-pilot commands its shaped curve, ${planTargetF} °F at ${slx.outdoorF} °F outdoor]`
+        : "";
+      this.lastResult = `idle: plan wants ${planTargetF} °F but the plant is at ${Math.round(operative)} °F — letting the auto-pilot settle the base first${basisNote}`;
       return;
     }
     const baseF = Math.round(operative);
@@ -806,8 +847,10 @@ export class IdentificationDriver {
    * failure stays 'pending' and is retried next tick.
    */
   private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
-    // Where the plant goes: the window's base, or — after plan_moved — the plan's new current target (persisted
-    // on the row, so a retry after a transient failure returns to the same place). The cap follows the target
+    // Where the plant goes: the window's base, or — after plan_moved — the plan's new command (persisted on the
+    // row, so a retry after a transient failure returns to the same place; on a shaped-curve hour it is the curve's
+    // output at the live outdoor, written flat — within the auto-pilot's tolerance of the curve it then holds, where
+    // the declared tank_target_f could sit 15 °F above it). The cap follows the target
     // like the auto-pilot's does: a sanitize block above the everyday cap needs the sanitize ceiling, or the
     // guarded write is refused 422 and the plant falls to the as-found curve instead (codex pass 3).
     const returnF = w.handoffTargetF ?? w.baseF;
@@ -891,7 +934,8 @@ export class IdentificationDriver {
     // ended: base 132 → plan 136 (503, pending) → plan 140 → a retry to 136 would spend the writer's slot on a
     // stale value and leave the auto-pilot's 140 rate-limited (codex pass 4 on #152). Refresh + persist first.
     const plans = await this.d.store.recentPlans(6);
-    const planNowF = currentPlanTargetF(plans.at(-1)?.plan ?? null, this.now().getTime());
+    const slxNow = await this.d.store.getLatestSlx().catch(() => null);
+    const planNowF = this.planCommandF(plans.at(-1)?.plan ?? null, this.now().getTime(), slxNow?.outdoorF ?? null);
     for (const w of rows) {
       if (w.handoffTargetF != null && planNowF != null && Math.round(planNowF) !== Math.round(w.handoffTargetF)) {
         console.log(`[identify] cleanup #${w.id}: handoff target refreshed ${w.handoffTargetF} → ${planNowF} °F (the plan moved again)`);
