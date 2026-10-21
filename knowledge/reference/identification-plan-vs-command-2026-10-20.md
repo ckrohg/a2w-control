@@ -113,10 +113,26 @@ so `SHAPED_CURVE=shadow` — stamped but written flat — resolves flat, as it s
 
 ## 5 · Not changed — follow-ups
 
-1. **Phase B leads the declared target.** `phaseb.ts currentPlanTarget()` reads `block.tank_target_f` and leads
-   the pump setpoints to `max(operative, plan, probe, curveLead)`: on a winter-guard hour it leads to 135 + margin
-   while the plant sits at 120. A COP cost (hotter outlet during every call), never a safety issue — I1 is only
-   strengthened. The same resolver fixes it; a separate PR, since it changes live pump setpoints.
+1. **Phase B leads the declared target — done in the follow-up PR (a2w-control#PRNUM, stacked on this one; deploys
+   the planner).** `phaseb.ts currentPlanTarget()` read `block.tank_target_f` and led the pump setpoints to
+   `max(operative, plan, probe, curveLead)`: on a winter-guard hour it led 135 + margin while the plant sat at 120.
+   Now `planLeadF()` leads `commandForBlock`'s number for the block in force — on a curve hour the curve's EXACT
+   output (the resolver's whole-°F rounding would sit under the `setCurve` I1 cross-check at the zero-slack points
+   117 / 126 / 135 / 144 °F, where a whole °C is a whole number of °F + 5), on an excursion the flat `tank_target_f`
+   as before — plus the NEXT block's curve at its forecast outdoor when that block is a curve hour (the device's
+   curve, which `curveLeadF` reads, is a flat line after an excursion and does not cover the curve the auto-pilot
+   writes back at the top of the hour), and never an excursion ahead (a soak / bank / pre-boost is led once in
+   force, exactly as before, so the hour before it does not run hotter). The declared target still leads when the
+   command cannot be evaluated (no outdoor anywhere); the device curve and the operative report stay in the max; so
+   no lead is ever below what the auto-pilot writes. `/health.phase_b.lead` shows every term of the max.
+   **What it cost**, from the same restore (scratch `lead_hours`, the 118 hours of §2): on 13 of the 20 winter-guard
+   hours the 135 term set the setpoint — 60 °C sent to both pumps, 52–55 °C under the command. On the other 7 (Oct 17
+   04:30–06:30 and 14:30, Oct 19 19:30–21:30) the frozen post-soak report (139.9 / 142 °F) set it — 63–64 °C — and this
+   change does not touch that term (item 5). During calls on the winter-guard hours pump 1 ran at a 60.3 °C setpoint
+   (floor hours: 56.7) and its outlet reached 65 °C, with 22 % of heating minutes at ≥ 60 °C (floor hours: 14 %); at a
+   52 °C setpoint — what these hours get now — the outlet sits at the setpoint 44 % of the time and never passes 54 °C:
+   the pump modulates against its setpoint instead of running free to 64–65 °C. Only six winter-guard hours had calls
+   at all, and call length depends on the tank at call start, so no COP figure is claimed.
 2. **The winter-guard block's 135 is informational under shaped-curve live.** `/health.demand_floor_cadence
    .lastBlockF`, the dashboard's plan strip and `plan_scores` all show the declared number. Whether the stamped
    curve should itself be floored by the as-found curve below `winterGuardF` (the guard's intent) is a winter-DP
@@ -128,6 +144,12 @@ so `SHAPED_CURVE=shadow` — stamped but written flat — resolves flat, as it s
 4. **`autopilot_log.target_f` on a `set-curve` row is the declared target**, not the command (1886: 135,
    set-curve). The ledger reads correctly only beside `hbx_writes`; recording the curve's output there would make
    the dashboard honest on its own.
+5. **Phase B's operative term is the raw report.** `runOnce()` tracks `getLatestSlx().targetF` as reported, so the
+   frozen post-soak report (`stale-slx-target-2026-10-19.md`) leads both pumps to 63 °C for 7–16 h after every soak:
+   39 of the 78 floor hours since Oct 15 had the report ≥ 3 °F above the curve (Phase B's setpoint on floor hours
+   averaged 55.6 °C, max 63), and it set the setpoint on 7 of the 20 winter-guard hours in item 1. The #215 proof
+   (`stale-target.ts`) says when the curve in force is the operative target; Phase B should read the report the same
+   way. More hours than item 1; a separate PR, since it changes live setpoints.
 
 Related: `stale-slx-target-2026-10-19.md` (the gate before this one), `bank-rebank-2026-10-19.md` (#218, the :04/:19
 double write visible in §1), `incident-20261016-hp2-e21-investigation.md` §6 (why the winter guard exists at all).

@@ -12,6 +12,15 @@
  * clamp to [floor 45 °C, cap 55 °C] — if the required setpoint exceeds the cap we send
  * the cap (best achievable) and the standing I1 monitor raises the alarm; per-pump
  * results are edge-alerted via ntfy only on sustained failure, never per write.
+ *
+ * The plan lead (2026-10-20, after #220): the plan's term in the max() is what the auto-pilot COMMANDS for the
+ * block in force — autopilot.commandForBlock. Under SHAPED_CURVE live a non-excursion block is commanded as its
+ * stamped curve, so the lead is that curve's output at the live outdoor; an excursion (bank / soak / pre-boost /
+ * storm) or a curve-less block is its flat tank_target_f, led exactly as before. Before this the lead read
+ * block.tank_target_f, and on every "winter guard: mimic HBX curve" hour (tank_target_f 135 from the as-found
+ * curve, stamped curve 120/118) both pumps were sent 60 °C while the plant sat at 120 °F — 13 of the 20 such
+ * hours Oct 15–19 (identification-plan-vs-command-2026-10-20.md §5). A COP cost, never a safety issue; the
+ * change keeps every lead at or above what the auto-pilot writes (planLeadF).
  */
 
 import { HubClient } from "./hub";
@@ -19,6 +28,7 @@ import type { Notify } from "./alertpolicy";
 import { Store } from "./store";
 import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
+import { commandForBlock } from "./autopilot";
 
 const SLX_FRESH_MS = 15 * 60 * 1000;
 const LEASE_MINUTES = 90;
@@ -48,6 +58,77 @@ export function curveLeadF(cfg: Record<string, any> | null, outdoorNowF: number 
   const c = { dot: cfg.dot as number, wwsd: cfg.wwsd as number, dbt: cfg.dbt as number, mbt: cfg.mbt as number };
   const outs = [outdoorNowF, outdoorNextF].filter((v): v is number => v != null && Number.isFinite(v)).map((o) => curveOutputF(c, o));
   return outs.length ? Math.max(...outs) : null;
+}
+
+/** The plan's contribution to the lead — planLeadF. Surfaced per cycle in /health.phase_b.lead. */
+export interface PlanLead {
+  /** the block in force: the auto-pilot's command for it (its curve's output, or its flat target), or its declared
+   *  tank_target_f when the command cannot be evaluated (basis "declared") — never below what the auto-pilot writes */
+  nowF: number | null;
+  basis: "curve" | "flat" | "declared" | null;
+  /** block.tank_target_f as declared — the lead before #220's resolver; kept beside nowF so /health shows the gap */
+  declaredF: number | null;
+  /** the NEXT block's command when it is a curve hour: its curve's output at its forecast outdoor. null for an
+   *  excursion ahead — a soak / bank / pre-boost is led once its block is in force, as before, never an hour early */
+  nextF: number | null;
+  /** the next block's forecast outdoor, for the device-curve lead (curveLeadF) as before */
+  nextOutdoorF: number | null;
+}
+
+const EMPTY_LEAD: PlanLead = { nowF: null, basis: null, declaredF: null, nextF: null, nextOutdoorF: null };
+
+const num = (v: unknown): number | null => {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * What the auto-pilot drives the plant to for `block`, as a LEAD: commandForBlock's number (#220 — the stamped
+ * curve's output on a curve hour under SHAPED_CURVE live, tank_target_f flat otherwise), except that a curve hour
+ * leads the curve's EXACT output rather than the resolver's whole-°F rounding: the setCurve I1 cross-check requires
+ * setpoint ≥ exact output + margin, and the whole-°C ceil in computeTracking has zero slack at 117 / 126 / 135 /
+ * 144 °F, so half a degree of rounding there would be an I1 refusal. null = nothing to lead (no finite
+ * tank_target_f, or a curve hour with no outdoor to evaluate at).
+ */
+function commandLeadF(block: Record<string, any>, outdoorF: number | null, shapedCurve: boolean): { f: number; basis: "curve" | "flat" } | null {
+  const cmd = commandForBlock(block, outdoorF, shapedCurve);
+  if (!cmd) return null;
+  if (cmd.basis !== "curve") return { f: cmd.targetF, basis: "flat" };
+  const exact = curveLeadF(block.shaped_curve ?? null, outdoorF, null);
+  return { f: Math.max(cmd.targetF, exact ?? -Infinity), basis: "curve" };
+}
+
+/**
+ * Pure: the plan's lead terms for the block in force and the block after it.
+ * (a) The block in force leads the auto-pilot's COMMAND for it (commandLeadF at the live outdoor; the block's own
+ *     forecast outdoor stands in when there is no live reading). If that cannot be evaluated the declared
+ *     tank_target_f leads, as it did before — the lead may overshoot, never undershoot, what the auto-pilot writes.
+ * (b) The next block leads ITS command only when it is a curve hour (its curve's output at its forecast outdoor):
+ *     the device's commanded curve, which curveLeadF reads, is a near-flat line after an excursion and would not
+ *     cover the curve the auto-pilot writes back at the top of the hour.
+ * (c) An excursion ahead (the daily soak, the bank, a pre-boost, a storm raise) is NOT led early: it is led from the
+ *     moment its block is in force (its flat tank_target_f, as before) and the auto-pilot's write waits on the I1
+ *     cross-check until the setpoints cover it — the same sequence as today, so the sanitize can never deadlock
+ *     and the hour before it does not run hotter than it needs to.
+ */
+export function planLeadF(plan: any[] | null | undefined, nowMs: number, outdoorNowF: number | null, shapedCurve: boolean): PlanLead {
+  if (!Array.isArray(plan) || plan.length === 0) return EMPTY_LEAD;
+  let idx = 0;
+  for (let n = 0; n < plan.length; n++) if (new Date(plan[n].ts).getTime() <= nowMs) idx = n;
+  const block = plan[idx] ?? null;
+  const next = plan[idx + 1] ?? null;
+  const declaredF = num(block?.tank_target_f);
+  const outdoorF = outdoorNowF ?? num(block?.outdoor_f);
+  const cmd = block ? commandLeadF(block, outdoorF, shapedCurve) : null;
+  const nextOutdoorF = num(next?.outdoor_f);
+  const nextCmd = next ? commandLeadF(next, nextOutdoorF ?? outdoorF, shapedCurve) : null;
+  return {
+    nowF: cmd ? cmd.f : declaredF,
+    basis: cmd ? cmd.basis : declaredF != null ? "declared" : null,
+    declaredF,
+    nextF: nextCmd?.basis === "curve" ? nextCmd.f : null,
+    nextOutdoorF,
+  };
 }
 
 /** Pure: what should each enrolled pump's setpoint be right now? */
@@ -119,26 +200,25 @@ export class PhaseB {
   setProbeTarget(t: number | null): void { this.probeTargetF = t; }
   get probeTarget(): number | null { return this.probeTargetF; }
 
-  /** Current-hour tank target from the latest shadow plan — setpoints must LEAD the plan up (esp.
-   *  the daily 140°F sanitize), or a rising target would deadlock I1. null if no usable plan.
-   *  Also returns the NEXT block's forecast outdoor, for the shaped-curve lead (#133). */
-  private async currentPlanTarget(): Promise<{ targetF: number | null; nextOutdoorF: number | null }> {
+  /** The plan's lead terms from the latest shadow plan (planLeadF at the live outdoor, in this instance's shaped-curve
+   *  mode — the same SHAPED_CURVE flag index.ts hands the AutoPilot, so the lead reads the block the way the auto-pilot
+   *  writes it). Setpoints must LEAD the plan up (esp. the daily 140°F sanitize), or a rising target would deadlock
+   *  I1. Empty on any read failure: the operative target and the device curve still lead. */
+  private async currentPlanLead(outdoorNowF: number | null): Promise<PlanLead> {
     try {
       const plans = await this.store.recentPlans(6);
-      const latest = plans.at(-1);
-      if (!latest || !Array.isArray(latest.plan) || latest.plan.length === 0) return { targetF: null, nextOutdoorF: null };
-      const now = Date.now();
-      let idx = 0;
-      for (let n = 0; n < latest.plan.length; n++) if (new Date(latest.plan[n].ts).getTime() <= now) idx = n;
-      const block = latest.plan[idx];
-      const next = latest.plan[idx + 1];
-      const t = Number(block?.tank_target_f);
-      const o = Number(next?.outdoor_f);
-      return { targetF: Number.isFinite(t) ? t : null, nextOutdoorF: Number.isFinite(o) ? o : null };
+      return planLeadF(plans.at(-1)?.plan ?? null, Date.now(), outdoorNowF, this.shapedCurve);
     } catch {
-      return { targetF: null, nextOutdoorF: null };
+      return EMPTY_LEAD;
     }
   }
+
+  /** The terms of the last cycle's lead, for /health.phase_b.lead: the setpoints track the max of them (+ margin). */
+  public lastLead: {
+    at: string; effective_f: number; operative_f: number;
+    plan_f: number | null; plan_basis: PlanLead["basis"]; plan_declared_f: number | null; next_f: number | null;
+    probe_f: number | null; device_curve_f: number | null;
+  } | null = null;
 
   async runOnce(): Promise<void> {
     const latest = await this.store.getLatestSlx();
@@ -151,11 +231,19 @@ export class PhaseB {
     // the auto-pilot commands it, instead of a target-up / setpoint-lagging I1 deadlock. max() never
     // drops the setpoint below tracking the operative target, so I1 is only ever strengthened.
     const opTarget = latest.targetF;
-    const { targetF: planTarget, nextOutdoorF } = await this.currentPlanTarget();
-    // #133 (b): the commanded CURVE's output now and next hour — with a shaped curve the operative target
-    // will climb on its own as it gets colder; the setpoints must already cover where it is going.
-    const curveLead = this.shapedCurve ? curveLeadF(await this.store.latestConfig().catch(() => null), latest.outdoorF, nextOutdoorF) : null;
-    const effectiveTarget = Math.max(opTarget, planTarget ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
+    const plan = await this.currentPlanLead(latest.outdoorF);
+    // #133 (b): the DEVICE's commanded curve's output now and next hour — with a shaped curve the operative target
+    // will climb on its own as it gets colder; the setpoints must already cover where it is going. Kept beside the
+    // plan's command: the device may still be on an excursion's flat line, or on the as-found curve after a refused
+    // set_curve, and the pumps must cover what the device is actually driving to.
+    const curveLead = this.shapedCurve ? curveLeadF(await this.store.latestConfig().catch(() => null), latest.outdoorF, plan.nextOutdoorF) : null;
+    const effectiveTarget = Math.max(opTarget, plan.nowF ?? -Infinity, plan.nextF ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
+    const r1 = (v: number | null): number | null => (v == null ? null : Math.round(v * 10) / 10);
+    this.lastLead = {
+      at: new Date().toISOString(), effective_f: r1(effectiveTarget) as number, operative_f: opTarget,
+      plan_f: r1(plan.nowF), plan_basis: plan.basis, plan_declared_f: plan.declaredF, next_f: r1(plan.nextF),
+      probe_f: this.probeTargetF, device_curve_f: r1(curveLead),
+    };
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();
 
