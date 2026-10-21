@@ -113,7 +113,7 @@ so `SHAPED_CURVE=shadow` — stamped but written flat — resolves flat, as it s
 
 ## 5 · Not changed — follow-ups
 
-1. **Phase B leads the declared target — done in the follow-up PR (a2w-control#PRNUM, stacked on this one; deploys
+1. **Phase B leads the declared target — done in the follow-up PR (a2w-control#222, stacked on this one; deploys
    the planner).** `phaseb.ts currentPlanTarget()` read `block.tank_target_f` and led the pump setpoints to
    `max(operative, plan, probe, curveLead)`: on a winter-guard hour it led 135 + margin while the plant sat at 120.
    Now `planLeadF()` leads `commandForBlock`'s number for the block in force — on a curve hour the curve's EXACT
