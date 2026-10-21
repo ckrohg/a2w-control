@@ -221,6 +221,9 @@ export function computeTracking(
   }));
 }
 
+/** Consecutive verifies without a lease before it is believed (each is one ~5-min Phase B cycle). */
+const NO_LEASE_STREAK = 3;
+
 export class PhaseB {
   private failStreak: Record<string, number> = {};
   /** paging latch: a "tracking failing" page went out for the current failure run; cleared by success or a dry-run cycle */
@@ -237,6 +240,8 @@ export class PhaseB {
    *  See verifyLeases() — this is the FINDING-1b fix. */
   private leaseArmed: Record<string, boolean | null> = {};
   private leaseAlerted: Record<string, boolean> = {};
+  /** consecutive verifies that saw no lease — one is usually the hub's pre-write snapshot (see verifyLeases) */
+  private noLeaseStreak: Record<string, number> = {};
   public lastRunAt: string | null = null;
   public lastResults: Record<string, string> = {};
 
@@ -378,7 +383,7 @@ export class PhaseB {
         if (this.recoveryPending[d.pump_id]) {
           this.recoveryPending[d.pump_id] = false;
           await this.notify("Phase B recovered", `${d.pump_id} tracking again (${d.value_c}°C).`, "default",
-            { tier: "attention", resolved: true, key: `phaseb-failing-${d.pump_id}` });
+            { tier: "record", resolved: true, key: `phaseb-failing-${d.pump_id}` });
         }
       } else {
         this.failStreak[d.pump_id] = (this.failStreak[d.pump_id] ?? 0) + 1;
@@ -396,9 +401,7 @@ export class PhaseB {
                   "it will stay where it is. See FINDING-1."
                 : "Lease will lapse to baseline — house safe, savings paused."),
             "high",
-            // a lapsed lease reverts to baseline on its own: record. Only with no lease armed is a human needed.
-            { tier: this.leaseArmed[d.pump_id] === false ? "attention" : "record", key: `phaseb-failing-${d.pump_id}`,
-              action: "Check the Pi is online (dashboard), then follow the FINDING-1 runbook to set baseline_setpoint_c on the Pi." },
+            { tier: "record", key: `phaseb-failing-${d.pump_id}` }, // engineer-only (owner 2026-10-21)
           );
         }
       }
@@ -436,29 +439,32 @@ export class PhaseB {
       const prev = this.lastResults[id] ?? "";
       if (!prev.startsWith("ok ")) continue; // the write itself failed; that message wins
       if (armed) {
+        this.noLeaseStreak[id] = 0;
         const mins = Math.max(0, Math.round((p.remote_lease_until! * 1000 - Date.now()) / 60000));
         this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} (lease ${mins}m armed)`;
         if (this.leaseAlerted[id]) {
           this.leaseAlerted[id] = false;
           await this.notify("Phase B lease armed", `${id}: the Pi is now holding a lease again.`, "default",
-            { tier: "attention", resolved: true, key: `phaseb-nolease-${id}` });
+            { tier: "record", resolved: true, key: `phaseb-nolease-${id}` });
         }
       } else {
         this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} — ⚠ NO LEASE ARMED`;
-        console.warn(`[phase-b] ${id}: wrote setpoint but the Pi armed NO lease — ` +
-          "baseline_setpoint_c is unset, revert-to-baseline cannot fire (FINDING-1)");
-        if (!this.leaseAlerted[id]) {
+        this.noLeaseStreak[id] = (this.noLeaseStreak[id] ?? 0) + 1;
+        console.warn(`[phase-b] ${id}: wrote setpoint but the hub shows NO lease (${this.noLeaseStreak[id]} in a row)`);
+        // The hub serves the Pi's LAST push, which can predate the write this verify follows: right after a Pi
+        // reconnect or bridge restart (the lease lives in the bridge's memory) one verify reads "no lease" although the
+        // write armed one — 2026-10-21 08:19 ET, three minutes after a 16 s Pi dropout. Only a lease missing across
+        // NO_LEASE_STREAK consecutive writes is real. Record tier (owner 2026-10-21): only an engineer can act on it,
+        // and drift-check's FINDING-1 section watches it daily.
+        if (this.noLeaseStreak[id] >= NO_LEASE_STREAK && !this.leaseAlerted[id]) {
           this.leaseAlerted[id] = true;
           await this.notify(
-            "⚠ Phase B: no lease armed",
-            `${id}: setpoint accepted but the Pi recorded NO lease, so baseline_setpoint_c is ` +
-              "unset and the revert-to-baseline failsafe cannot fire. The house is not at " +
-              "immediate risk (it holds the last warm setpoint) but there is no automatic " +
-              "recovery from a dead planner. See the FINDING-1 runbook.",
+            "Phase B: no lease armed",
+            `${id}: ${NO_LEASE_STREAK} setpoint writes in a row were accepted but the Pi shows no revert lease. If ` +
+              "baseline_setpoint_c is unset on the Pi the revert-to-baseline failsafe cannot fire (FINDING-1 runbook). " +
+              "The house holds the last warm setpoint meanwhile.",
             "high",
-            // latched in the DB: this used to re-send for each pump on every planner redeploy (60 emails in a month)
-            { tier: "attention", key: `phaseb-nolease-${id}`,
-              action: "Follow the FINDING-1 runbook: set baseline_setpoint_c in the Pi's config so the safety revert can work." },
+            { tier: "record", key: `phaseb-nolease-${id}` },
           );
         }
       }

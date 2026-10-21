@@ -559,7 +559,7 @@ class PumpPoller:
             self._push(title=f"⚠ {self.cfg.name}: gateway identity mismatch",
                        message=f"{self.cfg.host} answers with the wrong MAC — writes "
                                f"blocked. Check DHCP reservations.",
-                       priority="urgent", tags="rotating_light", tier="attention",
+                       priority="urgent", tags="rotating_light", tier="record",  # DHCP fix: engineer-only (owner 2026-10-21)
                        action="Fix the DHCP reservation so each W610 gateway keeps its own IP. Writes to this pump are blocked until then.",
                        facts=[("Address", self.cfg.host), ("Answers as", str(actual)), ("Expected", str(self.cfg.mac))])
             log.error("[%s] identity mismatch at %s: %s != %s",

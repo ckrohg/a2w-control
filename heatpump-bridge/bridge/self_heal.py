@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 # Self-heal steps that mean the feature itself cannot work as configured (owner alert policy, alert-policy.md):
 # emailed. Every other step — shadow "would cycle", attempts, recoveries, escalations — is record-only.
-SELF_HEAL_ATTENTION = frozenset({"history_unreadable", "unavailable", "identity_mismatch", "mapping_suspect"})
+SELF_HEAL_ATTENTION: frozenset[str] = frozenset()  # owner 2026-10-21: a mis-configured self-heal is engineer-only (record)
 
 TICK_S = 30.0
 FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything

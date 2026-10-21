@@ -1444,13 +1444,13 @@ async function checkSingleWriter(): Promise<void> {
              && Date.now() - multiInstanceSince >= MULTI_INSTANCE_ATTENTION_MS) {
     multiInstanceEscalated = true;
     await ntfy("Second planner instance still running after 30 min", body(sustained), "high",
-               { tier: "attention", key: "planner-multi-instance",
+               { tier: "record", key: "planner-multi-instance",
                  action: "In Railway, make sure only one a2w-planner deployment is running." });
   } else if (multiInstanceAlerted && !peerSet.size) {
     multiInstanceAlerted = false;
     multiInstanceSince = null;
     await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`, "default",
-               multiInstanceEscalated ? { tier: "attention", resolved: true, key: "planner-multi-instance" } : { tier: "record", resolved: true });
+               multiInstanceEscalated ? { tier: "record", resolved: true, key: "planner-multi-instance" } : { tier: "record", resolved: true });
     multiInstanceEscalated = false;
   }
 }
@@ -1503,7 +1503,7 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
     adoptionReheatSeenWhileOff = false;
     if (adoptionAlerted) {
       adoptionAlerted = false;
-      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`, "default", { tier: "attention", resolved: true, key: "hbx-adoption" });
+      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`, "default", { tier: "record", resolved: true, key: "hbx-adoption" });
     }
     return;
   }
@@ -1525,7 +1525,7 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
       "HBX target not adopting",
       `Commanded ${commanded.toFixed(1)}°F but operative is ${operative.toFixed(1)}°F — ${why}. The cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
       "high",
-      { tier: "attention", key: "hbx-adoption", // the device keeps heating on its last curve: savings, not safety
+      { tier: "record", key: "hbx-adoption", // the device keeps heating on its last curve: savings, not safety
         action: "Check the HBX in the SensorLinx app is online. The house keeps heating on the curve it has.",
         facts: [["Commanded", f0(commanded)], ["On the device", f0(operative)]] },
     );
@@ -2145,7 +2145,7 @@ async function checkLeaseAndPi(): Promise<void> {
   if (!WRITER_LEASE_ENABLED) return;
   if (held) {
     if (leaseAlerted) {
-      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { tier: "attention", resolved: true, key: "writer-lease" });
+      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { tier: "record", resolved: true, key: "writer-lease" });
     }
     leaseLostSince = null; leaseAlerted = false;
   } else {
@@ -2159,7 +2159,7 @@ async function checkLeaseAndPi(): Promise<void> {
           `The planner is up and healthy but is NOT driving the pumps, so the tank is running on whatever ` +
           `was last written. Check /health writer_lease and whether a second instance is contending.`,
         "high",
-        { tier: "attention", key: "writer-lease", // the pumps hold (or lease-revert to) a safe setpoint meanwhile
+        { tier: "record", key: "writer-lease", // the pumps hold (or lease-revert to) a safe setpoint meanwhile
           action: "Open the planner's /health page and check writer_lease; restart the a2w-planner service in Railway if it stays stuck." },
       );
     }
@@ -2358,7 +2358,7 @@ async function loopBody(): Promise<void> {
     lastPollAt = new Date().toISOString();
     if (consecutiveFailures >= OFFLINE_AFTER_FAILURES && offlineAlerted) {
       await ntfy("SensorLinx reader recovered", `polling resumed at ${lastPollAt}`, "default",
-                 consecutiveFailures >= SLX_ATTENTION_FAILURES ? { tier: "attention", resolved: true, key: "sensorlinx-offline" } : { tier: "record", resolved: true });
+                 consecutiveFailures >= SLX_ATTENTION_FAILURES ? { tier: "record", resolved: true, key: "sensorlinx-offline" } : { tier: "record", resolved: true });
       offlineAlerted = false;
     }
     consecutiveFailures = 0;
@@ -2378,7 +2378,7 @@ async function loopBody(): Promise<void> {
       await ntfy("SensorLinx reader offline for 6 h",
         `${consecutiveFailures} consecutive poll failures; last success: ${lastPollAt ?? "never"}. The HBX keeps heating on its ` +
           `own curve, but the planner is blind and not optimizing. Check the SensorLinx app and the HBX's internet connection.`,
-        "high", { tier: "attention", key: "sensorlinx-offline",
+        "high", { tier: "record", key: "sensorlinx-offline",
                   action: "Check the HBX shows online in the SensorLinx app, and that its network cable or WiFi is connected." });
     }
   }
