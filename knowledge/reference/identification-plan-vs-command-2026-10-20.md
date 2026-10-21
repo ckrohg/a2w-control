@@ -144,12 +144,31 @@ so `SHAPED_CURVE=shadow` — stamped but written flat — resolves flat, as it s
 4. **`autopilot_log.target_f` on a `set-curve` row is the declared target**, not the command (1886: 135,
    set-curve). The ledger reads correctly only beside `hbx_writes`; recording the curve's output there would make
    the dashboard honest on its own.
-5. **Phase B's operative term is the raw report.** `runOnce()` tracks `getLatestSlx().targetF` as reported, so the
-   frozen post-soak report (`stale-slx-target-2026-10-19.md`) leads both pumps to 63 °C for 7–16 h after every soak:
-   39 of the 78 floor hours since Oct 15 had the report ≥ 3 °F above the curve (Phase B's setpoint on floor hours
-   averaged 55.6 °C, max 63), and it set the setpoint on 7 of the 20 winter-guard hours in item 1. The #215 proof
-   (`stale-target.ts`) says when the curve in force is the operative target; Phase B should read the report the same
-   way. More hours than item 1; a separate PR, since it changes live setpoints.
+5. **Phase B's operative term was the raw report — done in the next follow-up PR (stacked on #222; deploys the
+   planner).** `runOnce()` tracked `getLatestSlx().targetF` as reported, so the frozen post-soak report
+   (`stale-slx-target-2026-10-19.md`) led both pumps to 63 °C for 7–16 h after every soak: 39 of the 78 floor hours
+   since Oct 15 had the report ≥ 3 °F above the curve (Phase B's setpoint on floor hours averaged 55.6 °C, max 63),
+   and it set the setpoint on 7 of the 20 winter-guard hours in item 1. Now `operativeLeadF()` runs the #215 proof
+   (`stale-target.ts`) on the same inputs the identification driver hands it — the report, the curve in force's
+   midpoint as the command and its output at the live outdoor, `htDif`, the last hour of polls (read only when the
+   report sits > 3 °F above the command) — and a PROVEN-stale report gives way to the curve in force's output;
+   anything short of proof leaves the raw report in charge, byte-identical. The device curve (`curveLeadF`) and the
+   plan (item 1) stay in the max, so the lead never drops below what the device drives to. `checkI1` (`index.ts`)
+   checks the pumps against the same operative term — against the raw report it would have flagged a false I1 for
+   every stale stretch once the setpoints covered the curve, and `isI1Violated()` would have idled the
+   identification driver on it. `/health.phase_b.lead.operative_basis` reads `report` or `stale→curve` (with
+   `reported_f` and `stale_proof`); `/health.i1.operative` shows what I1 compared against.
+   **What it changes**, from the same restore (scratch `stale_samples` / `lead_hours_stale`, Oct 15–19): the proof
+   holds on 260 of 1 417 samples (18 %; 51 % of the 513 where the report sat > 3 °F above the command). Of the 39
+   floor hours with the report ≥ 3 °F above the curve, 19 are proven stale at the hour's sample and drop from 55–63 °C
+   to 52–53 °C (floor-hour average 55.6 → 53.5 °C); the other 20 keep their setpoint — the tank was still above the
+   OLD call threshold right after the soak/bank (Oct 15 07:30: tank 138.6 vs 132), or a stage was being called —
+   the proof refusing to guess. Of the 7 report-dominated winter-guard hours in item 1, 5 drop from 63–64 to 52 °C
+   (Oct 17 06:30 and 14:30, Oct 19 19:30–21:30); Oct 17 04:30–05:30 stay at 63 (tank 142, above the threshold).
+   Four excursion hours drop too (Oct 19 16:30–18:30: the bank's 129/125 line in force under the soak's 139.9
+   report → 57 °C, not 63). 29 of the 118 hours in all. The proof can flap hour to hour when the device really is
+   re-commanded hourly (Oct 18 14:00–17:00, the #168-class soak re-write at :45 — stale at :30–:40 only); each flip
+   is logged once and the setpoint follows, raising first.
 
 Related: `stale-slx-target-2026-10-19.md` (the gate before this one), `bank-rebank-2026-10-19.md` (#218, the :04/:19
 double write visible in §1), `incident-20261016-hp2-e21-investigation.md` §6 (why the winter guard exists at all).
