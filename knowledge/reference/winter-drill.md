@@ -10,8 +10,8 @@ announced.
 
 ## What "pass" means
 
-Email = intervention tier only (equipment faults, prolonged outage, Pi dead, freeze-risk,
-Pi hardware). ntfy = everything actionable. See `resend-email-alerting` memory / #68.
+Tiers per `alert-policy.md` (2026-10-20): page = 6bb phone push + email, attention = email only, record = ntfy log
+only. `POST /api/drill` fires one page-tier and one attention-tier drill; its response says what should arrive where.
 
 ## The drill
 

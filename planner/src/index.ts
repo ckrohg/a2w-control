@@ -47,6 +47,8 @@ import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from 
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
+import { renderAlertEmail } from "./alertemail";
+import { route, tierSubject, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, piUnreachablePageAfterS, type Tier, type NotifyOpts } from "./alertpolicy";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
@@ -75,18 +77,13 @@ const POLL_SECONDS = Number(env("POLL_SECONDS", "300"));
 const PORT = Number(process.env.PORT ?? 8080);
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_SERVER = process.env.NTFY_SERVER ?? "https://ntfy.sh";
-// Email second channel (Resend). Owner policy 2026-08-06: email is for INTERVENE-NOW
-// only — planner operational warnings (adoption, I1, unserved calls, config changes,
-// storm, DHW comfort) page ntfy at "high" but stay out of the inbox. Freeze-risk is the
-// one planner condition that threatens the house, so it alone rides "urgent" and emails.
+// Email (Resend) and the 6bb phone push are chosen by TIER, never by priority: see alertpolicy.ts and
+// knowledge/reference/alert-policy.md (owner, 2026-10-20). Priority now only sets ntfy loudness.
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const RESEND_TO = process.env.RESEND_TO ?? "";
 const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
-// The owner reads email only (2026-08-23), so "high" must email as well — otherwise the
-// element-called / no-pump-running / reader-offline alerts have NO channel at all. Anything
-// quieter than high stays informational and does not email unless it is a resolution.
-const EMAIL_PRIORITIES = new Set(["urgent", "max", "high"]);
 const OFFLINE_AFTER_FAILURES = 5;
+const SLX_ATTENTION_FAILURES = 72; // ~6 h at the 5-min poll
 
 const HUB_URL = process.env.HUB_URL;
 const HUB_CLIENT_TOKEN = process.env.HUB_CLIENT_TOKEN;
@@ -377,7 +374,7 @@ function describeFetchError(err: unknown): string {
 }
 
 /**
- * Build the EMAIL subject. Deliberately not the ntfy title — ntfy titles are HTTP headers
+ * EMAIL subjects come from tierSubject (alertpolicy.ts) — deliberately not the ntfy title, which is an HTTP header
  * and must stay Latin-1 (see the sanitizer below).
  *
  * The 2026-08-20 bridge-offline alert was delivered and never opened. It was not a
@@ -386,34 +383,12 @@ function describeFetchError(err: unknown): string {
  * address, because both projects use Resend's shared onboarding domain. With the address
  * identical and the subject unremarkable, a genuine emergency looked like routine mail.
  *
- * So the severity leads, in the one place with room for it. Only genuinely actionable
- * alerts get the siren; if everything shouts, nothing does.
+ * So the tier leads, in the one place with room for it. Only a page gets the siren; if everything shouts, nothing does.
  */
-const CRITICAL_PRIORITIES = new Set(["urgent", "max"]);
+/** °F for an email fact ("?" when unknown). */
+const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.round(v)} °F`);
 
-/**
- * Four visual tiers, so the inbox is scannable at a glance and the siren keeps its
- * meaning. The owner reads EMAIL ONLY (2026-08-23: "I dont want to do ntfy... emails are
- * plenty"), so every tier below has to survive on its subject line alone.
- *
- *   🚨 CRITICAL  urgent/max — act now (freeze risk, winter cap)
- *   ⚠️  warning   high       — needs attention (element called, no pump, reader offline)
- *   ✅ RESOLVED  recovery   — the all-clear for something we already alerted on
- *      plain     default    — informational (config confirmations, digest)
- */
-export function alertSubject(title: string, priority: string, resolved = false): string {
-  const t = title.trim();
-  const core = () => t.replace(/^\s*A2W\s*[:—-]\s*/i, "").replace(/^[⚠✅🚨\s]+/, "").trim() || t;
-  if (resolved) return `✅ A2W RESOLVED — ${core()}`;
-  if (CRITICAL_PRIORITIES.has(priority)) return `🚨 A2W CRITICAL — ${core()}`;
-  if (priority === "high") return `⚠️ A2W — ${core()}`;
-  // Informational: only label it if it isn't already self-labelled, so the weekly digest
-  // doesn't become "A2W — A2W weekly: …".
-  return /^a2w\b/i.test(t) ? t : `A2W — ${t}`;
-}
-
-async function ntfy(title: string, body: string, priority = "default",
-                    opts: { resolved?: boolean; email?: boolean } = {}): Promise<void> {
+async function ntfy(title: string, body: string, priority: string, opts: NotifyOpts): Promise<void> {
   await ntfyDelivered(title, body, priority, opts);
 }
 
@@ -451,12 +426,16 @@ async function sixbbPush(source: string, title: string, body: string, priority: 
 }
 const pushTag = (t: string) => t.replace(/[^A-Za-z0-9 ]/g, "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 50);
 
-async function ntfyDelivered(title: string, body: string, priority = "default",
-                             opts: { resolved?: boolean; email?: boolean } = {}): Promise<boolean> {
+const latches = new Latches(store);
+const pageBudget = new PageBudget();
+let pageBudgetSeeded = false;
+
+async function ntfyDelivered(title: string, body: string, priority: string, opts: NotifyOpts): Promise<boolean> {
+  const resolved = !!opts.resolved;
   let delivered = false;
   if (!NTFY_TOPIC) {
     // No topic (rehearsal, local runs): the page is still a fact — log it so a harness can assert what WOULD have paged.
-    console.log(`[ntfy] (no topic) ${priority}${opts.resolved ? " resolved" : ""}: ${title}`);
+    console.log(`[ntfy] (no topic) ${opts.tier}/${priority}${resolved ? " resolved" : ""}: ${title}`);
   }
   if (NTFY_TOPIC) {
     // HTTP headers are ByteStrings — a leading emoji (⚠ = U+26A0) THROWS and silently
@@ -472,7 +451,7 @@ async function ntfyDelivered(title: string, body: string, priority = "default",
       try {
         const r = await fetch(`${NTFY_SERVER}/${NTFY_TOPIC}`, {
           method: "POST",
-          headers: { Title: safeTitle, Priority: priority, Tags: "hbx" },
+          headers: { Title: safeTitle, Priority: priority, Tags: `hbx,${opts.tier}` },
           body,
           signal: AbortSignal.timeout(10_000),
         });
@@ -484,13 +463,29 @@ async function ntfyDelivered(title: string, body: string, priority = "default",
       }
     }
   }
-  if (priority === "high" || priority === "urgent" || opts.resolved) {
-    if (await sixbbPush("a2w-planner", title, body, priority, pushTag(title))) delivered = true;
+
+  // Which tier actually applies: a keyed open already sent (this restart's re-fire, or within RENOTIFY_MS) goes no
+  // further; a keyed all-clear is due only if its alert was sent, and at the tier it was sent at.
+  let tier: Tier = opts.tier;
+  let suppressed: string | null = null;
+  if (opts.key && resolved) {
+    tier = (await latches.release(opts.key, opts.tier)) ?? "record";
+    if (tier === "record" && opts.tier !== "record") suppressed = "nothing was sent for it";
+  } else if (opts.key && opts.tier !== "record" && !(await latches.claim(opts.key, opts.tier))) {
+    tier = "record";
+    suppressed = "already sent (latched)";
   }
-  // opts.email is the explicit override in BOTH directions: false mutes a high-priority
-  // signal that fires too often to be worth an inbox slot, true forces one through.
-  const wantsEmail = opts.email ?? (EMAIL_PRIORITIES.has(priority) || !!opts.resolved);
-  if (wantsEmail && RESEND_API_KEY && RESEND_TO) {
+  const want = route(tier, resolved);
+
+  let pushed = false;
+  if (want.push && SIXBB_ALERT_URL && SIXBB_ALERT_KEY) {
+    // the key, when there is one, is the 6bb tag: the all-clear REPLACES its alert on the phone
+    const pushPriority = resolved ? "default" : (priority === "urgent" || priority === "max" ? "urgent" : "high");
+    pushed = await sixbbPush("a2w-planner", title, body, pushPriority, pushTag(opts.key ?? title));
+    if (pushed) delivered = true;
+  }
+  let emailed = false;
+  if (want.email && RESEND_API_KEY && RESEND_TO) {
     try {
       const r = await fetch("https://api.resend.com/emails", {
         method: "POST",
@@ -501,18 +496,36 @@ async function ntfyDelivered(title: string, body: string, priority = "default",
           // bridge's urllib silently failed for weeks on this, 2026-08-06) — honest UA.
           "User-Agent": "a2w-planner/1.0",
         },
-        body: JSON.stringify({ from: RESEND_FROM, to: [RESEND_TO],
-                               subject: alertSubject(title, priority, opts.resolved), text: body }),
+        body: JSON.stringify({
+          from: RESEND_FROM, to: [RESEND_TO], subject: tierSubject(title, tier, resolved), text: body,
+          html: opts.html ?? renderAlertEmail({ tier, resolved, title, body, action: opts.action, facts: opts.facts, source: "A2W planner" }),
+        }),
         signal: AbortSignal.timeout(10_000),
       });
       if (!r.ok) console.error("resend email failed:", r.status);
-      else delivered = true;
+      else { delivered = true; emailed = true; }
     } catch (e) {
       console.error("resend email failed:", (e as Error).message);
     }
   }
-  const anyChannel = !!NTFY_TOPIC || (wantsEmail && !!RESEND_API_KEY && !!RESEND_TO)
-    || ((priority === "high" || priority === "urgent" || !!opts.resolved) && !!SIXBB_ALERT_URL && !!SIXBB_ALERT_KEY);
+
+  if (tier === "page" && !resolved && pushed) {
+    if (!pageBudgetSeeded) {
+      pageBudgetSeeded = true;
+      const n = await store.pagesLast7d().catch(() => 0);
+      for (let i = 0; i < n; i++) pageBudget.note(Date.now() - 1);
+    }
+    const n = pageBudget.note();
+    if (pageBudget.over()) console.error(`[alert-policy] PAGE BUDGET EXCEEDED: ${n} pages in 7 days (budget ${PAGE_BUDGET_PER_WEEK}) — the alerting is too loud; check the notifications table`);
+  }
+  await store.logNotification({ source: "planner", tier: opts.tier, resolved, key: opts.key ?? null, title, body,
+                                pushed, emailed, suppressed }).catch((e) => console.error("notification log failed:", (e as Error).message));
+
+  // record tier has no owner channel to acknowledge: it is delivered by being logged. Otherwise true when a channel
+  // acknowledged, or when none of the wanted channels is configured (rehearsal / local: the log line is the delivery).
+  if (tier === "record") return true;
+  const anyChannel = !!NTFY_TOPIC || (want.email && !!RESEND_API_KEY && !!RESEND_TO)
+    || (want.push && !!SIXBB_ALERT_URL && !!SIXBB_ALERT_KEY);
   return delivered || !anyChannel;
 }
 
@@ -589,14 +602,14 @@ async function checkI1(tankTargetF: number | null): Promise<void> {
       `Tank target ${tankTargetF.toFixed(1)}°F.\n${i1Detail}\nUnreachable-target deadlock risk — raise the HP setpoint or lower the HBX target.`,
       "high",
       // ~0.4/day and usually self-clearing within a cycle — the /optimize banner and the
-      // i1_episodes history carry it. An inbox slot every other day would dull the tier.
-      { email: false },
+      // i1_episodes history carry it. Record only (alert-policy.md).
+      { tier: "record" },
     );
   } else if (!offenders.length && i1Violated) {
     i1Violated = false;
     i1Detail = null;
     await store.closeI1Episode().catch(() => {});
-    await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`, "default", { resolved: true, email: false });
+    await ntfy("I1 cleared", `All online pump setpoints back above tank target + ${DEFAULT_OPTS.i1MarginF}°F.`, "default", { tier: "record", resolved: true });
   }
 }
 
@@ -643,6 +656,9 @@ async function sanitizeDueNow(): Promise<{ due: boolean; urgent: boolean }> {
  *  under as-found/current temps; load-bearing once the cool-tank optimized targets run. */
 let i8Alerted = false;
 let i8BlindAlerted = false; // separate edge for the "can't verify" page — see checkI8
+// Owner alert policy: a missed hygiene window is record-only; only this long without any soak reaches the owner.
+const I8_ATTENTION_H = 72;
+let i8Escalated = false;
 // Last checkI8 verdict, surfaced on /health so go-live is verifiable with one curl (is the actuator
 // armed? what interval is in force? was the last window pasteurized?) — not inferable from __version__.
 let i8LastIntervalH: number | null = null;
@@ -700,10 +716,18 @@ async function checkI8(): Promise<void> {
       `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in ${intervalH}h`,
       `The DHW coil's potable slug hasn't held a pasteurizing soak (needs ≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min; best in the window: ${Math.round(dwellMin)} min). Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card), or check why the planner's sanitize didn't run.${gapNote}`,
       "high",
+      // one missed window self-corrects (the planner schedules the soak at the next chance): record. Escalates to the
+      // owner only after I8_ATTENTION_H with no soak at all — see below.
+      { tier: "record" },
     );
   } else if (satisfied && i8Alerted) {
     i8Alerted = false;
-    await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`, "default", { resolved: true });
+    await ntfy("I8 hygiene satisfied", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min — daily pasteurization met.`, "default", { tier: "record", resolved: true });
+    if (i8Escalated) {
+      i8Escalated = false;
+      await ntfy("I8 hygiene soak completed", `Tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`, "default",
+                 { tier: "attention", resolved: true, key: "i8-72h" });
+    }
   }
 
   // BLIND: can't confirm a soak, and the window is too sparse to call it overdue. This state used to
@@ -717,10 +741,28 @@ async function checkI8(): Promise<void> {
       "I8 hygiene: CANNOT VERIFY — telemetry gap",
       `The pasteurization monitor is blind: only ${res.length} of ~${minReadings}+ expected readings in the last ${intervalH}h, with a ${(largestGapMin / 60).toFixed(1)}h stretch of no data. This does NOT mean the soak was missed — it means we can't prove it happened. Check the bridge/Pi is reporting; the planner will soak at the earliest hour while the window reads as lapsed.`,
       "high",
+      { tier: "record" }, // a symptom of the telemetry gap, which the Pi-unreachable page already covers
     );
   } else if (satisfied && i8BlindAlerted) {
     i8BlindAlerted = false;
-    await ntfy("I8 hygiene verifiable again", `Telemetry recovered and the tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`, "default", { resolved: true });
+    await ntfy("I8 hygiene verifiable again", `Telemetry recovered and the tank held ≥${SANITIZE_VERIFY_F}°F for ${Math.round(dwellMin)} min.`, "default", { tier: "record", resolved: true });
+  }
+
+  // The owner hears about hygiene only when it has been missed for I8_ATTENTION_H — days, not one window.
+  if (i8Alerted && !i8Escalated) {
+    const long = await store.getRecentSeries(I8_ATTENTION_H);
+    if (long.length >= Math.round((I8_ATTENTION_H * 200) / 26) && !lastDwellEnd(long, SANITIZE_VERIFY_F, SANITIZE_DWELL_MIN)) {
+      i8Escalated = true;
+      await ntfy(
+        `I8 hygiene: no ${SANITIZE_DWELL_MIN}-min ≥${SANITIZE_VERIFY_F}°F soak in ${I8_ATTENTION_H}h`,
+        `The DHW coil has gone ${I8_ATTENTION_H}h without a pasteurizing soak (≥${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min), so the planner's automatic sanitize is not landing. Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for ~2h (Control → HBX card) and check why the scheduled soak didn't run.`,
+        "high",
+        { tier: "attention", key: "i8-72h",
+          action: `Boost the tank to ${DEFAULT_OPTS.sanitizeF}°F for about 2 hours (Control page → HBX card).`,
+          facts: [["Last soak", i8HoursSinceDwell == null ? `more than ${I8_ATTENTION_H} h ago` : `${Math.round(i8HoursSinceDwell)} h ago`],
+                  ["Needed", `${SANITIZE_VERIFY_F}°F for ${SANITIZE_DWELL_MIN} min`]] },
+      );
+    }
   }
 }
 
@@ -768,7 +810,7 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
       await openAlert(e.type, e.stage, e.pumpId, e.title, e.body);
     } else {
       await alerts.close(e.type, e.stage);
-      await ntfy(e.title, e.body, "default", { resolved: true });
+      await ntfy(e.title, e.body, "default", { tier: episodeTier(e.type), resolved: true });
     }
   }
   stageEpisodes24h = await store.alertEpisodes24h().catch(() => stageEpisodes24h);
@@ -849,7 +891,7 @@ async function restoreAlertState(): Promise<void> {
 }
 
 // #185 / #187: the alert outbox (alerts.ts) — pages resolved only on acknowledged delivery, re-sent every poll.
-const alerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "high"));
+const alerts = new AlertOutbox(store, (title, body, kind) => ntfyDelivered(title, body, "high", { tier: episodeTier(kind) }));
 async function openAlert(kind: string, key: string, pumpId: string | null, title: string, body: string): Promise<void> {
   await alerts.open(kind, key, pumpId, title, body);
 }
@@ -875,7 +917,7 @@ async function checkSpanLocal(): Promise<void> {
   if (n && !n.resolved) await openAlert("span_local_stale", "span", null, n.title, n.body);
   else if (n) {
     await alerts.close("span_local_stale", "span");
-    await ntfy(n.title, n.body, n.priority, { resolved: true });
+    await ntfy(n.title, n.body, n.priority, { tier: episodeTier("span_local_stale"), resolved: true });
   }
 }
 
@@ -966,7 +1008,7 @@ async function checkPumpHealth(): Promise<void> {
       else await shadowAlerts.open(kind, e.pumpId, e.pumpId, `${title} (shadow)`, e.body);
     } else if (live) {
       await alerts.close(kind, e.pumpId);
-      await ntfy(title, e.body, "default", { resolved: true });
+      await ntfy(title, e.body, "default", { tier: episodeTier(kind), resolved: true });
     } else {
       await shadowAlerts.close(kind, e.pumpId);
       console.log(`[pumphealth][shadow] ${title}: ${e.body}`);
@@ -1016,8 +1058,9 @@ async function checkPumpHealthDaily(): Promise<void> {
   if (!(await store.claimPumpDigest(yesterday))) { pumpDigestDoneFor = yesterday; return; } // sent already (or by a peer)
   try {
     const eps = await store.pumpHealthEpisodes24h().catch(() => []);
-    const { title, body } = digest(yesterday, pumpDays, pumpTrend, eps, pumpWatch.status(), pumpNames, PH_LIVE.live);
-    if (await ntfyDelivered(title, body, "default", { email: true })) {
+    const { title, body, html } = digest(yesterday, pumpDays, pumpTrend, eps, pumpWatch.status(), pumpNames, PH_LIVE.live);
+    // a normal day is record-only (dashboard + Monday digest); a flagged drift is worth an email
+    if (await ntfyDelivered(title, body, "default", { tier: /drift flagged/.test(title) ? "attention" : "record", html })) {
       await store.markPumpDigestSent(yesterday);
       pumpDigestDoneFor = yesterday;
       pumpDigestLast = { day: yesterday, sent_at: new Date().toISOString() };
@@ -1053,7 +1096,8 @@ let backupGateEpisodes7d: number | null = null;
 // shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
 // every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
 // The would-open is a log line + /health + the dashboard: no second email.
-const gateShadowAlerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "default", { email: true }));
+// shadow mode never notifies the owner (alert-policy.md): the episode row, /health and the dashboard carry it
+const gateShadowAlerts = new AlertOutbox(store, (title, body) => ntfyDelivered(title, body, "default", { tier: "record" }));
 
 async function checkBackupGate(reading: SlxReading): Promise<void> {
   if (BACKUP_GATE_CFG.mode === "off") { backupGateBlind = "disabled (BACKUP_GATE=off)"; return; }
@@ -1089,10 +1133,10 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
     if (e.kind === "confirmed") {
       // a live command whose hub answer was lost, now seen done on the relay: record it as the gate's own
       if (e.confirms === "close") await openAlert(backupGateKind, "buffer_tank", null, e.title, e.body);
-      else { await alerts.close(backupGateKind, "buffer_tank"); await ntfyDelivered(e.title, e.body, "default", { resolved: true }); }
+      else { await alerts.close(backupGateKind, "buffer_tank"); await ntfyDelivered(e.title, e.body, "default", { tier: episodeTier(backupGateKind), resolved: true }); }
       continue;
     }
-    if (e.kind !== "close" && e.kind !== "open") { await ntfyDelivered(e.title, e.body, e.priority); continue; }
+    if (e.kind !== "close" && e.kind !== "open") { await ntfyDelivered(e.title, e.body, e.priority, { tier: "record" }); continue; }
     if (BACKUP_GATE_CFG.mode === "live") {
       // the Pi's BreakerController verifies the relay read-back; the gate (and its episode) changes only on a verified
       // answer. A refusal (a bridge guard said no) stands the gate down for the episode; no Pi / no answer retries after
@@ -1108,7 +1152,11 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
           await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,
             `${r.detail}. ` + (r.refused ? "A bridge guard refused it; A2W will not retry until the condition ends. "
               : `A2W retries every ${BG.RETRY_MS / 60_000} min while the condition holds (no further pages). `) +
-            (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high");
+            (e.kind === "close" ? "If the house is losing heat, switch the Buffer Tank breaker ON at the SPAN panel. " : "") + e.body, "high",
+            // a close that didn't land needs a hand at the panel; an open that didn't is only cost
+            { tier: e.kind === "close" ? "page" : "attention",
+              action: e.kind === "close" ? "Switch the Buffer Tank breaker ON at the SPAN panel if the house is losing heat."
+                                         : "Switch the Buffer Tank breaker OFF at the SPAN panel when convenient (it is only costing money)." });
         }
         continue;
       }
@@ -1116,7 +1164,7 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
     if (e.kind === "close") await outbox.open(backupGateKind, "buffer_tank", null, e.title, e.body);
     else if (BACKUP_GATE_CFG.mode === "live") {
       await alerts.close(backupGateKind, "buffer_tank");
-      await ntfyDelivered(e.title, e.body, "default", { resolved: true });
+      await ntfyDelivered(e.title, e.body, "default", { tier: episodeTier(backupGateKind), resolved: true });
     } else {
       await gateShadowAlerts.close(backupGateKind, "buffer_tank"); // log + /health + dashboard only: no second email
     }
@@ -1124,6 +1172,9 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
   backupGateEpisodes7d = await store.alertEpisodesSince(backupGateKind, 7 * 24).catch(() => backupGateEpisodes7d);
 }
 
+// Owner alert policy: 29 of 36 unserved calls in Sept–Oct cleared within 15 min (start-up, defrost). The buffer tank
+// carries the house for hours, so only a call left unserved this long is a page.
+const UNSERVED_PAGE_POLLS = 9; // ~45 min at the 5-min poll
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
   if (!hub) return;
   const anyStageCall = reading.stagesCalled?.some(Boolean) === true;
@@ -1136,7 +1187,7 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
     if (unservedAlerted) {
       unservedAlerted = false;
       await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.", "default", { resolved: true });
+      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.", "default", { tier: "page", resolved: true, key: "no-heat" });
     }
     return;
   }
@@ -1147,12 +1198,12 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
     if (unservedAlerted) {
       unservedAlerted = false;
       await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "A pump is running against the call again.", "default", { resolved: true });
+      await ntfy("Unserved call cleared", "A pump is running against the call again.", "default", { tier: "page", resolved: true, key: "no-heat" });
     }
     return;
   }
   unservedStreak++;
-  if (unservedStreak >= 2 && !unservedAlerted) {
+  if (unservedStreak >= UNSERVED_PAGE_POLLS && !unservedAlerted) {
     unservedAlerted = true;
     const detail = `HBX stage call active ~${unservedStreak * 5} min with no pump running (tank ${reading.tankF ?? "?"}°F / target ${reading.tankTargetF ?? "?"}°F)`;
     await store.openUnservedEpisode(detail).catch(() => {});
@@ -1160,6 +1211,12 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
       "⚠ Heat call active but NO pump is running",
       `${detail}. Causes: pump powered off, failure-to-start (the HP2 winter pattern), or a write-disabled/faulted unit. The tank is falling while HBX waits.`,
       "high",
+      // THE "no heat" incident: the per-stage unserved/fault-called episodes are its record-only symptoms
+      { tier: "page", key: "no-heat",
+        action: "Check both heat pumps: is each one powered on, and is either showing a fault code? Power-cycling a faulted pump's breaker at the SPAN panel often clears it.",
+        facts: [["No heat for", `${unservedStreak * 5} min`], ["Tank", `${f0(reading.tankF)} (target ${f0(reading.tankTargetF)})`],
+                ["Outdoor", f0(reading.outdoorF)],
+                ["Pumps", st.pumps.map((p) => `${p.name ?? p.id}: ${p.online ? p.state ?? "?" : "offline"}`).join(" · ")]] },
     );
   }
 }
@@ -1175,10 +1232,11 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
       "16.5 kW backup element CALLED",
       "HBX has called the backup element (≈$5/hour if its breaker is on). Legitimate in design-cold; otherwise investigate.",
       "high",
+      { tier: "record" }, // a call is not a draw: the SPAN power alarm (spanwatch) is the one that emails
     );
   } else if (called === false && backupWasCalled) {
     backupWasCalled = false;
-    await ntfy("Backup element call ended", "HBX released the backup element.", "default", { resolved: true });
+    await ntfy("Backup element call ended", "HBX released the backup element.", "default", { tier: "record", resolved: true });
   }
 }
 
@@ -1190,7 +1248,7 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
  *  drawn-down call, breaker permitting; auto-raising the target here would fight autopilot's rate-limit).
  *  Edge-triggered both ways. */
 const DHW_SHORTFALL_F = 113;   // below the 45 °C unattended floor → clearly cold for delivery (normal cycle bottoms ~117°F)
-const DHW_SHORTFALL_POLLS = 4; // ~20 min sustained at the 5-min poll — not a transient draw dip
+const DHW_SHORTFALL_POLLS = 12; // ~60 min sustained at the 5-min poll — a draw dip recovers well inside that (alert-policy.md)
 let dhwShortfallStreak = 0;
 let dhwShortfallAlerted = false;
 async function checkDHWShortfall(reading: SlxReading): Promise<void> {
@@ -1199,17 +1257,23 @@ async function checkDHWShortfall(reading: SlxReading): Promise<void> {
     dhwShortfallStreak = 0;
     if (dhwShortfallAlerted) {
       dhwShortfallAlerted = false;
-      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`, "default", { resolved: true });
+      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`, "default", { tier: "page", resolved: true, key: "dhw-shortfall" });
     }
     return;
   }
   dhwShortfallStreak++;
   if (dhwShortfallStreak >= DHW_SHORTFALL_POLLS && !dhwShortfallAlerted) {
     dhwShortfallAlerted = true;
+    // one incident, one page: a cold tank while the "no heat" page is open is that incident's symptom (Oct 11 and
+    // Oct 15 2026, HP2 E21: both fired for the same outage)
+    const tier: Tier = unservedAlerted ? "record" : "page";
     await ntfy(
       "⚠ DHW comfort shortfall — buffer running cold",
       `Buffer ${reading.tankF.toFixed(0)}°F, below the ${Math.round(DEFAULT_OPTS.dhwFloorF)}°F DHW-ready floor for ~${dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
       "high",
+      { tier, key: "dhw-shortfall",
+        action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
+        facts: [["Tank", `${f0(reading.tankF)} for ${dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(DEFAULT_OPTS.dhwFloorF)]] },
     );
   }
 }
@@ -1230,6 +1294,7 @@ let leaseAlerted = false;
 let lastPiConnected: boolean | null = null; // cached from checkI1's existing hub read
 let piDisconnectedSince: number | null = null;
 let piQuietAlerted = false;
+let piQuietPaged = false;
 const LEASE_LOST_ALERT_S = 900;  // past the ~11-15 min handover a redeploy legitimately causes
 const PI_QUIET_ALERT_S = 600;
 async function checkFreezeRisk(reading: SlxReading): Promise<void> {
@@ -1240,11 +1305,14 @@ async function checkFreezeRisk(reading: SlxReading): Promise<void> {
     await ntfy(
       "⚠ Freeze-risk advisory",
       `Outdoor ${reading.outdoorF.toFixed(0)}°F with the buffer only ${reading.tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
-      "urgent", // the one planner alert that emails: house-threatening, intervene now
+      "urgent",
+      { tier: "page", key: "freeze-risk", // house-threatening, intervene now
+        action: "Make sure both heat pumps are running and the backup element breaker is ON at the SPAN panel.",
+        facts: [["Outdoor", f0(reading.outdoorF)], ["Tank", f0(reading.tankF)]] },
     );
   } else if (!risk && freezeRiskAlerted) {
     freezeRiskAlerted = false;
-    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`, "default", { resolved: true });
+    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`, "default", { tier: "page", resolved: true, key: "freeze-risk" });
   }
 }
 
@@ -1331,6 +1399,11 @@ function scheduleLeaseClaimRetry(): void {
 }
 let instancePrevPeers = new Set<string>();
 let multiInstanceAlerted = false;
+// All 34 second-instance alerts in Sept–Oct 2026 came within 3 h of a planner deploy: Railway's old and new containers
+// overlap for ~10–22 min. Record the overlap; only one that outlives a deploy reaches the owner.
+const MULTI_INSTANCE_ATTENTION_MS = 30 * 60_000;
+let multiInstanceSince: number | null = null;
+let multiInstanceEscalated = false;
 async function checkSingleWriter(): Promise<void> {
   let peers: string[];
   try {
@@ -1343,16 +1416,23 @@ async function checkSingleWriter(): Promise<void> {
   // Count only peers seen on BOTH this poll and the last — filters a redeploy's brief overlap.
   const sustained = peers.filter((id) => instancePrevPeers.has(id));
   instancePrevPeers = peerSet;
+  const body = (ids: string[]) => `This planner (${INSTANCE_ID}) sees another live instance: ${ids.join(", ")}. Only ONE planner may write the HBX (README §Single-writer invariant, #36) — a second writer bypasses the guardrails and can collide. Shut the extra instance down, or set its AUTOPILOT_DRY_RUN=1 / PHASE_B_DRY_RUN=1.`;
   if (sustained.length && !multiInstanceAlerted) {
     multiInstanceAlerted = true;
-    await ntfy(
-      "⚠ Second planner instance detected — single-writer at risk",
-      `This planner (${INSTANCE_ID}) sees another live instance for ≥2 polls: ${sustained.join(", ")}. Only ONE planner may write the HBX (README §Single-writer invariant, #36) — a second writer bypasses the guardrails and can collide. Shut the extra instance down, or set its AUTOPILOT_DRY_RUN=1 / PHASE_B_DRY_RUN=1.`,
-      "high",
-    );
+    multiInstanceSince = Date.now();
+    await ntfy("Second planner instance detected — single-writer at risk", body(sustained), "high", { tier: "record" });
+  } else if (sustained.length && multiInstanceSince != null && !multiInstanceEscalated
+             && Date.now() - multiInstanceSince >= MULTI_INSTANCE_ATTENTION_MS) {
+    multiInstanceEscalated = true;
+    await ntfy("Second planner instance still running after 30 min", body(sustained), "high",
+               { tier: "attention", key: "planner-multi-instance",
+                 action: "In Railway, make sure only one a2w-planner deployment is running." });
   } else if (multiInstanceAlerted && !peerSet.size) {
     multiInstanceAlerted = false;
-    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`, "default", { resolved: true });
+    multiInstanceSince = null;
+    await ntfy("Planner single-instance restored", `${INSTANCE_ID} is the only live instance again.`, "default",
+               multiInstanceEscalated ? { tier: "attention", resolved: true, key: "planner-multi-instance" } : { tier: "record", resolved: true });
+    multiInstanceEscalated = false;
   }
 }
 
@@ -1404,7 +1484,7 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
     adoptionReheatSeenWhileOff = false;
     if (adoptionAlerted) {
       adoptionAlerted = false;
-      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`, "default", { resolved: true });
+      await ntfy("HBX target adoption recovered", `Operative target now matches the commanded ${commanded.toFixed(1)}°F.`, "default", { tier: "attention", resolved: true, key: "hbx-adoption" });
     }
     return;
   }
@@ -1426,6 +1506,9 @@ async function checkAdoption(reading: SlxReading, config: Record<string, number>
       "HBX target not adopting",
       `Commanded ${commanded.toFixed(1)}°F but operative is ${operative.toFixed(1)}°F — ${why}. The cloud reset-curve write did not take effect on the device. Check the curve / re-command.`,
       "high",
+      { tier: "attention", key: "hbx-adoption", // the device keeps heating on its last curve: savings, not safety
+        action: "Check the HBX in the SensorLinx app is online. The house keeps heating on the curve it has.",
+        facts: [["Commanded", f0(commanded)], ["On the device", f0(operative)]] },
     );
   }
 }
@@ -1481,13 +1564,14 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
             ? `\nAuto-raise ACTIVE: pre-charging the tank toward ${ceilingF.toFixed(0)}°F (only raises, never lowers).`
             : `\nAuto-raise: proposing ${ceilingF.toFixed(0)}°F in the SHADOW plan only — the tank will NOT physically pre-charge until Phase B goes live (currently dry-run).`),
       "high",
+      { tier: "record" }, // A2W preparing for weather is it doing its job; the outcomes it guards against page on their own
     );
   } else {
     // a failed close is retried every tick, scoped to rows started before this stand-down (codex pass 5); several
     // stand-downs during one DB outage queue up and apply oldest first (codex pass 7)
     pendingStandDowns.push(new Date());
     await retryStormStandDown();
-    await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { resolved: true });
+    await ntfy(`Storm mode stand-down: ${transitions.join(", ")}`, "Storm window closed — back to the normal plan.", "default", { tier: "record", resolved: true });
   }
 }
 
@@ -1828,6 +1912,8 @@ async function shadowOnce(): Promise<void> {
             "Winter cap check: tonight is predicted to need more than 135°F",
             `If ${risk.zoneName} is calling around ${new Date(risk.start).toLocaleString("en-US", { timeZone: "America/New_York" })} it will need ~${Math.round(risk.requiredSupplyF)}°F supply (tank ${risk.tankTargetF}°F), above the ${opts.strictCapF}°F everyday cap — this is a capacity warning at the forecast outdoor, NOT a prediction that the zone will call. If rooms run cold tonight, the seasonal cap needs a deliberate raise (see winter-dp-commissioning.md).`,
             "urgent",
+          { tier: "attention", key: "cap-predicted", // an owner decision on the cap, not an emergency
+            action: "Decide whether to allow a higher water temperature tonight (Control page), or accept that this zone may run a little cool." },
           );
         } else if (!risk) {
           predictedCapLatched = false;
@@ -1862,6 +1948,8 @@ async function shadowOnce(): Promise<void> {
           "Winter cap check: zones may need more than 135°F",
           `${names} ${persistent.length === 1 ? "has" : "have"} been calling for ~${CAP_WATCH_STREAK}+ hours at ${Math.round(nowBlock.outdoor_f)}°F outdoor with the plan pinned at the ${DEFAULT_OPTS.strictCapF}°F cap. The as-found system ran hotter on days like this — if rooms are cold, the seasonal cap needs a deliberate raise (issue #59).`,
           "urgent",
+          { tier: "attention", key: "cap-watch", // an owner decision on the cap, not an emergency
+            action: "Decide whether to allow a higher water temperature (Control page), or accept that these zones may run a little cool." },
         );
       }
     } else {
@@ -2038,7 +2126,7 @@ async function checkLeaseAndPi(): Promise<void> {
   if (!WRITER_LEASE_ENABLED) return;
   if (held) {
     if (leaseAlerted) {
-      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { resolved: true });
+      await ntfy("Writer lease recovered", "The planner is commanding setpoints again.", "default", { tier: "attention", resolved: true, key: "writer-lease" });
     }
     leaseLostSince = null; leaseAlerted = false;
   } else {
@@ -2052,6 +2140,8 @@ async function checkLeaseAndPi(): Promise<void> {
           `The planner is up and healthy but is NOT driving the pumps, so the tank is running on whatever ` +
           `was last written. Check /health writer_lease and whether a second instance is contending.`,
         "high",
+        { tier: "attention", key: "writer-lease", // the pumps hold (or lease-revert to) a safe setpoint meanwhile
+          action: "Open the planner's /health page and check writer_lease; restart the a2w-planner service in Railway if it stays stuck." },
       );
     }
   }
@@ -2074,19 +2164,32 @@ async function checkLeaseAndPi(): Promise<void> {
       const downS = Math.round((Date.now() - piDisconnectedSince) / 1000);
       if (downS >= PI_QUIET_ALERT_S && !piQuietAlerted) {
         piQuietAlerted = true;
+        await ntfy("Pi disconnected", `The bridge has been disconnected for ~${Math.round(downS / 60)} min.`, "high", { tier: "record" });
+      }
+      // THE "Pi unreachable" incident (hub dead-man, SPAN-local stale and I8-blind are its record-only symptoms). The
+      // pumps hold their lease-reverted setpoints and the HBX keeps running its curve without the Pi, so this is a
+      // page only after hours — sooner when it is freezing out (piUnreachablePageAfterS).
+      const pageAfterS = piUnreachablePageAfterS(lastOutdoorF);
+      if (downS >= pageAfterS && !piQuietPaged) {
+        piQuietPaged = true;
         await ntfy(
-          "Pi disconnected",
-          `The bridge has been disconnected for ~${Math.round(downS / 60)} min. Setpoints are frozen at the last ` +
-            `written value, and until FINDING-1 (#117) is armed the revert-to-baseline failsafe cannot fire. ` +
-            `Precedent: a 73-minute WiFi drop on 2026-09-16, on a calm day.`,
+          "Pi unreachable",
+          `The heat-pump bridge (Pi) has not reported for ~${(downS / 3600).toFixed(1)} h` +
+            (lastOutdoorF != null ? ` with ${Math.round(lastOutdoorF)}°F outside` : "") + `. The pumps hold their ` +
+            `lease-reverted setpoints and the HBX keeps heating on its own curve, but A2W cannot see or optimize the plant. ` +
+            `Check the Pi's power and the house internet/WiFi (the Pi is 6bb-a2w-control at 192.168.184.197).`,
           "high",
+          { tier: "page", key: "pi-unreachable",
+            action: "Check the Pi (6bb-a2w-control) has power, and that the house internet and WiFi are up. Unplugging and replugging the Pi is safe.",
+            facts: [["Silent for", `${(downS / 3600).toFixed(1)} h`], ["Outdoor", f0(lastOutdoorF)]] },
         );
       }
     } else {
       if (piQuietAlerted) {
-        await ntfy("Pi reconnected", "The bridge is pushing state again.", "default", { resolved: true });
+        await ntfy("Pi reconnected", "The bridge is pushing state again.", "default",
+                   piQuietPaged ? { tier: "page", resolved: true, key: "pi-unreachable" } : { tier: "record", resolved: true });
       }
-      piDisconnectedSince = null; piQuietAlerted = false;
+      piDisconnectedSince = null; piQuietAlerted = false; piQuietPaged = false;
     }
   } catch { /* hub unreachable is already covered by the poll-failure path */ }
 }
@@ -2139,7 +2242,7 @@ async function pollOnce(): Promise<void> {
   if (drift.diagnosis) lastCurveDiagnosis = drift.diagnosis;
   {
     // an unconfirmed curve change is re-checked by the next poll; if that poll no longer sees it, say so (#177)
-    await pendingUnconfirmed.step(drift, (n) => ntfyDelivered(n.title, n.body, "default", { email: true }));
+    await pendingUnconfirmed.step(drift, (n) => ntfyDelivered(n.title, n.body, "default", { tier: "record" }));
   }
   {
     const c = config as { dot?: unknown; wwsd?: unknown; dbt?: unknown; mbt?: unknown };
@@ -2234,7 +2337,8 @@ async function loopBody(): Promise<void> {
     await pollOnce();
     lastPollAt = new Date().toISOString();
     if (consecutiveFailures >= OFFLINE_AFTER_FAILURES && offlineAlerted) {
-      await ntfy("SensorLinx reader recovered", `polling resumed at ${lastPollAt}`, "default", { resolved: true });
+      await ntfy("SensorLinx reader recovered", `polling resumed at ${lastPollAt}`, "default",
+                 consecutiveFailures >= SLX_ATTENTION_FAILURES ? { tier: "attention", resolved: true, key: "sensorlinx-offline" } : { tier: "record", resolved: true });
       offlineAlerted = false;
     }
     consecutiveFailures = 0;
@@ -2247,7 +2351,15 @@ async function loopBody(): Promise<void> {
         "SensorLinx reader offline",
         `${consecutiveFailures} consecutive poll failures; last success: ${lastPollAt ?? "never"}`,
         "high",
+        { tier: "record" }, // usually the SensorLinx cloud; the HBX keeps running its curve meanwhile
       );
+    }
+    if (consecutiveFailures === SLX_ATTENTION_FAILURES) {
+      await ntfy("SensorLinx reader offline for 6 h",
+        `${consecutiveFailures} consecutive poll failures; last success: ${lastPollAt ?? "never"}. The HBX keeps heating on its ` +
+          `own curve, but the planner is blind and not optimizing. Check the SensorLinx app and the HBX's internet connection.`,
+        "high", { tier: "attention", key: "sensorlinx-offline",
+                  action: "Check the HBX shows online in the SensorLinx app, and that its network cable or WiFi is connected." });
     }
   }
 
@@ -2653,23 +2765,22 @@ async function main(): Promise<void> {
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });
           await ntfy(
             "[DRILL] Freeze-risk advisory",
-            "Drill of the freeze-risk path (urgent → ntfy + email). No freeze risk exists — if you received this by EMAIL and push, the winter safety channel works end to end.",
+            "Drill of the PAGE tier (phone push + email). No freeze risk exists — if you received this by EMAIL and on your PHONE, the winter safety channel works end to end.",
             "urgent",
+            { tier: "page" },
           );
           await ntfy(
-            "[DRILL] Backup element called",
-            "Drill of the backup-element path (high → ntfy only, no email). If this arrived as a push and NOT an email, the tiering is correct.",
+            "[DRILL] Needs a look",
+            "Drill of the ATTENTION tier (email only). If this arrived as an email and NOT on your phone, the tiering is correct.",
             "high",
+            { tier: "attention" },
           );
           return json(res, 200, {
             fired: [
-              { drill: "freeze-risk", priority: "urgent",
-                expect: "ntfy push AND email, subject '🚨 A2W CRITICAL — …'" },
-              // Was "ntfy push only" until 2026-08-23. The owner reads email only, so `high`
-              // now emails on purpose — the regression to watch for here is the WRONG TIER
-              // (a siren on a warning), not the presence of an email.
-              { drill: "backup-element", priority: "high",
-                expect: "ntfy push AND email, subject '⚠️ A2W — …' (NOT the 🚨 siren)" },
+              { drill: "page", tier: "page",
+                expect: "6bb phone push AND email, subject '🚨 A2W — [DRILL] …'" },
+              { drill: "attention", tier: "attention",
+                expect: "email ONLY, subject 'A2W needs a look — [DRILL] …' — a phone push here is the regression" },
             ],
           });
         }
@@ -2734,6 +2845,7 @@ async function main(): Promise<void> {
             "Autonomy mode changed",
             `→ ${mode.toUpperCase()} (autopilot ${dry ? "shadow" : "LIVE"}, phase-b ${dry ? "shadow" : "LIVE"}) via dashboard`,
             mode === "arm" ? "high" : "default",
+            { tier: "record" }, // the owner's own dashboard action: never notify them of it
           );
           console.log(`[autonomy] mode → ${mode} (dry-run ${dry}) via dashboard`);
           return json(res, 200, { ok: true, ...stored });
@@ -2757,6 +2869,7 @@ async function main(): Promise<void> {
             "Identification mode changed",
             `→ ${mode.toUpperCase()} via dashboard${identification ? "" : " (driver not constructed on this deploy — set IDENTIFICATION_ENABLED=1)"}`,
             mode === "armed" ? "high" : "default",
+            { tier: "record" }, // the owner's own dashboard action: never notify them of it
           );
           console.log(`[identify] mode → ${mode} via dashboard`);
           return json(res, 200, { ok: true, mode, driver: identification ? identification.status() : "disabled" });
@@ -2784,6 +2897,7 @@ async function main(): Promise<void> {
             `Auto-sanitize ${body.enabled ? "ARMED" : "disarmed"}`,
             `Daily I8 pasteurization ${body.enabled ? "will now fire automatically when overdue" : "is back to alert-only"} (via dashboard).`,
             body.enabled ? "high" : "default",
+            { tier: "record" }, // the owner's own dashboard action: never notify them of it
           );
           console.log(`[sanitize] auto_sanitize → ${body.enabled} via dashboard`);
           return json(res, 200, { ok: true, enabled: stored.autoSanitize });

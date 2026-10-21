@@ -37,10 +37,10 @@ panel) is never "down". A pump that is stale with no fresh panel read is **unkno
 a Pi Wi-Fi/LAN drop loses Modbus and SPAN together and must not read as "every pump down". It makes at most one
 decision per 6 h.
 
-**Shadow pages are never phone pushes.** #211 pushes every high/urgent alert and every all-clear to the owner's phone
-via 6bb. In shadow, the planner's would-close goes out at default priority through its own outbox, as one email per
-episode. The would-open is a log line, `/health` and the dashboard only. The Pi fallback's shadow would-close is email
-only.
+**Shadow never notifies** (alert-policy.md, 2026-10-20). The planner's would-close and the Pi fallback's shadow
+would-close are record-tier: an `alert_episodes` / `events` row, `/health`, the dashboard and the Monday digest. The
+would-open is a log line, `/health` and the dashboard only. Live: A2W closing the breaker itself is an email
+(attention); a close that fails, is refused or is unconfirmed while both pumps are down is a page.
 
 ## 2 · Data
 

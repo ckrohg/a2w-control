@@ -338,6 +338,20 @@ class Store:
         await self._exec("DELETE FROM system_stats WHERE ts < ?",
                          (time.time() - system_days * 86400,))
 
+    async def count_events(self, pump_id: str, type_: str, code: str, since: float) -> int:
+        rows = await self._query(
+            "SELECT count(*) AS n FROM events WHERE pump_id=? AND type=? AND code=? AND ts>=?",
+            (pump_id, type_, code, since))
+        return int(rows[0]["n"]) if rows else 0
+
+    async def alert_event_since(self, pump_id: str, code: str, key: str, since: float) -> bool:
+        """Whether an `alert` event (an owner notification the bridge recorded) with this code and
+        detail.key exists since `since` — how a restart re-adopts a page it already sent."""
+        rows = await self._query(
+            "SELECT detail FROM events WHERE pump_id=? AND type='alert' AND code=? AND ts>=?",
+            (pump_id, code, since))
+        return any((json.loads(r["detail"]) if r["detail"] else {}).get("key") == key for r in rows)
+
     async def get_open_faults(self, pump_id: str) -> dict[str, float]:
         """Rebuild {fault_key: onset_ts} for faults with fault_on but no later fault_off —
         keeps 'active since' honest across bridge restarts. Bounded to a year so startup

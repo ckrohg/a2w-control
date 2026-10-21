@@ -204,7 +204,7 @@ class HubClient:
                     title=f"⚠ {poller.cfg.name}: remote control enabled",
                     message=f"Writes are now allowed ({source}). Guardrails "
                             f"(clamp, rate limit, read-back verify) remain active.",
-                    priority="high", tags="warning")
+                    priority="high", tags="warning", tier="record")  # the owner's own action
         await self._ack(ws, command_id, True, f"write_enabled={enabled}", None)
 
     async def _breaker_task(self, ws, msg: dict) -> None:

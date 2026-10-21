@@ -183,7 +183,7 @@ class BackupFallback:
         if relay == "CLOSED":
             await self._decide("already_available", "info",
                                f"every heat pump down {held_min:.0f} min ({why}); the backup element breaker is "
-                               "already ON — the HBX can fire the element.", relay, page=False)
+                               "already ON — the HBX can fire the element.", relay, tier="record")
             return
         if not self.cfg.live:
             await self._decide("would_close", "high",
@@ -191,14 +191,14 @@ class BackupFallback:
                                f"({why}). Live, A2W would close the '{BACKUP_ELEMENT_CIRCUIT}' breaker (now "
                                f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element. This runs on the Pi, "
                                "with no cloud.", relay,
-                               title="Backup fallback (shadow): WOULD close the element breaker", push=False)
+                               title="Backup fallback (shadow): WOULD close the element breaker", tier="record")
             return
         if self.breakers is None:
             await self._decide("unavailable", "critical",
                                f"Every heat pump has been down {held_min:.0f} min ({why}) but this bridge has no "
                                f"breaker control. Switch the '{BACKUP_ELEMENT_CIRCUIT}' breaker ON at the SPAN panel.",
                                relay, title="URGENT: both heat pumps down — turn the element breaker ON",
-                               priority="urgent")
+                               priority="urgent", tier="page")
             return
         try:
             res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback")
@@ -209,7 +209,7 @@ class BackupFallback:
                                "element on its own backup call.", res.get("relay_state"),
                                title=("A2W closed the backup element breaker (both pumps down)" if ok
                                       else "URGENT: element breaker close NOT confirmed — both pumps down"),
-                               priority="high" if ok else "urgent")
+                               priority="high" if ok else "urgent", tier="attention" if ok else "page")
         except Exception as exc:  # noqa: BLE001 — a refusal (BreakerRefused) or any error: retried, never latched
             # refused before anything was switched: retry in RETRY_S, page the first refusal of the episode
             self._decided = False
@@ -219,11 +219,11 @@ class BackupFallback:
                                f"'{BACKUP_ELEMENT_CIRCUIT}' breaker was refused: {exc}. A2W retries every "
                                f"{RETRY_S / 60:g} min; switch it ON at the SPAN panel if you can.", relay,
                                title="URGENT: both heat pumps down — element breaker close refused",
-                               priority="urgent", page=not self._refusal_paged)
+                               priority="urgent", tier="record" if self._refusal_paged else "page")
             self._refusal_paged = True
 
     async def _decide(self, code: str, severity: str, message: str, relay, *, title: str | None = None,
-                      priority: str = "high", page: bool = True, push: bool = True) -> None:
+                      priority: str = "high", tier: str) -> None:
         self.last = {"at": self._clock(), "outcome": code, "message": message, "relay_state": relay}
         log.warning("backup fallback %s: %s", code, message)
         try:
@@ -231,14 +231,13 @@ class BackupFallback:
                                        detail={"down": dict(self.down), "relay_state": relay, "live": self.cfg.live})
         except Exception as exc:  # noqa: BLE001 — an audit failure never blocks the decision
             log.warning("backup fallback audit failed: %s", exc)
-        if page:
-            # shadow (push=False) is an email only: ntfy high/urgent reaches the owner's phone via 6bb (#211)
-            t = title or "A2W backup fallback"
-            coros = [notify.email(self.notify_cfg, subject=t, body=message)]
-            if push:
-                coros.append(notify.ntfy(self.notify_cfg, title=t, message=message, priority=priority,
-                                         tags="rotating_light" if priority == "urgent" else "fire"))
-            for coro in coros:
-                task = asyncio.create_task(coro)
-                self._bg.add(task)
-                task.add_done_callback(self._bg.discard)
+        # owner alert policy (alert-policy.md): shadow and already-on are record; A2W switching the element on
+        # by itself is worth an email; both pumps down with the element still unavailable is a page
+        task = asyncio.create_task(notify.alert(
+            self.notify_cfg, tier=tier, title=title or "A2W backup fallback", message=message, priority=priority,
+            tags="rotating_light" if priority == "urgent" else "fire", tag="a2w-pi-backup-fallback",
+            action=("Switch the 'Buffer Tank' (backup element) breaker ON at the SPAN panel, then check both heat pumps."
+                    if tier == "page" else "Nothing right now: the element is covering. Check why both heat pumps are down."
+                    if tier == "attention" else None)))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)

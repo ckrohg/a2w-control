@@ -19,7 +19,7 @@ export interface AlertStore {
   undeliveredAlertEpisodes(): Promise<{ id: number; uid: string | null; kind: string; title: string; detail: string | null }[]>;
   closeAlertEpisodeIds(ids: number[]): Promise<void>;
 }
-export type Send = (title: string, body: string) => Promise<boolean>;
+export type Send = (title: string, body: string, kind: string) => Promise<boolean>;
 
 interface Unrecorded { uid: string; kind: string; key: string; pumpId: string | null; title: string; body: string; delivered: boolean }
 const k = (kind: string, key: string) => `${kind}\u0000${key}`;
@@ -85,7 +85,7 @@ export class AlertOutbox {
       this.log(`alert episode open failed: ${(e as Error).message}`); return null;
     });
     if (id != null) this.track(kind, key, id);
-    const delivered = await this.send(title, body);
+    const delivered = await this.send(title, body, kind);
     if (delivered && id != null) await this.mark(id);
     if (id == null) this.unrecorded.push({ uid, kind, key, pumpId, title, body, delivered });
     return delivered;
@@ -155,7 +155,7 @@ export class AlertOutbox {
         if (u.delivered) await this.mark(id);
         continue; // an unheard one is now an outbox row: the loop below delivers it
       }
-      if (!u.delivered && (await this.send(u.title, u.body + RESENT))) { sent++; u.delivered = true; }
+      if (!u.delivered && (await this.send(u.title, u.body + RESENT, u.kind))) { sent++; u.delivered = true; }
       this.unrecorded.push(u); // still not durable — keep trying to persist it
     }
     // a row whose uid is still held in memory (unrecorded — sent from memory, or already heard) or whose uid-close is
@@ -166,7 +166,7 @@ export class AlertOutbox {
       if (this.unclosed.has(a.id) || this.unmarked.has(a.id)) continue; // resolved, or already heard
       if (a.uid != null && heldUids.has(a.uid)) continue;
       if (!canResend(a.kind)) continue; // its watch has not re-evaluated the condition since a restore (index.ts)
-      if (!(await this.send(a.title, `${a.detail ?? ""}${RESENT}`))) break;
+      if (!(await this.send(a.title, `${a.detail ?? ""}${RESENT}`, a.kind))) break;
       await this.mark(a.id);
       sent++;
     }

@@ -151,8 +151,9 @@ class AuthConfig(BaseModel):
 
 
 class NotifyConfig(BaseModel):
-    # Push alerts via ntfy (free, no account). Create a hard-to-guess topic and either
-    # subscribe in the ntfy app or point it at your own server.
+    # Owner alert policy (knowledge/reference/alert-policy.md, 2026-10-20): every alert declares a tier —
+    # page (6bb phone push + email), attention (email), record (the ntfy log + events table only).
+    # ntfy is the LOG: everything goes there, nobody subscribes to it.
     ntfy_topic: str | None = None
     ntfy_server: str = "https://ntfy.sh"
     # External dead-man heartbeat (e.g. healthchecks.io): pinged every poll cycle. If the
@@ -160,28 +161,20 @@ class NotifyConfig(BaseModel):
     # it doesn't share fate with the Pi (fusion audit risk 3c). Optional now that the Railway
     # hub is itself a dead-man.
     heartbeat_url: str | None = None
-    # Email alerts via Resend (resend.com) — a second channel alongside ntfy for the SERIOUS
-    # alerts (high/urgent only; recoveries stay push-only). Needs a Resend API key. Without a
+    # Email via Resend (resend.com) — the page and attention tiers. Needs a Resend API key. Without a
     # verified sender domain, Resend delivers only to your own account email, which is exactly
     # right for personal alerts — set resend_to to that address.
     resend_api_key: str | None = None
     resend_to: str | None = None
     resend_from: str = "A2W Alerts <onboarding@resend.dev>"
-    # Phone push via the 6bb app (owner 2026-10-19). Nobody subscribed to the ntfy topic, so no A2W push ever
-    # reached a phone. High/urgent alerts and their all-clears also POST to 6bb's token-protected
-    # /api/external/alert, which pushes to the owner's devices. Email is unchanged.
+    # Phone push via the 6bb app (owner 2026-10-19): the page tier and its all-clear POST to 6bb's
+    # token-protected /api/external/alert, which pushes to the owner's devices. Unset = pages are email-only.
     sixbb_alert_url: str | None = None
     sixbb_alert_key: str | None = None
-    # Comm-loss alert shaping (owner asks 2026-08-06, after a morning of 20-min WiFi flaps
-    # each paging individually): brief dropouts are LOGGED (events/dashboard) but not
-    # pushed. An ntfy PAGE fires for what's actionable:
-    #   - continuously offline for offline_alert_min minutes (a real outage), or
-    #   - flap_alert_count offline edges within flap_window_min (link degrading — the
-    #     2026-08-06 pump-2 comm-board wedge announced itself exactly this way).
-    # EMAIL is reserved for the intervention tier (owner: "equipment errors that require
-    # intervention or a total prolonged outage"): equipment fault codes, a pump that has
-    # NEVER been online (bench-day miswire, immediate), and outages that persist past
-    # offline_email_min minutes. ntfy-paged-but-not-emailed events never hit the inbox.
+    # Comm-loss shaping: brief dropouts are logged only. offline_alert_min of continuous
+    # silence, or flap_alert_count edges within flap_window_min, is RECORDED (ntfy + events).
+    # ATTENTION (email) is a pump that has NEVER been online, or an outage past
+    # offline_email_min. A pump that has truly stopped heating is the planner's "no heat" page.
     offline_alert_min: float = 10
     offline_email_min: float = 60
     flap_alert_count: int = 3

@@ -12,6 +12,7 @@
  */
 
 import { Store } from "./store";
+import type { Notify } from "./alertpolicy";
 import { HbxWriter, WriteError, isBoostYield } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
 import { APPLY_TOLERANCE_F, curveAlreadyInForce, type ShapedCurve } from "./curve";
@@ -61,7 +62,7 @@ export class AutoPilot {
     private readonly store: Store,
     private readonly writer: HbxWriter,
     private dryRun: boolean,
-    private readonly notify: (title: string, body: string, priority?: string) => Promise<void>,
+    private readonly notify: Notify,
     /** #133 (b): command the plan's shaped curve for non-excursion hours (env SHAPED_CURVE=1). */
     private readonly shapedCurve = false,
     /** §6.11 storm shaping may raise a block up to this (env STORM_CAP_F, default = the everyday cap). */

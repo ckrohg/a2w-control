@@ -83,7 +83,8 @@ guardrails:
   lease_max_minutes: 180
   lease_warn_minutes: 15
 
-# Push alerts (ntfy — free, no account) + external dead-man heartbeat.
+# Alerts: ntfy (the log) + email (Resend) + 6bb phone push, chosen per alert by TIER — page = phone + email,
+# attention = email, record = log only (knowledge/reference/alert-policy.md). Plus an optional dead-man heartbeat.
 # EASIEST: pass A2W_NTFY_TOPIC and/or A2W_HEARTBEAT_URL to pi-bootstrap.sh and it writes this
 # block for you (same as the hub/analytics tokens). To wire it MANUALLY, uncomment below:
 notifications:
@@ -95,22 +96,21 @@ notifications:
   #    on the hub to the same topic above). heartbeat_url below is an optional extra channel
   #    (e.g. healthchecks.io) only if you want a second, hub-independent monitor.
   # heartbeat_url: "https://hc-ping.com/your-uuid"
-  # 3. Email for serious alerts (high/urgent — every fault edge qualifies, incl. WARNING
-  #    sensor/comm faults) via resend.com. With the default onboarding@resend.dev sender,
+  # 3. Email for the page + attention tiers via resend.com. With the default onboarding@resend.dev sender,
   #    Resend only delivers to the account owner's address — set resend_to to that.
   # resend_api_key: "re_..."
   # resend_to: "you@example.com"
-  # 4. Comm-loss alert shaping: brief dropouts land in the dashboard/event log only.
-  #    An ntfy PAGE fires after offline_alert_min of CONTINUOUS silence, or when
-  #    flap_alert_count dropouts occur within flap_window_min (link degrading).
-  #    EMAIL is the intervention tier only: equipment fault codes, a never-online pump
-  #    (bench-day miswire, immediate), and outages persisting past offline_email_min.
+  # 4. Comm-loss shaping: brief dropouts, offline_alert_min of silence and flapping are
+  #    RECORDED only. Email (attention): a never-online pump, or offline past offline_email_min.
   #    Defaults shown.
   # offline_alert_min: 10
   # offline_email_min: 60
   # flap_alert_count: 3
   # flap_window_min: 60
-  # 3. Optional email (Resend) — a sticky second channel for SERIOUS alerts (high/urgent only).
+  # 5. Phone push for the PAGE tier via the 6bb app (unset = pages arrive by email only):
+  # sixbb_alert_url: "https://<6bb host>/api/external/alert"
+  # sixbb_alert_key: "..."
+  # Email (Resend) — the page and attention tiers.
   #    EASIEST: pass A2W_RESEND_API_KEY + A2W_RESEND_TO to pi-bootstrap.sh. Without a verified
   #    sender domain Resend delivers only to your own account email — set resend_to to that.
   # resend_api_key: "re_..."          # from resend.com/api-keys
