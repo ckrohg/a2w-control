@@ -400,7 +400,10 @@ override + synthetic Xmas Room baseboard zone).
 | `EMITTER_OVERRIDES` | JSON name→deliveryType map (default empty — owner ID 2026-07-15: TempIQ delivery_types were right) |
 | `EMITTER_SYNTHETIC_ZONES` | JSON InsightZone[] (default empty — no missing zones; "Living Room Baseboard" IS the Xmas Room zone) |
 
-Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed).
+Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed);
+`zone_call_samples` (one compact row per feed refresh, every poll ≈ 5 min: `ts`, `calling_zone_ids text[]`
+(NULL = call feed unhealthy), `n_zones`, `source` = calls | cached | stale; self-pruned at 60 days. Lets an
+analysis say whether a zone was drawing during a 5–20 min charge, which the hourly snapshot cannot).
 `/health.winter_solver` = off | shadow | degraded.
 
 ## TempIQ perturbation windows (a2w#137, FLAG-OFF)

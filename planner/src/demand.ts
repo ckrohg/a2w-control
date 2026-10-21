@@ -365,6 +365,13 @@ export async function fetchInsightCalls(baseUrl: string, token: string): Promise
   });
 }
 
+/** One zone_call_samples row (DemandFeed.callSample): the calling set a refresh observed. */
+export interface ZoneCallSample {
+  callingZoneIds: string[] | null; // null = call feed unhealthy (same contract as callingZoneIds())
+  nZones: number;                  // hydronic zones in the /calls payload the ids were derived from
+  source: "calls" | "cached" | "stale";
+}
+
 /** Pure: IDs of zones actively calling for heat. HEATING is matched case-insensitively;
  * everything else (OFF, null, unknown) is treated as not-calling. */
 export function deriveCallingZoneIds(calls: InsightCall[]): string[] {
@@ -386,6 +393,7 @@ export class DemandFeed {
   private lastSuccessAt: Date | null = null;
   private calls: InsightCall[] = [];
   private callsLastSuccessAt: Date | null = null;
+  private lastRefreshFetchedCalls = false;
 
   constructor(
     private baseUrl: string,
@@ -401,12 +409,31 @@ export class DemandFeed {
     } catch (err) {
       console.warn(`[demand] TempIQ zone refresh failed: ${(err as Error).message}`);
     }
+    this.lastRefreshFetchedCalls = false;
     try {
       this.calls = await fetchInsightCalls(this.baseUrl, this.token);
       this.callsLastSuccessAt = new Date();
+      this.lastRefreshFetchedCalls = true;
     } catch (err) {
       console.warn(`[demand] TempIQ calls refresh failed: ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * The call state this refresh left behind, for zone_call_samples (one row per refresh, so an
+   * analysis can tell whether a zone was drawing during a 5–20 min charge — the hourly
+   * zone_floor_snapshots cannot). `source`: "calls" = /calls answered on THIS refresh;
+   * "cached" = it failed but the previous answer is still inside the health window (the ids
+   * are that previous answer); "stale" = no healthy answer, ids null (the all-zones posture).
+   * nZones is the payload's zone count, so an empty calling set from a healthy 7-zone payload
+   * ("nobody calling") is distinguishable from a shape-drifted or empty one.
+   */
+  callSample(): ZoneCallSample {
+    return {
+      callingZoneIds: this.callingZoneIds(),
+      nZones: this.calls.length,
+      source: this.lastRefreshFetchedCalls ? "calls" : this.callsHealthy() ? "cached" : "stale",
+    };
   }
 
   isHealthy(): boolean {
