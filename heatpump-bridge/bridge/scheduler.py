@@ -162,13 +162,14 @@ class Scheduler:
         active = key in self._health_alerts
         if raise_now and not active:
             self._health_alerts.add(key)
-            await notify.alert(self.notifications, tier="attention", title=title, message=message,
+            # owner 2026-10-21: a hot Pi is theirs to fix (airflow); a full disk is engineer-only (record)
+            await notify.alert(self.notifications, tier="attention" if key == "cpu_temp" else "record", title=title, message=message,
                                priority="high", tags="warning",  # the Pi needs a look; the house is fine
                                action=("Make sure the Pi has airflow around it and isn't in direct sun." if key == "cpu_temp"
                                        else "Free space on the Pi (old logs and backups), or ask Claude to prune bridge.db."))
         elif clear_now and active:
             self._health_alerts.discard(key)
-            await notify.alert(self.notifications, tier="attention", resolved=True, title=clear_title,
+            await notify.alert(self.notifications, tier="attention" if key == "cpu_temp" else "record", resolved=True, title=clear_title,
                                message=clear_message, tags="white_check_mark")  # record only
 
     async def _fire(self, poller: PumpPoller, action: str) -> None:

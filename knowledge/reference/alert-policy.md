@@ -72,29 +72,41 @@ These rules apply to every tier:
 
 ## What emails (attention)
 
+The test (owner, 2026-10-21): **can the owner do something about it with their hands or a decision?** If only an
+engineer or a Claude session can act, it is record-tier; it does not email the owner. Those items still surface on
+`/health`, in drift-check (daily) and in the Monday digest.
+
 - **Pumps and faults:**
-  - the same fault code 3+ times in 7 days (bridge);
-  - a pump that never answered since boot, or comm offline 60+ min;
-  - a W610 identity mismatch.
-- **Pi health:** CPU ≥ 80 °C, disk ≤ 10 % free.
-- **Hygiene:** no ≥ 134 °F × 30-min soak in 72 h (one missed window is record: the planner re-schedules the soak).
-- **Planner state:**
-  - Phase B with no lease armed (FINDING-1);
-  - writer lease unheld 15+ min;
+  - the same fault code 3+ times in 7 days: book a service visit;
+  - a pump that never answered since boot, or comm offline 60+ min: power-cycle the gateway or pump.
+- **Pi:** CPU ≥ 80 °C (give it airflow).
+- **Hygiene:** no ≥ 134 °F × 30-min soak in 72 h: boost the tank. One missed window is record, because the planner
+  re-schedules the soak.
+- **Cost and capacity:**
+  - the SPAN backup element drawing power: check the pumps;
+  - A2W closing the element breaker itself (backup gate or Pi fallback, live);
+  - winter cap checks: the owner decides on the cap.
+- **Panel:**
+  - SPAN local down 4+ h: re-pair it at the panel;
+  - the backup-element ARM going live: disarm it if unwanted.
+- **Pump health:** promoted pump-health checks, and a pump-health digest that flags drift.
+
+### Engineer-only: record, never emailed
+
+- **Planner internals:**
+  - Phase B tracking failing, and Phase B "no lease armed". The latter is now believed only after 3 consecutive
+    writes: one read is often the hub's pre-write snapshot. The 2026-10-21 08:19 ET email came 3 min after a 16 s Pi
+    dropout, with `baseline_setpoint_c` set all along.
+  - writer lease unheld;
   - a second planner instance still live after 30 min;
   - HBX target not adopting;
   - SensorLinx unreachable 6 h;
-  - an identification cleanup stuck (at most daily).
-- **Cost and capacity:**
-  - the SPAN backup element drawing power;
-  - A2W closing the element breaker itself (backup gate or Pi fallback, live);
-  - winter cap checks.
-- **Configuration and monitoring:**
-  - self-heal mis-configured (config invalid, history unreadable, identity mismatch, map swap suspected);
-  - SPAN local down 4+ h;
-  - the backup-element ARM going live;
-  - promoted pump-health checks;
-  - a pump-health digest that flags drift.
+  - boost cancel incomplete;
+  - identification cleanup stuck.
+- **Pi:**
+  - disk ≤ 10 % free;
+  - a W610 identity mismatch (DHCP);
+  - self-heal mis-configured.
 
 ## Replay: the last 30 days under this policy
 

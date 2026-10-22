@@ -871,7 +871,7 @@ export class IdentificationDriver {
       console.error(`[identify] cleanup #${w.id} (attempt ${attempts}): ${detail} — will retry`);
       if (attempts % CLEANUP_ALERT_EVERY === 0) {
         await this.d.notify("Identification cleanup stuck", `#${w.id}: the plant has NOT been returned to base after ${attempts} attempts — ${detail}. Check the HBX / SensorLinx.`, "high",
-          { tier: "attention", key: `identify-cleanup-${w.id}`, // latched: at most daily, not every hour
+          { tier: "record", key: `identify-cleanup-${w.id}`, // latched: at most daily, not every hour
             action: "Check the HBX is online in SensorLinx; then set the tank target back to normal on the Control page." });
       }
       return null;
