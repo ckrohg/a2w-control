@@ -3,9 +3,31 @@
 // the headline savings number. Run: npx tsx --test src/realized.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { computeDayRealized, asfoundBufferF, carnotFactor, type DayInputs, type RealizedParams } from "./realized";
+import { readFileSync } from "node:fs";
+import { computeDayRealized, asfoundBufferF, carnotFactor, ASFOUND_CFG, type DayInputs, type RealizedParams } from "./realized";
+import { curveTargetF } from "./shadow";
 
 const P: RealizedParams = { rateUsdKwh: 0.30, uaBtuHrF: 25, ambientF: 70, dailyKwhFallback: 11.8 };
+
+// The as-found curve lives in three hand-synced places (this inlined copy, shadow.ts curveTargetF,
+// and the mirror's frozen curve-history.json meta.asfound) — pin them together so none drifts silently.
+test("inlined asfoundBufferF matches shadow.ts curveTargetF over ASFOUND_CFG at every outdoor °F", () => {
+  for (let o = -30; o <= 90; o++) {
+    const ref = curveTargetF(ASFOUND_CFG, o);
+    assert.ok(ref != null, `curveTargetF returned null at ${o}°F`);
+    assert.ok(Math.abs(asfoundBufferF(o) - ref) < 1e-9, `mismatch at ${o}°F: inlined ${asfoundBufferF(o)} vs shadow ${ref}`);
+  }
+});
+
+test("ASFOUND_CFG matches the mirror's frozen curve-history.json meta.asfound.cfg", () => {
+  const hist = JSON.parse(readFileSync(new URL("../../analytics-mirror/lib/curve-history.json", import.meta.url), "utf8"));
+  const cfg = hist.meta.asfound.cfg;
+  assert.deepEqual(
+    { dot: cfg.dot, dbt: cfg.dbt, wwsd: cfg.wwsd, mbt: cfg.mbt },
+    ASFOUND_CFG,
+    "curve-history.json meta.asfound.cfg drifted from realized.ts ASFOUND_CFG — decide which is right",
+  );
+});
 
 test("as-found curve reconstructs the ~154°F summer buffer from real outdoor temp", () => {
   assert.ok(Math.abs(asfoundBufferF(75) - 153.3) < 1, `expected ~153°F at 75°F out, got ${asfoundBufferF(75)}`);
