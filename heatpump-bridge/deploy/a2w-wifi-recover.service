@@ -1,0 +1,5 @@
+[Unit]
+Description=A2W: recover Wi-Fi fast instead of waiting out the 30-min AP ignore
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/a2w-wifi-recover
