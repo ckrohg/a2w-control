@@ -108,6 +108,9 @@ export class PageBudget {
 export function episodeTier(kind: string): Tier {
   if (kind.startsWith("pump_")) return "attention";       // promoted pump-health checks: a real equipment trend
   if (kind === "backup_gate") return "attention";          // A2W closed the element breaker itself: worth knowing, not acting
+  // #212: a pump a person switched off is still off hours later while the HBX calls for it — the one reminder per stop
+  // (a forgotten switch-off in January): someone has to switch it back on
+  if (kind === "stopped_reminder") return "page";
   // stage_unserved / fault_called / span_local_stale: symptoms that the one "no heat" incident (checkUnserved) and the
   // bridge's sustained-fault and Pi-unreachable pages already cover — record them, never page them twice.
   return "record";

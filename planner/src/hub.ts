@@ -24,6 +24,11 @@ export interface HubPump {
   write_enabled?: boolean;
   /** COUNT of the pump's active faults (bridge hub_client.py state frame); the codes are in the mirror's pump_snapshots */
   active_faults?: number | null;
+  /**
+   * #212 (bridge deliberate_stop.py): set while a PERSON has this pump's breaker off (6bb, the SPAN app, the panel) and
+   * A2W did not switch it — a deliberate stop, not a fault. since = Pi wall seconds. Absent on older bridges.
+   */
+  deliberate_stop?: { circuit?: string; since: number; announced?: boolean } | null;
 }
 
 /** One allowlisted breaker in the Pi's SPAN snapshot (bridge span_control.BreakerController.snapshot). */

@@ -3,10 +3,14 @@
  * (04:30–04:54Z: stage 2 called, HP2 FAULT/E21, HP1 idle, lagT 180) and pins: the fault-while-called page at once, the
  * stage-unserved page within 10 min naming the unit, its state, the code and lagT; stage-2-only with pump2 FAULT and
  * pump1 heating still pages; both heating → none; inside the grace → none; defrost suspends the clock; unverifiable
- * hub state moves nothing; restore() closes instead of re-paging. Run with: npx tsx planner/src/stagewatch.test.ts
+ * hub state moves nothing; restore() closes instead of re-paging. #212: a pump a person switched off (the Pi's
+ * per-pump deliberate_stop, in the hub frame shape the bridge sends: offline, Air-Water 2 OPEN) is not unserved or
+ * faulted, closes what was open, and pages ONE reminder per stop when its stage is called 4 h into it; the "no heat"
+ * helper. Run with: npx tsx planner/src/stagewatch.test.ts
  */
 import assert from "node:assert/strict";
-import { StageWatch, parseStagePumpMap, partitionRestore, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, type StagePump, type StageEvent } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, STOPPED_REMIND_MS, type StagePump, type StageEvent } from "./stagewatch";
+import { episodeTier } from "./alertpolicy";
 
 const t0 = Date.parse("2026-10-16T04:30:00Z");
 const min = (m: number) => t0 + m * 60_000;
@@ -167,6 +171,85 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   assert.deepEqual(r.stale.map((o) => o.id), [1]);
   assert.deepEqual(r.keep.map((o) => o.id), [2, 3]);
   assert.deepEqual(partitionRestore(open, { "1": "pump1", "2": "pump2" }).stale.map((o) => o.id), [2]);
+}
+
+// ── 11. #212: a pump a PERSON switched off is a deliberate stop, not an unserved stage ─────────────────────────────────
+{
+  // the hub frame the bridge sends while Air-Water 2 is OPEN by a person: Modbus timed out (measured 2026-10-19), so
+  // the pump is offline, and deliberate_stop carries the circuit and the Pi-clock time it went off
+  const since = min(0) / 1000;
+  const off2 = (atMin = 0): StagePump => ({ id: "pump2", name: "Heat Pump 2", online: false, state: "offline", active_faults: 0,
+    deliberate_stop: { circuit: "Air-Water 2", since: since + atMin * 60, announced: true } });
+  const w = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  const ev: { at: number; e: StageEvent }[] = [];
+  const run = (from: number, to: number, called: boolean[], pumps: () => StagePump[]) => {
+    for (let m = from; m <= to; m += 5) for (const e of w.step({ nowMs: min(m), stagesCalled: called, pumps: pumps(), lagTMin: 60 })) ev.push({ at: m, e });
+  };
+  // HBX rotation makes stage 2 the lead: stage 2 alone for the full lagT (60 min), HP1 idle → no unserved, no fault
+  run(0, 60, [false, true], () => [hp1("idle"), off2()]);
+  assert.deepEqual(ev, [], "a deliberately stopped pump's stage is never 'unserved'");
+  assert.equal(w.status()["2"].pump_state, "switched off outside A2W");
+  assert.equal(w.status()["2"].called_not_heating_min, 0);
+  // 3 h 55 min into the stop, still nothing
+  run(235, 235, [false, true], () => [hp1("idle"), off2()]);
+  assert.deepEqual(ev, []);
+  // 4 h into the stop with its stage called: ONE reminder
+  run(240, 300, [false, true], () => [hp1("heating"), off2()]);
+  assert.deepEqual(ev.map((x) => [x.at, x.e.kind, x.e.type]), [[240, "open", "stopped_reminder"]], "once per stop");
+  const r = ev[0].e;
+  assert.equal(r.priority, "high");
+  assert.equal(episodeTier(r.type), "page", "a forgotten switch-off is the owner's to fix: a page");
+  assert.match(r.title, /Heat Pump 2 is still switched off and the HBX is calling for it/);
+  assert.match(r.body, /'Air-Water 2' breaker was switched off outside A2W at 12:30 AM \(4 h ago/);
+  assert.match(r.body, /switch it back on/);
+  assert.equal(w.remindersOpen(), true);
+  // the call ends; nothing moves without seeing the pump
+  run(305, 330, [false, false], () => []);
+  assert.equal(ev.length, 1);
+  // switched back on, no call (index.ts reads the hub while a reminder is open): the reminder closes
+  run(335, 335, [false, false], () => [hp1("idle"), hp2("idle")]);
+  assert.deepEqual(ev.slice(1).map((x) => [x.e.kind, x.e.type]), [["close", "stopped_reminder"]]);
+  assert.match(ev[1].e.title, /Heat Pump 2 is switched back on/);
+  assert.equal(w.remindersOpen(), false);
+  // a NEW stop later gets its own reminder after another 4 h
+  run(400, 400 + 235, [false, true], () => [hp1("heating"), off2(400)]);
+  assert.equal(ev.length, 2);
+  run(640, 640, [false, true], () => [hp1("heating"), off2(400)]);
+  assert.deepEqual(ev.slice(2).map((x) => x.e.type), ["stopped_reminder"]);
+}
+{
+  // episodes open when the person switches the pump off (E21, then switched off — maybe to power-cycle it by hand) close
+  const w = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  const ev: StageEvent[] = [];
+  for (let m = 0; m <= 15; m += 5) ev.push(...w.step({ nowMs: min(m), stagesCalled: [false, true], pumps: [hp1("idle"), hp2("fault", E21)], lagTMin: 60 }));
+  assert.deepEqual(ev.map((e) => e.type), ["fault_called", "stage_unserved"]);
+  const off = w.step({ nowMs: min(20), stagesCalled: [false, true], lagTMin: 60,
+    pumps: [hp1("idle"), { id: "pump2", name: "Heat Pump 2", online: false, state: "offline", deliberate_stop: { circuit: "Air-Water 2", since: min(18) / 1000 } }] });
+  assert.deepEqual(off.map((e) => [e.kind, e.type]).sort(), [["close", "fault_called"], ["close", "stage_unserved"]]);
+  assert.ok(off.every((e) => /switched off outside A2W at 12:48 AM — a deliberate stop, not a fault/.test(e.body)));
+  // a restart re-adopts an open reminder: never re-sent for the same stop, closed when the pump is back
+  const r = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  r.restore([{ type: "stopped_reminder", stage: "2" }]);
+  const stopped = { id: "pump2", online: false, state: "offline", deliberate_stop: { since: min(0) / 1000 - 6 * 3600 } };
+  assert.deepEqual(r.step({ nowMs: min(0), stagesCalled: [false, true], pumps: [hp1("idle"), stopped], lagTMin: 60 }), []);
+  assert.deepEqual(r.step({ nowMs: min(5), stagesCalled: [false, true], pumps: [hp1("idle"), hp2("heating")], lagTMin: 60 }).map((e) => [e.kind, e.type]),
+    [["close", "stopped_reminder"]]);
+  // a reminder episode for the wrong unit after a STAGE_PUMP_MAP correction is stale like the others
+  assert.deepEqual(partitionRestore([{ id: 9, kind: "stopped_reminder", key: "2", pumpId: "pump2" }], { "1": "pump2", "2": "pump1" }).stale.map((o) => o.id), [9]);
+  assert.equal(STOPPED_REMIND_MS, 4 * 3_600_000);
+}
+{
+  // the all-idle "no heat" check stands down only when EVERY called stage's pump is deliberately stopped
+  const map = { ...DEFAULT_STAGE_PUMP_MAP };
+  const off = (id: string): StagePump => ({ id, online: false, state: "offline", deliberate_stop: { since: 1 } });
+  assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), off("pump2")]), true, "stage 2 alone, HP2 switched off");
+  assert.equal(calledStagesAllStopped([true, true], map, [hp1("idle"), off("pump2")]), false, "stage 1 called too: HP1 should heat");
+  assert.equal(calledStagesAllStopped([true, true], map, [off("pump1"), off("pump2")]), true, "both switched off");
+  assert.equal(calledStagesAllStopped([false, false], map, [off("pump1"), off("pump2")]), false, "no call");
+  assert.equal(calledStagesAllStopped(null, map, [off("pump2")]), false, "unknown stages");
+  assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), hp2("offline", { online: false })]), false, "offline is not a stop");
+  assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), { ...off("pump2"), deliberate_stop: null }]), false);
+  assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle")]), false, "a pump missing from the frame is not a stop");
 }
 
 console.log("stagewatch.test.ts: all assertions passed");

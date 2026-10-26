@@ -240,4 +240,27 @@ const verdict = (v: Verdict[], k: string) => v.find((x) => x.kind === k)!;
   assert.equal(covered([{ ts: 0 }, { ts: 100 }, { ts: 200 }], 0, 200, 150)!.length, 3);
   assert.equal(covered([{ ts: 0 }, { ts: 200 }], 0, 200, 150), null);
 }
+// ── #212: a pump a PERSON switched off (Air-Water 2 OPEN at the panel) trips nothing — pump health needs no special case
+{
+  // the shape measured 2026-10-19 13:38–13:43 ET: pump2 idle (outlet 16 °C), Air-Water 2 at −5…−9 W; once the breaker is
+  // OPEN the circuit reads 0 W and pump2's Modbus times out, so the mirror's readings carry online=false / "offline".
+  // Stage 2 stays called the whole time (HBX rotation made it the lead).
+  const t0 = Date.parse("2026-10-19T17:38:00Z") / 1000, OFF = t0 + 30 * 60, END = OFF + 4 * 3600;
+  const rd: PumpReading[] = [], sp: SpanSample[] = [], tk: TankReading[] = [];
+  for (let ts = t0; ts <= END; ts += 60) {
+    const on = ts < OFF;
+    rd.push({ ts, online: on, state: on ? "idle" : "offline", inlet_c: on ? 16 : null, outlet_c: on ? 16 : null, ambient_c: on ? 9 : null });
+  }
+  for (let ts = t0; ts <= END; ts += 25) sp.push({ ts, power_w: ts < OFF ? -7.6 : 0 });
+  for (let ts = t0, f = 128; ts <= END; ts += 300, f -= 0.6) tk.push({ ts, tank_f: f, stages_called: [false, true] });
+  const w = new PumpHealthWatch({ pump2: "Heat Pump 2" });
+  const seen: Record<string, number> = {};
+  for (let now = t0 + PH.LOOKBACK_S; now <= END; now += 300) {
+    const v = [...evaluatePump("pump2", rd.filter((r) => r.ts <= now), sp.filter((x) => x.ts <= now), now),
+      evaluateTankFlat("2", "pump2", rd.filter((r) => r.ts <= now), sp.filter((x) => x.ts <= now), tk.filter((x) => x.ts <= now), now, 30)];
+    for (const x of v) seen[x.state] = (seen[x.state] ?? 0) + 1;
+    assert.deepEqual(w.step(v), [], `nothing opens at ${iso(now)}`);
+  }
+  assert.equal(seen.tripped ?? 0, 0, "a switched-off pump never trips a check");
+}
 console.log("pumphealth: all assertions passed");
