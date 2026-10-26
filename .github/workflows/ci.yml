@@ -29,6 +29,8 @@ jobs:
   # cover the demand floor, the winter DP, hygiene, realized savings and the forecast path:
   # the logic that decides what water temperature this house runs at. Verified all 7 green
   # before wiring them in, so a red here is a real regression, not a pre-existing failure.
+  # Runs via `npm test` (same shape as hub-tests and mirror-tests). tsx is NOT a planner
+  # devDependency -- npx resolves it on the runner, as this job always has.
   planner-tests:
     runs-on: ubuntu-latest
     defaults:
@@ -46,14 +48,7 @@ jobs:
           cache-dependency-path: planner/package-lock.json
       - run: npm ci
       - name: Run planner assertion suites
-        run: |
-          set -euo pipefail
-          fail=0
-          for f in src/*.test.ts; do
-            echo "── $f"
-            npx tsx "$f" || { echo "::error file=planner/$f::assertions failed"; fail=1; }
-          done
-          exit "$fail"
+        run: npm test
 
   # #166: the hub's Pi-dropout tracker (hub/src/dropouts.ts) is a node:assert script under
   # tsx, the same shape as the planner suites, so `npm run build` would never execute it.
