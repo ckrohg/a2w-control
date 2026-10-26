@@ -59,39 +59,70 @@ export class TempiqPusher {
       }
       const ts = new Date(tsMs).toISOString();
 
+      // Each pump's POST is independent: one pump's failure must not blank the other's
+      // telemetry for the tick (TempIQ's COP model reads each equipment separately).
+      let attempted = 0;
       let pushed = 0;
       const results: string[] = [];
       for (const pump of state.pumps) {
         if (!pump.online) continue;
         const metrics = this.metricsFor(pump, ts);
         if (metrics.length === 0) continue;
-        const res = await fetch(`${this.baseUrl}/api/insights/readings`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ equipment: `a2w-${pump.id}`, metrics }),
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (!res.ok) throw new Error(`tempiq POST readings (${pump.id}): HTTP ${res.status}`);
-        const body = (await res.json()) as { inserted?: number; deduped?: number };
-        results.push(`${pump.id}: +${body.inserted ?? "?"}/${body.deduped ?? "?"}dup`);
-        pushed++;
+        attempted++;
+        try {
+          results.push(`${pump.id}: ${await this.pushPump(pump.id, metrics)}`);
+          pushed++;
+        } catch (e) {
+          results.push(`${pump.id}: error: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
-      this.lastPushAt = new Date().toISOString();
-      this.lastResult = pushed > 0 ? results.join(", ") : "skipped: no online pumps with data";
-      this.consecutiveFailures = 0;
-      if (pushed > 0) console.log(`[tempiq-push] ${this.lastResult}`);
+      if (attempted === 0) {
+        this.lastPushAt = new Date().toISOString();
+        this.lastResult = "skipped: no online pumps with data";
+        this.consecutiveFailures = 0;
+        return;
+      }
+      if (pushed > 0) this.lastPushAt = new Date().toISOString();
+      this.lastResult = results.join(", ");
+      if (pushed === attempted) {
+        this.consecutiveFailures = 0;
+        console.log(`[tempiq-push] ${this.lastResult}`);
+      } else {
+        this.recordFailure();
+      }
     } catch (e) {
-      this.consecutiveFailures++;
       this.lastResult = `error: ${e instanceof Error ? e.message : String(e)}`;
-      // Log every failure but only loudly warn on streaks — transient Vercel/network
-      // blips are expected and the next tick retries with server-side dedupe.
-      if (this.consecutiveFailures === 1 || this.consecutiveFailures % 12 === 0) {
-        console.error(`[tempiq-push] ${this.lastResult} (streak ${this.consecutiveFailures})`);
-      }
+      this.recordFailure();
     }
+  }
+
+  /** One tick with any failure counts once toward the streak (a half-successful tick included). */
+  private recordFailure(): void {
+    this.consecutiveFailures++;
+    // Log every failure but only loudly warn on streaks — transient Vercel/network
+    // blips are expected and the next tick retries with server-side dedupe.
+    if (this.consecutiveFailures === 1 || this.consecutiveFailures % 12 === 0) {
+      console.error(`[tempiq-push] ${this.lastResult} (streak ${this.consecutiveFailures})`);
+    }
+  }
+
+  /** POST one pump's readings; resolves to the "+inserted/deduped" summary, throws on non-OK. */
+  private async pushPump(
+    pumpId: string,
+    metrics: Array<{ metric: string; value: number; unit: string; ts: string }>,
+  ): Promise<string> {
+    const res = await fetch(`${this.baseUrl}/api/insights/readings`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ equipment: `a2w-${pumpId}`, metrics }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = (await res.json()) as { inserted?: number; deduped?: number };
+    return `+${body.inserted ?? "?"}/${body.deduped ?? "?"}dup`;
   }
 
   private metricsFor(
