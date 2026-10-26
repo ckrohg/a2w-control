@@ -250,6 +250,15 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), hp2("offline", { online: false })]), false, "offline is not a stop");
   assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), { ...off("pump2"), deliberate_stop: null }]), false);
   assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle")]), false, "a pump missing from the frame is not a stop");
+  assert.equal(calledStagesAllStopped([false, true], map, [hp1("idle"), { ...off("pump2"), online: true, state: "idle" }]), false,
+    "a pump that answers Modbus is never a stop, whatever deliberate_stop says");
+  // the same rule in the stage watch: an online pump carrying a stray deliberate_stop is judged as usual
+  const w = new StageWatch({ ...DEFAULT_STAGE_PUMP_MAP });
+  const stray = (state: string): StagePump => hp2(state, { deliberate_stop: { since: min(0) / 1000 - 6 * 3600 } });
+  const ev: StageEvent[] = [];
+  for (let m = 0; m <= 10; m += 5) ev.push(...w.step({ nowMs: min(m), stagesCalled: [false, true], pumps: [hp1("idle"), stray("idle")], lagTMin: 60 }));
+  assert.deepEqual(ev.map((e) => e.type), ["stage_unserved"], "unserved as usual, no reminder");
+  assert.equal(w.status()["2"].pump_state, "idle");
 }
 
 console.log("stagewatch.test.ts: all assertions passed");
