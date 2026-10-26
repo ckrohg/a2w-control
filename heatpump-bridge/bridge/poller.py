@@ -106,6 +106,9 @@ class PumpPoller:
         # reboot — exactly the post-power-blip window where DHCP reshuffles need healing.
         self._last_rediscover = float("-inf")
         self.on_gateway_change = None   # optional async callback(pump_id, host, port)
+        # #212: callable () -> dict | None, set by main.py (deliberate_stop.DeliberateStops) — a pump whose
+        # breaker a PERSON switched off answers no polls, and that is expected, not an outage to escalate
+        self.deliberate_stop = None
         # _write_lock makes guardrail check-then-act atomic under concurrent requests
         # (rate limit was bypassable by requests arriving during a slow 2400-baud write);
         # _poll_lock stops interleaved polls double-emitting edge events / mixing reads
@@ -427,6 +430,7 @@ class PumpPoller:
         # Alert on the explicit edge flag, not on the previous snapshot's online state — a
         # pump that has NEVER been online (boot into a dead/miswired gateway: the bench-day
         # case) must alert too, exactly once, with a message that points at the triage table.
+        stopped = self._deliberately_stopped()
         if failures >= threshold and not self._offline_alerted:
             self._offline_alerted = True
             self._offline_since = time.monotonic()
@@ -443,7 +447,7 @@ class PumpPoller:
             await self.store.add_event(
                 self.cfg.id, "comm", code="offline", severity="high",
                 message=message, detail={"category": exc.category})
-            if never_online:
+            if never_online and not stopped:
                 # Bench-day miswire: nothing to flap against, page immediately — a pump
                 # that has never answered is a provisioning failure needing a human.
                 # Counts as the email tier so recovery closes the loop by email too.
@@ -461,12 +465,17 @@ class PumpPoller:
             if failures >= threshold:
                 self.snapshot["online"] = False
                 self.snapshot["state"] = "offline"
+        if stopped and self._offline_since is not None:
+            # #212: its breaker is OFF by a person's choice — silence is the expected result, not an outage. The outage
+            # clock restarts from the moment the stop ends, so a pump that stays silent after being switched back on
+            # still escalates on the usual schedule.
+            self._offline_since = time.monotonic()
         # Sustained outage: the edge was logged quietly; RECORD once the silence outlasts a WiFi
         # blip. The owner hears only at the prolonged tier below (alert-policy.md): the pump keeps
         # running on its own controller, and a pump that has really stopped heating is caught by
         # the planner's one "no heat" page.
         ncfg = self.app_cfg.notifications
-        if (self._offline_alerted and not self._offline_push_sent
+        if (self._offline_alerted and not self._offline_push_sent and not stopped
                 and self._offline_since is not None
                 and time.monotonic() - self._offline_since >= ncfg.offline_alert_min * 60):
             self._offline_push_sent = True
@@ -476,7 +485,7 @@ class PumpPoller:
                                f"Check the gateway / WiFi / pump comm board.",
                        priority="high", tags="warning", tier="record")
         # Prolonged outage: the "requires intervention" tier — attention (email, no phone).
-        if (self._offline_alerted and not self._offline_email_sent
+        if (self._offline_alerted and not self._offline_email_sent and not stopped
                 and self._offline_since is not None
                 and time.monotonic() - self._offline_since >= ncfg.offline_email_min * 60):
             self._offline_email_sent = True
@@ -493,6 +502,15 @@ class PumpPoller:
             self.snapshot["link"] = link
             self.snapshot["link_detail"] = detail
         await self._maybe_comm_row(force=True)
+
+    def _deliberately_stopped(self) -> bool:
+        if self.deliberate_stop is None:
+            return False
+        try:
+            return self.deliberate_stop() is not None
+        except Exception as exc:  # noqa: BLE001 — a #212 bug must never cost the outage alerting
+            log.warning("[%s] deliberate-stop check failed: %s", self.cfg.id, exc)
+            return False
 
     def _note_offline_edge(self, category: str) -> None:
         """Flap detector: a single brief dropout is logged, not paged — but

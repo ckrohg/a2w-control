@@ -7,7 +7,7 @@
 # Per pump, one of: DOWN — a fresh snapshot with a blocking fault while not running, or Modbus-stale while a FRESH panel
 # read shows no compressor draw on its circuit (a gateway outage with the pump still heating is NOT down — measured
 # 2026-10-19: both gateways stale with SPAN reachable never lasted > 3.5 min in 97 d); OFF — switched off on purpose (on
-# the unit, from 6bb, or its circuit OPEN at the panel), never a failure; UNKNOWN — stale with no fresh panel read, or no
+# the unit, from 6bb, or its circuit OPEN at the panel — #212's deliberate stop), never a failure; UNKNOWN — stale with no fresh panel read, or no
 # draw reading: a Pi Wi-Fi/LAN drop loses Modbus AND SPAN together, so it must never read as "every pump down" — any
 # UNKNOWN pump resets the episode; UP — anything else.
 # Default SHADOW: audit + EMAIL "would close" once per cooldown (never a phone push) and switch nothing until
@@ -36,7 +36,7 @@ EVENT_TYPE = "backup_fallback"
 
 class BackupFallback:
     def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None, circuits: dict | None = None,
-                 clock=time.time, mono=time.monotonic):
+                 clock=time.time, mono=time.monotonic, stops=None):
         self.cfg = cfg                  # BackupFallbackConfig
         self.pollers = pollers
         self.breakers = breakers        # span_control.BreakerController | None
@@ -46,6 +46,7 @@ class BackupFallback:
         self.circuits = circuits or {"pump1": "Air-Water 1", "pump2": "Air-Water 2"}
         self._clock = clock
         self._mono = mono
+        self.stops = stops              # deliberate_stop.DeliberateStops | None: only words the reason (#212)
         self._task: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
         self._since: float | None = None          # monotonic: every pump down since
@@ -132,7 +133,8 @@ class BackupFallback:
         if span is not None and self.circuits.get(pid):
             circ = next((c for c in span["circuits"] if c["name"] == self.circuits[pid]), None)
         if circ is not None and circ.get("relay_state") == "OPEN":
-            return "off", "is switched off at the panel (deliberate, or a self-heal power cycle)"
+            why = self.stops.describe(pid) if self.stops is not None else None
+            return "off", why or "is switched off at the panel (deliberate, or a self-heal power cycle)"
         s = poller.snapshot
         if self._fresh(s):
             if s.get("on") is False or s.get("state") == "off":

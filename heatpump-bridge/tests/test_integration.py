@@ -385,6 +385,46 @@ async def test_prolonged_offline_emails_and_recovery_closes_by_email(rig, monkey
     assert {p["ch"] for p in recovery} == {"ntfy"}, "an attention all-clear is record-only"
 
 
+async def test_a_deliberately_stopped_pump_never_escalates_its_silence(rig, monkeypatch):
+    """#212: a pump whose breaker a person switched off answers no polls (measured 2026-10-19: Air-Water 2 OPEN ->
+    Modbus timeout). That silence is expected: no 'offline'/'prolonged outage' push or email while the stop lasts.
+    Once it ends, a pump that STAYS silent escalates on the usual schedule, counted from the end of the stop."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    stop = {"circuit": "Air-Water 1", "since": 0.0, "announced": True}
+    poller.deliberate_stop = lambda: stop
+    poller.app_cfg.notifications.offline_alert_min = 0
+    poller.app_cfg.notifications.offline_email_min = 0
+    await poller.poll_once()
+    await pump.server.shutdown()
+    for _ in range(8):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert not poller.online
+    assert [p for p in pushes if "offline" in p["title"]] == []
+    poller.deliberate_stop = lambda: None            # switched back on... but the pump stays silent
+    for _ in range(3):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert "email" in [p["ch"] for p in pushes if "prolonged outage" in p["title"]]
+
+
+async def test_a_deliberate_stop_at_boot_is_not_a_never_responded_page(tmp_path, monkeypatch):
+    """A bridge that boots while a pump is switched off must not email 'has never responded' about it."""
+    pushes = _capture_pushes(monkeypatch)
+    cfg = AppConfig(pumps=[PumpConfig(id="pump1", name="HP1", host="127.0.0.1", port=free_port())],
+                    db_path=str(tmp_path / "b.db"))
+    store = Store(cfg.db_path)
+    await store.open()
+    poller = PumpPoller(cfg.pumps[0], cfg, store, SetpointGuard(cfg.guardrails))
+    poller.deliberate_stop = lambda: {"circuit": "Air-Water 1", "since": 0.0, "announced": False}
+    for _ in range(4):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert [p for p in pushes if p["ch"] == "email"] == []
+    await store.close()
+
+
 async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
     """Repeated brief dropouts (each individually below the sustained gate) must page as a
     pattern: flap_alert_count offline edges inside flap_window_min -> one 'link degrading'

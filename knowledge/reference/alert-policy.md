@@ -69,6 +69,7 @@ These rules apply to every tier:
 | Pi unreachable | planner `checkLeaseAndPi` | 2 h when outdoor < 32 °F, else 12 h |
 | Planner down | hub planner dead-man | 2 h (was 15 min) |
 | Foreign HBX curve writer | planner `drift.ts` | Any confirmed foreign write; at most one page a day |
+| Heat pump left switched off (#212) | planner `stagewatch.ts` | A pump switched off outside A2W, still off 4 h while the HBX calls its stage: one reminder per stop |
 
 ## What emails (attention)
 
@@ -77,6 +78,10 @@ engineer or a Claude session can act, it is record-tier; it does not email the o
 `/health`, in drift-check (daily) and in the Monday digest.
 
 - **Pumps and faults:**
+  - a heat-pump breaker switched off outside A2W (#212: 6bb, the SPAN app or the panel), once it has stayed off
+    3 min: switch it back on if that was not meant. Then quiet until it is back; the back-on note is record-only.
+    While it lasts it is not a fault: self-heal stands down for that pump, its offline escalation, the per-stage
+    episodes and the "no heat" page don't fire for it (bridge `deliberate_stop.py`);
   - the same fault code 3+ times in 7 days: book a service visit;
   - a pump that never answered since boot, or comm offline 60+ min: power-cycle the gateway or pump.
 - **Pi:** CPU ≥ 80 °C (give it airflow).
