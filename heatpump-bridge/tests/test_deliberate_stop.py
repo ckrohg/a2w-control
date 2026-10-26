@@ -5,7 +5,8 @@
 # a short 6bb power cycle never emails; A2W's own power cycle is never a deliberate stop (in progress, or within the
 # attribution window after it); a stale panel read changes nothing; a restart never re-announces; self-heal stands
 # down for the stopped pump, never cycles the one pump left, and does not note "both down"; the backup fallback words
-# it; the hub frame and /api/health carry it.
+# it; the hub frame and /api/health carry it; a held verdict expires without a recent panel read, and a pump that
+# answers Modbus is never "stopped" (both fail loud).
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,7 @@ from bridge import self_heal as sh_mod
 from bridge import span_control
 from bridge.config import BackupFallbackConfig, HubConfig, SelfHealConfig, SpanConfig
 from bridge.backup_fallback import BackupFallback
-from bridge.deliberate_stop import ATTRIBUTION_S, CONFIRM_S, DeliberateStops
+from bridge.deliberate_stop import ATTRIBUTION_S, CONFIRM_S, VERDICT_MAX_AGE_S, DeliberateStops
 from bridge.hub_client import HubClient
 from bridge.self_heal import SelfHealer
 from bridge.span_control import BreakerController
@@ -49,11 +50,13 @@ class FakePoller:
     def __init__(self, pid, name, ft):
         self.cfg = SimpleNamespace(id=pid, name=name)
         self.ft = ft
+        self.powered = True       # its breaker: a pump without power answers no poll
         self.snapshot = {"online": True, "last_poll_ts": ft.clock(), "last_poll_mono": ft.mono(), "running": False,
                          "defrosting": False, "state": "idle", "active_faults": [], "identity_ok": True}
 
     def fresh(self, **kw):
-        self.snapshot.update(last_poll_ts=self.ft.clock(), last_poll_mono=self.ft.mono(), online=True, **kw)
+        if self.powered:
+            self.snapshot.update(last_poll_ts=self.ft.clock(), last_poll_mono=self.ft.mono(), online=True, **kw)
 
     def silent(self):
         """what a switched-off pump looks like on the Pi: polls time out, the last snapshot ages (2026-10-19)."""
@@ -110,8 +113,13 @@ async def rig(tmp_path, alerts):
         poller.note_circuits(await poller.client.fetch_circuits(), ft.clock(), ft.mono())
 
     def person_switches(circuit, state):
-        """6bb / the SPAN app / the panel: the relay changes with no A2W action (OPEN reads 0 W)."""
+        """6bb / the SPAN app / the panel: the relay changes with no A2W action (OPEN reads 0 W, and the pump on it goes
+        silent — its Modbus times out, measured 2026-10-19)."""
         panel.set(circuit, relayState=state, **({"instantPowerW": 0.0} if state == "OPEN" else {}))
+        pump = pollers[{v: k for k, v in CIRCUITS.items()}[circuit]]
+        pump.powered = state != "OPEN"
+        if not pump.powered:
+            pump.silent()
 
     async def advance(stops, seconds, *, heal=None, live_pumps=("pump1", "pump2")):
         """seconds of wall time in 30-s ticks: fresh polls for live pumps, a panel read, then the ticks."""
@@ -249,6 +257,57 @@ async def test_a_stale_panel_read_neither_starts_nor_ends_a_stop(rig):
     assert stops.stopped("pump1") is None            # and an old read starts nothing
     await rig.prime()                                # a fresh read decides both
     assert stops.stopped("pump2") is None and stops.stopped("pump1") is not None
+
+
+async def test_a_held_verdict_expires_without_a_recent_panel_read(rig):
+    """The SPAN local stream dies (record-only) while a stop is held; someone switches the pump back ON and it then
+    fails to start or loses comms. A stop nobody can confirm must not keep silencing that pump: after
+    VERDICT_MAX_AGE_S without a fresh read it is no longer in force (fail loud)."""
+    stops = rig.make_stops()
+    rig.person_switches("Air-Water 2", "OPEN")
+    await rig.advance(stops, CONFIRM_S + 60, live_pumps=("pump1",))
+    assert stops.stopped("pump2")["announced"]
+    rig.person_switches("Air-Water 2", "CLOSED")
+    rig.p2.powered = False                         # switched back on, but the pump never answers again
+    rig.ft.t += VERDICT_MAX_AGE_S - 30              # no panel read since: still held, still in force
+    await stops.tick()
+    assert stops.stopped("pump2") is not None
+    rig.ft.t += 60                                  # past the limit: held, but no longer in force
+    await stops.tick()
+    assert stops.stopped("pump2") is None
+    assert stops.status()["pumps"]["pump2"]["in_force"] is False
+    # the guards see it as an ordinary down pump again
+    heal = SelfHealer(SelfHealConfig(live=True, circuits_verified=True), rig.pollers, rig.ctl, rig.store,
+                      state_dir=str(rig.tmp_path), clock=rig.ft.clock, mono=rig.ft.mono, boot_id="boot-A", stops=stops)
+    assert heal._pump_down("pump2", span=None) == "is offline"
+    # a fresh read showing it OPEN again puts it back in force
+    rig.person_switches("Air-Water 2", "OPEN")
+    await rig.prime()
+    assert stops.stopped("pump2") is not None
+
+
+async def test_a_pump_that_answers_modbus_is_never_stopped(rig):
+    """A switched-off pump cannot answer Modbus. If it does — the panel read held from before is wrong or old — the
+    breaker is on, whatever the last read said."""
+    stops = rig.make_stops()
+    rig.person_switches("Air-Water 2", "OPEN")
+    await rig.advance(stops, 60, live_pumps=("pump1",))
+    assert stops.stopped("pump2")
+    cache = rig.ctl.cache
+    cache.latest_circuits_mono = cache.latest_circuits_ts = rig.ft.t - 600   # the panel stream goes stale...
+    rig.p2.powered = True
+    rig.p2.fresh()                                   # ...and pump2 answers a poll: it has power
+    assert stops.stopped("pump2") is None
+    assert stops.status()["pumps"]["pump2"]["in_force"] is False
+    rig.p2.snapshot["last_poll_mono"] = rig.ft.t - 200   # silent again (stale snapshot): the held stop is back in force
+    assert stops.stopped("pump2") is not None
+    # and the announcement waits for a verdict in force
+    s2 = rig.make_stops()
+    rig.p2.fresh()
+    s2._stops["pump2"]["seen"] -= CONFIRM_S * 2
+    s2._stops["pump2"]["announced"] = False
+    await s2.tick()
+    assert s2._stops["pump2"]["announced"] is False
 
 
 async def test_a_restart_never_re_announces(rig):

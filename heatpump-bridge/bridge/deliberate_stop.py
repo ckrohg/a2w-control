@@ -13,6 +13,11 @@
 #     pump health don't page it as a fault, and the planner sends the one reminder when it is still off hours later
 #     while the HBX calls its stage (the Pi cannot see the HBX call).
 # A stale panel read changes nothing: the last verdict holds, so a Pi network drop neither starts nor ends a stop.
+# But a held verdict is only IN FORCE (what stopped() reports to the guards, the poller and the planner) while it is
+# backed by a panel read at most VERDICT_MAX_AGE_S old, and while the pump itself is silent: a switched-off pump cannot
+# answer Modbus (measured 2026-10-19), so a fresh online poll means the breaker is back on whatever the last read said.
+# Both fail LOUD — without them a dead SPAN stream would keep a pump that failed after being switched back on
+# "deliberately stopped" for ever, silencing its offline escalation, self-heal and the planner's stage episodes.
 # since/announced are persisted next to the DB, so a bridge restart never re-announces a stop.
 from __future__ import annotations
 
@@ -32,6 +37,8 @@ TICK_S = 30.0
 SPAN_FRESH_S = 120.0       # a panel read older than this is not evidence (self-heal's rule)
 ATTRIBUTION_S = 10 * 60.0  # an OPEN this soon after A2W switched the circuit is A2W's (panel/read-back lag margin)
 CONFIRM_S = 3 * 60.0       # off this long before the email: a 6bb power cycle (60 s min) never announces itself
+VERDICT_MAX_AGE_S = 10 * 60.0  # a held stop older than its last fresh panel read by this is no longer in force
+FRESH_POLL_S = 90.0        # a pump snapshot this fresh and online is a pump with power (self-heal's freshness rule)
 STATE_FILE = "deliberate-stops.json"
 EVENT_PUMP_ID = "span"     # events.pump_id for breaker-related rows (mirrored like pump events)
 EVENT_TYPE = "deliberate_stop"
@@ -57,6 +64,7 @@ class DeliberateStops:
         for st in self._stops.values():
             st["seen"] = self._mono()   # across a restart the confirmation restarts (announced stays announced)
         self._events: list[tuple] = []  # transitions observed synchronously, flushed (audit + notify) by tick()
+        self._read_mono: float | None = None   # when the last FRESH panel read was taken (monotonic)
         self._task: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
 
@@ -88,9 +96,19 @@ class DeliberateStops:
         controller's current panel read, so a guard asking right before acting never sees a 30-s-old verdict."""
         self._observe()
         st = self._stops.get(pid)
-        if st is None:
+        if st is None or not self._in_force(pid):
             return None
         return {"circuit": self.circuits[pid], "since": st["since"], "announced": bool(st.get("announced"))}
+
+    def _in_force(self, pid: str) -> bool:
+        """A held stop counts only while a recent panel read backs it and the pump is silent (header)."""
+        if self._read_mono is None or self._mono() - self._read_mono > VERDICT_MAX_AGE_S:
+            return False
+        snap = getattr(self.pollers.get(pid), "snapshot", None) or {}
+        mono = snap.get("last_poll_mono")
+        answers = (snap.get("online") is True and isinstance(mono, (int, float))
+                   and 0 <= self._mono() - float(mono) < FRESH_POLL_S)
+        return not answers
 
     def describe(self, pid: str) -> str | None:
         """'was switched off outside A2W at 3:12 PM' — for the other modules' reasons; None when not stopped."""
@@ -101,7 +119,8 @@ class DeliberateStops:
         self._observe()
         return {"attribution_min": ATTRIBUTION_S / 60, "confirm_min": CONFIRM_S / 60,
                 "pumps": {pid: ({"circuit": c, "since": self._stops[pid]["since"],
-                                 "announced": bool(self._stops[pid].get("announced"))}
+                                 "announced": bool(self._stops[pid].get("announced")),
+                                 "in_force": self._in_force(pid)}
                                 if pid in self._stops else None)
                           for pid, c in self.circuits.items()}}
 
@@ -126,6 +145,7 @@ class DeliberateStops:
         relays = self._fresh_relays()
         if relays is None:
             return                       # no fresh evidence: the last verdict holds
+        self._read_mono = self._mono()
         changed = False
         for pid, circuit in self.circuits.items():
             relay = relays.get(circuit)
@@ -148,7 +168,7 @@ class DeliberateStops:
         self._observe()
         now = self._mono()
         for pid, st in self._stops.items():
-            if not st.get("announced") and now - st["seen"] >= CONFIRM_S:
+            if not st.get("announced") and now - st["seen"] >= CONFIRM_S and self._in_force(pid):
                 st["announced"] = True
                 self._save()
                 self._events.append(("announced", pid, dict(st)))

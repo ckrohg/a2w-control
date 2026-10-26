@@ -135,7 +135,10 @@ class BreakerController:
         """Why a relay state on `name` may be A2W's OWN doing right now (None: A2W has not switched it). #212 uses it
         to tell a circuit a PERSON switched off (6bb, the SPAN app, the panel — the panel reports USER for all of
         them) from one A2W is cycling: A2W leaves a heat-pump circuit OPEN only inside its own action, a re-close it
-        keeps retrying, or an interrupted cycle it has not finished, plus `within_s` after its last relay write."""
+        keeps retrying, or an interrupted cycle it has not finished, plus `within_s` after its last relay write.
+        _opened_at is deliberately not consulted: a heat-pump circuit is never bare-OPENed (config forbids it), so an
+        OPEN that outlives A2W's own action (after a restart, or more than `within_s` after its last write) reads as
+        a person's choice. Acceptable: someone did choose it, and the planner's reminder still covers a forgotten one."""
         if self._busy is not None and self._busy.get("circuit") == name:
             return f"A2W is running {self._busy.get('action')} on it"
         if name in self._pending_close:
