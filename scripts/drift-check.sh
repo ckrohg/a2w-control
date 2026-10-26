@@ -54,6 +54,30 @@ fail() {
 }
 skip() { printf '  --   %s\n' "$1"; }
 
+# [2a]'s classifier: one phase_b.lastResults value -> armed | nolease | requested | failed | handover | dryrun |
+# STALE. Every shape planner/src/phaseb.ts writes (runOnce + verifyLeases), re-derived 2026-10-25:
+#   "ok 61°C (lease 87m armed)"                           verifyLeases: the Pi confirmed a lease   -> armed
+#   "ok 61°C — ⚠ NO LEASE ARMED"                          verifyLeases: wrote, Pi armed nothing    -> nolease
+#   "ok 61°C (lease 90m requested)"                       sent; the verify's hub read failed       -> requested
+#   "failed: <hub detail>"                                the write itself failed (no lease info) -> failed
+#   "skipped 61°C — writer lease not held / handing over" not this instance's turn (every deploy
+#                                                         handover, Railway old/new overlap)       -> handover
+#   "DRY-RUN would send 61°C — <reason>"                  dry-run lane                             -> dryrun
+# ("_skip" is the no-fresh-target marker; the jq filter drops it before this.) Anything else -> STALE.
+phaseb_result_class() {
+  case "$1" in
+    *"NO LEASE ARMED"*)                                       echo nolease ;;
+    "ok "*"°C (lease "*"m armed)")                            echo armed ;;
+    "ok "*"°C (lease "*"m requested)")                        echo requested ;;
+    "failed: "*)                                              echo failed ;;
+    "skipped "*"°C — writer lease not held / handing over")   echo handover ;;
+    "DRY-RUN would send "*)                                   echo dryrun ;;
+    *)                                                        echo STALE ;;
+  esac
+}
+# scripts/drift-check.test.sh sources the helpers above and stops here.
+[ -n "${DRIFT_CHECK_LIB_ONLY:-}" ] && return 0
+
 echo "drift-check $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo
@@ -84,10 +108,11 @@ PHASE_B_MODE="$(jq -r '.phase_b.mode // "unknown"' <<<"${HEALTH:-{\}}")"
 # [2a] TOKEN-FREE assertion. #97 made phase_b report what the Pi actually ARMED rather than
 # echoing its own LEASE_MINUTES constant, so the public /health now carries the answer and this
 # check needs no credentials -- which means it runs in CI, on a phone, from anywhere.
-# phaseb.ts emits exactly three shapes (phaseb.ts:130/192/198):
-#   "(lease Nm armed)"     -> the Pi confirmed a lease   -> ok
-#   "NO LEASE ARMED"       -> wrote, Pi armed nothing    -> DRIFT (this is FINDING-1)
-#   "(lease Nm requested)" -> hub read failed, unobserved -> cannot assert, say so
+# The result shapes are classified by phaseb_result_class (top of this file, with phaseb.ts's exact
+# strings): armed -> ok; nolease -> DRIFT (this is FINDING-1); requested / failed / handover / dryrun
+# -> cannot assert this cycle, say so. A handover is the normal state of the OLD instance during every
+# deploy (it no longer holds the writer lease); one that never ends is the planner's own
+# writer-lease-unheld alert, not this check's.
 # Anything else means the string changed and THIS CHECK HAS GONE STALE. That is reported as
 # drift too, deliberately: a silently-passing safety assertion is the exact failure class
 # this script exists to prevent -- see the header. Do not "fix" it by loosening the match.
@@ -102,16 +127,20 @@ else
   else
     while IFS=$'\t' read -r PUMP MSG; do
       [ -z "$PUMP" ] && continue
-      case "$MSG" in
-        *"NO LEASE ARMED"*)
+      case "$(phaseb_result_class "$MSG")" in
+        nolease)
           fail "$PUMP: wrote a setpoint but the Pi armed NO lease — revert-to-baseline CANNOT fire"
           fail "  -> baseline_setpoint_c is unset on the live Pi (~/bridge-data/config.yaml)"
           fail "  -> fix: knowledge/reference/finding1-arm-baseline-runbook.md" ;;
-        *"armed)"*)
+        armed)
           pass "$PUMP: Pi confirmed a live lease — failsafe armed (${MSG})" ;;
-        *"requested)"*)
+        requested)
           skip "$PUMP: lease unverified — the planner could not read hub state (${MSG})" ;;
-        *"DRY-RUN"*)
+        failed)
+          skip "$PUMP: lease unverified — the last setpoint write failed (${MSG}); Phase B's fail streak watches that" ;;
+        handover)
+          skip "$PUMP: lease unverified — this planner instance is not the writer right now (deploy handover) (${MSG})" ;;
+        dryrun)
           skip "$PUMP: phase_b in dry-run (${MSG})" ;;
         *)
           fail "$PUMP: unrecognised phase_b result \"${MSG}\" — this assertion has gone STALE"

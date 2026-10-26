@@ -106,3 +106,13 @@ jobs:
           cache-dependency-path: ${{ matrix.dir }}/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  # The ops scripts' own offline tests (no network, no live system): drift-check's classifier of
+  # phase_b results (a string phaseb.ts writes must never read as STALE drift) and deploy-gate's
+  # #113 replay. Both need only bash, jq and curl, which the runner image has.
+  script-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/drift-check.test.sh
+      - run: bash scripts/deploy-gate.test.sh
