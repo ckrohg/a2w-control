@@ -148,6 +148,12 @@ sudo cp deploy/heatpump-bridge-update.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now heatpump-bridge-update.timer
 
+echo "==> Wi-Fi fast recovery (clears wpa_supplicant's 30-min AP ignore after 2 min down)"
+sudo install -m 755 deploy/a2w-wifi-recover.sh /usr/local/sbin/a2w-wifi-recover
+sudo cp deploy/a2w-wifi-recover.service deploy/a2w-wifi-recover.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now a2w-wifi-recover.timer
+
 echo "==> waiting for service"
 for _ in $(seq 1 20); do
   if curl -fsS localhost:8000/api/health >/dev/null 2>&1; then break; fi
