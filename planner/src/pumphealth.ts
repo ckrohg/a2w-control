@@ -8,7 +8,7 @@
  *   running_no_lift  — heating steadily 15 min (≥ 5 min into the run, ≥ 5 min after defrost) at ≥ 1 kW, mean ΔT < 1.5 °C
  *   heating_no_draw  — reports heating ≥ 7 min, SPAN 5-min mean < 1 kW
  *   idle_draw        — reports idle/off ≥ 10 min, SPAN 9-min mean > 1 kW (stuck contactor, internal heater)
- *   defrost_overlong — reports defrost continuously > 20 min (the unit's own max defrost setting caps at 20): stagewatch
+ *   defrost_overlong — reports defrost continuously > 12 min (register 2016 max defrost time: default 8, range 5–20; weekly review 2026-10-26): stagewatch
  *                      SUSPENDS its clock in defrost, so a stuck "defrost" while called was invisible (Oct 18, 83 min)
  *   called_tank_flat — stage called + its pump engaged (heating/defrost) ≥ 90 % of 45 min, tank net rise + standby loss
  *                      ≤ 2 °F AND the unit's mean ΔT over it < 1.5 °C, for 30 min (a flat tank ALONE is house load — measured)
@@ -29,7 +29,7 @@ export const PH = {
   IDLE_DRAW_WINDOW_S: 10 * 60,
   IDLE_DRAW_SKIP_S: 60,         // the first minute after a stop still shows run-down draw
   IDLE_DRAW_W: 1000,            // measured idle 4-min mean maximum 672 W; >1 kW idle samples last ≤ 0.8 min
-  DEFROST_OVERLONG_S: 20 * 60,  // measured normal 4.0–9.4 min
+  DEFROST_OVERLONG_S: 12 * 60,  // measured normal 2–9.4 min (19 spells); stuck spells 17.6, 30, 82 min. Was 20 (missed pump2 Oct 19)
   TANK_FLAT_WINDOW_S: 45 * 60,
   TANK_FLAT_ENGAGED_SHARE: 0.9,  // heating or defrost
   TANK_FLAT_PERSIST_S: 30 * 60, // every 45-min window ending in the last 30 min must be flat (doc §5)
@@ -150,7 +150,7 @@ export function evaluatePump(pumpId: string, readings: PumpReading[], span: Span
   {
     const lead = covered(readings, nowPi - PH.DEFROST_OVERLONG_S, nowPi, PH.MAX_READING_GAP_S);
     if (!lead) out.push(v("defrost_overlong", "unknown", "readings do not cover the window"));
-    else if (!lead.every(defrosting)) out.push(v("defrost_overlong", "ok", "no defrost longer than 20 min"));
+    else if (!lead.every(defrosting)) out.push(v("defrost_overlong", "ok", "no defrost longer than 12 min"));
     else {
       // how long it has been in defrost, as far back as the readings stay contiguous
       let start = lead[0].ts;
@@ -158,7 +158,7 @@ export function evaluatePump(pumpId: string, readings: PumpReading[], span: Span
       for (let i = before.length - 1, next = lead[0].ts; i >= 0 && defrosting(before[i]) && next - before[i].ts <= PH.MAX_READING_GAP_S; next = before[i].ts, i--) start = before[i].ts;
       const min = Math.round((nowPi - start) / 60);
       const last = lead[lead.length - 1];
-      out.push(v("defrost_overlong", "tripped", `reports defrost continuously for ${min} min (normal 4–9 min; the unit's max defrost setting caps at 20)`,
+      out.push(v("defrost_overlong", "tripped", `reports defrost continuously for ${min} min (normal 2–9 min; the unit's max defrost time is 8 min by default)`,
         { defrost_min: min, outlet_c: last.outlet_c, inlet_c: last.inlet_c }));
     }
   }
