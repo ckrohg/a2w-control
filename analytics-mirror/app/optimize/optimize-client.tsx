@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useBoost } from "../ui/use-boost";
-import { COAST_CAVEAT, coastLine, type Thermal } from "@/lib/tank-coast";
+import { COAST_CAVEAT, coastLine, type ThermalRead } from "@/lib/tank-coast";
 import { BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, STRICT_CAP_F, boostBody, boostChartSpan, estimateLines, etHour, fmtMinutes, overlayBoost, chartShowsBoost } from "@/lib/boost-state";
 
 const COP_SENS_PER_F = 0.01; // ~1%/°F — rough; A-4 measures the real slope
@@ -503,15 +503,16 @@ export default function OptimizeClient({
   // display-only ✓ toggles for the Request-mode "changes waiting" chips
   const [approved, setApproved] = useState<Set<number>>(new Set());
   const bst = useBoost();
-  // /health.thermal for the post-boost coast line; null until read, and on any failure (the line hides).
-  const [thermal, setThermal] = useState<Thermal | null>(null);
+  // /api/planner/thermal (/health.thermal + the Phase B lead the auto-pilot commands) for the post-boost coast
+  // line; null until read, and on any failure (the line hides).
+  const [thermal, setThermal] = useState<ThermalRead | null>(null);
   useEffect(() => {
     let live = true;
     const load = async () => {
       try {
         const res = await fetch("/api/planner/thermal", { cache: "no-store", signal: AbortSignal.timeout(10_000) });
-        const body: { thermal?: Thermal } = await res.json().catch(() => ({}));
-        if (live) setThermal(res.ok && body.thermal ? body.thermal : null);
+        const body: ThermalRead = await res.json().catch(() => ({}));
+        if (live) setThermal(res.ok && body.thermal ? body : null);
       } catch {
         if (live) setThermal(null);
       }
@@ -579,10 +580,11 @@ export default function OptimizeClient({
   const est = estimateLines(bst.st?.tank_f ?? null, estTarget ?? STRICT_CAP_F);
   const customReq = boostBody(clamp(Math.round(customF) || STRICT_CAP_F, 120, STRICT_CAP_F),
     clamp(Math.round(customMin) || BOOST_MAX_MINUTES, BOOST_MIN_MINUTES, BOOST_MAX_MINUTES));
-  const customCoast = coastLine(thermal, customReq.target_f, bst.nowMs);
+  // ht_dif_f from the writer status sizes the reheat band; its target_f (the raw report) is deliberately NOT read.
+  const customCoast = coastLine(thermal, customReq.target_f, bst.nowMs, bst.st?.ht_dif_f);
   const sendBoost = (target: number, minutes: number, label: string) => {
     const e = estimateLines(bst.st?.tank_f ?? null, target);
-    const coast = coastLine(thermal, target, bst.nowMs);
+    const coast = coastLine(thermal, target, bst.nowMs, bst.st?.ht_dif_f);
     bst.send(target, minutes, `${label}: boost the tank to ${target} °F for ${fmtMinutes(minutes)}?`,
       `Hot water ${e.now}.\nHot water ${e.ifCompletes}.` + (coast ? `\n${coast} (${COAST_CAVEAT}).` : ""));
   };
@@ -1117,7 +1119,7 @@ export default function OptimizeClient({
           <span className="pb-est">Hot water {est.now}</span>
           {estTarget != null && <span className="pb-est">Hot water {est.ifCompletes}</span>}
           {!ab && PRESETS.map((p) => {
-            const c = coastLine(thermal, p.target, bst.nowMs);
+            const c = coastLine(thermal, p.target, bst.nowMs, bst.st?.ht_dif_f);
             return c ? <span key={p.label} className="pb-est">{p.label}: {c} <i>({COAST_CAVEAT})</i></span> : null;
           })}
           <span className="pb-est">estimate: ≈3.4 gal per °F above 110 °F (TempIQ tank model), ~2 gal/min shower</span>
