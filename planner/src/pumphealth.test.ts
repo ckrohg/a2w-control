@@ -38,8 +38,8 @@ function replay(p: string, rd: PumpReading[], sp: SpanSample[]): { opens: { at: 
 // ── 1. REAL replay: exactly one episode — pump1's 83-min stuck defrost — and no false positive anywhere ─────────────────
 {
   const p1 = replay("pump1", R("pump1"), S("Air-Water 1"));
-  assert.deepEqual(p1.opens.map((o) => [o.at, o.check]), [["2026-10-18T02:30", "defrost_overlong"]], "pump1: only the stuck defrost opens");
-  assert.match(p1.opens[0].body, /reports defrost continuously for 2[0-9] min/);
+  assert.deepEqual(p1.opens.map((o) => [o.at, o.check]), [["2026-10-18T02:20", "defrost_overlong"]], "pump1: only the stuck defrost opens (12-min threshold, tuned 2026-10-26)");
+  assert.match(p1.opens[0].body, /reports defrost continuously for 1[2-9] min/);
   assert.deepEqual(p1.closes.map((c) => [c.at, c.check]), [["2026-10-18T03:30", "defrost_overlong"]], "…and it closes when the unit leaves defrost (03:29Z)");
   for (const k of ["running_no_lift", "heating_no_draw", "idle_draw"]) assert.equal(p1.states[`${k}:tripped`] ?? 0, 0, `pump1 ${k} never trips on real data`);
   const p2 = replay("pump2", R("pump2"), S("Air-Water 2"));
