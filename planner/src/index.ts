@@ -17,7 +17,7 @@ import os from "node:os";
 import { TempiqPusher } from "./tempiq";
 import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
-import { TempiqReader } from "./tempiq-read";
+import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { HubClient, type HubState } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H, priorExcursionsFromPlans } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
@@ -253,8 +253,12 @@ if (TEMPIQ_PUSH_ENABLED && !tempiq) console.warn("TEMPIQ_PUSH_ENABLED but hub/TE
 // TempIQ read seam (§6.7, TempIQ#1470 read half — live 2026-07-14). Inert without the flag+token.
 const TEMPIQ_READ_ENABLED = process.env.TEMPIQ_READ_ENABLED === "1";
 const TEMPIQ_READ_EVERY_MIN = Number(process.env.TEMPIQ_READ_EVERY_MIN ?? "60");
+// TempIQv2#2124: TempIQ defers a COP point until the charge's end is observable and re-upserts its overlap day on
+// every hourly run, so each read tick re-reads this many days behind the newest mirrored point (upsert, not
+// insert-only). 0 restores the pre-#2124 "newest point" cursor — it then misses every completed row.
+const COP_OVERLAP_DAYS = Number(process.env.COP_OVERLAP_DAYS ?? "3");
 const tempiqRead = TEMPIQ_READ_ENABLED && TEMPIQ_SURFACE_TOKEN
-  ? new TempiqReader(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN)
+  ? new TempiqReader(store, TEMPIQ_BASE_URL, TEMPIQ_SURFACE_TOKEN, { copOverlapDays: COP_OVERLAP_DAYS })
   : null;
 if (TEMPIQ_READ_ENABLED && !tempiqRead) console.warn("TEMPIQ_READ_ENABLED but TEMPIQ_SURFACE_TOKEN missing — reader disabled");
 
@@ -2947,6 +2951,26 @@ async function main(): Promise<void> {
           );
           console.log(`[sanitize] auto_sanitize → ${body.enabled} via dashboard`);
           return json(res, 200, { ok: true, enabled: stored.autoSanitize });
+        }
+        if (req.url === "/api/tempiq/cop-refetch") {
+          // One-off mirror repair (TempIQv2#2124: TempIQ backfilled Sep 29 → Oct 27 with timestamps older than the
+          // mirror's cursor): walk TempIQ's COP measurements from an explicit `since` (optional exclusive `before`)
+          // and upsert them — the hourly tick's own walk, just from a caller-chosen bound. Same bearer gate as
+          // POST /api/hbx/target. Runs inline on this request (a one-off; the poll loop is a separate timer and the
+          // upsert is idempotent, so overlapping with a tick is harmless) with the reader's 20 s per-request
+          // timeout and a 50-page bound. 401 no bearer · 405 not POST · 503 reader off · 422 malformed / future /
+          // > 400-day since or a before ≤ since · 409 one already running · 502 a page failed (partial counts in
+          // the body). The summary also sits on /health.tempiq_read.lastCopRefetch.
+          if (!authed(req)) return json(res, 401, { error: "unauthorized" });
+          if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
+          if (!tempiqRead) return json(res, 503, { error: "tempiq read disabled (TEMPIQ_READ_ENABLED=1 + TEMPIQ_SURFACE_TOKEN)" });
+          let body: unknown;
+          try { body = JSON.parse((await readBody(req)) || "{}"); } catch { return json(res, 422, { error: "body must be JSON: {\"since\": ISO, \"before\"?: ISO}" }); }
+          const parsed = parseCopRefetchRequest(body, new Date());
+          if (!parsed.ok) return json(res, 422, { error: parsed.error });
+          if (tempiqRead.refetchInFlight()) return json(res, 409, { error: "a cop-refetch is already running on this instance" });
+          const summary = await tempiqRead.refetchCop(parsed.since, parsed.before);
+          return json(res, summary.error ? 502 : 200, summary);
         }
         res.writeHead(404).end();
       } catch (e) {

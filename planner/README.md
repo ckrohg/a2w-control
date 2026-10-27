@@ -298,6 +298,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
+| `COP_OVERLAP_DAYS` | no | how far behind the newest mirrored TempIQ COP point each hourly read re-reads (upsert), default `3` — see §TempIQ COP mirror. `0` is the pre-TempIQv2#2124 cursor and misses every completed row. |
 | `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
 | `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. `shadow` computes and stamps the curve and reports it at `/health.curve.plan_implies` (with `would_write`) but writes nothing — the step before `1` on a live auto-pilot. Default off = the flat per-hour target. |
@@ -418,6 +419,31 @@ Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed
 (NULL = call feed unhealthy), `n_zones`, `source` = calls | cached | stale; self-pruned at 60 days. Lets an
 analysis say whether a zone was drawing during a 5–20 min charge, which the hourly snapshot cannot).
 `/health.winter_solver` = off | shadow | degraded.
+
+## TempIQ COP mirror (`tempiq-read.ts` → `tempiq_cop_points`)
+
+The hourly read mirrors TempIQ's hydronic COP measurements (`GET /api/insights/cop-measurements`) into
+`tempiq_cop_points`; that table is the measured anchor for the winter DP (`getCopAnchor`), the realized-savings
+ledger (`getRealizedDayInputs`) and the `/curve` chart. Since TempIQv2#2124 TempIQ's writer **defers** a point
+until the charge's end is observable and **re-upserts its overlap day** on every hourly run, so the newest
+mirrored point is not a safe cursor and a mirrored row can legitimately change. The mirror therefore:
+
+- re-reads from `newest stored measured_at − COP_OVERLAP_DAYS` (default 3; 7 days back on an empty table),
+- pages backwards with `before=<oldest received + 1 ms>` until a short page, so the endpoint's 2000-row cap never
+  truncates (a row from the other pump that shares a page-boundary timestamp repeats and upserts as unchanged),
+- UPSERTs on `(measured_at, system)`, touching a row only when a mirrored field moved; `lastResult` reads
+  `cop: +3 new / 2 updated / 41 seen`.
+
+A backfill older than the window (TempIQ wrote Sep 29 → Oct 27 on 2026-10-27) needs the one-off:
+
+```
+POST /api/tempiq/cop-refetch  {"since": "2026-09-29", "before"?: ISO}   Authorization: Bearer $PLANNER_API_TOKEN
+  → {fetched, inserted, updated, pages, oldest, newest, truncated, durationMs, error}
+  401 no bearer · 422 malformed / future / > 400-day since, before ≤ since · 503 reader off · 409 one running · 502 a page failed
+```
+
+It runs inline on the request (same 20 s per-page timeout, 50-page bound) and the summary stays on
+`/health.tempiq_read.lastCopRefetch`. Never a cron: the hourly window covers steady state.
 
 ## TempIQ perturbation windows (a2w#137, FLAG-OFF)
 
