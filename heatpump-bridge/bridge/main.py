@@ -86,13 +86,30 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 logging.getLogger(__name__).exception("span breaker recovery failed")
         app.state.span_breakers = span_breakers
         hub_client.span = span_breakers   # before start(): the first state frame advertises it
+        stops = None
+        if span_breakers is not None:
+            from .deliberate_stop import DeliberateStops
+            try:  # #212: a person switching a heat pump off is a deliberate stop, not a fault
+                stops = DeliberateStops(span_breakers, cfg.self_heal.circuits, pollers, store,
+                                        notify_cfg=cfg.notifications,
+                                        state_dir=str(Path(cfg.db_path).resolve().parent))
+                for pid, poller in pollers.items():
+                    poller.deliberate_stop = (lambda pid=pid: stops.stopped(pid))
+                stops.start()
+            except Exception:  # noqa: BLE001 — never stop the bridge booting
+                logging.getLogger(__name__).exception("deliberate-stop watch failed to start")
+                for poller in pollers.values():
+                    poller.deliberate_stop = None
+                stops = None
+        app.state.deliberate_stops = stops
+        hub_client.stops = stops
         hub_client.start()
         from .self_heal import SelfHealer
         self_healer = None
         try:  # a self-heal bug must never stop the bridge (the setpoint path) from booting
             self_healer = SelfHealer(cfg.self_heal, pollers, span_breakers, store,
                                      notify_cfg=cfg.notifications, span_cfg=cfg.span,
-                                     state_dir=str(Path(cfg.db_path).resolve().parent))
+                                     state_dir=str(Path(cfg.db_path).resolve().parent), stops=stops)
             self_healer.start()
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("self-heal failed to start")
@@ -101,7 +118,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         backup_fallback = None
         try:  # likewise: the fallback must never stop the bridge booting
             backup_fallback = BackupFallback(cfg.backup_fallback, pollers, span_breakers, store,
-                                             notify_cfg=cfg.notifications, circuits=cfg.self_heal.circuits)
+                                             notify_cfg=cfg.notifications, circuits=cfg.self_heal.circuits,
+                                             stops=stops)
             backup_fallback.start()
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("backup fallback failed to start")
@@ -113,6 +131,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await self_healer.stop()     # no new self-heal decisions during shutdown
         if backup_fallback is not None:
             await backup_fallback.stop()
+        if stops is not None:
+            await stops.stop()
         await hub_client.stop()          # stop command intake first...
         if span_breakers is not None:
             await span_breakers.stop()   # ...then let a running power cycle finish its hold + CLOSE

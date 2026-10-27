@@ -426,6 +426,9 @@ async def health(request: Request, response: Response):
         # the backup-element gate's Pi-local fallback (both pumps down → close the element breaker)
         "backup_fallback": (request.app.state.backup_fallback.status()
                             if getattr(request.app.state, "backup_fallback", None) is not None else None),
+        # #212: per pump, whether a PERSON has its breaker off (6bb / SPAN app / the panel) — a deliberate stop
+        "deliberate_stops": (request.app.state.deliberate_stops.status()
+                             if getattr(request.app.state, "deliberate_stops", None) is not None else None),
     }
 
 

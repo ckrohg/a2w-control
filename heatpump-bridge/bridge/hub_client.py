@@ -37,6 +37,7 @@ class HubClient:
         self.pollers = pollers
         self.span = None   # span_control.BreakerController when SPAN local is configured
         self.backup_fallback = None   # backup_fallback.BackupFallback — its status rides frame["span"]
+        self.stops = None             # deliberate_stop.DeliberateStops — per pump "deliberate_stop" (#212)
         self._task: asyncio.Task | None = None
         self._breaker_tasks: set[asyncio.Task] = set()
 
@@ -271,6 +272,9 @@ class HubClient:
                 "error_rate": p.client.stats.as_dict()["error_rate"],
                 "remote_lease_until": s.get("remote_lease_until"),
                 "write_enabled": p.cfg.write_enabled,
+                # #212: {circuit, since (Pi wall s), announced} while a PERSON has its breaker OFF, else null. The
+                # planner's stage watch / "no heat" / pump health read it; the hub relays pumps unchanged.
+                "deliberate_stop": self._deliberate(p.cfg.id),
             })
         frame = {"type": "state", "ts": time.time(), "pumps": pumps}
         if self.span is not None:
@@ -284,6 +288,15 @@ class HubClient:
                 except Exception as exc:  # noqa: BLE001 — a status bug never costs the state frame
                     log.warning("hub: backup fallback status failed: %s", exc)
         return frame
+
+    def _deliberate(self, pid: str) -> dict | None:
+        if self.stops is None:
+            return None
+        try:
+            return self.stops.stopped(pid)
+        except Exception as exc:  # noqa: BLE001 — a status bug never costs the state frame
+            log.warning("hub: deliberate-stop status failed: %s", exc)
+            return None
 
     async def _send_state(self, ws) -> None:
         await self._safe_send(ws, self._state_payload())

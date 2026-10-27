@@ -99,6 +99,7 @@ class BreakerController:
         self._record_task: asyncio.Task | None = None
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
         self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
+        self._switched: dict[str, float] = {}               # circuit name -> mono time A2W last wrote its relay
         self._open_untimed: set[str] = set()                # bare OPEN dispatched, landing time unknown
         self._bg: set[asyncio.Task] = set()
         self._boot_id = read_boot_id()
@@ -129,6 +130,25 @@ class BreakerController:
             "min_off_s": self.cfg.min_off_s,
             "max_off_s": self.cfg.max_off_s,
         }
+
+    def own_switching(self, name: str, within_s: float) -> str | None:
+        """Why a relay state on `name` may be A2W's OWN doing right now (None: A2W has not switched it). #212 uses it
+        to tell a circuit a PERSON switched off (6bb, the SPAN app, the panel — the panel reports USER for all of
+        them) from one A2W is cycling: A2W leaves a heat-pump circuit OPEN only inside its own action, a re-close it
+        keeps retrying, or an interrupted cycle it has not finished, plus `within_s` after its last relay write.
+        _opened_at is deliberately not consulted: a heat-pump circuit is never bare-OPENed (config forbids it), so an
+        OPEN that outlives A2W's own action (after a restart, or more than `within_s` after its last write) reads as
+        a person's choice. Acceptable: someone did choose it, and the planner's reminder still covers a forgotten one."""
+        if self._busy is not None and self._busy.get("circuit") == name:
+            return f"A2W is running {self._busy.get('action')} on it"
+        if name in self._pending_close:
+            return "A2W is retrying its switch-back-ON"
+        if self._record_blocked:
+            return "an interrupted A2W power cycle is not resolved yet"
+        t = self._switched.get(name)
+        if t is not None and self._mono() - t < within_s:
+            return f"A2W switched it {self._mono() - t:.0f} s ago"
+        return None
 
     async def execute(self, circuit, action, *, off_s=None, source: str = "ui",
                       precheck=None) -> dict:
@@ -428,6 +448,7 @@ class BreakerController:
             self._open_untimed.discard(name)
             raise BreakerRefused("could not persist the switch-off time (disk?) — refusing to "
                                  "switch anything off", 503)
+        self._switched[name] = self._mono()
         _, exc, cancelled = await self._finish(   # wait for the worker even if cancelled
             self.client.set_relay(cid, "OPEN",
                                   open_permit=OpenPermit(cid, name, f"open ({source})", guard)))
@@ -505,6 +526,7 @@ class BreakerController:
         dispatched = True
         try:
             self._opened_at[name] = self._mono()
+            self._switched[name] = self._mono()
             # Shielded: a cancellation must not stop us waiting for the worker thread, or the
             # OPEN could land after we have started (and shortened) the hold.
             _, exc, c1 = await self._finish(self.client.set_relay(
@@ -517,6 +539,7 @@ class BreakerController:
                 open_err = str(exc)          # may have landed anyway: hold regardless
             open_mono = self._mono()
             self._opened_at[name] = open_mono
+            self._switched[name] = open_mono
             # Timed from when the OPEN call RETURNED: a late-landing OPEN still gets its full hold.
             self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": self._clock(),
                                     "opened_mono": open_mono, "boot_id": self._boot_id,
@@ -628,6 +651,7 @@ class BreakerController:
 
     async def _close_once(self, cid: str, name: str) -> tuple[str | None, str | None]:
         err = None
+        self._switched[name] = self._mono()
         try:
             await self.client.set_relay(cid, "CLOSED")
         except Exception as exc:  # noqa: BLE001 — may have landed; the read-back decides
