@@ -8,12 +8,14 @@
  * computes + logs what it WOULD set without writing. A2W stays STANDALONE — the shadow plan falls
  * back to the HBX reset curve if TempIQ is down, so the auto-pilot never hard-depends on TempIQ.
  * Every decision is recorded to autopilot_log (dedup'd on change) so the dashboard can show it.
- * An active boost (hbx_boosts, started from the dashboard) HOLDS the auto-pilot until its restore_at.
+ * An active boost (hbx_boosts, started from the dashboard) HOLDS the auto-pilot until its restore_at; the expiry
+ * then restores THIS auto-pilot's command for the block in force (planCommand → writes.ts restore, #232), not the
+ * July as-found curve.
  */
 
 import { Store } from "./store";
 import type { Notify } from "./alertpolicy";
-import { HbxWriter, WriteError, isBoostYield } from "./writes";
+import { HbxWriter, WriteError, isBoostYield, type PlanCommand } from "./writes";
 import { DEFAULT_OPTS } from "./shadow";
 import { APPLY_TOLERANCE_F, curveAlreadyInForce, curveOutputF, type ShapedCurve } from "./curve";
 // #173: curveAlreadyInForce + APPLY_TOLERANCE_F live in curve.ts now (shared with writes.ts status() and /health);
@@ -75,6 +77,48 @@ export function commandForBlock(
   return { targetF: t, basis: "flat" };
 }
 
+/** The plan block in force at `nowMs`: the newest block at or before now, else the plan's first (applyLatestPlan's rule). */
+export function blockInForce(plan: Array<{ ts: string }>, nowMs: number): Record<string, unknown> | null {
+  if (!Array.isArray(plan) || plan.length === 0) return null;
+  return (plan.filter((b) => new Date(b.ts).getTime() <= nowMs).at(-1) ?? plan[0]) as Record<string, unknown>;
+}
+
+/**
+ * a2w#156: the I4 ceiling a block's IDENTITY authorises, never the target's size. The soak (`sani`) may run to
+ * sanitizeCapF; a storm block (`storm`, §6.11) to STORM_CAP_F (owner-configured, 135 by default); everything else is
+ * clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot disagree
+ * about what this hour is — the writer refuses it (fail closed, logged) instead of writing it under an excursion's
+ * ceiling. A block can carry more than one identity (a storm window over the soak hour sets both sani and storm);
+ * each authorises its own ceiling and the block may run to the highest one its producers were allowed.
+ */
+export function capForBlock(block: Record<string, unknown> | null | undefined, stormCapF: number): number {
+  const isSoak = block?.sani === true, isStorm = block?.storm === true;
+  return Math.max(DEFAULT_OPTS.strictCapF, isSoak ? DEFAULT_OPTS.sanitizeCapF : 0, isStorm ? stormCapF : 0);
+}
+
+/**
+ * #232, pure: the WRITE the auto-pilot makes for a plan block — what restore() returns the plant to when a boost
+ * expires or the Control page restores the curve. The companion of commandForBlock (which gives the resulting
+ * NUMBER for the identification driver's gates): in shaped-curve mode a non-excursion hour is the plan's shaped
+ * curve itself (its endpoints, so the device weather-compensates on its own, exactly as applyLatestPlan writes it);
+ * an excursion (bank / soak / pre-boost / storm) or a curve-less block is the flat tank_target_f under the ceiling
+ * its identity authorises (capForBlock). null = nothing is commanded for this block (no finite tank_target_f —
+ * applyLatestPlan refuses such a block before classifying it), so a restore falls back to the as-found curve.
+ */
+export function planCommandForBlock(
+  block: Record<string, unknown> | null | undefined,
+  shapedCurve: boolean,
+  stormCapF: number,
+): PlanCommand | null {
+  if (!block) return null;
+  const t = Number(block.tank_target_f);
+  if (!Number.isFinite(t)) return null;
+  const reason = String(block.reason ?? "");
+  const d = shapedCurve ? curveDecision(block) : null;
+  if (d?.kind === "curve") return { kind: "curve", curve: { dot: d.curve.dot, dbt: d.curve.dbt, mbt: d.curve.mbt, wwsd: d.curve.wwsd }, reason };
+  return { kind: "flat", targetF: t, capF: capForBlock(block, stormCapF), reason };
+}
+
 export class AutoPilot {
   public lastRunAt: string | null = null;
   public lastResult = "not run yet";
@@ -106,6 +150,24 @@ export class AutoPilot {
   /** What THIS auto-pilot drives the plant to for `block` (its own shaped-curve mode applied) — see commandForBlock. */
   commandForBlock(block: Record<string, unknown> | null | undefined, outdoorF: number | null): { targetF: number; basis: "flat" | "curve" } | null {
     return commandForBlock(block, outdoorF, this.shapedCurve);
+  }
+
+  /**
+   * #232: the command the plant is RETURNED to when a boost expires or the owner presses "Restore curve" — THIS
+   * auto-pilot's own write for the block in force right now (planCommandForBlock in its shaped-curve mode and storm
+   * cap), resolved inside the writer's restore slot (writes.ts restoreSerial via setPlanCommand). The restore then
+   * lands exactly what applyLatestPlan would write, so the next tick reads "already commanded" and the 15-min rate
+   * limit never holds the plan off for a write that was already made — the hole #232 found. null = nothing of the
+   * plan is being commanded (shadow / dry run: the planner does not command the plan, so a restore must not either;
+   * no recent plan; no finite target on the block in force) → the writer falls back to the as-found curve, which
+   * is what a restore meant before the plan was commanded at all.
+   */
+  async planCommand(): Promise<PlanCommand | null> {
+    if (this.dryRun) return null;
+    const plans = await this.store.recentPlans(6);
+    const latest = plans.at(-1);
+    if (!latest || !Array.isArray(latest.plan) || latest.plan.length === 0) return null;
+    return planCommandForBlock(blockInForce(latest.plan, Date.now()), this.shapedCurve, this.stormCapF);
   }
 
   // Identification hold (identify.ts): while a randomised AWT window runs, the auto-pilot must not
@@ -158,9 +220,7 @@ export class AutoPilot {
       this.lastResult = "no recent shadow plan";
       return;
     }
-    const now = Date.now();
-    const block =
-      latest.plan.filter((b: { ts: string }) => new Date(b.ts).getTime() <= now).at(-1) ?? latest.plan[0];
+    const block = blockInForce(latest.plan, Date.now());
     const target = Number(block?.tank_target_f);
     if (!Number.isFinite(target)) {
       this.lastResult = "plan block missing tank_target_f";
@@ -172,8 +232,9 @@ export class AutoPilot {
     // Dashboard boost hold (incident 2026-10-14..16): a boost the owner started (POST /api/hbx/boost → writes.ts
     // boost(), durable in hbx_boosts) is a human command with its own timer and its own restore. The auto-pilot must
     // not write its plan over it once the 15-min rate limit clears — before this it did, and a 3 h "Heat now" lasted
-    // ~15 min. Held until restore_at; expireBoosts() then restores the as-found curve and the auto-pilot resumes on
-    // the next unthrottled poll. Checked before every other branch (dry run and shaped-curve mode included): there
+    // ~15 min. Held until restore_at; expireBoosts() then restores the plan's command (planCommand, #232) and the
+    // auto-pilot reads "already commanded" on its next poll. Checked before every other branch (dry run and
+    // shaped-curve mode included): there
     // is nothing to decide while a human holds the target. Logged as `held`, never a rejection — nothing refused it.
     const boost = await this.store.activeBoost();
     if (boost) { await this.holdForBoost(boost, target, reason, block); return; }
@@ -231,15 +292,10 @@ export class AutoPilot {
       }
       // excursion or no curve → the flat target write below, exactly as before
     }
-    // a2w#156: the block's IDENTITY authorises its ceiling, never the target's size. The soak (`sani`) may run to
-    // sanitizeCapF; a storm block (`storm`, §6.11) to STORM_CAP_F (owner-configured, 135 by default); everything else
-    // is clamped to the everyday cap by the plan, so an unflagged target above it means the plan and the auto-pilot
-    // disagree about what this hour is — refuse it (fail closed, logged) instead of writing it under an excursion's
-    // ceiling. Identification probes do not pass through here (identify.ts writes with its own cap).
-    // A block can carry more than one identity (a storm window over the soak hour sets both sani and storm); each
-    // identity authorises its own ceiling and the block may run to the highest one its producers were allowed.
+    // a2w#156: the block's IDENTITY authorises its ceiling, never the target's size (capForBlock). Identification
+    // probes do not pass through here (identify.ts writes with its own cap).
     const isSoak = block?.sani === true, isStorm = block?.storm === true;
-    const capF = Math.max(DEFAULT_OPTS.strictCapF, isSoak ? DEFAULT_OPTS.sanitizeCapF : 0, isStorm ? this.stormCapF : 0);
+    const capF = capForBlock(block, this.stormCapF);
     if (target > capF) {
       // Checked BEFORE the dry-run branch so a dry run previews the same verdict (codex pass 3 on #157): a malformed
       // plan must read "would reject" during commissioning, not "would set".

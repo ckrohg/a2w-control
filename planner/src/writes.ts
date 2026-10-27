@@ -6,10 +6,13 @@
  * see memory hbx-remote-target-uncontrollable). Adoption is asynchronous — we do NOT synchronously
  * verify the operative target (the old dbt==mbt flatten + 8 s temp1.target check was the bug: the
  * device ignores a degenerate curve and only recomputes on the next cycle anyway). Restore
- * re-applies the as-found endpoints from the seed config version.
+ * (#232) returns the plant to the PLAN's command for the block in force — the auto-pilot's own write
+ * (the shaped curve, or the flat excursion target), through the same I4/I1 guards — and re-applies
+ * the as-found endpoints from the seed config version only when no plan is being commanded or the
+ * caller asks for them (`to: "as-found"`).
  * Guardrails, in order: I4 envelope clamp (bandFor, outdoor-indexed) → I1 cross-check against live
- * pump setpoints from the hub → rate limit (restore exempt: reverting to baseline must never be
- * blocked) → PATCH with response-echo verify (proves the API accepted dbt/mbt) → self-recorded
+ * pump setpoints from the hub → rate limit (restore exempt: a restore ENDS an excursion, it never
+ * starts one, and returning the plant must never be blocked) → PATCH with response-echo verify (proves the API accepted dbt/mbt) → self-recorded
  * config version (so the drift detector doesn't re-alert our own write) → audit row for EVERY
  * attempt, accepted or rejected → ntfy on success. Adoption then shows up in the 5-min poll loop
  * as temp1.target moves onto the new band; status() reports commanded-vs-operative.
@@ -50,7 +53,7 @@ export const PI_CLOCK_SKEW_MAX_S = 5 * 60;
 /**
  * The reason the hub's state cannot stand in for the live pumps — or null when it can. Pure, so the three refusal
  * shapes are unit-testable without a Store (writes.test.ts). Used by BOTH I1 checks (setTarget, setCurve) and by the
- * identification driver's setpoint-coverage check; restore() stays exempt (reverting to baseline is never blocked).
+ * identification driver's setpoint-coverage check — the plan restore (#232) included; only the as-found restore skips it.
  * `ts` is the Pi's own `time.time()` — UNIX SECONDS (heatpump-bridge/bridge/hub_client.py:227), relayed by the hub
  * unchanged (hub/src/index.ts GET /api/state). A millisecond value (> 1e11, i.e. after the year 5138 in seconds) is
  * normalised rather than trusted: read as seconds it would sit far in the future and make every frame look fresh.
@@ -103,6 +106,23 @@ export function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
  * otherwise the auto-pilot would keep holding a boost the owner already cancelled.
  */
 export type WriteOpts = { yieldToBoost?: boolean; endsBoost?: boolean };
+/**
+ * #232: what restore() returns the plant TO when a plan is being commanded — the auto-pilot's own write for the block
+ * in force (autopilot.ts planCommandForBlock): the shaped curve on a curve hour, the flat target under the ceiling
+ * its identity authorises on an excursion or a curve-less block. Resolved INSIDE the restore's serial slot, so it is
+ * the block in force at the moment of the write, not at the moment the boost was started.
+ */
+export type PlanCommand =
+  | { kind: "curve"; curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">; reason: string }
+  | { kind: "flat"; targetF: number; capF: number; reason: string };
+/**
+ * Where a restore goes. "plan" (the default): the plan's command for the block in force, the as-found curve only when
+ * none is being commanded. "as-found": the July as-found endpoints unconditionally — the pre-#232 semantics, kept for
+ * the emergency case (the identification driver's abort fallback, an operator who wants the device on the human's
+ * regime) and reachable from the API as POST /api/hbx/restore {"to":"as-found"}.
+ */
+export type RestoreTo = "plan" | "as-found";
+export type RestoreOpts = WriteOpts & { to?: RestoreTo };
 export const BOOST_YIELD = "yielded to an active boost";
 export function isBoostYield(e: unknown): e is BoostYieldError { return e instanceof BoostYieldError; }
 
@@ -238,6 +258,8 @@ export class HbxWriter {
     }
   }
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
+  /** #232: resolves the plan's command for the block in force (AutoPilot.planCommand); null until index.ts wires it. */
+  private planCommand: (() => Promise<PlanCommand | null>) | null = null;
 
   constructor(
     private readonly slx: SensorLinxClient,
@@ -322,6 +344,14 @@ export class HbxWriter {
   }
 
   /**
+   * #232: how restore() learns what the plan commands right now — the auto-pilot's planCommand(), wired by index.ts
+   * when an auto-pilot is constructed. Without one (AUTOPILOT_ENABLED=0) every restore is the as-found curve, as before.
+   */
+  setPlanCommand(resolve: (() => Promise<PlanCommand | null>) | null): void {
+    this.planCommand = resolve;
+  }
+
+  /**
    * #167: the I1 cross-check may only read hub state that IS the live pumps. A disconnected Pi, a hub that has had no
    * frame since it started, or a frame older than PI_STATE_FRESH_MS is refused with 503 — the same status and the
    * same "cannot verify I1" shape as an unreachable hub, which the auto-pilot already files as a rejection (no page)
@@ -339,7 +369,14 @@ export class HbxWriter {
   async setTarget(targetF: number, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
     return this.guarded(source, "set_target", { target_f: targetF }, opts, () => this.setTargetSerial(targetF, source, capF));
   }
-  private async setTargetSerial(targetF: number, source: string, capF: number): Promise<Record<string, unknown>> {
+  /**
+   * `asRestore` (#232): this flat write IS a restore — the plan's excursion target the plant is returned to after a
+   * boost. Same I4 / I1 / lease / audit guards; the rate limit is skipped (a restore ends an excursion, it never
+   * starts one) and no epoch is passed to patch() (a restore is the last word, as the as-found one is). The audit
+   * row still says set_target: the device got a near-flat target curve, which is what the TempIQ window poster must
+   * see (a set_target both closes the boost's window and opens the excursion's).
+   */
+  private async setTargetSerial(targetF: number, source: string, capF: number, asRestore = false): Promise<Record<string, unknown>> {
     const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
@@ -386,7 +423,7 @@ export class HbxWriter {
       }
     }
 
-    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
+    if (!asRestore && Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
       await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
     }
 
@@ -420,8 +457,8 @@ export class HbxWriter {
       { dbt, mbt },
       source,
       "set_target",
-      `target ${targetF}°F commanded (curve ${dbt}/${mbt} → ${targetF}°F output at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
-      epoch,
+      `target ${targetF}°F ${asRestore ? "restored (the plan's target for the block in force; " : "commanded ("}curve ${dbt}/${mbt} → ${targetF}°F output at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      asRestore ? undefined : epoch,
     );
   }
 
@@ -438,13 +475,21 @@ export class HbxWriter {
   async setCurve(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
     return this.guarded(source, "set_curve", { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd }, opts, () => this.setCurveSerial(curve, source, capF));
   }
-  private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number): Promise<Record<string, unknown>> {
+  /**
+   * `asRestore` (#232): this curve write IS a restore — the plan's shaped curve the plant is returned to after a
+   * boost. Same I4 / I1 / lease / audit guards; the rate limit is skipped and no epoch is passed (see setTargetSerial).
+   * The audit row says `restore`: like the as-found restore it puts the STANDING curve back and opens no TempIQ
+   * window — it only closes the boost's (store.pendingCurveWrites counts set_target and restore as closers; the
+   * auto-pilot's own set_curve rows are neither opened nor closers, so `restore` is the honest action here).
+   */
+  private async setCurveSerial(curve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd">, source: string, capF: number, asRestore = false): Promise<Record<string, unknown>> {
     const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
+    const action = asRestore ? "restore" : "set_curve";
     // wwsd rides along UNCHANGED so patch()'s read-back verifies the device executes the line we
     // validated (the guard already refused a wwsd that differs from the live one).
     const requested = { dot: curve.dot, dbt: curve.dbt, mbt: curve.mbt, wwsd: curve.wwsd };
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
-      await this.store.insertHbxWrite({ source, action: "set_curve", requested, result: "rejected", detail });
+      await this.store.insertHbxWrite({ source, action, requested, result: "rejected", detail });
       throw new WriteError(status, detail, stable);
     };
     const latest = await this.store.getLatestSlx();
@@ -474,24 +519,25 @@ export class HbxWriter {
         await reject(503, `hub unreachable — cannot verify I1: ${(e as Error).message}`);
       }
     }
-    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
+    if (!asRestore && Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
       await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
     }
     return this.patch(
       requested,
       source,
-      "set_curve",
-      `curve commanded: ${curve.dbt}°F at ${curve.dot}°F → ${curve.mbt}°F at ${curve.wwsd}°F (output ${outputNow.toFixed(1)}°F at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
-      epoch,
+      action,
+      `${asRestore ? "plan curve restored" : "curve commanded"}: ${curve.dbt}°F at ${curve.dot}°F → ${curve.mbt}°F at ${curve.wwsd}°F (output ${outputNow.toFixed(1)}°F at ${Math.round(latest!.outdoorF as number)}°F outdoor; adopts on the next reheat cycle)`,
+      asRestore ? undefined : epoch,
     );
   }
 
   /**
    * Timed boost with DURABLE auto-restore: set a fixed target now, and the poll loop
-   * restores the as-found curve when restore_at passes — recorded in Neon, so a planner
+   * restores the plan's command for the block in force (#232; the as-found curve only when no plan
+   * is being commanded) when restore_at passes — recorded in Postgres, so a planner
    * restart mid-boost cannot strand the override (the Phase C write-safety primitive,
    * built early in human-triggered form). All setTarget guardrails apply to the boost;
-   * the restore is exempt (reverting to baseline is never blocked).
+   * the restore is exempt from the rate limit (returning the plant is never blocked).
    */
   async boost(targetF: number, minutes: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
     if (!Number.isFinite(minutes) || minutes < 15 || minutes > 120) {
@@ -527,9 +573,11 @@ export class HbxWriter {
   /**
    * Called every poll: restore any boost whose timer has passed (durable expiry). A due row while a NEWER boost is
    * active (an old row left unrestored through downtime or a failing restore, then the owner boosted again) is retired
-   * without a restore: restoring the as-found curve then would erase the live boost, and the auto-pilot's boost hold
+   * without a restore: restoring the curve then would erase the live boost, and the auto-pilot's boost hold
    * would keep the plant on that curve until the newer boost ran out (codex pass 1). The newer boost's own expiry
-   * restores the curve.
+   * restores the curve. The restore goes to the PLAN's command (#232): a refused one (I1 / Pi unverifiable / lease)
+   * throws, the row stays due and the next poll retries — the plant meanwhile sits at the boost's own I4/I1-checked
+   * target, never at the July as-found curve.
    */
   async expireBoosts(): Promise<void> {
     return this.serial(async () => {
@@ -540,17 +588,33 @@ export class HbxWriter {
       if (active) {
         console.log(`[boost] retiring ${due.length} overdue boost row(s) without a restore — a newer boost to ${active.targetF}°F is active until ${active.restoreAt.toISOString()}`);
       } else {
-        await this.restoreSerial("boost-expiry");
+        await this.restoreSerial("boost-expiry", "plan");
       }
       await this.store.markBoostsRestored(due.map((d) => d.id));
     });
   }
 
-  /** Re-apply the as-found curve endpoints. Never rate-limited, never envelope-checked. */
-  async restore(source: string, opts: WriteOpts = {}): Promise<Record<string, unknown>> {
-    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source), this.restoreQueueWaitMs);
+  /**
+   * Return the plant to its standing command. `to: "plan"` (the default, #232): the plan's command for the block in
+   * force — the auto-pilot's own write, through the I4 / I1 / lease guards — so the device never sees the July
+   * as-found curve (≈ 158 °F at 46 °F outdoor against ~125 °F pump setpoints: an I1 violation Phase B then chases to
+   * the 140 °F cap) and the auto-pilot's next tick reads "already commanded" instead of being rate-limited against
+   * its own plan for 15 min. The as-found endpoints are applied only when nothing of the plan is being commanded
+   * (no auto-pilot, shadow, no plan block) or on `to: "as-found"`. Never rate-limited either way.
+   */
+  async restore(source: string, opts: RestoreOpts = {}): Promise<Record<string, unknown>> {
+    return this.guarded(source, "restore", null, opts, () => this.restoreSerial(source, opts.to ?? "plan"), this.restoreQueueWaitMs);
   }
-  private async restoreSerial(source: string): Promise<Record<string, unknown>> {
+  private async restoreSerial(source: string, to: RestoreTo): Promise<Record<string, unknown>> {
+    let why = to === "as-found" ? "as-found requested" : "no plan command resolver (auto-pilot not constructed)";
+    if (to === "plan" && this.planCommand) {
+      // A failed plan read propagates (fail closed): a boost expiry retries next poll and the dashboard sees the
+      // error — the device is never handed the as-found curve because the DB hiccuped.
+      const cmd = await this.planCommand();
+      if (cmd?.kind === "curve") return this.setCurveSerial(cmd.curve, source, DEFAULT_OPTS.strictCapF, true);
+      if (cmd?.kind === "flat") return this.setTargetSerial(cmd.targetF, source, cmd.capF, true);
+      why = "no plan command to return to (auto-pilot in shadow, no recent plan, or no target on the block in force)";
+    }
     const baseline = await this.store.baselineConfig();
     if (!baseline || typeof baseline.dbt !== "number" || typeof baseline.mbt !== "number") {
       await this.store.insertHbxWrite({ source, action: "restore", requested: null, result: "rejected", detail: "no baseline config version" });
@@ -560,7 +624,7 @@ export class HbxWriter {
     const fields: Record<string, number> = { dbt: baseline.dbt as number, mbt: baseline.mbt as number };
     if (typeof baseline.dot === "number") fields.dot = baseline.dot as number;
     return this.patch(fields, source, "restore",
-      `as-found curve restored (${baseline.dbt}/${baseline.mbt}°F${typeof baseline.dot === "number" ? ` from ${baseline.dot}°F` : ""})`);
+      `as-found curve restored (${baseline.dbt}/${baseline.mbt}°F${typeof baseline.dot === "number" ? ` from ${baseline.dot}°F` : ""}) — ${why}`);
   }
 
   private async patch(

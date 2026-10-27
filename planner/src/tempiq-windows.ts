@@ -262,8 +262,9 @@ export class TempiqWindowPoster {
         const outgoing: Array<{ payload: WindowPayload; writeId: number; kind: WindowKind; closedAt: Date | null }> = [];
         for (const w of pending) {
           if (w.action === "restore") {
-            // A restore re-applies the as-found curve: it CLOSES the previous window (its ts is that
-            // window's closer) and opens nothing — the plant is back on the human's curve.
+            // A restore puts the STANDING curve back — the plan's shaped curve (#232) or the as-found one: it
+            // CLOSES the previous window (its ts is that window's closer) and opens nothing. (A restore to a flat
+            // excursion target is audited as a set_target and takes the ordinary path below.)
             marks.push({ writeId: w.id, externalId: externalIdFor(w.id), kind: "restore", closedAt: w.ts, lastError: null });
             restores++;
             continue;

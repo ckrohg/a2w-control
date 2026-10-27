@@ -2115,6 +2115,10 @@ const writer = new HbxWriter(slx, store, hub, BUILDING_ID, SYNC_CODE, ntfy, AUTO
 // writes and after a planner death. Off = today's flat per-hour target. The curve itself is computed
 // in shadowOnce (it needs the demand feed + the 24 h forecast) and stamped on every plan block.
 const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY_RUN, ntfy, SHAPED_CURVE, STORM_CAP_F) : null;
+// #232: a restore (boost expiry, Control page "Restore curve") returns the plant to what THIS auto-pilot commands for
+// the block in force — resolved inside the writer's restore slot — and to the as-found curve only when no plan is
+// being commanded (no auto-pilot here, or it is in shadow).
+if (autopilot) writer.setPlanCommand(() => autopilot.planCommand());
 
 // Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs
 // RANDOMISED supply-water probes drawn from TempIQ's identification plan so U4 can MEASURE each
@@ -2829,10 +2833,13 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.status());
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-          if (req.url === "/api/hbx/restore") {
-            return json(res, 200, await writer.restore("dashboard", { endsBoost: true })); // the owner cancelled any boost
-          }
           const body = JSON.parse((await readBody(req)) || "{}");
+          if (req.url === "/api/hbx/restore") {
+            // #232: the default returns the plant to the plan's command for the block in force; {"to":"as-found"}
+            // (or {"as_found":true}) is the pre-#232 emergency path — the July as-found endpoints, unconditionally.
+            const to = body.to === "as-found" || body.as_found === true ? "as-found" : "plan";
+            return json(res, 200, await writer.restore("dashboard", { endsBoost: true, to })); // the owner cancelled any boost
+          }
           if (req.url === "/api/hbx/boost") {
             return json(res, 200, await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard"));
           }
