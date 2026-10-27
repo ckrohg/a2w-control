@@ -419,6 +419,8 @@ async def test_two_failures_escalate_instead_of_looping(rig):
     assert c.count("cycle_start") == 2 and c.count("not_recovered") == 2
     assert c.count("escalated") == 1
     assert any(a[2] == "urgent" for a in r.alerts if a[0] == "log")
+    # giving up means a person must act: it reaches the owner's phone and inbox, not just the log
+    assert len([a for a in r.alerts if a[0] == "push"]) >= 1 and any(a[0] == "email" for a in r.alerts)
     assert "escalated" in heal.status()["pumps"]["pump2"]["status"]
 
 
@@ -434,6 +436,9 @@ async def test_peer_failing_after_escalation_still_pages_both_down(rig):
     await settle()
     assert "both_down" in await codes(r.store)
     assert r.panel.writes == []
+    pushes = [a[1] for a in r.alerts if a[0] == "push"]
+    assert any("both heat pumps down" in t.lower() for t in pushes), pushes   # both down PAGES (phone + email)
+    assert any(a[0] == "email" and "both heat pumps down" in a[1].lower() for a in r.alerts)
 
 
 async def test_budget_survives_a_restart_and_a_wall_clock_step(rig):
@@ -522,7 +527,9 @@ async def test_both_down_pages_even_during_verification(rig):
     assert (await all_codes(r.store)).count("both_down") == 1
     assert len([a for a in r.alerts if a[0] == "log" and "both heat pumps" in a[1]]) == 1
     # record: the planner's one "no heat" page is the incident the owner hears about
-    assert not [a for a in r.alerts if a[0] in ("push", "email") and "both heat pumps" in a[1]]
+    # owner 2026-10-27: both-down PAGES again (phone + email), exactly once per episode
+    assert len([a for a in r.alerts if a[0] == "push" and "both heat pumps" in a[1]]) == 1
+    assert len([a for a in r.alerts if a[0] == "email" and "both heat pumps" in a[1].lower()]) == 1
 
 
 async def test_disagreeing_states_page_exactly_once(rig):
@@ -548,7 +555,8 @@ async def test_disagreeing_states_page_exactly_once(rig):
     await settle()
     logged = [a for a in r.alerts if a[0] == "log" and "both heat pumps" in a[1]]
     owner = [a for a in r.alerts if a[0] in ("push", "email") and "both heat pumps" in a[1]]
-    assert len(logged) == 1 and owner == []
+    assert len(logged) == 1
+    assert sorted(o[0] for o in owner) == ["email", "push"]           # paged exactly once (owner 2026-10-27)
 
 
 async def test_a_bridge_restart_does_not_page_both_down(rig):

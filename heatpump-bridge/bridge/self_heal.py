@@ -37,6 +37,12 @@ log = logging.getLogger(__name__)
 # Self-heal steps that mean the feature itself cannot work as configured (owner alert policy, alert-policy.md):
 # emailed. Every other step — shadow "would cycle", attempts, recoveries, escalations — is record-only.
 SELF_HEAL_ATTENTION: frozenset[str] = frozenset()  # owner 2026-10-21: a mis-configured self-heal is engineer-only (record)
+# The steps where a PERSON must act now are PAGES (6bb phone push + email), not record: the house may be without
+# heat-pump heat and nothing automatic will fix it. #219 sent every step to the record tier on the theory that the
+# pump's own stuck-fault page covers it, but these three are not a pump fault: both units down at once (often
+# offline/switched off, no fault code), self-heal giving up after its attempt budget, and a cycle self-heal could not
+# make ("switch it OFF and ON by hand"). The Oct 14-16 incident was exactly "nobody was told in time".
+SELF_HEAL_PAGE: frozenset[str] = frozenset({"both_down", "escalated", "cycle_refused"})
 
 TICK_S = 30.0
 FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything
@@ -752,14 +758,15 @@ class SelfHealer:
     async def _step(self, pid, code, severity, message, detail, *, title: str,
                     priority: str = "high") -> None:
         """Audit one step (every step is in the events table and the dashboard) and route it through
-        the owner alert policy. Steps are RECORD: the incident the owner hears about is the pump fault
+        the owner alert policy. Steps are RECORD, except SELF_HEAL_PAGE (a person must act now: both pumps down,
+        self-heal gave up, a cycle it could not make), which PAGE. Otherwise the incident the owner hears about is the pump fault
         itself, which the poller pages once it has stuck for 30 min (poller.FAULT_PAGE_AFTER_S) and
         clears when it clears; a stuck-OFF circuit pages from span_control. Only a self-heal that
         cannot work as configured is worth an email (SELF_HEAL_ATTENTION)."""
         log.info("self-heal [%s] %s: %s", pid, code, message)
         await self._audit(pid, code, severity, message, detail)
         tags = "rotating_light" if priority == "urgent" else "wrench"
-        tier = "attention" if code in SELF_HEAL_ATTENTION else "record"
+        tier = "page" if code in SELF_HEAL_PAGE else "attention" if code in SELF_HEAL_ATTENTION else "record"
         t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
                                              priority=priority, tags=tags,
                                              action="Self-heal can't run as configured. Check the self_heal section of the "
