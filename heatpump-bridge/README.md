@@ -67,8 +67,8 @@ bridge/
   notify.py         best-effort ntfy push, Resend email for the intervention tier, dead-man
                     heartbeat; never raises into the caller
   exporter.py       read-only analytics mirror push to Vercel; out of the control loop
-  hub_client.py     outbound WebSocket to the Railway hub: state frames out, setpoint-only
-                    commands + `breaker` actions in, through the existing guarded paths
+  hub_client.py     outbound WebSocket to the Railway hub: state frames out, `setpoint`,
+                    `write_enable` and `breaker` actions in, through the existing guarded paths
   span_local.py     SPAN panel LOCAL-API poller (circuit instantPowerW), headless token re-mint,
                     CLOSE-ONLY relay writes unless an OpenPermit is held
   span_control.py   guarded breaker controller: allowlist, power_cycle / close / open, global
@@ -99,7 +99,8 @@ event log with their source. Per-pump `write_enabled: false` disables the write 
 (the default for a freshly configured real pump). Unattended writers (scheduler, machine
 tokens, hub commands) are setpoint-only under `guardrails.restrict_unattended_writes` and
 floored by `unattended_min_setpoint_c`; a remote setpoint is a lease that reverts to
-`baseline_setpoint_c` when the optimizer goes silent.
+`baseline_setpoint_c` when the optimizer goes silent. The lease is dormant until
+`baseline_setpoint_c` is set (`deploy/config.production.yaml` sets it).
 
 ## SPAN local
 
@@ -170,7 +171,9 @@ so it works with the cloud down.
   it *would* do and switches nothing. Flipping it live also requires `circuits_verified: true`,
   the owner's confirmation that the `circuits` pump→SPAN-circuit map was checked on the house
   (a swapped map would cycle the healthy pump). Until then `live: true` is reported
-  "unavailable" in `/api/health.self_heal` and pages; shadow keeps running either way.
+  "unavailable" in `/api/health.self_heal` and pages; shadow keeps running either way. That
+  is the code default; the Pi's own config may differ, so check `/api/health.self_heal` for
+  the mode actually running before assuming shadow.
 - **Never a boot failure.** A pump whose circuit is not an `allow_cycle` heat-pump breaker, or
   an `off_s` outside the span limits, is reported unavailable, not fatal: the bridge also runs
   the setpoint path and must always start.
@@ -182,10 +185,18 @@ Config keys (`self_heal:`): `enabled`, `live`, `fault_codes`, `grace_min`, `max_
 
 `bridge/hub_client.py`. The Pi dials OUT to the Railway hub over WebSocket and holds the
 connection; no inbound port is opened. It pushes a state frame every `hub.state_interval_s`
-and accepts setpoint commands (routed through `poller.write_setpoint`, so a nack from clamp,
-rate limit, offline, floor or `write_enabled` is a normal outcome) and `breaker` actions
-(routed through the breaker controller's guards, in their own task so a 60 s power cycle never
-stalls setpoints). Any other action is ignored by design. If the hub is down, local LAN and
+and accepts exactly three relayed actions:
+
+- `setpoint` — routed through `poller.write_setpoint`, so a nack from clamp, rate limit,
+  offline, floor or `write_enabled` is a normal outcome.
+- `write_enable` — the armed-dashboard remote arm/disarm toggle (the hub gates it behind a
+  separate arm token). Same set + persist + audit path as the local `/write-enable` API route,
+  with a high-priority push on enable; acked so the dashboard shows the outcome.
+- `breaker` — routed through the breaker controller's guards, in its own task so a 60 s power
+  cycle never stalls setpoints.
+
+Power, mode and parameter writes are never relayed: any other action is logged and dropped
+without an ack, and those stay human-only on the direct path. If the hub is down, local LAN and
 Tailscale Funnel control are unaffected. Enabled only when both `hub.url` and `hub.token` are
 set. See `deploy/railway-hub.md`.
 
