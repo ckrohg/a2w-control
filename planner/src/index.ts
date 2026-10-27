@@ -43,7 +43,7 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
@@ -810,7 +810,8 @@ let lastLagTMin: number | null = null; // the HBX's lag-stage timer, from this p
  * (#167 piStateUnverifiable) — then nothing moves. Fault codes come from the mirror's pump_snapshots.
  */
 async function checkStages(reading: SlxReading, state: HubState | null, anyStageCall: boolean): Promise<void> {
-  const live = !anyStageCall ? [] : state && !piStateUnverifiable(state) ? state.pumps : null;
+  // with no call nothing moves — except an open #212 reminder, which closes once the pump is seen switched back on
+  const live = !anyStageCall && !stageWatch.remindersOpen() ? [] : state && !piStateUnverifiable(state) ? state.pumps : null;
   let pumps: StagePump[] | null = live;
   if (live && live.some((p) => p.state === "fault")) {
     // codes only ANNOTATE a live fault, and only from a snapshot ≤ 15 min old (the Pi attaches one every ~5 min)
@@ -879,7 +880,7 @@ async function restoreAlertState(): Promise<void> {
     const open = await store.openAlertEpisodes();
     // a stage episode is re-adopted only if it is about the pump that stage maps to NOW: after STAGE_PUMP_MAP was
     // corrected, an old episode for the wrong unit is closed, never allowed to suppress the right one (codex pass 10)
-    const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called";
+    const isStage = (o: { kind: string }) => o.kind === "stage_unserved" || o.kind === "fault_called" || o.kind === "stopped_reminder";
     // an episode the outbox is already closing (opened and recovered while restore was failing) is never re-adopted —
     // re-adopting it would latch the watch "open" over rows being closed and silence a recurrence (codex pass 11)
     // pump health: a shadow episode belongs to the shadow outbox, a live one to the paging outbox; one whose check was
@@ -902,7 +903,7 @@ async function restoreAlertState(): Promise<void> {
     shadowAlerts.adopt(phKeep.filter(({ k }) => !k!.live).map(({ o }) => o));
     pumpWatch.restore(phKeep.filter(({ o }) => o.pumpId != null).map(({ o, k }) => ({ check: k!.check, pumpId: o.pumpId as string })));
     stageWatch.restore(keep.filter(isStage)
-      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called", stage: o.key })));
+      .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called" | "stopped_reminder", stage: o.key })));
     if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
     alertStateRestored = true;
   } catch (e) {
@@ -1200,7 +1201,7 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
   const anyStageCall = reading.stagesCalled?.some(Boolean) === true;
   // one hub read serves both alarms; the stage watch runs first and never changes the all-idle logic below
   let st: HubState | null = null;
-  if (anyStageCall) { try { st = await hub.getState(); } catch { st = null; } }
+  if (anyStageCall || stageWatch.remindersOpen()) { try { st = await hub.getState(); } catch { st = null; } }
   await checkStages(reading, st, anyStageCall).catch((e) => console.error("stage check failed:", (e as Error).message));
   if (!anyStageCall) {
     unservedStreak = 0;
@@ -1220,6 +1221,12 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
       await store.closeUnservedEpisode().catch(() => {});
       await ntfy("Unserved call cleared", "A pump is running against the call again.", "default", { tier: "page", resolved: true, key: "no-heat" });
     }
+    return;
+  }
+  if (!piStateUnverifiable(st) && calledStagesAllStopped(reading.stagesCalled, STAGE_MAP.map, st.pumps)) {
+    // #212: every called stage's pump was switched off by a person (6bb / SPAN app / the panel). No heat is the owner's
+    // choice, not a failure: the stage watch's one stopped_reminder covers a forgotten switch-off. The streak restarts.
+    unservedStreak = 0;
     return;
   }
   unservedStreak++;

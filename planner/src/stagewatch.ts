@@ -8,6 +8,11 @@
  *   stage_unserved — stage N called, its mapped pump not heating for STAGE_START_GRACE_MS of called time (the clock is
  *                    SUSPENDED while the pump defrosts, and never runs on unverifiable hub state);
  *   fault_called   — stage N called while its mapped pump reports an active fault: immediate.
+ * Deliberate stops (#212): a pump whose breaker a PERSON switched off (6bb, the SPAN app, the panel — the Pi's
+ * deliberate_stop.py, relayed per pump as `deliberate_stop`) is not a fault: its stage's episodes close and stay closed
+ * while the stop lasts. One edge instead, PAGED by policy (alertpolicy.ts episodeTier):
+ *   stopped_reminder — stage N called while its pump has been switched off outside A2W for ≥ STOPPED_REMIND_MS: once
+ *                      per stop (a forgotten switch-off in January matters); it closes when the pump is back.
  * Pure (no I/O): index.ts feeds it the poll's HBX stages, the hub's pump states (only when piStateUnverifiable says
  * they are live), fault codes from the mirror's pump_snapshots, and lagT from the HBX config.
  */
@@ -19,6 +24,8 @@ export const STAGE_START_GRACE_MS = 10 * 60 * 1000;
  */
 export const MAX_STEP_MS = 7.5 * 60 * 1000;
 export const DEFAULT_STAGE_PUMP_MAP: Readonly<Record<string, string>> = { "1": "pump1", "2": "pump2" };
+/** #212: how long a pump may stay switched off outside A2W before a heating call on its stage sends the one reminder. */
+export const STOPPED_REMIND_MS = 4 * 3_600_000;
 
 /**
  * STAGE_PUMP_MAP env → map of HBX stage number → hub pump id. It is the PHYSICAL stage-relay → heat-pump wiring
@@ -56,9 +63,11 @@ export interface StagePump {
   active_faults?: number | null;
   /** codes from the mirror's pump_snapshots, when known */
   fault_codes?: string[];
+  /** #212: set by the Pi while a PERSON has this pump's breaker off — since = Pi wall seconds */
+  deliberate_stop?: { circuit?: string; since: number; announced?: boolean } | null;
 }
 
-export type StageEpisodeKind = "stage_unserved" | "fault_called";
+export type StageEpisodeKind = "stage_unserved" | "fault_called" | "stopped_reminder";
 export interface StageEvent {
   kind: "open" | "close";
   type: StageEpisodeKind;
@@ -76,9 +85,18 @@ interface StageState {
   unservedOpen: boolean;
   faultOpen: boolean;
   lastPumpState: string | null;
+  /** #212: the reminder episode is open / the stop (its `since`) already reminded about — one reminder per stop */
+  reminderOpen: boolean;
+  remindedFor: number | null;
 }
 
 const label = (p: StagePump | undefined, id: string) => p?.name?.trim() || id;
+/** "3:12 PM" in the house's time zone */
+const hhmm = (sinceS: number) => new Date(sinceS * 1000).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+// a pump that answers Modbus has power, so it cannot be switched off — whatever the frame's deliberate_stop says (defence in
+// depth: the Pi already drops the stop when the pump answers)
+const stopOf = (p: StagePump | undefined) =>
+  (p?.deliberate_stop && Number.isFinite(p.deliberate_stop.since) && p.online !== true ? p.deliberate_stop : null);
 // The bridge's LIVE derived `fault` state is the only fault signal: it already excludes info-level protections (P17
 // anti-freeze is NORMAL — poller.py _derive_state), while the hub's raw active_faults COUNT includes them (codex pass
 // 1), and the mirror's pump_snapshots codes can be minutes stale (codex pass 2) — they only ANNOTATE a live fault.
@@ -92,9 +110,13 @@ const describe = (p: StagePump | undefined, id: string): string => {
 export class StageWatch {
   private st: Record<string, StageState> = {};
 
-  constructor(private readonly map: Record<string, string>, private readonly graceMs = STAGE_START_GRACE_MS) {
-    for (const k of Object.keys(map)) this.st[k] = { calledMs: 0, lastStepMs: null, unservedOpen: false, faultOpen: false, lastPumpState: null };
+  constructor(private readonly map: Record<string, string>, private readonly graceMs = STAGE_START_GRACE_MS,
+              private readonly remindMs = STOPPED_REMIND_MS) {
+    for (const k of Object.keys(map)) this.st[k] = { calledMs: 0, lastStepMs: null, unservedOpen: false, faultOpen: false, lastPumpState: null, reminderOpen: false, remindedFor: null };
   }
+
+  /** true while a stopped-pump reminder is open: index.ts then reads the hub even without a call, so it can close */
+  remindersOpen(): boolean { return Object.values(this.st).some((s) => s.reminderOpen); }
 
   /** Re-adopt episodes still open in the DB after a restart, so they close (not re-page) when the condition clears. */
   restore(open: { type: StageEpisodeKind; stage: string }[]): void {
@@ -102,6 +124,7 @@ export class StageWatch {
       const s = this.st[o.stage];
       if (!s) continue;
       if (o.type === "stage_unserved") { s.unservedOpen = true; s.calledMs = this.graceMs; }
+      else if (o.type === "stopped_reminder") s.reminderOpen = true; // still open: never re-sent for this stop
       else s.faultOpen = true;
     }
   }
@@ -122,7 +145,14 @@ export class StageWatch {
       const s = this.st[stage];
       const called = i.stagesCalled[Number(stage) - 1] === true;
       const pump = i.pumps.find((p) => p.id === pumpId);
-      s.lastPumpState = pump ? (pump.online ? pump.state ?? null : "offline") : null;
+      const stop = stopOf(pump);
+      s.lastPumpState = stop ? "switched off outside A2W" : pump ? (pump.online ? pump.state ?? null : "offline") : null;
+      // #212: the reminder closes as soon as the pump is seen back, called or not
+      if (s.reminderOpen && pump && !stop) {
+        s.reminderOpen = false;
+        out.push({ kind: "close", type: "stopped_reminder", stage, pumpId, priority: "default",
+          title: `${label(pump, pumpId)} is switched back on`, body: `${label(pump, pumpId)} is no longer switched off outside A2W.` });
+      }
       const others = Object.entries(this.map).filter(([k]) => k !== stage).map(([k, id]) => {
         const p = i.pumps!.find((x) => x.id === id);
         const c = i.stagesCalled![Number(k) - 1] === true;
@@ -134,6 +164,30 @@ export class StageWatch {
         if (s.unservedOpen) out.push(this.close(stage, pumpId, "stage_unserved", `Stage ${stage} is no longer called.`));
         if (s.faultOpen) out.push(this.close(stage, pumpId, "fault_called", `Stage ${stage} is no longer called.`));
         s.unservedOpen = false; s.faultOpen = false; s.calledMs = 0; s.lastStepMs = null;
+        continue;
+      }
+
+      if (stop) {
+        // #212: a PERSON switched this pump off — not a fault. Its episodes close (record), the clock stays at zero, and
+        // a call on its stage after STOPPED_REMIND_MS of stop sends the one reminder for this stop.
+        const why = `${label(pump, pumpId)} was switched off outside A2W at ${hhmm(stop.since)} — a deliberate stop, not a fault.`;
+        if (s.unservedOpen) out.push(this.close(stage, pumpId, "stage_unserved", why));
+        if (s.faultOpen) out.push(this.close(stage, pumpId, "fault_called", why));
+        s.unservedOpen = false; s.faultOpen = false; s.calledMs = 0; s.lastStepMs = null;
+        const offMs = i.nowMs - stop.since * 1000;
+        if (!s.reminderOpen && s.remindedFor !== stop.since && offMs >= this.remindMs) {
+          s.reminderOpen = true;
+          s.remindedFor = stop.since;
+          const h = Math.floor(offMs / 3_600_000);
+          const circuit = stop.circuit ? `'${stop.circuit}'` : "its";
+          out.push({
+            kind: "open", type: "stopped_reminder", stage, pumpId, priority: "high",
+            title: `⚠ ${label(pump, pumpId)} is still switched off and the HBX is calling for it`,
+            body: `${label(pump, pumpId)}'s ${circuit} breaker was switched off outside A2W at ${hhmm(stop.since)} (${h} h ago: the 6bb app, ` +
+              `the SPAN app or the panel), and the HBX is calling stage ${stage} for it now. ${others} ` +
+              `If it was not meant to stay off, switch it back on.`,
+          });
+        }
         continue;
       }
 
@@ -188,14 +242,25 @@ export class StageWatch {
     };
   }
 
-  status(): Record<string, { pump: string; called_not_heating_min: number; unserved_open: boolean; fault_open: boolean; pump_state: string | null }> {
+  status(): Record<string, { pump: string; called_not_heating_min: number; unserved_open: boolean; fault_open: boolean; stopped_reminder_open: boolean; pump_state: string | null }> {
     const out: ReturnType<StageWatch["status"]> = {};
     for (const [stage, pumpId] of Object.entries(this.map)) {
       const s = this.st[stage];
-      out[stage] = { pump: pumpId, called_not_heating_min: Math.round(s.calledMs / 6_000) / 10, unserved_open: s.unservedOpen, fault_open: s.faultOpen, pump_state: s.lastPumpState };
+      out[stage] = { pump: pumpId, called_not_heating_min: Math.round(s.calledMs / 6_000) / 10, unserved_open: s.unservedOpen, fault_open: s.faultOpen, stopped_reminder_open: s.reminderOpen, pump_state: s.lastPumpState };
     }
     return out;
   }
+}
+
+/**
+ * #212, for the all-idle "no heat" check: true when at least one stage is called and EVERY called stage's pump is
+ * switched off outside A2W by a person. Then the missing heat is the owner's choice, not a failure — the stage watch's
+ * stopped_reminder is the one page for it. Any called stage whose pump is available keeps the "no heat" logic as is.
+ */
+export function calledStagesAllStopped(stagesCalled: boolean[] | null, map: Record<string, string>, pumps: StagePump[]): boolean {
+  if (!stagesCalled) return false;
+  const called = Object.entries(map).filter(([k]) => stagesCalled[Number(k) - 1] === true);
+  return called.length > 0 && called.every(([, id]) => !!stopOf(pumps.find((p) => p.id === id)));
 }
 
 /**
@@ -206,7 +271,7 @@ export class StageWatch {
 export function partitionRestore<T extends { kind: string; key: string; pumpId: string | null }>(
   open: T[], map: Record<string, string>,
 ): { keep: T[]; stale: T[] } {
-  const isStage = (o: T) => o.kind === "stage_unserved" || o.kind === "fault_called";
+  const isStage = (o: T) => o.kind === "stage_unserved" || o.kind === "fault_called" || o.kind === "stopped_reminder";
   const stale = open.filter((o) => isStage(o) && map[o.key] !== o.pumpId);
   return { keep: open.filter((o) => !stale.includes(o)), stale };
 }
