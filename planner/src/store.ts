@@ -793,24 +793,41 @@ export class Store {
   }
 
   /** Insert-only COP points, deduped on (measured_at, system). Returns rows actually inserted. */
+  /** UPSERT on the PK (measured_at, system). Since TempIQv2#2124 TempIQ's hydronic COP writer defers a point until
+   *  the charge's end is observable and re-upserts its overlap day on every hourly run, so a mirrored row can
+   *  legitimately change (a short or provisional row completed later); the old DO NOTHING kept whatever version
+   *  arrived first, forever. A row whose mirrored fields are unchanged is left alone (the WHERE on DO UPDATE —
+   *  row-wise IS DISTINCT FROM, so null ↔ value counts as a change), which keeps the counts honest: inserted = a
+   *  new PK, updated = an existing row whose fields moved, and the rest of `points` were re-sent unchanged.
+   *  `xmax = 0` on the returned row distinguishes an insert from an update. Proof: scripts/tempiq-cop-upsert-local-check.ts. */
   async insertTempiqCopPoints(points: Array<{
     measuredAt: Date; system: string; outdoorTempF: number | null; sinkTempF: number | null;
     cop: number | null; thermalKwh: number | null; electricalKwh: number | null;
     quality: string | null; qualityScore: number | null;
-  }>): Promise<number> {
-    let inserted = 0;
+  }>): Promise<{ inserted: number; updated: number }> {
+    let inserted = 0, updated = 0;
     for (const p of points) {
       const res = await this.pool.query(
-        `INSERT INTO tempiq_cop_points
+        `INSERT INTO tempiq_cop_points AS t
            (measured_at, system, outdoor_temp_f, sink_temp_f, cop, thermal_kwh, electrical_kwh, quality, quality_score)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (measured_at, system) DO NOTHING`,
+         ON CONFLICT (measured_at, system) DO UPDATE SET
+           outdoor_temp_f = EXCLUDED.outdoor_temp_f, sink_temp_f = EXCLUDED.sink_temp_f, cop = EXCLUDED.cop,
+           thermal_kwh = EXCLUDED.thermal_kwh, electrical_kwh = EXCLUDED.electrical_kwh,
+           quality = EXCLUDED.quality, quality_score = EXCLUDED.quality_score
+         WHERE (t.outdoor_temp_f, t.sink_temp_f, t.cop, t.thermal_kwh, t.electrical_kwh, t.quality, t.quality_score)
+           IS DISTINCT FROM
+           (EXCLUDED.outdoor_temp_f, EXCLUDED.sink_temp_f, EXCLUDED.cop, EXCLUDED.thermal_kwh, EXCLUDED.electrical_kwh,
+            EXCLUDED.quality, EXCLUDED.quality_score)
+         RETURNING (xmax = 0) AS inserted`,
         [p.measuredAt, p.system, p.outdoorTempF, p.sinkTempF, p.cop,
          p.thermalKwh, p.electricalKwh, p.quality, p.qualityScore],
       );
-      inserted += res.rowCount ?? 0;
+      const row = res.rows[0];
+      if (!row) continue; // conflict, nothing changed
+      if (row.inserted) inserted++; else updated++;
     }
-    return inserted;
+    return { inserted, updated };
   }
 
   /** Latest TempIQ zone-energy snapshot (single-row upsert; shadow model picks fields). */
