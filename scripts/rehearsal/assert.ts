@@ -13,11 +13,14 @@ if (!/^postgres(ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) { 
 const OUT = process.env.REHEARSAL_OUT!;
 const scenario = JSON.parse(fs.readFileSync(process.env.REHEARSAL_SCENARIO!, "utf8"));
 const expect_ = scenario.expect ?? {};
+const shapedLive = process.env.REHEARSAL_SHAPED_CURVE_MODE === "live";
 const fake = JSON.parse(fs.readFileSync(path.join(OUT, "fake-state.json"), "utf8"));
 const requests = fs.readFileSync(path.join(OUT, "requests.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 // Wave 3: what the planner WOULD have paged (ntfy logs the title when no topic is configured) and what it logged.
-const plannerLogs = fs.readdirSync(OUT).filter((f) => /^planner-run\d+\.log$/.test(f)).sort().map((f) => fs.readFileSync(path.join(OUT, f), "utf8")).join("\n");
-const pages = plannerLogs.split("\n").filter((l) => l.includes("[ntfy] (no topic)")).map((l) => l.replace(/^.*\[ntfy\] \(no topic\) /, ""));
+const runLogs = fs.readdirSync(OUT).filter((f) => /^planner-run\d+\.log$/.test(f)).sort().map((f) => fs.readFileSync(path.join(OUT, f), "utf8"));
+const plannerLogs = runLogs.join("\n");
+const pagesIn = (log: string) => log.split("\n").filter((l) => l.includes("[ntfy] (no topic)")).map((l) => l.replace(/^.*\[ntfy\] \(no topic\) /, ""));
+const pages = pagesIn(plannerLogs);
 const store = new Store(url);
 const pool = (store as unknown as { pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: any[] }> } }).pool;
 const fToC = (f: number) => (f - 32) * 5 / 9;
@@ -40,10 +43,11 @@ async function main() {
   const ident = (await pool.query(`SELECT * FROM identification_windows ORDER BY ctid`)).rows;
   const windowPosts = (await pool.query(`SELECT * FROM tempiq_window_posts ORDER BY ctid`)).rows;
   const configVersions = (await pool.query(`SELECT * FROM hbx_config_versions ORDER BY ctid`)).rows;
+  const boostRows = (await pool.query(`SELECT * FROM hbx_boosts ORDER BY id`)).rows;
   const readings = (await pool.query(`SELECT count(*)::int AS n FROM slx_readings`)).rows[0].n;
 
   console.log(`\n── ledger (${scenario.name}) ──────────────────────────────`);
-  console.log(`slx_readings ${readings} · shadow_plans ${plans.length ? 1 : 0} · autopilot_log ${autopilot.length} · hbx_writes ${writes.length} · phase_b_log ${phaseB.length} · identification_windows ${ident.length} · tempiq_window_posts ${windowPosts.length} · hbx_config_versions ${configVersions.length}`);
+  console.log(`slx_readings ${readings} · shadow_plans ${plans.length ? 1 : 0} · autopilot_log ${autopilot.length} · hbx_writes ${writes.length} · phase_b_log ${phaseB.length} · identification_windows ${ident.length} · tempiq_window_posts ${windowPosts.length} · hbx_config_versions ${configVersions.length} · hbx_boosts ${boostRows.length}`);
   const now = Date.now();
   const plan: any[] = plans[0]?.plan ?? [];
   const current = plan.filter((b) => new Date(b.ts).getTime() <= now).at(-1) ?? null;
@@ -54,6 +58,7 @@ async function main() {
   for (const w of writes) console.log(`hbx_write: ${w.source} ${w.action} ${JSON.stringify(w.requested)} → ${w.result} ${w.detail ?? ""}`.slice(0, 220));
   for (const p of phaseB) console.log(`phase_b: ${p.pump_id} ${p.mode} ${p.value_c}°C → ${p.result}`);
   for (const w of ident) console.log(`identification: ${JSON.stringify(w).slice(0, 320)}`);
+  for (const b of boostRows) console.log(`hbx_boost: #${b.id} ${b.target_f}°F restore_at ${new Date(b.restore_at).toISOString()} restored=${b.restored}`);
   for (const p of windowPosts.slice(0, 5)) console.log(`window_post: ${JSON.stringify(p).slice(0, 200)}`);
   console.log(`fake: ${fake.patches.length} PATCH(es) ${JSON.stringify(fake.patches.map((p: any) => p.body))} · ${fake.commands.length} hub command(s) ${JSON.stringify(fake.commands.map((c: any) => [c.body.pump_id, c.body.value_c, c.body.lease_minutes]))} · ${fake.posts.length} TempIQ POST(s) ${JSON.stringify(fake.posts.map((p: any) => p.path))}`);
   console.log(`fake device now: target ${fake.device.temps.temp1.target}°F curve dot ${fake.device.dot} wwsd ${fake.device.wwsd} dbt ${fake.device.dbt} mbt ${fake.device.mbt}`);
@@ -112,9 +117,14 @@ async function main() {
   // plan existed (correct at the time); run 2 is the one that must sit above the plan's current block.
   const latestCmd = new Map<string, any>(); for (const c of fake.commands) latestCmd.set(String(c.body.pump_id), c);
   for (const c of fake.commands) check(c.body.lease_minutes === 90, `pump ${c.body.pump_id} write carries the 90-min lease (got ${c.body.lease_minutes})`);
+  // What Phase B leads for the block in force: under SHAPED_CURVE live a non-excursion hour is commanded as the plan's
+  // shaped curve, so the lead is that curve's OUTPUT at the live outdoor (#222), not the block's declared tank_target_f
+  // (135 "winter guard" beside a 120/118 curve); an excursion or flat-target mode leads the declared target.
+  const excursion = current && (current.sani === true || current.bank === true || current.boost === true || current.storm === true || /sanitize|storm|bank|boost|pre-?charge/i.test(String(current.reason ?? "")));
+  const leadF = shapedLive && current?.shaped_curve && !excursion ? (curveOutputF(current.shaped_curve, scenario.outdoorF) ?? targetF) : targetF;
   for (const c of latestCmd.values()) {
     if (expect_.phaseBMinC != null) check(Number(c.body.value_c) >= expect_.phaseBMinC, `pump ${c.body.pump_id} latest setpoint ${c.body.value_c}°C ≥ ${expect_.phaseBMinC}°C (tank target + I1 margin)`);
-    if (current) check(Number(c.body.value_c) >= Math.ceil(fToC(targetF + 5)), `pump ${c.body.pump_id} latest ${c.body.value_c}°C ≥ ceil(${targetF}°F + 5°F → ${Math.ceil(fToC(targetF + 5))}°C) (I1)`);
+    if (current) check(Number(c.body.value_c) >= Math.ceil(fToC(leadF + 5)), `pump ${c.body.pump_id} latest ${c.body.value_c}°C ≥ ceil(${leadF.toFixed(1)}°F + 5°F → ${Math.ceil(fToC(leadF + 5))}°C) (I1 against what the auto-pilot commands)`);
   }
   if (expect_.phaseBCommands != null) check(latestCmd.size >= expect_.phaseBCommands, `every configured pump got a leased setpoint (${latestCmd.size} distinct pumps)`);
   const soakSoon = next3h.some((b) => b.sani || /sanitize/i.test(b.reason));
@@ -139,6 +149,40 @@ async function main() {
       if (w.state === "active") check(windowPostBodies.some((b) => /identification/i.test(b)), `the ACTIVE identification window (${w.arm} ${w.direction}) was posted open (among ${windowPostBodies.length} posts)`);
       else check(["arming", "pending_write"].includes(String(w.state)), `an unposted window is still arming / pending its write (state ${w.state}, arm ${w.arm}) — not silently dropped`);
     }
+  }
+  if (expect_.boost) {
+    // #232: the boost's timer ran out between polls 2 and 3 (inject-boost.ts). The expiry must restore the PLAN's
+    // command for the block in force — the auto-pilot's own curve — through the guarded writer, within that one
+    // poll, and never the July as-found curve; afterwards the auto-pilot has nothing to write and Phase B leads the
+    // restored curve, not a 158 °F one.
+    const b = expect_.boost;
+    const fakeInject = JSON.parse(fs.readFileSync(path.join(OUT, "fake-state-after-inject.json"), "utf8"));
+    check(boostRows.length === 1 && boostRows[0].restored === true, `the one boost row was marked restored by the expiry (${JSON.stringify(boostRows.map((r) => [r.target_f, r.restored]))})`);
+    const boostWrite = writes.find((w) => w.source === "dashboard" && w.action === "set_target" && w.result === "accepted");
+    check(boostWrite != null, `the boost itself went through the guarded writer (dashboard set_target accepted)`);
+    const expiry = writes.filter((w) => w.source === "boost-expiry");
+    check(expiry.length === 1 && expiry[0].result === "accepted", `exactly one boost-expiry write, accepted (${JSON.stringify(expiry.map((w) => [w.action, w.result, w.detail]))})`);
+    check(/restored/.test(String(expiry[0]?.detail ?? "")), `the expiry write says what it restored: ${expiry[0]?.detail}`);
+    check(fake.patches.length === fakeInject.patches.length + 1, `the restore was the ONLY device write after the boost (${fake.patches.length - fakeInject.patches.length} PATCHes over polls 3–4) — within one poll, no second write`);
+    const last = fake.patches.at(-1)?.body ?? {};
+    if (b.restoredToPlanCurve) {
+      const sc = current?.shaped_curve ?? null;
+      const same = sc && ["dot", "dbt", "mbt", "wwsd"].every((k) => Number(last[k]) === Number(sc[k]));
+      check(!!same, `the last PATCH is the plan's shaped curve in force ${sc ? `${sc.dbt}@${sc.dot}→${sc.mbt}@${sc.wwsd}` : "(none)"} — got ${JSON.stringify(last)}`);
+      check(expiry[0]?.action === "restore", `a curve-hour restore is audited as a restore (closes the boost's TempIQ window), got ${expiry[0]?.action}`);
+    }
+    const outs = fake.patches.map((p: any) => curveOutputF(p.body, scenario.outdoorF));
+    check(outs.every((o) => o != null && o < b.noOutputAboveF), `no PATCH ever outputs ≥ ${b.noOutputAboveF}°F at ${scenario.outdoorF}°F — the as-found curve never came back (outputs ${JSON.stringify(outs.map((o) => o == null ? null : Math.round(o * 10) / 10))})`);
+    const lastOut = outs.at(-1);
+    check(lastOut != null && Math.abs(lastOut - leadF) <= 1, `the restored curve outputs the plan's command at ${scenario.outdoorF}°F (${lastOut == null ? "—" : lastOut.toFixed(1)} vs ${leadF.toFixed(1)})`);
+    const expiryTs = expiry[0] ? new Date(expiry[0].ts).getTime() : 0;
+    const after = autopilot.filter((r) => new Date(r.ts).getTime() > expiryTs);
+    check(after.length >= 1 && after.every((r) => /^held/.test(String(r.result))), `after the expiry the auto-pilot only HELD (already commanded) — never rate-limited against its own plan (${JSON.stringify(after.map((r) => r.result))})`);
+    if (b.phaseBMaxCAfterExpiry != null) for (const c of latestCmd.values()) check(Number(c.body.value_c) <= b.phaseBMaxCAfterExpiry, `pump ${c.body.pump_id} latest ${c.body.value_c}°C ≤ ${b.phaseBMaxCAfterExpiry}°C — Phase B leads the restored curve, not a 158°F one`);
+    // Polls 3+ only: a scenario that starts with the as-found curve in force may legitimately page I1 on poll 1 (the
+    // 159 °F as-found target against the pumps' starting setpoints) — that is the premise, not the boost's doing.
+    const i1Pages = runLogs.slice(2).flatMap(pagesIn).filter((t) => /I1/i.test(t));
+    check(i1Pages.length === 0, `no I1 page from the boost's expiry onwards — polls 3+ (${JSON.stringify(i1Pages)})`);
   }
   if (expect_.noUnhandledUpstreamCalls) check(unhandled.length === 0, `no unhandled upstream call (${unhandled.length})`);
   check(!requests.some((r) => /ntfy|resend/i.test(String(r.path))), `no alert egress attempted through the fake`);

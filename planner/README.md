@@ -205,6 +205,18 @@ tagged `changed_fields._source` → an audit row in `hbx_writes` for **every** a
 (accepted *or* rejected). Adoption is asynchronous (next reheat cycle); `status()` reports
 commanded-vs-operative.
 
+**Restore goes to the plan, not to July (#232).** A boost expiry (`expireBoosts`, every poll) and
+`POST /api/hbx/restore` return the plant to what the auto-pilot commands for the block in force
+*right now* (`AutoPilot.planCommand` → `planCommandForBlock`: the shaped curve on a curve hour, the
+flat excursion target under its identity's cap otherwise), through the same I4 / I1 / lease guards,
+rate-limit exempt. The auto-pilot's next tick then reads "already commanded", so the 15-min rate
+limit never holds the plan off. The July as-found endpoints (`hbx_config_versions` row 1, ≈ 158 °F at
+46 °F outdoor — an I1 violation against 52 °C setpoints that Phase B would chase to the 140 °F cap)
+are written only when nothing of the plan is being commanded (no auto-pilot, Off/shadow, no plan
+block) or on an explicit `{"to":"as-found"}`. A refused plan restore (I1 short, Pi unverifiable, no
+lease) throws instead of falling back: the device keeps the boost's own guarded target and the next
+poll retries. The identification driver's abort fallback still asks for the as-found curve by name.
+
 **Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
 planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
 integration) MUST call the planner so the guardrails apply:
@@ -212,7 +224,8 @@ integration) MUST call the planner so the guardrails apply:
 ```
 POST /api/hbx/target   {"target_f": 128}     Authorization: Bearer $PLANNER_API_TOKEN
 POST /api/hbx/boost    {"target_f": 140, "minutes": 90}
-POST /api/hbx/restore
+POST /api/hbx/restore                        → the plan's command for the block in force (#232)
+POST /api/hbx/restore  {"to": "as-found"}    → the July as-found endpoints, unguarded (emergency only)
 GET  /api/hbx/target                          → writer.status()
 ```
 
@@ -530,7 +543,7 @@ LOCAL_DATABASE_URL=postgres://$(whoami)@localhost:5432/a2w_local npx tsx ../scri
 
 ## Cold-day rehearsal (`scripts/rehearsal/`)
 
-Runs the **real planner** (`POLL_ONCE=1`, three polls) against a **local** Postgres with every upstream faked
+Runs the **real planner** (`POLL_ONCE=1`, three polls — four when the scenario injects a boost) against a **local** Postgres with every upstream faked
 — SensorLinx (device read + PATCH echo), the hub (state + leased commands), TempIQ (zones, calls,
 identification plan, posts), open-meteo, NWS, OutageWatch — from a scenario JSON, then asserts what the
 planner *did* (DB ledgers + the fake's request log), not what it logged.
@@ -542,6 +555,9 @@ scripts/rehearsal/run.sh tempiq-down      # cold morning, every /api/insights ro
 scripts/rehearsal/run.sh forecast-down    # cold morning, open-meteo 503 → cached / no plan, nothing written blind
 scripts/rehearsal/run.sh pi-offline       # hub unreachable (/api/state 503) → every write refused, no probe
 scripts/rehearsal/run.sh pi-dropped-hub-up # hub UP, Pi gone 2 h: stale pumps[] + pi_connected:false → refused 503 (#167)
+scripts/rehearsal/run.sh boost-expiry     # #232: as-found 165/145 in force at 40 °F, SHAPED_CURVE live; poll 2 writes the plan
+                                          # curve, a real 128 °F boost is injected and expires → poll 3 restores the PLAN's
+                                          # curve (never the as-found), auto-pilot holds, poll 4 Phase B leads 52 °C (four polls)
 ```
 
 **Hour-independent by construction** (eval 2026-09-30, F1): the plan's daily 140 °F soak goes to the warmest

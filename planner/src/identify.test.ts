@@ -160,7 +160,10 @@ async function main(): Promise<void> {
           if (f != null) throw new WriteError(f, f === 429 ? "rate limited" : "rejected");
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
-        async restore(source: string, opts?: { yieldToBoost?: boolean }) {
+        async restore(source: string, opts?: { yieldToBoost?: boolean; to?: string }) {
+          // #232: the writer's default restore is now the PLAN's command, guarded like the re-command the cleanup was
+          // just refused; the cleanup's last resort must ask for the as-found curve by name
+          if (opts?.to !== "as-found") throw new Error(`identification cleanup must restore the as-found curve explicitly (got to=${String(opts?.to)})`);
           if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new BoostYieldError(over.boost.v); }
           if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
           restores.push(source); return { ok: true };

@@ -1128,7 +1128,7 @@ export default function OptimizeClient({
           Writes through the planner&apos;s guarded boost: I4 envelope (≤ {STRICT_CAP_F} °F), I1 pump-setpoint
           check, one HBX write per 15 min, {BOOST_MIN_MINUTES}–{BOOST_MAX_MINUTES} min. The HBX adopts a new target
           only at its next reheat cycle; the planner restores the curve itself when the timer ends. There is
-          no early-stop button yet — <b>Restore as-found curve</b> at the bottom reverts immediately.
+          no early-stop button yet — <b>Restore curve</b> at the bottom reverts immediately.
         </p>
         {bst.Modals}
       </div>
@@ -1262,11 +1262,12 @@ export default function OptimizeClient({
               act(
                 "/api/planner/restore",
                 undefined,
-                `Restore the as-found curve${st.baseline ? ` (${st.baseline.dbt}/${st.baseline.mbt}°F)` : ""}? This undoes the cooler-tank setting.`,
+                `Restore the planner's current curve? This undoes the cooler-tank setting and cancels any boost. (Only when no plan is being commanded does it fall back to the as-found curve${st.baseline ? ` ${st.baseline.dbt}/${st.baseline.mbt}°F` : ""}.)`,
               )
             }
+            title="Return the HBX to what the planner commands for this hour (a2w#232)"
           >
-            Restore as-found curve
+            Restore curve
           </button>
         </div>
         {msg && st ? <div className="pr-msg meta">{msg}</div> : null}

@@ -918,8 +918,12 @@ export class IdentificationDriver {
       }
     }
     // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
+    //    Explicitly `to: "as-found"` since #232 made the writer's default the plan's command: that one runs the same
+    //    guards the re-command above was just refused by, so as a LAST RESORT it would be refused too and the plant
+    //    would sit at the probe target. Whether an identification abort should prefer the plan's command (it does
+    //    land on a 429) and only then the as-found curve is a separate decision — see #232's follow-up.
     try {
-      await this.d.writer.restore(cleanupSource(w.id, urgent), { yieldToBoost: true });
+      await this.d.writer.restore(cleanupSource(w.id, urgent), { yieldToBoost: true, to: "as-found" });
       return await done(`as-found curve restored (base re-command refused${urgent ? "; abort" : ""})`);
     } catch (e) {
       if (isBoostYield(e)) return done(`a boost took over during cleanup — ${(e as Error).message}; nothing to return`);
