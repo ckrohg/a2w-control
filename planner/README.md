@@ -215,7 +215,10 @@ limit never holds the plan off. The July as-found endpoints (`hbx_config_version
 are written only when nothing of the plan is being commanded (no auto-pilot, Off/shadow, no plan
 block) or on an explicit `{"to":"as-found"}`. A refused plan restore (I1 short, Pi unverifiable, no
 lease) throws instead of falling back: the device keeps the boost's own guarded target and the next
-poll retries. The identification driver's abort fallback still asks for the as-found curve by name.
+poll retries. The identification driver's cleanup (`identify.ts`) takes the same plan restore once its
+guarded base re-command is refused (most often a 429 inside 15 min of the probe write); only an *abort*
+whose plan restore is refused too falls back to the as-found curve, by name, because an abort must end
+with a landed write — a window that ended normally stays pending and retries instead.
 
 **Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
 planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
@@ -465,8 +468,10 @@ through `writer.setTarget` with the identification ceiling (owner decision 2026-
 exceed the everyday 135 °F cap up to `sanitizeCapF` 145; I1 + the rate limit still guard) → the
 auto-pilot is **held** for the window → abort checks every poll (I1 violated, room deficit on a
 down-probe, DHW draw on a down-probe, hub/SLX stale, storm, boost) → on the window's end the hold
-is released and the auto-pilot re-commands its plan. A down-probe abort **restores the as-found
-curve immediately** (the one write the rate limit never blocks; hotter is the safe direction).
+is released and the auto-pilot re-commands its plan. The driver's own cleanup returns the plant to the
+base through the guarded writer; when that is refused (a 429 inside 15 min of the probe write) it takes
+the rate-limit-exempt **plan restore** (#232), and only an abort whose plan restore is refused too falls
+back to the as-found curve (hotter is the safe direction; a normal end stays pending and retries).
 
 Windows persist in `identification_windows` (restart-safe) and are posted to TempIQ as kind
 `awt_identification` **with the drawn assignment** — the only kind U4 may fit. The quarantine
