@@ -31,6 +31,9 @@ export type WriterStatus = {
   adoption_pending?: boolean;
   band?: { lo: number; hi: number } | null; // I4 envelope at the live outdoor
   i1_margin_f?: number;
+  /** the HBX hot-tank differential in force (writes.ts status(); null until a config version is recorded) — the
+   *  HBX reheats ht_dif/2 under its target, which is where the Boost card's coast line ends (lib/tank-coast.ts) */
+  ht_dif_f?: number | null;
   active_boost?: { target_f: number; restore_at: string } | null;
   /** in-memory time of the writer's last accepted HBX write (null after a planner restart) */
   last_write_at?: string | null;
