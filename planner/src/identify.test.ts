@@ -108,7 +108,7 @@ async function main(): Promise<void> {
 
   // ── the driver against fakes ──
   type Post = { url: string; body: any };
-  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; curveOutputF?: number | null; htDifF?: number | null; recentSeries?: Array<{ ts: Date; tankF: number | null; anyCall: boolean; hdActive?: boolean | null }>; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void; shapedCurve?: boolean }) {
+  function harness(over: { plan?: IdentPlan; rng?: () => number; mode?: "off" | "shadow" | "armed"; commanded?: number | null; operative?: number | null; adoptionPending?: boolean; curveOutputF?: number | null; htDifF?: number | null; recentSeries?: Array<{ ts: Date; tankF: number | null; anyCall: boolean; hdActive?: boolean | null }>; autopilotDryRun?: boolean; pumpsCoverF?: number; i1?: boolean; zones?: any[]; slxAgeMs?: number; outdoorF?: number; lastEnd?: Date | null; writeFails?: Array<number | null>; restoreFails?: number; planRestoreFails?: Array<number | null>; onRestore?: (to: string) => void; acceptedFor?: Record<string, { id: number; ts: Date; targetF: number | null }>; planBlocks?: any[]; seedRows?: IdentWindow[]; statusFailsAfterWrite?: boolean; liveCommanded?: () => Promise<number | null> ; interlock?: { status: number; body?: any }; interlockSequence?: Array<{ status: number; body?: any }>; boost?: { v: { targetF: number; restoreAt: Date } | null | Error }; onSetTarget?: (source: string) => void; shapedCurve?: boolean }) {
     const rows: IdentWindow[] = [...(over.seedRows ?? [])];
     const posts: Post[] = [];
     const interlockCalls: string[] = [];
@@ -120,6 +120,7 @@ async function main(): Promise<void> {
     let clock = T0.getTime();
     const now = () => new Date(clock);
     const writeFails = [...(over.writeFails ?? [])];
+    const planRestoreFails = [...(over.planRestoreFails ?? [])];
     const store: IdentStore = {
       async getLatestSlx() { return { ts: new Date(clock - (over.slxAgeMs ?? 60_000)), tankF: 130, targetF: over.commanded ?? 135, outdoorF: over.outdoorF ?? 40 }; },
       async activeBoost() { const b = over.boost?.v ?? null; if (b instanceof Error) throw b; return b; },
@@ -161,12 +162,20 @@ async function main(): Promise<void> {
           writes.push({ targetF, source, capF: capF ?? 135 }); return { ok: true };
         },
         async restore(source: string, opts?: { yieldToBoost?: boolean; to?: string }) {
-          // #232: the writer's default restore is now the PLAN's command, guarded like the re-command the cleanup was
-          // just refused; the cleanup's last resort must ask for the as-found curve by name
-          if (opts?.to !== "as-found") throw new Error(`identification cleanup must restore the as-found curve explicitly (got to=${String(opts?.to)})`);
-          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push("YIELD"); throw new BoostYieldError(over.boost.v); }
-          if ((over.restoreFails ?? 0) > restores.filter((r) => r.startsWith("FAIL")).length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
-          restores.push(source); return { ok: true };
+          // #232: the real writer's restore has two modes — "plan" (its default: the plan's command for the block in
+          // force, guarded like a set_target but rate-limit exempt; refused with a WriteError when the guards say so)
+          // and "as-found" (the July curve, unguarded). The cleanup must name the one it means. Ledger entries:
+          // `<mode>:<source>` landed, `REFUSED:<status>` a refused plan restore, `FAIL` a failed as-found write,
+          // `YIELD:<mode>` a boost yield.
+          const to = opts?.to;
+          if (to !== "plan" && to !== "as-found") throw new Error(`identification cleanup must name the restore mode (got to=${String(to)})`);
+          over.onRestore?.(to);
+          if (opts?.yieldToBoost && over.boost?.v && !(over.boost.v instanceof Error)) { restores.push(`YIELD:${to}`); throw new BoostYieldError(over.boost.v); }
+          if (to === "plan") {
+            const f = planRestoreFails.shift();
+            if (f != null) { restores.push(`REFUSED:${f}`); throw new WriteError(f, f === 409 ? "I1 conflict: pump1 at 130.0°F < 140°F" : f === 503 ? "hub unreachable — cannot verify I1" : "rejected"); }
+          } else if ((over.restoreFails ?? 0) > restores.filter((r) => r === "FAIL").length) { restores.push("FAIL"); throw new WriteError(502, "SensorLinx write failed"); }
+          restores.push(`${to}:${source}`); return { ok: true };
         },
         async status() {
           if (over.statusFailsAfterWrite && writes.length) throw new Error("SensorLinx unreachable");
@@ -530,7 +539,8 @@ async function main(): Promise<void> {
     assert.equal(h.posts[0].body.windows[0].commandedTargetF, 135);
   }
   // 4. DOWN probe: pending_write → written → active; a room deficit aborts it; the base re-command is
-  //    rate-limited (inside 15 min of the probe write) so the as-found curve is RESTORED; close posted.
+  //    rate-limited (inside 15 min of the probe write) so the PLAN restore — rate-limit exempt, the auto-pilot's own
+  //    command — lands, never the July as-found curve (#232 follow-up); close posted.
   {
     const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], writeFails: [null, 429] });
     await h.driver.tick();
@@ -542,11 +552,72 @@ async function main(): Promise<void> {
     await h.driver.tick();
     assert.equal(h.rows[0].state, "ended");
     assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
-    assert.deepEqual(h.restores, ["identification-abort#1"]);
+    assert.deepEqual(h.restores, ["plan:identification-abort#1"], "the 429 case lands the plan's command; no as-found curve");
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
+    assert.match(h.rows[0].cleanupDetail ?? "", /plan's command restored \(base re-command refused; abort\)/);
     assert.ok(h.notes.includes("Identification probe aborted"));
     assert.equal(h.posts.length, 2);
+  }
+  // 4-i. (#232 follow-up) When the plan restore is ITSELF refused — the hub cannot vouch for it (503), the pumps do not
+  //      cover the plan (409), envelope (422), lease (423) — an ABORT still ends with a landed write: the as-found
+  //      curve, unguarded, hotter being the safe direction.
+  for (const status of [409, 503, 422, 423]) {
+    const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], writeFails: [null, 429], planRestoreFails: [status] });
+    await h.driver.tick();
+    h.advance(10);
+    await h.driver.tick();
+    assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
+    assert.deepEqual(h.restores, [`REFUSED:${status}`, "as-found:identification-abort#1"], `plan restore refused ${status} → the as-found curve lands`);
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", new RegExp(`as-found curve restored \\(abort; base re-command and plan restore refused: ${status} `));
+    assert.ok(h.notes.includes("Identification probe aborted"));
+  }
+  // 4-ii. A window that ended NORMALLY never writes unguarded: the base re-command refused (429) and the plan restore
+  //       refused (409: Phase B has not led the plan's new block yet) → pending, no as-found curve; the next tick's
+  //       plan restore lands once the guards clear (the re-command is still rate-limited).
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 429, 429], planRestoreFails: [409, null] });
+    await h.driver.tick(); await h.driver.tick();          // arming → active
+    h.advance(121);
+    await h.driver.tick();                                  // completed; re-command 429, plan restore 409 → pending
+    assert.equal(h.rows[0].endReason, "completed");
+    assert.equal(h.rows[0].cleanupState, "pending");
+    assert.match(h.rows[0].cleanupDetail ?? "", /plan restore refused: 409 /);
+    assert.deepEqual(h.restores, ["REFUSED:409"], "no as-found curve for a window that ended normally");
+    await h.driver.tick();                                  // cleanupPending: re-command 429 again, the plan restore lands
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.deepEqual(h.restores, ["REFUSED:409", "plan:identification-end#1"]);
+    assert.match(h.rows[0].cleanupDetail ?? "", /plan's command restored \(base re-command refused\)/);
+    assert.equal(h.writes.length, 1, "the probe write is the only set_target");
+  }
+  // 4-iii. …and a non-urgent cleanup that will not resolve still pages after CLEANUP_ALERT_EVERY attempts, the plant
+  //        left at the probe's own guarded target rather than at 158 °F.
+  {
+    const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, ...Array(12).fill(429)], planRestoreFails: Array(12).fill(503) });
+    await h.driver.tick(); await h.driver.tick();
+    h.advance(121);
+    for (let i = 0; i < 12; i++) await h.driver.tick();     // completed (attempt 1), then 11 retries
+    assert.equal(h.rows[0].cleanupState, "pending");
+    assert.equal(h.rows[0].cleanupAttempts, 12);
+    assert.ok(h.notes.includes("Identification cleanup stuck"), "the stuck page still fires");
+    assert.ok(!h.restores.some((r) => r.startsWith("as-found")), "never the as-found curve for a normal end");
+    assert.equal(h.restores.filter((r) => r === "REFUSED:503").length, 12, "the plan restore is retried every tick");
+  }
+  // 4-iv. An UP-probe abort: the plan's command sits BELOW the probe, so the setpoints led for the probe cover it and
+  //       the plan restore lands on the 429 — before this change the as-found curve (≈ 158 °F) landed, hotter than
+  //       the probe itself.
+  {
+    const o = { plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 429], i1: false };
+    const h = harness(o);
+    await h.driver.tick(); await h.driver.tick();          // arming → active (143 °F)
+    assert.equal(h.rows[0].state, "active"); assert.equal(h.rows[0].direction, "up");
+    o.i1 = true;                                            // I1 trips mid-window
+    h.advance(5);
+    await h.driver.tick();
+    assert.equal(h.rows[0].endReason, "aborted:i1_violated");
+    assert.deepEqual(h.restores, ["plan:identification-abort#1"]);
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.match(h.rows[0].cleanupDetail ?? "", /plan's command restored \(base re-command refused; abort\)/);
   }
   // 4b. Cleanup is DURABLE: a re-command that fails for a non-rate-limit reason stays pending and is retried on later ticks.
   {
@@ -680,7 +751,7 @@ async function main(): Promise<void> {
     await e.driver.tick();
     assert.equal(e.writes.length, 0); assert.equal(e.rows[0].state, "pending_write");
   }
-  // 5f. Cleanup YIELDS to an active boost — on the urgent abort (boost_active, the as-found restore path) and on a
+  // 5f. Cleanup YIELDS to an active boost — on the urgent abort (boost_active, the restore path) and on a
   //     pending non-urgent cleanup — even when the device still reads as the probe target. The boost's own expiry
   //     restores the curve; an unreadable boost table keeps a non-urgent cleanup pending.
   {
@@ -712,7 +783,8 @@ async function main(): Promise<void> {
   }
   // 5g. Interleaving (codex pass 2 on the boost hold): the boost lands AFTER cleanup's step-0a check. (i) It lands
   //     before the re-command's slot → the writer yields → done, no write. (ii) It lands after the re-command was
-  //     refused 429 → the fallback restore, which the rate limit never blocks, yields too → done, no restore.
+  //     refused 429 → the plan restore, which the rate limit never blocks, yields too → done, no restore. (iii) It
+  //     lands while the plan restore is being refused → the as-found fallback yields → done, no restore.
   {
     const ended = (): IdentWindow => ({
       id: 1, createdAt: new Date(T0.getTime() - 300 * 60_000), state: "ended", arm: "probe", direction: "up", zoneIds: ["z-lr"], bandLo: 30, bandHi: 45,
@@ -732,7 +804,16 @@ async function main(): Promise<void> {
       onSetTarget: () => { /* the boost's write is ahead in the queue: 429 for us, and its row is visible by the restore */ queueMicrotask(() => { b2.v = tapped; }); } });
     await ii.driver.tick();
     assert.equal(ii.rows[0].cleanupState, "done"); assert.match(ii.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
-    assert.deepEqual(ii.restores, ["YIELD"], "the restore was attempted and YIELDED — it did not erase the boost");
+    assert.deepEqual(ii.restores, ["YIELD:plan"], "the plan restore was attempted and YIELDED — it did not erase the boost");
+    const b3 = { v: null as { targetF: number; restoreAt: Date } | null | Error };
+    const iii = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], writeFails: [null, 429], planRestoreFails: [409], boost: b3,
+      onRestore: (to) => { if (to === "plan") queueMicrotask(() => { b3.v = tapped; }); } }); // the boost lands while the plan restore is being refused
+    await iii.driver.tick();
+    iii.advance(10);
+    await iii.driver.tick();                                 // urgent abort (room deficit)
+    assert.equal(iii.rows[0].endReason, "aborted:room_deficit:z-lr");
+    assert.equal(iii.rows[0].cleanupState, "done"); assert.match(iii.rows[0].cleanupDetail ?? "", /a boost took over during cleanup/);
+    assert.deepEqual(iii.restores, ["REFUSED:409", "YIELD:as-found"], "the as-found fallback yielded — it did not erase the boost");
   }
   // 5h. a probe write queued behind a boost yields → the window ends unwritten (no 429 retry loop)
   {
@@ -802,22 +883,33 @@ async function main(): Promise<void> {
     h.advance(10);
     await h.driver.tick();                                  // room deficit → urgent abort with status unavailable
     assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
-    assert.deepEqual(h.restores, ["identification-abort#1"], "urgent: the as-found restore does not depend on the saved base");
+    assert.deepEqual(h.restores, ["plan:identification-abort#1"], "urgent: the plan restore does not depend on the saved base");
     assert.equal(h.rows[0].cleanupState, "done");
     assert.equal(h.writes.length, 1);
   }
-  // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope) falls back to
-  //     the as-found restore immediately instead of retrying the impossible command forever…
+  {
+    const h = harness({ plan: downPlan, commanded: 130, zones: [{ id: "z-lr", roomF: 66, setpointF: 68 }], statusFailsAfterWrite: true, planRestoreFails: [503] });
+    await h.driver.tick();
+    h.advance(10);
+    await h.driver.tick();                                  // urgent abort, status unavailable, plan restore refused 503
+    assert.equal(h.rows[0].endReason, "aborted:room_deficit:z-lr");
+    assert.deepEqual(h.restores, ["REFUSED:503", "as-found:identification-abort#1"], "urgent: the as-found curve still lands when the plan restore is refused");
+    assert.equal(h.rows[0].cleanupState, "done");
+    assert.equal(h.writes.length, 1);
+  }
+  // 4c. Cleanup classification (codex pass 2, high): a PERMANENT guard rejection (422 envelope: the saved base is
+  //     outside I4 at the new outdoor) falls through to the plan restore immediately — the plan's command is resolved
+  //     fresh, inside I4 — instead of retrying the impossible command forever…
   {
     const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 422] });
     await h.driver.tick(); await h.driver.tick();
     h.advance(121);
     await h.driver.tick();
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.deepEqual(h.restores, ["identification-end#1"]);
-    assert.match(h.rows[0].cleanupDetail ?? "", /as-found curve restored/);
+    assert.deepEqual(h.restores, ["plan:identification-end#1"]);
+    assert.match(h.rows[0].cleanupDetail ?? "", /plan's command restored/);
   }
-  // …transient failures (5xx) are retried, but after CLEANUP_TRANSIENT_MAX the restore is used anyway…
+  // …transient failures (5xx) are retried, but after CLEANUP_TRANSIENT_MAX the plan restore is tried anyway…
   {
     const h = harness({ plan: upPlan, commanded: 135, pumpsCoverF: 150, writeFails: [null, 503, 503, 503, 503, 503, 503] });
     await h.driver.tick(); await h.driver.tick();
@@ -827,9 +919,9 @@ async function main(): Promise<void> {
     for (let i = 0; i < 4; i++) await h.driver.tick();   // attempts 2–5 → still pending
     assert.equal(h.rows[0].cleanupState, "pending");
     assert.equal(h.rows[0].cleanupAttempts, 5);
-    await h.driver.tick();                       // attempt 6 → permanent by count → restore
+    await h.driver.tick();                       // attempt 6 → permanent by count → the plan restore
     assert.equal(h.rows[0].cleanupState, "done");
-    assert.deepEqual(h.restores, ["identification-end#1"]);
+    assert.deepEqual(h.restores, ["plan:identification-end#1"]);
   }
   // …and while ANY live probe is still unreturned, no new window opens.
   {
