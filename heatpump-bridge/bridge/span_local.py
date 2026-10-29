@@ -12,6 +12,9 @@
 #     hourly-cloud record are all unaffected. urllib in a thread (no new dependency).
 # Relay writes are CLOSE-ONLY unless the caller holds an OpenPermit, which only the guarded
 # breaker controller (span_control.py) mints — see SpanClient._set_relay_sync.
+# Transport (#199): SPAN removes v1 REST on 2026-12-31. SpanClient prefers the v2 MQTT interface
+# (span_v2.py) and falls back to v1 while the panel still serves it; every consumer sees the v1
+# /circuits shape either way, and transport_status() says which transport answered.
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +27,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import span_v2
+from .span_v2 import SpanV2, V2AuthError, V2NotSent, canon_id
+
 log = logging.getLogger(__name__)
+TRANSPORTS = ("auto", "v2", "v1")   # auto = v2 first, v1 fallback
 
 # SPAN rejects a duplicate client name ("Name already exists"), so every registration uses a
 # fresh unique name. Registration is rare — the minted token is long-lived and persisted, so we
@@ -57,7 +64,10 @@ class SpanClient:
     `ip_fallback`. All network calls run in a thread (urllib) so they never block the loop."""
 
     def __init__(self, host: str, passphrase: str, *, ip_fallback: str | None = None,
-                 token: str | None = None, token_path: str | None = None, timeout_s: float = 8.0):
+                 token: str | None = None, token_path: str | None = None, timeout_s: float = 8.0,
+                 transport: str = "auto", state_dir: str | None = None):
+        if transport not in TRANSPORTS:
+            raise ValueError(f"span transport must be one of {TRANSPORTS}, not {transport!r}")
         self.host = host
         self.ip_fallback = ip_fallback
         self.passphrase = passphrase
@@ -69,6 +79,14 @@ class SpanClient:
         # One panel conversation at a time: the poll loop and the breaker controller share this
         # client from worker threads, and a token re-mint mutates _token/_base and the token file.
         self._lock = threading.RLock()
+        self.transport = transport
+        if state_dir is None and token_path:
+            state_dir = str(Path(token_path).parent)
+        self.v2 = (SpanV2(host, passphrase, ip_fallback=ip_fallback, state_dir=state_dir, timeout_s=timeout_s)
+                   if transport != "v1" else None)
+        self._v1_ids: dict[str, str] = {}    # canonical id -> the id v1 spells it with
+        self._answered: dict[str, dict] = {"read": {}, "write": {}}   # which transport answered, when
+        self._errors: dict[str, str | None] = {"v1": None, "v2": None}
 
     # --- token persistence (survive restarts so we almost never re-register) --
     def _load_token(self) -> str | None:
@@ -143,6 +161,8 @@ class SpanClient:
                 self._persist_token(payload["accessToken"])
                 return payload["accessToken"]
             detail = (payload or {}).get("detail", f"HTTP {status}")
+            if status == 404:   # not a passphrase problem: this panel no longer serves v1 (#199)
+                raise ConnectionError(f"v1 register: HTTP 404 — v1 REST is not served by this panel")
             # a bad passphrase / proximity requirement won't be fixed by retrying another base
             raise SpanAuthError(f"register rejected: {detail}")
         raise ConnectionError(f"register: panel unreachable ({last_err})")
@@ -165,6 +185,59 @@ class SpanClient:
         raise ConnectionError(f"circuits: {last_err}")
 
     def _fetch_sync(self) -> dict:
+        """{canonical id: circuit} in the v1 /circuits shape: v2 first (unless transport=v1), then v1
+        (unless transport=v2). Raises when no allowed transport answered."""
+        v2_err = None
+        if self.v2 is not None:
+            try:
+                circuits = self.v2.fetch()
+            except (ConnectionError, V2AuthError, OSError) as e:
+                v2_err = self._errors["v2"] = str(e)
+            else:
+                self._errors["v2"] = None
+                self._note("read", "v2")
+                return {canon_id(k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
+            if self.transport == "v2":
+                raise ConnectionError(v2_err)
+        try:
+            circuits = self._v1_circuits()
+        except Exception as e:  # noqa: BLE001 — report both transports' failures
+            if v2_err is None:
+                raise
+            raise ConnectionError(f"v1: {e} | {v2_err}") from e
+        self._note("read", "v1")
+        return {canon_id(c.get("id") or k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
+
+    def _v1_circuits(self) -> dict:
+        """A v1 /circuits read that also learns how v1 spells each circuit id (a v1 write needs that spelling)."""
+        try:
+            circuits = self._v1_fetch_sync()
+        except Exception as e:  # noqa: BLE001
+            self._errors["v1"] = str(e)
+            raise
+        self._errors["v1"] = None
+        for k, c in circuits.items():
+            raw = c.get("id") or k
+            self._v1_ids[canon_id(raw)] = raw
+        return circuits
+
+    def _note(self, kind: str, transport: str) -> None:
+        self._answered[kind] = {"transport": transport, "ts": time.time()}
+
+    def transport_status(self) -> dict:
+        """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
+        frame. `read` falling back to v1 means v2 is failing — v1 is removed 2026-12-31."""
+        return {"mode": self.transport,
+                "read": self._answered["read"].get("transport"), "read_ts": self._answered["read"].get("ts"),
+                "write": self._answered["write"].get("transport"), "write_ts": self._answered["write"].get("ts"),
+                "v2": self.v2.status() if self.v2 is not None else None,
+                "v2_error": self._errors["v2"], "v1_error": self._errors["v1"]}
+
+    def close(self) -> None:
+        if self.v2 is not None:
+            self.v2.close()
+
+    def _v1_fetch_sync(self) -> dict:
         """Return {circuits} with a valid token, re-registering ONCE on an auth failure."""
         if not self._token:
             self._token = self._register_sync()
@@ -199,6 +272,42 @@ class SpanClient:
             open_permit.check(circuit_id)
         elif want != "CLOSED":
             raise ValueError(f"set_relay: unknown relay state {want!r}")
+        v2_err = None
+        if self.v2 is not None:
+            try:   # an OPEN's permit recheck (expiry + guard) runs at v2's dispatch boundary; OpenAborted propagates
+                state = self.v2.set_relay(circuit_id, want,
+                                          before_send=open_permit.recheck if want == "OPEN" else None)
+            except V2NotSent as e:      # never reached the panel: v1 may try (OPEN rechecks again)
+                v2_err = self._errors["v2"] = str(e)
+            except (ConnectionError, OSError) as e:
+                v2_err = self._errors["v2"] = str(e)
+                if want == "OPEN":      # may have landed: NEVER send a second OPEN on another transport
+                    raise ConnectionError(f"OPEN possibly delivered over v2: {e}") from e
+            else:
+                self._note("write", "v2")
+                if state == want:
+                    return state
+                v2_err = f"v2: sent {want}, the panel still shows {state or 'nothing'} after {span_v2.ECHO_WAIT_S:g} s"
+                if want == "OPEN":      # sent: the caller's read-back decides; no v1 retry of an OPEN
+                    raise ConnectionError(v2_err)
+            if self.transport == "v2":
+                raise ConnectionError(v2_err)
+            log.warning("span: %s over v2 failed (%s) — trying v1", want, v2_err)
+        if canon_id(circuit_id) not in self._v1_ids:   # reads came over v2: learn v1's spelling of the id
+            try:
+                self._v1_circuits()
+            except Exception as e:  # noqa: BLE001 — the POST below reports the panel's answer
+                log.info("span: v1 id lookup failed before a %s: %s", want, e)
+        try:
+            state = self._v1_set_relay_sync(self._v1_ids.get(canon_id(circuit_id), circuit_id), want,
+                                            open_permit=open_permit)
+        except ConnectionError as e:
+            raise ConnectionError(f"{e}{' | ' + v2_err if v2_err else ''}") from e
+        self._note("write", "v1")
+        return state
+
+    def _v1_set_relay_sync(self, circuit_id: str, want: str, *,
+                           open_permit: "OpenPermit | None" = None) -> str:
         if not self._token:
             self._token = self._register_sync()
         # The panel's schema (OpenAPI Body_set_circuit_state…: relayStateIn → RelayStateIn) nests
@@ -268,7 +377,7 @@ class OpenPermit:
     def check(self, circuit_id: str) -> None:
         if self._used:
             raise ValueError(f"open permit for '{self.name}' already used")
-        if circuit_id != self.circuit_id:
+        if canon_id(circuit_id) != canon_id(self.circuit_id):   # one id, spelled by v1 or v2 (#199)
             raise ValueError(f"open permit is for '{self.name}', not circuit {circuit_id!r}")
         if time.monotonic() > self._expires:
             raise ValueError(f"open permit for '{self.name}' expired")
@@ -346,7 +455,7 @@ class SpanLocalPoller:
         self.store = store
         self.notify = notify
         self.client = SpanClient(cfg.host, cfg.passphrase, ip_fallback=cfg.ip_fallback,
-                                 token_path=token_path)
+                                 token_path=token_path, transport=getattr(cfg, "transport", "auto"))
         self.arm_state_path = arm_state_path
         self._task: asyncio.Task | None = None
         self._last_ok = 0.0
@@ -371,6 +480,7 @@ class SpanLocalPoller:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        await asyncio.to_thread(self.client.close)
 
     async def poll_once(self) -> list[dict]:
         circuits = await self.client.fetch_circuits()
@@ -386,6 +496,10 @@ class SpanLocalPoller:
             if self.notify:
                 await self.notify("SPAN local recovered", "Instant circuit power logging is back.", tier="attention", resolved=True)
         return rows
+
+    def status(self) -> dict:
+        """/api/health "span": whether the LAN poll is landing and which transport answered (#199)."""
+        return {"last_ok_ts": self._last_ok or None, **self.client.transport_status()}
 
     def note_circuits(self, circuits: dict, ts: float, mono: float | None = None) -> None:
         """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""

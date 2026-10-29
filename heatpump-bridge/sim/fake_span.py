@@ -6,6 +6,9 @@
 # fake once accepted a flat {"relayStateIn": "OPEN"} the real panel rejects. Knobs simulate the
 # failure modes breaker control must survive: writes the panel ignores (read-back mismatch),
 # CLOSE requests that fail N times, a panel that stops answering, non-controllable circuits.
+# v2 (#199): FakeSpan(v2=True) also serves POST /api/v2/auth/register + GET /api/v2/certificate/ca and runs the
+# eBus MQTT broker + panel (sim/fake_span_v2.py) over the SAME circuit state; v1=False removes the v1 endpoints
+# (404), i.e. the panel after 2026-12-31.
 from __future__ import annotations
 
 import json
@@ -43,7 +46,13 @@ def schema_errors(value, schema: dict, loc: str = "body") -> list[str]:
 class FakeSpan:
     TOKEN = "fake-span-token"
 
-    def __init__(self, circuits: dict[str, dict] | None = None):
+    # tests/conftest.py's span_transport fixture flips these to run a whole suite against a v2-only panel
+    DEFAULT_V1 = True
+    DEFAULT_V2 = False
+
+    def __init__(self, circuits: dict[str, dict] | None = None, *, v1: bool | None = None, v2: bool | None = None):
+        v1 = self.DEFAULT_V1 if v1 is None else v1
+        v2 = self.DEFAULT_V2 if v2 is None else v2
         # name -> {id, relayState, isUserControllable, instantPowerW}. Like the real panel,
         # consumption is NEGATIVE (Air-Water 2 heating read -5694 W on 2026-10-19).
         self.circuits = circuits or {
@@ -62,10 +71,28 @@ class FakeSpan:
         self.fail_opens = 0           # next N OPEN writes answer 500 and change nothing
         self.auth_fail_writes = 0     # next N writes answer 401 (token rejected) and change nothing
         self.ignore_writes = False    # 200 to every write, relay never changes (mismatch)
-        self.down = False             # every request answers 503
+        self._down = False            # every request answers 503 (v2: the broker drops + refuses sessions)
         self.dupes: dict[str, tuple[str, dict]] = {}   # extra circuits {id: (name, fields)} on the wire
         self.lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
+        self.v1 = v1
+        self.ebus = None
+        if v2:
+            from .fake_span_v2 import FakeEbus
+            self.ebus = FakeEbus(self)
+        self.v2_registrations: list[dict] = []        # every v2 register body
+        self.v1_requests: list[tuple[str, str]] = []  # every v1 request (method, path) that reached the panel
+        self.passphrase: str | None = None            # None: any passphrase registers
+
+    @property
+    def down(self) -> bool:
+        return self._down
+
+    @down.setter
+    def down(self, value: bool) -> None:
+        self._down = bool(value)
+        if self._down and self.ebus is not None:
+            self.ebus.drop_sessions()   # at once, as a dead panel's sockets would be
 
     # --- lifecycle -----------------------------------------------------------
     def start(self) -> str:
@@ -89,7 +116,16 @@ class FakeSpan:
             def do_GET(self):
                 if fake.down:
                     return self._send(503, {"detail": "down"})
-                if self.path != "/api/v1/circuits":
+                if self.path == "/api/v2/certificate/ca" and fake.ebus is not None:
+                    data = fake.ebus.ca_pem.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-pem-file")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    return self.wfile.write(data)
+                if self.path.startswith("/api/v1/"):
+                    fake.v1_requests.append(("GET", self.path))
+                if self.path != "/api/v1/circuits" or not fake.v1:
                     return self._send(404, {"detail": "nope"})
                 if not self._authed():
                     return self._send(401, {"detail": "auth"})
@@ -104,6 +140,22 @@ class FakeSpan:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if fake.down:
                     return self._send(503, {"detail": "down"})
+                if self.path == "/api/v2/auth/register" and fake.ebus is not None:
+                    from .fake_span_v2 import BROKER_USER, CAPTURE, SERIAL
+                    with fake.lock:
+                        fake.v2_registrations.append(body)
+                    if fake.passphrase is not None and body.get("hopPassphrase") != fake.passphrase:
+                        return self._send(401, {"detail": "invalid passphrase"})
+                    # exactly the keys the real panel answers with (span_v2_capture.json)
+                    vals = {"accessToken": "fake-v2-jwt", "tokenType": "Bearer", "serialNumber": SERIAL,
+                            "hostname": f"span-{SERIAL}.local", "ebusBrokerHost": f"span-{SERIAL}.local",
+                            "ebusBrokerUsername": BROKER_USER, "ebusBrokerPassword": fake.ebus.password,
+                            "ebusBrokerMqttsPort": fake.ebus.port}
+                    return self._send(200, {k: vals.get(k) for k in CAPTURE["register_keys"]})
+                if self.path.startswith("/api/v1/"):
+                    fake.v1_requests.append(("POST", self.path))
+                if not fake.v1:
+                    return self._send(404, {"detail": "Not Found"})
                 if self.path == "/api/v1/auth/register":
                     return self._send(200, {"accessToken": FakeSpan.TOKEN})
                 if not self.path.startswith("/api/v1/circuits/"):
@@ -137,11 +189,15 @@ class FakeSpan:
                     state = fake.circuits[name]["relayState"]
                 return self._send(200, {"relayState": state})
 
+        if self.ebus is not None:
+            self.ebus.start()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         return f"127.0.0.1:{self._server.server_address[1]}"
 
     def stop(self) -> None:
+        if self.ebus is not None:
+            self.ebus.stop()
         if self._server:
             self._server.shutdown()
             self._server.server_close()

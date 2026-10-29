@@ -25,6 +25,9 @@ from bridge.span_local import OpenPermit, SpanClient, SpanLocalPoller
 from bridge.store import Store
 from sim.fake_span import FakeSpan
 
+# #199: every test here runs against the v1 fake AND a v2-only (v1 removed) panel — tests/conftest.py
+pytestmark = pytest.mark.usefixtures("span_transport")
+
 
 class FakeTime:
     """Injected clock + sleep: sleeping advances the clock instantly. `block` holds every
@@ -393,6 +396,7 @@ def late_guard(refuse_from_call: int):
     return guard, calls
 
 
+@pytest.mark.v1_only
 async def test_guard_rechecks_before_an_auth_retry_post(rig, monkeypatch):
     from bridge import span_local
     panel, ctl, ft, *_ = rig
@@ -816,7 +820,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(rig):
+async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(rig, span_transport):
     panel, ctl, ft, *_ = rig
     frames: list[dict] = []
     conn: dict = {}
@@ -860,6 +864,14 @@ async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(
         ack = await send("c1", circuit="Air-Water 2", op="power_cycle", off_s=60)
         assert ack["ok"] is True and ack["result"]["relay_state"] == "CLOSED"
         assert ack["result"]["verified"] is True and ack["result"]["off_s"] >= 60
+        # #199: the frame says which local API answered (drift-check [10] reads it from the hub)
+        frames.clear()
+        for _ in range(500):
+            if any(f.get("type") == "state" for f in frames):
+                break
+            await asyncio.sleep(0.01)
+        tx = next(f for f in frames if f.get("type") == "state")["span"]["transport"]
+        assert tx["mode"] == "auto" and tx["read"] == span_transport and tx["write"] == span_transport
 
         ack = await send("c2", circuit="Buffer Tank", op="open")
         assert ack["ok"] is False and ack["result"]["refused"] is True
@@ -898,6 +910,7 @@ async def test_relay_write_body_matches_the_panels_schema():
         panel.stop()
 
 
+@pytest.mark.v1_only
 def test_fake_refuses_the_flat_body_the_real_panel_refused():
     panel = FakeSpan()
     try:
@@ -915,6 +928,7 @@ def test_fake_refuses_the_flat_body_the_real_panel_refused():
         panel.stop()
 
 
+@pytest.mark.v1_only
 async def test_a_refused_write_carries_the_panels_detail(monkeypatch):
     panel = FakeSpan()
     try:

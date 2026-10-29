@@ -319,6 +319,25 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
+echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199)"
+# The Pi reports which local API answered its last panel read in the hub state frame (span.transport). auto mode
+# prefers v2 (MQTT on the panel) and falls back to v1, so a "v1" here means v2 is failing — and on 2026-12-31 v1 goes.
+if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
+  skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
+else
+  [ -n "${STATE:-}" ] || STATE="$(curl -sf -m 20 -H "Authorization: Bearer $HUB_CLIENT_TOKEN" "$HUB/api/state" 2>/dev/null)" || STATE=""
+  SPANTX="$(jq -r 'if .span == null then "nospan" elif .span.transport == null then "absent" else (.span.transport.read // "none") end' <<<"${STATE:-null}" 2>/dev/null)"
+  SPANV2ERR="$(jq -r '.span.transport.v2_error // empty' <<<"${STATE:-null}" 2>/dev/null)"
+  case "$SPANTX" in
+    v2)     pass "SPAN local reads come over v2 (MQTT eBus)" ;;
+    v1)     fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
+    none)   fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
+    absent) skip "the Pi's bridge predates #199 (no span.transport) — cut a release to assert it" ;;
+    *)      skip "hub /api/state has no span frame (unreachable, or SPAN not configured on the Pi)" ;;
+  esac
+fi
+
+echo
 if [ "$FAILED" -eq 0 ]; then
   if [ "$ACKED" -gt 0 ]; then echo "no NEW drift ($ACKED acknowledged: $ACKED_BY)"; else echo "no drift detected"; fi
 else

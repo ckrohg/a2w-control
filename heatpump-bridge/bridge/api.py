@@ -426,6 +426,10 @@ async def health(request: Request, response: Response):
         # the backup-element gate's Pi-local fallback (both pumps down → close the element breaker)
         "backup_fallback": (request.app.state.backup_fallback.status()
                             if getattr(request.app.state, "backup_fallback", None) is not None else None),
+        # #199: the SPAN LAN link — last good poll and which transport (v2 MQTT / v1 REST) answered
+        "span": (request.app.state.span_poller.status()
+                 if getattr(request.app.state, "span_poller", None) is not None
+                 and getattr(request.app.state.span_poller, "_task", None) is not None else None),
         # #212: per pump, whether a PERSON has its breaker off (6bb / SPAN app / the panel) — a deliberate stop
         "deliberate_stops": (request.app.state.deliberate_stops.status()
                              if getattr(request.app.state, "deliberate_stops", None) is not None else None),
