@@ -271,3 +271,21 @@ Owner:
 TempIQ's production database (calorimetric band rows, `learnedThermalMassGallons`, `utility_config`),
 the Pi, and the HBX panel itself. Everything above is from the a2w mirror restored from the
 2026-10-20T01:44Z backup, the planner's public `/health`, and source in both repositories.
+
+---
+
+## Status addendum — 2026-10-30
+
+What changed after this deep dive, measured, not inferred:
+
+| finding | state now |
+|---|---|
+| §3.3 TempIQ COP feed dead (A2W windows quarantined) | **Fixed.** TempIQv2 #2107/#2109/#2113 (per-consumer exclusion, clamp-floor COP never "measured", newest certified row), #2124 (bounded scan — the writer was also timing out scanning all history); backfill Sep 29 → Oct 27 wrote 58 rows; A2W #238 mirrors with a 3-day overlap and upserts, refetch pulled 50 points. |
+| cold-weather COP | **Still unmeasured.** TempIQ's tank-calorimetry gates drop every cold-night charge (Oct 17–18 produced no points). gtm#1692: pump-side lift × flow method, in progress. |
+| §4.1 realized ledger ~14× inflated | **Fixed** (#207, #214). Oct 18 reads 49.9 kWh (was 686.1). |
+| §4.2 TempIQ prices hydronic heat at COP 1.0 | Guarded by #2109 (a clamp-floor COP is never presented as measured). |
+| §4.3 two rates | **Fixed.** 37.2 ¢/kWh: owner says TempIQ settings already had it; planner `ELECTRIC_RATE_USD_KWH=0.372` and the dashboard's Vercel copy set (was the 0.30 default). |
+| §1 three unverified hydronic zones | **Fixed.** Upstairs Bathroom, Kitchen Radiant, Master Bathroom owner-verified radiant floor in TempIQ (2026-10-29). |
+| §1 Living Room Baseboard / Dining off | Owner: comfort-only. TempIQ gtm#1637 (#2142) adds `heating_policy`; both zones are `on_demand` — out of the scoreboard's hydronic headline, not nagged by the readiness check. |
+| §2 DHW floor (120 °F) governs the tank | Trial at 116 °F (#240) reverted to 120 the next day: showers were already lukewarm at 120. The mixing valve is set to ~120 °F, so with a 5–8 °F coil approach any draw from a 120 °F tank delivers below the valve setting. Deep draws (sag ≥ 8 °F) cluster 07–11 local; fix in progress = bigger, earlier pre-boost (p90 sag, owner-declared morning window). |
+| §2 SensorLinx target frozen at 139.9 °F | Explained: the reported target is a snapshot that freezes while the HBX is idle (`stale-slx-target-2026-10-19.md`); #215/#223 read the curve in force instead. |
