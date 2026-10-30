@@ -1150,6 +1150,64 @@ async def test_gateway_overrides_persist_and_respect_mac(tmp_path):
     assert no_mac.pumps[0].mac == "d8:b0:4c:12:34:56"
 
 
+async def test_gateway_overrides_compare_macs_like_the_identity_check(tmp_path):
+    """The override staleness guard must use the same MAC comparison as the poller's
+    identity check (discovery.normalize_mac: case, zero-padded octets, '-' separators).
+    Otherwise a config.yaml MAC written as 'D8-B0-4C-1-2-3' is the SAME unit to
+    _check_identity but a DIFFERENT unit to the override loader, and the write_enabled
+    toggle plus any gateway reassignment silently revert on the next restart."""
+    import json
+    from bridge.config import (AppConfig, apply_gateway_overrides, save_gateway_override,
+                               save_write_enabled)
+
+    state_file = tmp_path / "gateway-overrides.json"
+
+    def make_cfg(mac):
+        return AppConfig(
+            pumps=[PumpConfig(id="p1", name="P1", host="10.0.0.5", mac=mac,
+                              write_enabled=False)],
+            db_path=str(tmp_path / "bridge.db"))
+
+    # 1. state file holds the canonical form; config.yaml uses dashes and no zero-padding
+    state_file.write_text(json.dumps({"overrides": {"p1": {
+        "host": "10.0.0.99", "port": 8899, "mac": "d8:b0:4c:01:02:03",
+        "write_enabled": True}}, "added_pumps": []}))
+    fresh = make_cfg("D8-B0-4C-1-2-3")
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].host == "10.0.0.99"          # gateway reassignment applied
+    assert fresh.pumps[0].port == 8899
+    assert fresh.pumps[0].write_enabled is True        # toggle survived the restart
+
+    # 2. a genuinely different unit is still skipped — nothing applies, writes stay off
+    other = make_cfg("aa:aa:aa:aa:aa:aa")
+    apply_gateway_overrides(other)
+    assert other.pumps[0].host == "10.0.0.5"
+    assert other.pumps[0].write_enabled is False
+
+    # 3. a legacy state file written by the old code with the raw (un-normalised) config
+    #    MAC still matches a canonical config MAC after the change
+    state_file.write_text(json.dumps({"overrides": {"p1": {
+        "host": "10.0.0.77", "port": 8899, "mac": "D8-B0-4C-1-2-3",
+        "write_enabled": True}}, "added_pumps": []}))
+    legacy = make_cfg("d8:b0:4c:01:02:03")
+    apply_gateway_overrides(legacy)
+    assert legacy.pumps[0].host == "10.0.0.77"
+    assert legacy.pumps[0].write_enabled is True
+
+    # 4. new state written from an odd-format config MAC is canonical on disk, and the
+    #    write_enabled-only path normalises too
+    state_file.unlink()
+    cfg = make_cfg("D8-B0-4C-1-2-3")
+    save_gateway_override(cfg, "p1", "10.0.0.42", 8899)
+    assert json.loads(state_file.read_text())["overrides"]["p1"]["mac"] == "d8:b0:4c:01:02:03"
+    state_file.unlink()
+    save_write_enabled(make_cfg("D8-B0-4C-1-2-3"), "p1", True)
+    assert json.loads(state_file.read_text())["overrides"]["p1"]["mac"] == "d8:b0:4c:01:02:03"
+    canonical = make_cfg("d8:b0:4c:01:02:03")
+    apply_gateway_overrides(canonical)
+    assert canonical.pumps[0].write_enabled is True
+
+
 async def test_add_and_remove_pump_at_runtime(rig):
     from types import SimpleNamespace
     from bridge import api as api_mod
