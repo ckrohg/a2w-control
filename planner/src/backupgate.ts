@@ -14,7 +14,9 @@
  *       available), and the tank is below FLOOR_F and not rising, continuously for FLOOR_HOLD ("totally cannot keep up").
  * and re-opens it (the `recovered` rule) once tank ≥ target − OPEN_MARGIN_F (or the HBX is satisfied: no stage called)
  * AND every pump is healthy, continuously for OPEN_HOLD — only a breaker the GATE closed, never sooner than MIN_DWELL
- * after its last action. Thresholds are MEASURED: knowledge/reference/backup-gate-thresholds.md.
+ * after its last action. Thresholds are MEASURED: knowledge/reference/backup-gate-thresholds.md. On the generator (#241,
+ * generator.ts) a close the rules want is refused unless the house load leaves room for the element and the house is
+ * getting cold: knowledge/reference/generator-outage-mode.md.
  *
  * Clocks follow stagewatch.ts: time is credited only between two consecutive qualifying observations ≤ MAX_STEP apart;
  * a non-qualifying observation resets the clock; a BLIND observation (hub/Pi state unverifiable, SensorLinx field
@@ -107,13 +109,17 @@ export interface GateInput {
   pumps: GatePump[] | null;
   /** the REAL Buffer Tank relay from the Pi's SPAN snapshot, null when unknown */
   relay?: "OPEN" | "CLOSED" | null;
+  /** #241 generator.ts: allowed = false refuses a close the rules want (on the generator without headroom, or the house
+   *  not getting cold). Absent = no generator restriction. */
+  generator?: { allowed: boolean; why: string } | null;
 }
 
 export type GateRule = "failed_not_recovering" | "floor" | "recovered";
 export interface GateEvent {
   /** close / open = act (shadow: "would"; live: index.ts pages it only after the Pi verified the switch); reopen_blocked = live, re-open wanted but disabled; override = live, a human
-   *  opened the breaker the gate closed — the gate stands down for OVERRIDE_MS */
-  kind: "close" | "open" | "reopen_blocked" | "override" | "confirmed";
+   *  opened the breaker the gate closed — the gate stands down for OVERRIDE_MS; generator_lockout = a close the rules
+   *  want, refused by the generator rule (#241), once per episode */
+  kind: "close" | "open" | "reopen_blocked" | "override" | "confirmed" | "generator_lockout";
   /** kind "confirmed": a live command whose answer was lost (hub timeout) is now seen done on the relay */
   confirms?: "close" | "open";
   rule: GateRule | null;
@@ -169,6 +175,9 @@ export class BackupGate {
   /** live: a command with no definite answer (timeout): it may still land — the relay read decides */
   private unconfirmed: { kind: "close" | "open"; atMs: number } | null = null;
   private reopenBlockedPaged = false;
+  /** #241: why the generator rule is refusing the close the rules want now (null = it is not); one event per episode */
+  private genLockout: string | null = null;
+  private genLockoutNoted = false;
   private readonly failC = clock();
   private readonly floorC = clock();
   private readonly openC = clock();
@@ -293,11 +302,13 @@ export class BackupGate {
     if (this.state === "open" && this.failC.ms === 0 && this.floorC.ms === 0 && this.failC.last == null && this.floorC.last == null) {
       if (this.standDown === "close") this.standDown = null;
       this.failPaged = false;
+      this.genLockoutNoted = false;
     }
     if (this.state === "closed" && this.openC.ms === 0 && this.openC.last == null) {
       if (this.standDown === "open") this.standDown = null;
       this.failPaged = false;
     }
+    this.genLockout = null;
     if (this.pending) return out; // live: a command is in flight — applied() resolves it
     if (this.retryAtMs != null && now < this.retryAtMs) return out;
     const dwellOk = this.lastActionMs == null || now - this.lastActionMs >= BG.MIN_DWELL_MS;
@@ -309,6 +320,21 @@ export class BackupGate {
       if (this.failC.ms >= this.t.failHoldMs) rule = "failed_not_recovering";
       else if (this.floorC.ms >= this.t.floorHoldMs) rule = "floor";
       if (!rule) return out;
+      if (i.generator && !i.generator.allowed) {
+        this.genLockout = i.generator.why;
+        if (!this.genLockoutNoted) {
+          this.genLockoutNoted = true;
+          out.push(this.ev(now, {
+            kind: "generator_lockout", rule, priority: "default",
+            title: this.mode === "live" ? "Backup element: generator rule holds the breaker OFF"
+              : "Backup element gate (shadow): would close, but the generator rule says no",
+            body: `${this.mode === "live" ? "" : "SHADOW — nothing was switched. "}Rule ${rule} wants the 16.5 kW element ` +
+              `available, but ${i.generator.why}. The element stays locked out while that holds; the gate re-checks every ` +
+              `poll. ${ctx}`,
+          }));
+        }
+        return out;
+      }
       const why = rule === "floor"
         ? `the tank has been below the ${this.t.floorF} °F floor for ${Math.round(this.floorC.ms / 60_000)} min while the HBX calls and ` +
           `${c.available?.length ? `every available pump (${c.available.join(", ")}) is running` : "no pump is available"} — the heat pumps cannot keep up.`
@@ -392,6 +418,7 @@ export class BackupGate {
     this.reopenBlockedPaged = false;
     this.standDown = null;
     this.failPaged = false;
+    this.genLockoutNoted = false;
   }
 
   private ev(now: number, e: GateEvent): GateEvent {
@@ -402,6 +429,8 @@ export class BackupGate {
   get breakerState(): "open" | "closed" { return this.state; }
   get closedByGate(): boolean { return this.byGate; }
   get pendingAction(): "close" | "open" | null { return this.pending?.kind ?? null; }
+  /** #241: the generator rule refused this would-close episode's close (cleared when the episode ends) */
+  get generatorLockoutEpisode(): boolean { return this.genLockoutNoted; }
 
   status(nowMs: number): Record<string, unknown> {
     const min = (ms: number) => Math.round(ms / 6_000) / 10;
@@ -423,6 +452,7 @@ export class BackupGate {
       retry_at: this.retryAtMs != null && this.retryAtMs > nowMs ? new Date(this.retryAtMs).toISOString() : null,
       stand_down: this.standDown,
       unconfirmed: this.unconfirmed ? { kind: this.unconfirmed.kind, at: new Date(this.unconfirmed.atMs).toISOString() } : null,
+      generator_lockout: this.genLockout,
       override_until: this.overrideUntilMs != null && this.overrideUntilMs > nowMs ? new Date(this.overrideUntilMs).toISOString() : null,
       clocks: {
         failed_not_recovering_min: min(this.failC.ms), floor_min: min(this.floorC.ms), recovered_min: min(this.openC.ms),

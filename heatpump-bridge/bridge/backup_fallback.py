@@ -10,7 +10,11 @@
 # the unit, from 6bb, or its circuit OPEN at the panel — #212's deliberate stop), never a failure; UNKNOWN — stale with no fresh panel read, or no
 # draw reading: a Pi Wi-Fi/LAN drop loses Modbus AND SPAN together, so it must never read as "every pump down" — any
 # UNKNOWN pump resets the episode; UP — anything else.
-# Default SHADOW: audit + EMAIL "would close" once per cooldown (never a phone push) and switch nothing until
+# GENERATOR BUDGET (#241): the Pi cannot tell the grid from the generator (the transfer switch is upstream of the panel
+# and no outage information reaches the Pi), so it always applies the generator rule: no close unless the live house
+# load (every circuit but the element's, from a fresh panel read) + element_w + generator_margin_w ≤ generator_cap_w.
+# Unknown load = no close. A refused episode is re-checked every tick (the load may drop) and noted once.
+# Default SHADOW: audit + record "would close" once per cooldown (never a phone push) and switch nothing until
 # backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
 from __future__ import annotations
@@ -54,6 +58,8 @@ class BackupFallback:
         self._next_ok: float | None = None        # monotonic: no decision before this (cooldown / retry)
         self._decided = False                     # one decision per all-down episode
         self._refusal_paged = False
+        self._budget_noted = False                # one budget-refusal note per all-down episode
+        self.budget: dict | None = None           # the last generator-budget check (status)
         self.down: dict[str, str | None] = {}      # pump -> why it is DOWN (None: not down)
         self.pumps: dict[str, dict] = {}            # pump -> {state: down|off|unknown|up, why}
         self.last: dict | None = None
@@ -90,6 +96,8 @@ class BackupFallback:
             "down": dict(self.down), "pumps": dict(self.pumps), "all_down_min": held,
             "all_down_since": self._since_wall,
             "relay": (self._backup() or {}).get("relay_state"),
+            "generator_cap_w": self.cfg.generator_cap_w, "generator_margin_w": self.cfg.generator_margin_w,
+            "budget": self.budget,
             "last": self.last,
         }
 
@@ -153,6 +161,20 @@ class BackupFallback:
             return "up", f"is offline but its circuit draws {draw:.0f} W (running)"
         return "down", f"is offline and its circuit draws {draw:.0f} W (not running)"
 
+    def budget_check(self) -> dict:
+        """#241: would the element fit on a ~24 kW generator right now? {fits, house_w, projected_w, why}."""
+        snap = self._span()
+        house = snap.get("house_w") if snap else None
+        if not isinstance(house, (int, float)) or isinstance(house, bool):
+            return {"fits": False, "house_w": None, "projected_w": None,
+                    "why": "the live house load is unknown (no fresh panel read)"}
+        projected = house + self.cfg.element_w + self.cfg.generator_margin_w
+        fits = projected <= self.cfg.generator_cap_w
+        return {"fits": fits, "house_w": round(house), "projected_w": round(projected),
+                "why": (f"house {house / 1000:.1f} kW + element {self.cfg.element_w / 1000:.1f} kW + margin "
+                        f"{self.cfg.generator_margin_w / 1000:.1f} kW = {projected / 1000:.1f} kW "
+                        f"{'fits under' if fits else 'exceeds'} the {self.cfg.generator_cap_w / 1000:.1f} kW generator cap")}
+
     # --- the decision -----------------------------------------------------------
     async def tick(self) -> None:
         if not self.cfg.enabled:
@@ -167,6 +189,8 @@ class BackupFallback:
             self._since = self._since_wall = None
             self._decided = False
             self._refusal_paged = False
+            self._budget_noted = False
+            self.budget = None
             return
         now = self._mono()
         if self._since is None:
@@ -176,12 +200,31 @@ class BackupFallback:
             return
         if self._next_ok is not None and now < self._next_ok:
             return
+        backup = self._backup()
+        relay = (backup or {}).get("relay_state")
+        if relay != "CLOSED":
+            self.budget = self.budget_check()
+            if not self.budget["fits"]:
+                if not self._budget_noted:
+                    self._budget_noted = True
+                    why = "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
+                                    for p, d in self.down.items())
+                    await self._decide(
+                        "generator_budget", "high" if self.cfg.live else "info",
+                        f"{'' if self.cfg.live else 'SHADOW — nothing was switched. '}Every heat pump has been down "
+                        f"{held_min:.0f} min ({why}), but the element stays OFF: {self.budget['why']}. The Pi cannot "
+                        "tell the grid from the generator, so it always keeps the generator inside its budget. If the "
+                        f"house is on the grid, switch the '{BACKUP_ELEMENT_CIRCUIT}' breaker ON yourself; on the "
+                        "generator, shed a big load (EV charger, mini-splits). A2W re-checks every 30 s.", relay,
+                        title=("Both heat pumps down — element held OFF (generator budget)" if self.cfg.live
+                               else "Backup fallback (shadow): would close, but the generator budget says no"),
+                        priority="urgent" if self.cfg.live else "default", tier="page" if self.cfg.live else "record")
+                return
         self._decided = True
         self._next_ok = now + self.cfg.cooldown_h * 3600
         why = "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
                         for p, d in self.down.items())
-        backup = self._backup()
-        relay = (backup or {}).get("relay_state")
+        budget = f" ({self.budget['why']})" if self.budget else ""
         if relay == "CLOSED":
             await self._decide("already_available", "info",
                                f"every heat pump down {held_min:.0f} min ({why}); the backup element breaker is "
@@ -191,8 +234,8 @@ class BackupFallback:
             await self._decide("would_close", "high",
                                f"SHADOW — nothing was switched. Every heat pump has been down {held_min:.0f} min "
                                f"({why}). Live, A2W would close the '{BACKUP_ELEMENT_CIRCUIT}' breaker (now "
-                               f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element. This runs on the Pi, "
-                               "with no cloud.", relay,
+                               f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element{budget}. This runs on "
+                               "the Pi, with no cloud.", relay,
                                title="Backup fallback (shadow): WOULD close the element breaker", tier="record")
             return
         if self.breakers is None:
@@ -206,7 +249,7 @@ class BackupFallback:
             res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback")
             ok = bool(res.get("ok"))
             await self._decide("closed" if ok else "close_unverified", "high" if ok else "critical",
-                               f"Every heat pump has been down {held_min:.0f} min ({why}). A2W closed the "
+                               f"Every heat pump has been down {held_min:.0f} min ({why}){budget}. A2W closed the "
                                f"'{BACKUP_ELEMENT_CIRCUIT}' breaker → {res.get('detail')}. The HBX can now fire the "
                                "element on its own backup call.", res.get("relay_state"),
                                title=("A2W closed the backup element breaker (both pumps down)" if ok
@@ -230,7 +273,8 @@ class BackupFallback:
         log.warning("backup fallback %s: %s", code, message)
         try:
             await self.store.add_event(EVENT_PUMP_ID, EVENT_TYPE, code=code, severity=severity, message=message,
-                                       detail={"down": dict(self.down), "relay_state": relay, "live": self.cfg.live})
+                                       detail={"down": dict(self.down), "relay_state": relay, "live": self.cfg.live,
+                                               "budget": self.budget})
         except Exception as exc:  # noqa: BLE001 — an audit failure never blocks the decision
             log.warning("backup fallback audit failed: %s", exc)
         # owner alert policy (alert-policy.md): shadow and already-on are record; A2W switching the element on

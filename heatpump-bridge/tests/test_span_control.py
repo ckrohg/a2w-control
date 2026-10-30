@@ -25,6 +25,9 @@ from bridge.span_local import OpenPermit, SpanClient, SpanLocalPoller
 from bridge.store import Store
 from sim.fake_span import FakeSpan
 
+# #199: every test here runs against the v1 fake AND a v2-only (v1 removed) panel — tests/conftest.py
+pytestmark = pytest.mark.usefixtures("span_transport")
+
 
 class FakeTime:
     """Injected clock + sleep: sleeping advances the clock instantly. `block` holds every
@@ -393,6 +396,7 @@ def late_guard(refuse_from_call: int):
     return guard, calls
 
 
+@pytest.mark.v1_only
 async def test_guard_rechecks_before_an_auth_retry_post(rig, monkeypatch):
     from bridge import span_local
     panel, ctl, ft, *_ = rig
@@ -635,15 +639,18 @@ async def test_recover_cancelled_during_its_first_audit_still_closes(rig, monkey
     gate = asyncio.Event()
     real = store.add_event
 
+    pending = asyncio.Event()
+
     async def slow_add_event(*a, **k):
         if k.get("code") == "cycle_recover":
+            pending.set()
             await gate.wait()
         return await real(*a, **k)
     monkeypatch.setattr(store, "add_event", slow_add_event)
     t0 = ft.t
     await ctl.recover()
     task = ctl._task
-    await asyncio.sleep(0.02)
+    await asyncio.wait_for(pending.wait(), 10)   # not a fixed sleep: cancel when the audit is really pending
     task.cancel()                             # cancelled while the audit is still pending
     await asyncio.sleep(0.02)
     gate.set()
@@ -655,11 +662,13 @@ async def test_recover_cancelled_during_its_first_audit_still_closes(rig, monkey
 async def test_cancel_while_the_open_is_in_flight_holds_from_when_it_lands(rig, monkeypatch):
     panel, ctl, ft, *_ = rig
     gate = asyncio.Event()
+    in_flight = asyncio.Event()
     stamps: list[tuple[str, float]] = []
     real = ctl.client.set_relay
 
     async def slow_set_relay(cid, want="CLOSED", **kw):
         if want == "OPEN":
+            in_flight.set()
             await gate.wait()                 # the OPEN is slow to land...
             ft.t += 30                        # ...30 s late
         out = await real(cid, want, **kw)
@@ -667,10 +676,10 @@ async def test_cancel_while_the_open_is_in_flight_holds_from_when_it_lands(rig, 
         return out
     monkeypatch.setattr(ctl.client, "set_relay", slow_set_relay)
     caller = asyncio.create_task(ctl.execute("Air-Water 2", "power_cycle"))
-    while ctl._task is None:
-        await asyncio.sleep(0.01)
+    # Cancel only once the OPEN is really in flight. A fixed sleep raced the run's first panel read (on v2 that read
+    # also starts the MQTT session); a cancel that lands before the dispatch switches nothing — a different test.
+    await asyncio.wait_for(in_flight.wait(), 10)
     inner = ctl._task
-    await asyncio.sleep(0.02)
     inner.cancel()                            # cancelled while the OPEN is still in flight
     await asyncio.sleep(0.02)
     gate.set()
@@ -816,7 +825,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(rig):
+async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(rig, span_transport):
     panel, ctl, ft, *_ = rig
     frames: list[dict] = []
     conn: dict = {}
@@ -860,6 +869,15 @@ async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(
         ack = await send("c1", circuit="Air-Water 2", op="power_cycle", off_s=60)
         assert ack["ok"] is True and ack["result"]["relay_state"] == "CLOSED"
         assert ack["result"]["verified"] is True and ack["result"]["off_s"] >= 60
+        # #199: the frame says which local API answered (drift-check [10] reads it from the hub)
+        frames.clear()
+        for _ in range(500):
+            if any(f.get("type") == "state" for f in frames):
+                break
+            await asyncio.sleep(0.01)
+        tx = next(f for f in frames if f.get("type") == "state")["span"]["transport"]
+        assert tx["mode"] == ("v1" if span_transport == "v1" else "auto")
+        assert tx["read"] == span_transport and tx["write"] == span_transport
 
         ack = await send("c2", circuit="Buffer Tank", op="open")
         assert ack["ok"] is False and ack["result"]["refused"] is True
@@ -898,6 +916,7 @@ async def test_relay_write_body_matches_the_panels_schema():
         panel.stop()
 
 
+@pytest.mark.v1_only
 def test_fake_refuses_the_flat_body_the_real_panel_refused():
     panel = FakeSpan()
     try:
@@ -915,6 +934,7 @@ def test_fake_refuses_the_flat_body_the_real_panel_refused():
         panel.stop()
 
 
+@pytest.mark.v1_only
 async def test_a_refused_write_carries_the_panels_detail(monkeypatch):
     panel = FakeSpan()
     try:
