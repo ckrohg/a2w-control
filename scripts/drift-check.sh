@@ -75,6 +75,16 @@ phaseb_result_class() {
     *)                                                        echo STALE ;;
   esac
 }
+
+# [11]'s readers (#164). Each prints a service's watch patterns sorted and space-joined, so two sources compare as
+# strings. LC_ALL=C: a locale sort orders "package-lock.json" and "package.json" differently from jq's sort.
+# railway_watch_want <dir>: the DECLARED set -- both spellings on purpose (see .railway/railway.ts).
+railway_watch_want() { printf '%s\n' "$1/**" "src/**" package.json package-lock.json tsconfig.json railway.toml | LC_ALL=C sort | paste -sd' ' -; }
+# iac_watch <file> <service>: the one-line list after `nodeService("<service>"` in .railway/railway.ts
+iac_watch() { grep -A1 "nodeService(\"$2\"" "$1" 2>/dev/null | tail -n +2 | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort | paste -sd' ' -; }
+# toml_watch <file>: the `watchPatterns = [ ... ]` block of a railway.toml
+toml_watch() { sed -n '/^watchPatterns *= *\[/,/^\]/p' "$1" 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort | paste -sd' ' -; }
+
 # scripts/drift-check.test.sh sources the helpers above and stops here.
 [ -n "${DRIFT_CHECK_LIB_ONLY:-}" ] && return 0
 
@@ -351,6 +361,69 @@ else
     absent) skip "the Pi's bridge predates #199 (no span.transport) — cut a release to assert it" ;;
     *)      skip "hub /api/state has no span frame (unreachable, or SPAN not configured on the Pi)" ;;
   esac
+fi
+
+echo
+echo "[11] Railway deploy config — watch patterns, build, start, restart (#164: railway.toml stops being read 2026-12-01)"
+# The watch patterns are the only thing that stops a docs-, knowledge/- or scripts/-only push from redeploying the
+# planner (a writer-lease handover on live heating) and the hub. Until #164 they lived only in planner/ and
+# hub/railway.toml, which Railway stops reading on 2026-12-01, and nothing would go red when that happened.
+# .railway/railway.ts now declares them. It takes effect only through `railway config apply`, so the files can be
+# correct while the services still are not. The second half of this section reads what the newest BUILT
+# deployment of each service actually ran with. That needs a logged-in railway CLI and skips without one,
+# like [2b] without a token.
+IAC="$REPO_ROOT/.railway/railway.ts"
+TOML_CUTOFF=2026-12-01
+RAILWAY_PROJECT="${RAILWAY_PROJECT_ID:-bbd24081-be2f-46df-a892-c3040565585c}"   # a2w-hub (planner + hub + Postgres)
+WANT_REST="NIXPACKS|npm install && npm run build|npm start|ON_FAILURE|10"       # builder|build|start|restart policy|retries
+if [ ! -f "$IAC" ]; then
+  fail ".railway/railway.ts is missing — nothing carries the watch patterns past ${TOML_CUTOFF} (#164)"
+else
+  MISSING=""
+  for needle in 'builder: "NIXPACKS"' 'buildCommand: "npm install && npm run build"' 'startCommand: "npm start"' \
+                'restartPolicyType: "ON_FAILURE"' 'restartPolicyMaxRetries: 10' 'variables: { managed: false }'; do
+    grep -qF -- "$needle" "$IAC" || MISSING="${MISSING:+$MISSING; }$needle"
+  done
+  [ -z "$MISSING" ] && pass ".railway/railway.ts declares nixpacks, build, npm start, ON_FAILURE×10, unmanaged variables" \
+                    || fail ".railway/railway.ts lacks: ${MISSING}"
+fi
+for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+  svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"
+  if [ -f "$IAC" ]; then
+    got="$(iac_watch "$IAC" "$svc")"
+    [ "$got" = "$want" ] && pass "${svc}: railway.ts watch patterns = the declared set (both spellings)" \
+                         || fail "${svc}: railway.ts watch patterns [${got}] ≠ declared [${want}]"
+  fi
+  TOML="$REPO_ROOT/$dir/railway.toml"
+  if [ ! -f "$TOML" ]; then
+    pass "${dir}/railway.toml is gone — deploys read the service settings (the live half below checks they were applied)"
+  elif [[ ! "$TODAY" < "$TOML_CUTOFF" ]]; then
+    fail "${dir}/railway.toml still exists on/after ${TOML_CUTOFF}, when Railway stopped reading it — delete it, and check the live half below (#164)"
+  elif [ "$(toml_watch "$TOML")" = "$want" ]; then
+    pass "${dir}/railway.toml matches (it overrides the service settings at deploy until deleted or ${TOML_CUTOFF})"
+  else
+    fail "${dir}/railway.toml watch patterns [$(toml_watch "$TOML")] ≠ declared [${want}] — the two configs disagree"
+  fi
+done
+if command -v railway >/dev/null 2>&1 && railway whoami >/dev/null 2>&1; then
+  for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+    svc="${pair%%:*}"; want="$(railway_watch_want "${pair##*:}")"
+    # SKIPPED deployments carry no manifest. The newest one that was built shows the config Railway actually used.
+    BUILT="$(railway deployment list -p "$RAILWAY_PROJECT" -e production -s "$svc" --json --limit 30 2>/dev/null \
+             | jq -c '[.[] | select(.meta.serviceManifest != null)][0] // empty' 2>/dev/null)"
+    if [ -z "$BUILT" ]; then skip "${svc}: no built deployment readable from the railway CLI"; continue; fi
+    got="$(jq -r '.meta.serviceManifest.build.watchPatterns // [] | sort | join(" ")' <<<"$BUILT")"
+    rest="$(jq -r '.meta.serviceManifest | "\(.build.builder)|\(.build.buildCommand)|\(.deploy.startCommand)|\(.deploy.restartPolicyType)|\(.deploy.restartPolicyMaxRetries)"' <<<"$BUILT")"
+    from="$(jq -r '.meta.configFile // "service settings"' <<<"$BUILT")"
+    dep="$(jq -r '"\(.id[0:8]) \(.createdAt[0:16])Z"' <<<"$BUILT")"
+    if [ "$got" = "$want" ] && [ "$rest" = "$WANT_REST" ]; then
+      pass "${svc}: newest build ${dep} ran with the declared config (from ${from})"
+    else
+      fail "${svc}: newest build ${dep} ran with watch [${got}], ${rest} (from ${from}) — not the declared config; \`railway config plan\` from the repo root shows what is unapplied (#164)"
+    fi
+  done
+else
+  skip "railway CLI absent or logged out — the config live builds ran with is not asserted (files only)"
 fi
 
 echo

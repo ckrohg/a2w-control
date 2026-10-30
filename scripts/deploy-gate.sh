@@ -68,6 +68,7 @@ dropout_summary() {  # $1 = hub /health json -> "" | "dropouts24h=N longest=Mmin
 classify_files() {  # stdin = newline-separated paths
   local files; files="$(cat)"
   [ -z "${files//[[:space:]]/}" ] && { echo unknown; return 0; }
+  # .railway/ (#164) is inert HERE: Railway reads it only through `railway config apply`, never on a push.
   grep -qE '^(planner|hub)/' <<<"$files" && echo deploying || echo inert
 }
 classify_pr() {  # $1 = PR number; tries two sources before admitting it cannot tell

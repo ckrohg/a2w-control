@@ -80,6 +80,24 @@ nowhere, which is the exact failure class this file was created to prevent.
   > measured — this bullet was transcribed belief, not a reading. The deploy-topology section is
   > the part of this document least anchored to a live probe, which is exactly why it drifted
   > first. **Read `railway.toml`, not this file, for deploy behaviour.**
+
+  > **2026-10-29: moving to `.railway/railway.ts` (#164).** Railway stops reading `railway.toml` on
+  > **2026-12-01**. Measured that day, read-only: every built deployment records
+  > `configFile: /planner/railway.toml` (or `/hub/…`), and the toml OVERRIDES each service's own
+  > settings at deploy time. Those settings underneath are only `watchPatterns ["/planner/**"]`
+  > (or `["/hub/**"]`), builder unset (Railpack), and no build or start command. So if nothing were
+  > done, docs-only pushes would still skip after Dec 1, but the next real deploy would silently
+  > change builder from Nixpacks to Railpack's defaults. Deploy history since #96 matches the
+  > declared patterns on 138 of 139 commit/service pairs. The odd one out: #225 also redeployed the hub.
+  > - `.railway/railway.ts` is ONE file for the whole project, at the repo root. Railway never reads
+  >   it on a push. `railway config apply` writes its values into the service settings, so the toml
+  >   and the settings carry identical values until the toml files are deleted.
+  > - `classify_files()` is unchanged. Merging `.railway/**` is inert, and the APPLY is the step that
+  >   changes the services. `scripts/drift-check.sh` [11] asserts the files, plus, with a logged-in
+  >   railway CLI, the config the newest build actually ran with.
+  > - Done when: the apply has landed, the toml-deletion PR's deploy records no `configFile` and has the
+  >   declared values, and a docs-only commit after that is SKIPPED on both services. Until then the
+  >   toml is still what deploys read.
 - **CI**: skips `knowledge/**`, `.tenet/**`, `**.md`.
 
 ## Env vars present on the planner (names only)
