@@ -45,7 +45,7 @@ import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
-import { OutageFeed, assess, comfortRisk, houseLoadW, parseGenConfig, type GenAssessment } from "./generator";
+import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
@@ -1131,6 +1131,8 @@ let backupGateEpisodes7d: number | null = null;
 const GEN_CFG = parseGenConfig(process.env);
 for (const e of GEN_CFG.errors) console.warn(e);
 const outageFeed = new OutageFeed();
+const zoneAges = new ZoneAges(); // TempIQ zones carry no reading time: an unchanged temperature ages (generator.ts)
+const COMFORT_EXCLUDE = parseComfortExclude(process.env);
 let genAssessment: GenAssessment | null = null;
 let genEvaluatedSinceRestore = false;
 let genOnePumpLogged = false;
@@ -1167,13 +1169,16 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
   backupGateBlind = blind;
   // #241: the generator rule — house load from a fresh Pi panel read, comfort from TempIQ's zones (the demand feed)
   const zonesOk = demandFeed?.isHealthy() ?? false;
+  const zones: ZoneTemp[] | null = zonesOk
+    ? demandFeed!.zones().map((z) => ({ id: z.id, name: z.name, roomF: z.roomF, setpointF: z.setpointF, mode: z.mode ?? null, deliveryType: z.deliveryType }))
+    : null;
+  if (zones) zoneAges.observe(zones, Date.now());
   genAssessment = assess({
     nowMs: Date.now(), supply: outageFeed.supply(Date.now()),
     houseW: blind ? null : houseLoadW(state?.ts ?? null, state?.span ?? null),
     relay: blind ? null : relay,
     pumpsEngaged: pumps ? pumps.filter((p) => p.online && p.state === "heating").length : null,
-    comfort: comfortRisk(zonesOk ? demandFeed!.zones().map((z) => ({ id: z.id, name: z.name, roomF: z.roomF, setpointF: z.setpointF })) : null,
-      demandFeed?.callingZoneIds() ?? null),
+    comfort: comfortRisk(zones, demandFeed?.callingZoneIds() ?? null, { nowMs: Date.now(), ages: zoneAges, exclude: COMFORT_EXCLUDE }),
   }, GEN_CFG.cfg);
   const events = backupGate.step({
     nowMs: Date.now(), tankF: reading.tankF, tankTargetF: reading.tankTargetF, stagesCalled: reading.stagesCalled,
@@ -1235,8 +1240,8 @@ async function checkGenerator(g: GenAssessment, blind: string | null): Promise<v
       `${g.projected_w ?? "?"} W against the ${g.cap_w} W cap.`;
     await genEpisode("shed", g.shed, "Backup element (shadow): breaker is ON on the generator without headroom",
       `SHADOW — nothing was switched. The Buffer Tank breaker is ON, so the HBX can fire the 16.5 kW element at any moment, ` +
-      `but ${why} Live, A2W would switch it OFF until the house load drops. If you can, switch it off at the SPAN panel ` +
-      "or in the 6bb app, or shed another big load (EV charger).");
+      `but ${why} A2W does NOT switch it off — nothing re-opens the breaker on the generator (an owner decision before ` +
+      "going live). If you can, switch it off at the SPAN panel or in the 6bb app, or shed another big load (EV charger).");
     if (g.one_pump !== genOnePumpLogged) {
       genOnePumpLogged = g.one_pump;
       if (g.one_pump) console.warn(`[generator] both pumps running near the cap — would hold to one pump. ${why}`);
@@ -2667,8 +2672,10 @@ async function main(): Promise<void> {
               live_ready: BACKUP_GATE_CFG.mode !== "live" || !!HUB_ARM_TOKEN,
               pi_fallback: backupGateHub.pi_fallback,
               // #241: grid / generator / unknown, the house-load budget, TempIQ comfort and whether the element may close
-              generator: genAssessment ? { ...genAssessment, feed: outageFeed.status(Date.now()), open: [...genOpen], config_errors: GEN_CFG.errors }
-                : { feed: outageFeed.status(Date.now()), open: [...genOpen], config_errors: GEN_CFG.errors },
+              generator: {
+                ...(genAssessment ?? {}), feed: outageFeed.status(Date.now()), open: [...genOpen], config_errors: GEN_CFG.errors,
+                comfort_exclude: COMFORT_EXCLUDE, zone_unchanged_min: zoneAges.status(Date.now()),
+              },
             },
             pi: piLink
               ? { ...withLiveAges(piLink, Date.now()), refresh_error: piLinkError }

@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { BackupGate, type GateEvent, type GatePump } from "./backupgate";
 import { StageWatch, DEFAULT_STAGE_PUMP_MAP } from "./stagewatch";
-import { GEN, OutageFeed, assess, comfortRisk, houseLoadW, parseGenConfig, type Comfort, type ZoneTemp } from "./generator";
+import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type Comfort, type ZoneTemp } from "./generator";
 import { episodeTier } from "./alertpolicy";
 
 const BASE_W = 1_211;  // SPAN power-flows/site, 2026-10-29
@@ -53,22 +53,70 @@ const PUMP_W = 5_100;  // measured p50 heating draw
   assert.equal(f.supply(t + 86 * 60_000).supply, "grid", "30 min after the last outage answer: grid");
 }
 
-// ── 3. comfort: the coldest calling zone decides; unknown is unknown ──────────────────────────────────────────────────
-const Z = (id: string, roomF: number | null, setpointF: number | null, name = id): ZoneTemp => ({ id, name, roomF, setpointF });
+// ── 3. comfort: every OCCUPIED zone counts, the coldest decides; a zone with no / a stale temperature is unknown ──────
+const Z = (id: string, roomF: number | null, setpointF: number | null, name = id, extra: Partial<ZoneTemp> = {}): ZoneTemp =>
+  ({ id, name, roomF, setpointF, ...extra });
 {
-  const zones = [Z("mom", 66.5, 68, "Mom's room"), Z("kit", 67.8, 68, "Kitchen"), Z("base", 57, null, "Upstairs Baseboard")];
+  const T = Date.parse("2026-12-20T12:00:00Z");
+  const mom = Z("mom", 66.5, 68, "Mom's room"), kit = Z("kit", 67.8, 68, "Kitchen");
+  const base = Z("base", 57, null, "Upstairs Baseboard"); // an OFF Nest: no setpoint, deliberately unheated (comfort-only)
   assert.equal(comfortRisk(null, null).at_risk, null);
-  assert.equal(comfortRisk(zones, []).at_risk, false, "nobody calling: not getting cold");
-  const ok = comfortRisk(zones, ["mom", "kit"]);
+  const ok = comfortRisk([mom, kit, base], ["kit"], { nowMs: T });
   assert.equal(ok.at_risk, false, ok.why);
-  assert.equal(ok.coldest?.name, "Mom's room");
-  assert.equal(comfortRisk(zones, ["base"]).at_risk, true, "a calling zone near the floor");
-  assert.match(comfortRisk(zones, ["base"]).why, /within 2 °F of the 60 °F floor/);
-  assert.equal(comfortRisk(zones, null).at_risk, false, "no call feed: zones with a setpoint count, an OFF Nest does not (baseboard)");
-  const behind = comfortRisk([Z("mom", 65.9, 68, "Mom's room"), Z("kit", 67, 68)], ["mom", "kit"]);
+  assert.equal(ok.coldest?.name, "Mom's room", "a satisfied zone that is not calling still counts");
+  // her thermostat set back to 59, satisfied, not calling: the FLOOR still sees her room
+  const setBack = comfortRisk([Z("mom", 59.4, 59, "Mom's room"), kit], [], { nowMs: T });
+  assert.equal(setBack.at_risk, true, "nobody calling, but an occupied room is within 2 °F of the floor");
+  assert.match(setBack.why, /Mom's room is 59.4 °F — within 2 °F of the 60 °F floor/);
+  assert.equal(comfortRisk([mom, Z("mom2", 66, 68, "Den", { mode: "off" })], null, { nowMs: T }).at_risk, false, "a thermostat in OFF is not occupied");
+  assert.equal(comfortRisk([mom, Z("dhw", null, null, "Hot Water", { deliveryType: "dhw" })], null, { nowMs: T }).at_risk, false, "DHW is not a room");
+  assert.equal(comfortRisk([mom, base], null, { nowMs: T }).at_risk, false, "an OFF Nest (no setpoint) is not occupied");
+  assert.equal(comfortRisk([mom, Z("tack", 59, 62.6, "Barn - Tack")], null, { nowMs: T }).at_risk, false, "the barn is excluded by default");
+  assert.equal(comfortRisk([mom, Z("tack", 59, 62.6, "Barn - Tack")], null, { nowMs: T, exclude: [] }).at_risk, true, "… unless the owner says otherwise");
+  assert.deepEqual(parseComfortExclude({}), DEFAULT_COMFORT_EXCLUDE);
+  assert.deepEqual(parseComfortExclude({ COMFORT_EXCLUDE_ZONES: " Barn - Tack , Garage " }), ["Barn - Tack", "Garage"]);
+  // target at risk
+  const behind = comfortRisk([Z("mom", 65.9, 68, "Mom's room"), Z("kit", 67, 68)], ["mom", "kit"], { nowMs: T });
   assert.equal(behind.at_risk, true, "2 °F below its setpoint = target at risk");
   assert.match(behind.why, /Mom's room is 65.9 °F, 2.1 °F below its 68 °F setpoint/);
-  assert.equal(comfortRisk([Z("mom", null, 68)], ["mom"]).at_risk, null, "a calling zone without a temperature is unknown");
+  // a calling zone with no temperature is never dropped: unknown
+  const noTemp = comfortRisk([kit, Z("mom", null, 68, "Mom's room")], ["mom"], { nowMs: T });
+  assert.equal(noTemp.at_risk, null);
+  assert.deepEqual(noTemp.unknown, ["Mom's room no temperature"]);
+  // ... but a KNOWN zone at risk still decides
+  assert.equal(comfortRisk([Z("x", 61, 68), Z("mom", null, 68)], ["mom"], { nowMs: T }).at_risk, true);
+  // staleness: a reading unchanged for 6 h is stale → unknown
+  const ages = new ZoneAges();
+  ages.observe([mom, kit], T);
+  ages.observe([{ ...mom }, { ...kit, roomF: 67.9 }], T + 5 * 3600_000);
+  assert.equal(comfortRisk([mom, { ...kit, roomF: 67.9 }], null, { nowMs: T + 5.9 * 3600_000, ages }).at_risk, false, "5.9 h unchanged: fresh");
+  const st = comfortRisk([mom, { ...kit, roomF: 67.9 }], null, { nowMs: T + 6 * 3600_000, ages });
+  assert.equal(st.at_risk, null, "6 h unchanged: stale → unknown, never ignored");
+  assert.deepEqual(st.unknown, ["Mom's room stale at 66.5 °F"]);
+  ages.observe([{ ...mom, roomF: 66.4 }], T + 7 * 3600_000);
+  assert.equal(ages.stale("mom", T + 7 * 3600_000), false, "a new value resets the age");
+}
+
+// ── 3b. the REAL zone snapshot (zone_floor_snapshots, 2026-10-29 17:37 ET; modes not mirrored, so unknown) ──────────
+{
+  const snap = readFileSync(new URL("../fixtures/zones-20261029.json", import.meta.url), "utf8");
+  const zones = (JSON.parse(snap).zones as Array<{ zoneId: string; name: string; roomF: number | null; setpointF: number | null; deliveryType: string }>)
+    .map((z) => Z(z.zoneId, z.roomF, z.setpointF, z.name, { deliveryType: z.deliveryType }));
+  const c = comfortRisk(zones, [], { nowMs: 0 });
+  // Den / Office reads 59 °F against 70.7: if it is occupied, the house IS cold there — the verdict says so by name
+  assert.equal(c.at_risk, true);
+  assert.equal(c.coldest?.name, "Den / Office");
+  assert.match(c.why, /Den \/ Office is 59 °F — within 2 °F of the 60 °F floor/);
+  // MEASURED (367 hourly snapshots, Oct 15–29): with every occupied zone counting, comfort was "at risk" 100 % of the
+  // time — mini-split rooms sit well under their setpoints. Excluding Den / Office and Xmas Room still leaves Ally's
+  // Bedroom 6.3 °F under 72.5 °F here (84 % at risk over the window). So under the owner's rule the generator check
+  // binds on the BUDGET; comfort rarely says "not cold". Which zones count is the owner's call (COMFORT_EXCLUDE_ZONES).
+  const rest = comfortRisk(zones, [], { nowMs: 0, exclude: [...DEFAULT_COMFORT_EXCLUDE, "Den / Office", "Xmas Room"] });
+  assert.equal(rest.at_risk, true);
+  assert.match(rest.why, /Ally’s Bedroom is 66.2 °F, 6.3 °F below its 72.5 °F setpoint/);
+  // the hydronic zones alone (what the element can heat) are fine at this moment
+  const minis = zones.filter((z) => z.deliveryType === "mini_split").map((z) => z.name);
+  assert.equal(comfortRisk(zones, [], { nowMs: 0, exclude: [...DEFAULT_COMFORT_EXCLUDE, ...minis] }).at_risk, false);
 }
 
 // ── 4. budget + house load ───────────────────────────────────────────────────────────────────────────────────────────

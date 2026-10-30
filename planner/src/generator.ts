@@ -13,10 +13,10 @@
  *     first minutes of an outage (the doc covers what that leaves open).
  *   - BUDGET: house load (every SPAN circuit but the element's, from a fresh Pi panel read) + the element's 16.5 kW +
  *     MARGIN must stay ≤ CAP. Unknown load = does not fit.
- *   - COMFORT from TempIQ (the planner's demand feed): the zones with a heating call — every zone with a setpoint when
- *     the call feed is unavailable — and the coldest drives it. At risk = within FLOOR_BUFFER of the 60 °F floor, or
- *     TARGET_DEFICIT below its own setpoint. Unknown comfort counts AS at risk (the budget still binds): the gate only
- *     gets here because the heat pumps already cannot hold the tank, and a TempIQ outage must not leave her cold.
+ *   - COMFORT from TempIQ (the planner's demand feed): every OCCUPIED zone (comfortRisk), the coldest driving it. At
+ *     risk = within FLOOR_BUFFER of the 60 °F floor, or TARGET_DEFICIT below its own setpoint. A zone with no or a stale
+ *     temperature makes it unknown, and unknown comfort counts AS at risk (the budget still binds): the gate only gets
+ *     here because the heat pumps already cannot hold the tank, and a TempIQ outage must not leave her cold.
  * Two advisories ride along (log, /health, dashboard; never acted on): `shed` — the element breaker is ON while on the
  * generator without headroom (the HBX could fire it any moment); `one_pump` — both pumps run and the house is near the
  * cap.
@@ -97,35 +97,93 @@ export class OutageFeed {
   }
 }
 
-export interface ZoneTemp { id: string; name: string; roomF: number | null; setpointF: number | null }
+export interface ZoneTemp {
+  id: string;
+  name: string;
+  roomF: number | null;
+  setpointF: number | null;
+  /** TempIQ's thermostat mode; "off" = not occupied. null/absent = unknown (counts as occupied) */
+  mode?: string | null;
+  deliveryType?: string;
+}
 export interface Comfort {
   at_risk: boolean | null;
   coldest: { name: string; room_f: number; setpoint_f: number | null } | null;
   why: string;
+  /** occupied zones whose temperature is missing or stale (they make an otherwise-fine verdict unknown) */
+  unknown?: string[];
 }
 
-/** The coldest comfort zone decides. callingIds null = the call feed is unavailable: every zone with a setpoint counts
- *  (the same all-zones posture as demand.ts computeFloors); [] = nobody is calling. */
-export function comfortRisk(zones: ZoneTemp[] | null, callingIds: string[] | null): Comfort {
-  if (!zones) return { at_risk: null, coldest: null, why: "TempIQ zone temperatures unavailable" };
-  if (callingIds && callingIds.length === 0) return { at_risk: false, coldest: null, why: "no zone is calling for heat" };
-  const pool = (callingIds ? zones.filter((z) => callingIds.includes(z.id)) : zones.filter((z) => z.setpointF != null))
-    .filter((z): z is ZoneTemp & { roomF: number } => z.roomF != null);
-  if (!pool.length) return { at_risk: null, coldest: null, why: "no temperature for the zones calling for heat" };
-  const coldest = pool.reduce((a, b) => (b.roomF < a.roomF ? b : a));
-  const c = { name: coldest.name, room_f: coldest.roomF, setpoint_f: coldest.setpointF };
-  const r1 = (v: number) => Math.round(v * 10) / 10;
-  if (coldest.roomF < GEN.FLOOR_F + GEN.FLOOR_BUFFER_F) {
-    return { at_risk: true, coldest: c, why: `${coldest.name} is ${r1(coldest.roomF)} °F — within ${GEN.FLOOR_BUFFER_F} °F of the ${GEN.FLOOR_F} °F floor` };
+/**
+ * Zones TempIQ reports that are not the house. Measured (zone_floor_snapshots, 14 days to 2026-10-29): "Barn - Tack"
+ * read exactly 59 °F in 344 of 344 samples (a stuck sensor), and "Barn Basement" is held at 55.4 °F on purpose. Either
+ * would put the 60 °F floor permanently "at risk". COMFORT_EXCLUDE_ZONES (comma-separated names) replaces this list.
+ */
+export const DEFAULT_COMFORT_EXCLUDE = ["Barn - Tack", "Barn Basement"];
+export function parseComfortExclude(env: Record<string, string | undefined>): string[] {
+  const v = env.COMFORT_EXCLUDE_ZONES;
+  return v == null ? DEFAULT_COMFORT_EXCLUDE : v.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * TempIQ's zone payload carries no per-zone reading time, so staleness is inferred: a room temperature that has not
+ * changed for STALE_MS is treated as stale (a sensor or integration that stopped reporting keeps serving its last
+ * value — "Barn - Tack" above). A real occupied room moves by a step in hours, and certainly once the heat is failing.
+ */
+export class ZoneAges {
+  static readonly STALE_MS = 6 * 3600_000;
+  private seen = new Map<string, { roomF: number | null; sinceMs: number }>();
+  observe(zones: ZoneTemp[], nowMs: number): void {
+    for (const z of zones) {
+      const prev = this.seen.get(z.id);
+      if (!prev || prev.roomF !== z.roomF) this.seen.set(z.id, { roomF: z.roomF, sinceMs: nowMs });
+    }
   }
-  const behind = pool.filter((z) => z.setpointF != null && z.roomF <= z.setpointF - GEN.TARGET_DEFICIT_F)
+  stale(id: string, nowMs: number): boolean {
+    const s = this.seen.get(id);
+    return s != null && nowMs - s.sinceMs >= ZoneAges.STALE_MS;
+  }
+  status(nowMs: number): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [id, s] of this.seen) out[id] = Math.round((nowMs - s.sinceMs) / 60_000);
+    return out;
+  }
+}
+
+/**
+ * Owner (2026-10-29): ALL OCCUPIED ZONES count, and the coldest drives the decision. Occupied = a zone with a heating
+ * call, or with a setpoint whose thermostat is not OFF (an OFF Nest — the baseboard and dining comfort-only zones — has no
+ * setpoint and is not occupied). DHW and the excluded zones never count. Every occupied zone is checked against the
+ * floor (< FLOOR_F + FLOOR_BUFFER_F) and its own target (≤ setpoint − TARGET_DEFICIT_F), set back or satisfied or not.
+ * Verdict: at risk if ANY occupied zone with a fresh temperature is; otherwise UNKNOWN if any occupied zone has no
+ * temperature or a stale one (never silently dropped); otherwise not at risk.
+ */
+export function comfortRisk(zones: ZoneTemp[] | null, callingIds: string[] | null,
+  opts: { nowMs?: number; ages?: ZoneAges; exclude?: string[] } = {}): Comfort {
+  if (!zones) return { at_risk: null, coldest: null, why: "TempIQ zone temperatures unavailable" };
+  const exclude = new Set((opts.exclude ?? DEFAULT_COMFORT_EXCLUDE).map((n) => n.trim().toLowerCase()));
+  const occupied = zones.filter((z) => z.deliveryType !== "dhw" && !exclude.has(z.name.trim().toLowerCase())
+    && ((callingIds?.includes(z.id) ?? false) || (z.setpointF != null && !/^off$/i.test(z.mode ?? ""))));
+  if (!occupied.length) return { at_risk: null, coldest: null, why: "no occupied zone reported" };
+  const now = opts.nowMs ?? Date.now();
+  const unknown = occupied.filter((z) => z.roomF == null || (opts.ages?.stale(z.id, now) ?? false));
+  const known = occupied.filter((z): z is ZoneTemp & { roomF: number } => !unknown.includes(z) && z.roomF != null);
+  const r1 = (v: number) => Math.round(v * 10) / 10;
+  const unk = unknown.map((z) => `${z.name} ${z.roomF == null ? "no temperature" : `stale at ${r1(z.roomF)} °F`}`);
+  const coldestZ = known.length ? known.reduce((a, b) => (b.roomF < a.roomF ? b : a)) : null;
+  const c = coldestZ ? { name: coldestZ.name, room_f: coldestZ.roomF, setpoint_f: coldestZ.setpointF } : null;
+  if (coldestZ && coldestZ.roomF < GEN.FLOOR_F + GEN.FLOOR_BUFFER_F) {
+    return { at_risk: true, coldest: c, unknown: unk, why: `${coldestZ.name} is ${r1(coldestZ.roomF)} °F — within ${GEN.FLOOR_BUFFER_F} °F of the ${GEN.FLOOR_F} °F floor` };
+  }
+  const behind = known.filter((z) => z.setpointF != null && z.roomF <= z.setpointF - GEN.TARGET_DEFICIT_F)
     .sort((a, b) => (a.roomF - a.setpointF!) - (b.roomF - b.setpointF!));
   if (behind.length) {
     const z = behind[0];
-    return { at_risk: true, coldest: c, why: `${z.name} is ${r1(z.roomF)} °F, ${r1(z.setpointF! - z.roomF)} °F below its ${r1(z.setpointF!)} °F setpoint` };
+    return { at_risk: true, coldest: c, unknown: unk, why: `${z.name} is ${r1(z.roomF)} °F, ${r1(z.setpointF! - z.roomF)} °F below its ${r1(z.setpointF!)} °F setpoint` };
   }
-  return { at_risk: false, coldest: c, why: `the coldest calling zone, ${coldest.name}, is ${r1(coldest.roomF)} °F` +
-    (coldest.setpointF != null ? ` (setpoint ${r1(coldest.setpointF)} °F)` : "") };
+  if (unk.length) return { at_risk: null, coldest: c, unknown: unk, why: `no temperature to trust for ${unk.join(", ")}` };
+  return { at_risk: false, coldest: c, unknown: unk, why: `the coldest occupied zone, ${coldestZ!.name}, is ${r1(coldestZ!.roomF)} °F` +
+    (coldestZ!.setpointF != null ? ` (setpoint ${r1(coldestZ!.setpointF)} °F)` : "") };
 }
 
 export interface GenInput {

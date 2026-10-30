@@ -47,7 +47,7 @@ export async function BackupGateCard() {
         <div className="meta" style={v.generator.supply !== "grid" ? { color: "var(--warm)" } : undefined}>
           ⚡ {generatorLine(v.generator)}
           {v.generator.lockout ? ` Would close now, but: ${v.generator.lockout}.` : ""}
-          {v.generator.shed ? " The breaker is ON without headroom: live, A2W would switch it OFF." : ""}
+          {v.generator.shed ? " The breaker is ON without headroom — A2W does not switch it off; shed a load or switch it off by hand." : ""}
           {v.generator.onePump ? " Both pumps run near the cap: would hold to one pump." : ""}
         </div>
       ) : null}

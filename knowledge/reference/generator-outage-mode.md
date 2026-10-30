@@ -77,12 +77,28 @@ is treated as the generator.
 - **On the generator or unknown, the gate may close the element only if both hold:**
   - **budget:** house load (every SPAN circuit except the element's, from a fresh Pi panel read) + 16.5 kW + margin ≤
     cap. An unknown load fails.
-  - **comfort:** the house is getting cold:
-    - which zones: the TempIQ zones with a heating call; when the call feed is down, every zone with a setpoint (an OFF
-      Nest does not count);
-    - at risk when the coldest is < 62 °F (2 °F above the floor), or any of them is ≥ 2 °F below its own setpoint.
+  - **comfort:** the house is getting cold, judged over **every occupied zone** (owner: "all occupied zones"):
+    - **occupied:** a zone with a heating call, or with a setpoint whose thermostat mode is not OFF. A thermostat set
+      back or satisfied still counts.
+    - **never counted:**
+      - an OFF Nest (no setpoint: the baseboard and dining comfort-only zones);
+      - DHW;
+      - `COMFORT_EXCLUDE_ZONES`. The default is the barn: "Barn - Tack" read exactly 59 °F in 344 of 344 samples (a
+        stuck sensor), and "Barn Basement" is held at 55.4 °F.
+    - **at risk** when any occupied zone is < 62 °F (2 °F above the floor), or ≥ 2 °F below its own setpoint.
+    - **unknown** when an occupied zone has no temperature, or a stale one. TempIQ's payload has no per-zone reading
+      time, so a reading unchanged for 6 h counts as stale. Such a zone is never silently dropped.
 
-  **Unknown comfort counts as at risk** (TempIQ down must not leave her cold; the budget still binds). The gate's own
+  **Unknown comfort counts as at risk** (TempIQ down must not leave her cold; the budget still binds).
+
+  **Measured, Oct 15–29 (367 hourly zone snapshots): under this rule the house is "getting cold" 100 % of the time.**
+  - Den / Office and Xmas Room are mini-splits that sit at a median 57 °F and 56 °F against 70.7 °F setpoints.
+  - Excluding them too still leaves 84 % at risk, 15 % unknown and 1 % not at risk: mini-split bedrooms sit under their
+    setpoints.
+  - The hydronic zones alone (the only rooms the element can heat) give 9 % at risk, 8 % unknown and 83 % not at risk.
+
+  So on the generator the **budget is the check that actually binds**, and "last resort" rests on it. Whether the
+  mini-split rooms belong in the comfort set is the owner's call: set `COMFORT_EXCLUDE_ZONES`. The gate's own
   rules (a pump failed and the tank is not recovering, or every pump runs and the tank stays under 100 °F) still decide
   whether it wants the element at all. The generator rule only refuses.
 - **Advisories (/health, dashboard, log; never acted on):**
@@ -124,6 +140,27 @@ DHW resilience, explicitly **not** a space-heat bridge (#114). On the generator 
 pre-charge is headroom, not survival. Pre-heating the house itself (raising zone setpoints before onset) is TempIQ's
 domain and is not built.
 
+## Pre-live gaps (owner decision before going live; not built)
+
+- **Nothing re-checks the budget once the breaker is ON.**
+  - A breaker closed on the grid (by the gate, the Pi or a person) stays ON when the generator takes over.
+  - The planner only *reports* it (`shed`, one email).
+  - Nothing re-opens it, and the Pi can only close.
+  - Automatic shedding needs an OPEN on the generator: either `BACKUP_GATE_REOPEN=1` plus `span.backup_reopen` with a
+    generator trigger, or 6bb's shedding.
+- **A stale outage feed blocks the element on the grid too.**
+  - Unknown supply is treated as the generator. In normal winter use the floor rule fires only while every available
+    pump runs: at least 5.1 kW of house, so the budget fails.
+  - So if 6bb's feed is silent for more than 15 min, the backup gate cannot close the element even on the grid.
+  - How often that happens is **not knowable from A2W's data**: the planner never persisted feed answers, and this feed
+    went live on 2026-10-29.
+  - The precedent is bad: the previous feed (OutageWatch) was dead from 2026-03-15 to 2026-10-29 unnoticed, which
+    under this rule would have meant the whole season.
+  - drift-check [5] now asserts the feed daily (#242).
+  - Options: trust the last "no outage" answer for hours instead of 15 min, or treat unknown as the grid unless an
+    outage was seen recently.
+- **The feed's latency at outage start has never been measured** (see Detection).
+
 ## Residual risks (owner should know)
 
 1. **The email-lag window.** In the first minutes of an outage, before National Grid's email arrives, the planner
@@ -146,8 +183,10 @@ domain and is not built.
 - **Decide the defaults:**
   - the cap: 24 kW, or the generator's real continuous rating;
   - the 2.4 kW margin;
-  - unknown supply → generator;
-  - unknown comfort → at risk.
+  - unknown supply → generator, given the stale-feed gap above;
+  - unknown comfort → at risk;
+  - which zones count for comfort (`COMFORT_EXCLUDE_ZONES`; the mini-split rooms?);
+  - the pre-live gaps above.
 - **Install the ATS aux contact** into a Pi GPIO. That would replace the email feed as the supply input.
 - **Do a transfer test:** throw the utility main for 15 min while the Pi logs SPAN v2 voltage/site power and the pumps'
   AC voltage every 5 s. That measures what the panel actually sees on the generator.
