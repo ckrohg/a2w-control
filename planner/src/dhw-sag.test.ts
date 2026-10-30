@@ -3,7 +3,7 @@
  * Run with: npx tsx planner/src/dhw-sag.test.ts
  */
 import assert from "node:assert/strict";
-import { measureWindowSags, peakWindows, SAG_HORIZON_MIN } from "./dhw";
+import { measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, SAG_HORIZON_MIN } from "./dhw";
 
 // Five days of 5-min samples at 120 °F. Each evening at 18:10 local a shower: three consecutive 2.5 °F
 // drops (one draw, merged), trough 112.5, recovering 1 °F per sample after 30 min. Mornings: one 2 °F
@@ -28,6 +28,7 @@ const [morning, evening] = sags;
 assert.equal(evening.windowStart, 17);
 assert.equal(evening.n, 5, "one merged draw per evening, five evenings");
 assert.equal(evening.sagP75F, 7.5, "pre 120 − trough 112.5");
+assert.equal(evening.sagP90F, 7.5, "p90 of five equal sags");
 assert.equal(evening.sagMedianF, 7.5);
 assert.equal(evening.preDrawMedianF, 120);
 assert.equal(evening.troughMedianF, 112.5);
@@ -35,7 +36,7 @@ assert.equal(morning.n, 2, "two single-sample morning blips");
 assert.equal(morning.sagP75F, 2, "a 2 °F blip is a 2 °F sag — below the 3 °F boost floor");
 // a window with no draws reports zeros, not NaN
 const none = measureWindowSags(rows, [[11, 13]]);
-assert.deepEqual(none[0], { windowStart: 11, windowEnd: 13, n: 0, sagP75F: 0, sagMedianF: 0, preDrawMedianF: 0, troughMedianF: 0 });
+assert.deepEqual(none[0], { windowStart: 11, windowEnd: 13, n: 0, sagP75F: 0, sagP90F: 0, sagMedianF: 0, preDrawMedianF: 0, troughMedianF: 0 });
 // the trough is looked for within SAG_HORIZON_MIN only: a slow, unrelated sag 70+ min later (below
 // DROP_F per sample, so not a draw of its own) does not deepen this draw's trough
 const late = rows.map((r) => ({ ...r }));
@@ -53,4 +54,37 @@ const scores = Array.from({ length: 24 }, (_, h) => (h >= 17 && h <= 19 ? 0.8 : 
 assert.deepEqual(peakWindows(scores), [[7, 8], [17, 20]], "two peaks, no padding, 20:00 at 0.4 is not a peak");
 assert.deepEqual(peakWindows(scores, 0.3), [[0, 24]], "at the floor threshold everything merges — the reason peaks exist");
 assert.deepEqual(peakWindows(Array(24).fill(0)), []);
+// p90 sits above p75 when one window's draws vary: ten evenings, sags 4..13 °F → p75 = 11, p90 = 12 (nearest rank).
+{
+  const varied: { ts: Date; tankF: number }[] = [];
+  for (let day = 0; day < 10; day++) {
+    const sag = 4 + day;
+    for (let m = 0; m < 24 * 60; m += 5) {
+      const ts = new Date(2026, 9, 1 + day, 0, m, 0);
+      const h = ts.getHours(), mm = ts.getMinutes();
+      let tankF = 120;
+      if (h === 18 && mm === 15) tankF = 120 - sag;            // one sharp sample: a draw of `sag` °F
+      else if (h === 18 && mm > 15 && mm <= 40) tankF = 120 - sag; // trough holds
+      varied.push({ ts, tankF });
+    }
+  }
+  const [v] = measureWindowSags(varied, [[17, 22]]);
+  assert.equal(v.n, 10);
+  assert.equal(v.sagP75F, 11);
+  assert.equal(v.sagP90F, 12, "the boost is sized from the worse mornings, not the typical one");
+}
+// DHW_SHOWER_WINDOWS (owner 2026-10-30): start rounds down, end rounds up, junk is skipped.
+{
+  const warn = console.warn; const warned: string[] = []; console.warn = (m: string) => { warned.push(m); };
+  assert.deepEqual(parseShowerWindows("06:30-10:00"), [[6, 10]]);
+  assert.deepEqual(parseShowerWindows(" 06:30 - 10:00 , 19:15-20:45 "), [[6, 10], [19, 21]]);
+  assert.deepEqual(parseShowerWindows("10:00-06:30,7-9,25:00-26:00,06:61-08:00,05:00-24:00"), [[5, 24]], "inverted, malformed, past 24:00 and bad minutes are skipped");
+  assert.equal(warned.length, 4, "each skipped entry warns once");
+  assert.deepEqual(parseShowerWindows(undefined), []); assert.deepEqual(parseShowerWindows("  "), []);
+  console.warn = warn;
+  assert.deepEqual(mergeWindows([[8, 10], [15, 16]], [[6, 10]]), [[6, 10], [15, 16]], "the declared morning window extends the learned peak");
+  assert.deepEqual(mergeWindows([[6, 8]], [[8, 9]]), [[6, 9]], "abutting ranges join");
+  assert.deepEqual(mergeWindows([[8, 10]], [[19, 21]]), [[8, 10], [19, 21]], "a separate declared window stays separate");
+  assert.deepEqual(mergeWindows([], []), []);
+}
 console.log("dhw-sag.test.ts: all assertions passed");
