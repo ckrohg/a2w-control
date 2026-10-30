@@ -3,7 +3,7 @@
 // Buffer Tank breaker beside it. Server component; reads the planner's /health.backup_gate. In SHADOW the gate's state
 // is virtual (nothing is switched), and the card says so in words, so it is never mistaken for the panel.
 import { fetchPlannerBackupGate } from "@/lib/planner-health";
-import { backupGateView, gateChip, relayLine } from "@/lib/backup-gate";
+import { backupGateView, gateChip, generatorLine, relayLine } from "@/lib/backup-gate";
 import { fmtDateTime } from "@/lib/tz";
 
 const f1 = (v: number | null) => (v == null ? "—" : v.toFixed(1));
@@ -43,6 +43,14 @@ export async function BackupGateCard() {
       {v.clocks.filter((k) => k.min > 0).map((k) => (
         <div className="meta" key={k.label} style={{ color: "var(--warm)" }}>⏱ {k.label}: {Math.round(k.min)} of {k.of} min</div>
       ))}
+      {v.generator ? (
+        <div className="meta" style={v.generator.supply !== "grid" ? { color: "var(--warm)" } : undefined}>
+          ⚡ {generatorLine(v.generator)}
+          {v.generator.lockout ? ` Would close now, but: ${v.generator.lockout}.` : ""}
+          {v.generator.shed ? " The breaker is ON without headroom: live, A2W would switch it OFF." : ""}
+          {v.generator.onePump ? " Both pumps run near the cap: would hold to one pump." : ""}
+        </div>
+      ) : null}
       {v.lastEvent ? <div className="meta">Last: {v.lastEvent.title} ({fmtDateTime(new Date(v.lastEvent.at))})</div> : null}
       {v.overrideUntil ? <div className="meta">Standing down after a manual switch-off until {fmtDateTime(new Date(v.overrideUntil))}.</div> : null}
       {v.piFallback ? (

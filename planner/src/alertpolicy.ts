@@ -108,6 +108,9 @@ export class PageBudget {
 export function episodeTier(kind: string): Tier {
   if (kind.startsWith("pump_")) return "attention";       // promoted pump-health checks: a real equipment trend
   if (kind === "backup_gate") return "attention";          // A2W closed the element breaker itself: worth knowing, not acting
+  // #241 shadow, on the generator: the element was wanted but held off (lockout), or is ON without headroom (shed). The
+  // owner can act — shed a load, flip the breaker — so one email per episode
+  if (kind === "generator_shadow") return "attention";
   // #212: a pump a person switched off is still off hours later while the HBX calls for it — the one reminder per stop
   // (a forgotten switch-off in January): someone has to switch it back on
   if (kind === "stopped_reminder") return "page";

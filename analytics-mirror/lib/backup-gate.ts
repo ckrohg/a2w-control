@@ -28,6 +28,22 @@ export interface BackupGateView {
   episodes7d: number | null;
   overrideUntil: string | null;
   piFallback: { mode: string; allDownMin: number | null; holdMin: number | null; down: string[]; last: string | null } | null;
+  /** #241: grid / generator / unknown and whether the element may close (planner generator.ts) */
+  generator: GeneratorView | null;
+}
+
+export interface GeneratorView {
+  supply: "grid" | "generator" | "unknown";
+  supplyWhy: string;
+  houseW: number | null;
+  projectedW: number | null;
+  capW: number | null;
+  allowed: boolean | null;
+  why: string;
+  coldest: string | null;
+  lockout: string | null;
+  shed: boolean;
+  onePump: boolean;
 }
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -42,7 +58,7 @@ export function backupGateView(raw: unknown): BackupGateView {
     blind: null, error: null, clocks: [], rules: { failedNotRecovering: null, floor: null, recovered: null },
     conditions: { tankF: null, targetF: null, riseF: null, called: null, failed: [] }, floorF: null, floorHoldMin: null,
     deficitF: null, failHoldMin: null,
-    lastEvent: null, episodes7d: null, overrideUntil: null, piFallback: null,
+    lastEvent: null, episodes7d: null, overrideUntil: null, piFallback: null, generator: null,
   };
   if (!g) return empty;
   const t = obj(g.thresholds) ?? {};
@@ -86,13 +102,43 @@ export function backupGateView(raw: unknown): BackupGateView {
       down: Object.entries(pfDown).filter(([, v]) => typeof v === "string").map(([k, v]) => `${k} ${v}`),
       last: pfLast ? `${str(pfLast.outcome) ?? "?"}` : null,
     } : null,
+    generator: generatorView(obj(g.generator), str(g.generator_lockout)),
   };
+}
+
+function generatorView(gen: Record<string, unknown> | null, lockout: string | null): GeneratorView | null {
+  if (!gen || (gen.supply !== "grid" && gen.supply !== "generator" && gen.supply !== "unknown")) return null;
+  const c = obj(obj(gen.comfort)?.coldest);
+  const room = num(c?.room_f);
+  return {
+    supply: gen.supply,
+    supplyWhy: str(gen.supply_why) ?? "",
+    houseW: num(gen.house_w),
+    projectedW: num(gen.projected_w),
+    capW: num(gen.cap_w),
+    allowed: bool(gen.element_allowed),
+    why: str(gen.element_why) ?? "",
+    coldest: c && room != null ? `${str(c.name) ?? "?"} ${room.toFixed(1)}°` : null,
+    lockout,
+    shed: gen.shed === true,
+    onePump: gen.one_pump === true,
+  };
+}
+
+/** The generator line: where the power comes from, the budget, and what it means for the element. */
+export function generatorLine(g: GeneratorView): string {
+  const kw = (w: number | null) => (w == null ? "?" : (w / 1000).toFixed(1));
+  const src = g.supply === "grid" ? "Grid" : g.supply === "generator" ? "ON GENERATOR" : "Supply unknown (treated as generator)";
+  if (g.supply === "grid") return `${src} — no generator limit.`;
+  return `${src}: house ${kw(g.houseW)} kW, with the element ${kw(g.projectedW)} of ${kw(g.capW)} kW. ` +
+    `${g.allowed ? "Element allowed if needed" : "Element locked out"}${g.coldest ? ` · coldest ${g.coldest}` : ""}.`;
 }
 
 /** The card's chip: the gate's mode and, when it has acted (or would have), that first. */
 export function gateChip(v: BackupGateView): { cls: string; text: string } {
   if (!v.available) return { cls: "offline", text: "unavailable" };
   if (v.mode === "off") return { cls: "off", text: "off" };
+  if (v.generator?.lockout) return { cls: "warn", text: "held OFF (generator)" };
   if (v.gateState === "closed") return { cls: "warn", text: v.virtual ? "would be ON (shadow)" : "element available" };
   if (v.blind) return { cls: "offline", text: "not judged" };
   if (v.clocks.some((c) => c.min > 0 && c.label !== "recovered")) return { cls: "warn", text: "watching" };
