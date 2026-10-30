@@ -373,8 +373,20 @@ async def test_fallback_status_rides_the_hub_state_frame(rig):
 def test_house_load_sums_every_circuit_but_the_element():
     from bridge.span_local import house_load_w
     circuits = {"a": {"name": "Air-Water 1", "instantPowerW": -5100.0}, "b": {"name": "Buffer Tank", "instantPowerW": -16400.0},
-                "c": {"name": "Kitchen", "instantPowerW": -50.0}, "d": {"name": "EV Charger", "instantPowerW": None}}
-    assert house_load_w(circuits) == 5150.0, "abs of every circuit, the element's excluded, an unknown one skipped"
+                "c": {"name": "Kitchen", "instantPowerW": -50.0}, "d": {"name": "EV Charger", "instantPowerW": -7200.0}}
+    assert house_load_w(circuits) == 12350.0, "abs of every circuit, the element's own excluded"
+    # one circuit without a reading (a v2 session still filling in after a reconnect) makes the TOTAL unknown: summing
+    # the rest would read the 7.2 kW EV charger as 0 W and let the element "fit"
+    circuits["d"]["instantPowerW"] = None
+    assert house_load_w(circuits) is None
+    circuits["d"].pop("instantPowerW")
+    assert house_load_w(circuits) is None
+    circuits["d"]["instantPowerW"] = True
+    assert house_load_w(circuits) is None, "a bool is not a power"
+    # ... but the ELEMENT's own missing reading does not matter: the budget adds it at its full rating
+    circuits["d"]["instantPowerW"] = -7200.0
+    circuits["b"]["instantPowerW"] = None
+    assert house_load_w(circuits) == 12350.0
     assert house_load_w({"b": {"name": "Buffer Tank", "instantPowerW": 0.0}}) is None
     assert house_load_w({}) is None
 
@@ -424,6 +436,19 @@ async def test_fallback_shadow_budget_refusal_is_record_only(rig):
     assert any(a[0] == "log" and "generator budget says no" in a[1] for a in rig.alerts)
     assert not any(a[0] in ("email", "push") for a in rig.alerts), "shadow stays record (alert-policy.md)"
     assert rig.panel.writes == []
+
+
+async def test_fallback_one_unknown_circuit_never_closes(rig):
+    # the EV charger draws 7.2 kW but its reading is missing: the house must not read as 66 W
+    rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
+                                        "instantPowerW": None}
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(60):
+        await rig.step(fb)
+    assert rig.panel.writes == []
+    assert rig.ctl.snapshot()["house_w"] is None
+    assert fb.status()["budget"]["fits"] is False and fb.status()["budget"]["house_w"] is None
 
 
 async def test_fallback_unknown_house_load_never_closes(rig):

@@ -318,13 +318,21 @@ def extract_relay(circuits: dict, name: str) -> dict | None:
 def house_load_w(circuits: dict) -> float | None:
     """#241: the whole-house draw from one /circuits read — every circuit's |instantPowerW| (consumption is negative on
     this panel; abs also counts any producing circuit as load, the safe side) EXCEPT the backup element's own, which the
-    generator budget adds at its full rating. None when no circuit reported a power. Loads not on a SPAN circuit (none
-    known) are what generator_margin_w is for."""
+    generator budget adds at its full rating. None (= unknown, the element stays locked out) when ANY other circuit has
+    no power reading: summing the rest would read a 7 kW EV charger whose value is missing (a v2 session still filling
+    in after a reconnect, #239) as 0 W. Loads not on a SPAN circuit (none known) are what generator_margin_w is for."""
     from .config import BACKUP_ELEMENT_CIRCUIT
-    vals = [abs(float(c["instantPowerW"])) for c in circuits.values()
-            if (c.get("name") or "").strip() != BACKUP_ELEMENT_CIRCUIT
-            and isinstance(c.get("instantPowerW"), (int, float)) and not isinstance(c.get("instantPowerW"), bool)]
-    return round(sum(vals), 1) if vals else None
+    total = 0.0
+    seen = 0
+    for c in circuits.values():
+        if (c.get("name") or "").strip() == BACKUP_ELEMENT_CIRCUIT:
+            continue
+        v = c.get("instantPowerW")
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        total += abs(float(v))
+        seen += 1
+    return round(total, 1) if seen else None
 
 
 # --- arm intent: owner-set, persisted on the bridge (default DISARMED) --------
