@@ -126,8 +126,24 @@ def test_v2_only_panel_down_is_an_error_not_a_v1_answer(make):
         c._fetch_locked()
 
 
+def test_the_release_default_is_v1_and_touches_no_v2(make, tmp_path):
+    """Owner rollout 2026-10-29: the release ships pinned to v1 (no behaviour change); v2 is a later config flip."""
+    assert SpanConfig().transport == "v1" and SpanConfig().v2_soak is False
+    panel = FakeSpan(v1=True, v2=True)
+    addr = panel.start()
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw"), None, token_path=str(tmp_path / "tok"))
+    try:
+        poller.client._fetch_locked()
+        poller.client._set_relay_sync(cid(poller.client, "Kitchen"), "CLOSED")
+        st = poller.client.transport_status()
+        assert st["mode"] == "v1" and st["read"] == st["write"] == "v1" and st["v2"] is None and st["soak"] is None
+        assert panel.v2_registrations == [] and panel.ebus.connects == [] and panel.ebus.sets == []
+    finally:
+        poller.client.close()
+        panel.stop()
+
+
 def test_transport_config_is_validated():
-    assert SpanConfig().transport == "auto"
     with pytest.raises(ValueError):
         SpanConfig(transport="mqtt")
     with pytest.raises(ValueError):
@@ -283,7 +299,7 @@ def test_credentials_persist_privately_and_are_reused(make, tmp_path):
     assert creds.exists() and (creds.stat().st_mode & 0o777) == 0o600
     assert panel.v2_registrations[0]["hopPassphrase"] == "pw"
     c.close()
-    c2 = SpanClient(c.host, "pw", state_dir=str(sd))
+    c2 = SpanClient(c.host, "pw", state_dir=str(sd), transport="auto")
     try:
         c2._fetch_locked()
         assert len(panel.v2_registrations) == 1           # the restart reused the stored registration
@@ -343,7 +359,7 @@ async def test_poller_logs_power_and_reports_the_transport(tmp_path):
     addr = panel.start()
     store = Store(str(tmp_path / "b.db"))
     await store.open()
-    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw"), store,
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", transport="auto"), store,
                              token_path=str(tmp_path / "span-local-token"))
     try:
         rows = await poller.poll_once()
@@ -367,7 +383,8 @@ def test_api_health_reports_the_span_transport(tmp_path):
     addr = panel.start()
     try:
         cfg = AppConfig(pumps=[PumpConfig(id="pump1", name="P1", host="127.0.0.1", port=59999, poll_interval_s=999)],
-                        span=SpanConfig(host=addr, passphrase="pw"), db_path=str(tmp_path / "b.db"), ui_dir="ui")
+                        span=SpanConfig(host=addr, passphrase="pw", transport="auto"), db_path=str(tmp_path / "b.db"),
+                        ui_dir="ui")
         with TestClient(create_app(cfg)) as c:
             assert wait_for(lambda: (c.get("/api/health").json()["span"] or {}).get("read") == "v2", 10)
             h = c.get("/api/health").json()["span"]
@@ -378,3 +395,59 @@ def test_api_health_reports_the_span_transport(tmp_path):
                     db_path=str(tmp_path / "c.db"), ui_dir="ui")
     with TestClient(create_app(cfg)) as c:
         assert c.get("/api/health").json()["span"] is None     # SPAN not configured
+
+
+# --- the read-only v2 soak beside the v1 default ---------------------------------------------------
+def soak_client(make, **kw):
+    panel, _ = make()
+    c = SpanClient(panel_addr(panel), "pw", transport="v1", v2_soak=True, **kw)
+    return panel, c
+
+
+def panel_addr(panel):
+    return f"127.0.0.1:{panel._server.server_address[1]}"
+
+
+def test_soak_shadows_v2_read_only_and_never_decides(make, tmp_path):
+    panel, c = soak_client(make, state_dir=str(tmp_path))
+    try:
+        c._fetch_locked()                                   # first read: v2 session still starting — not waited for
+        assert wait_for(lambda: c._soak.status()["synced"], 5)
+        c._fetch_locked()
+        c._set_relay_sync(cid(c, "Kitchen"), "CLOSED")
+        st = c.transport_status()
+        assert st["mode"] == "v1" and st["read"] == st["write"] == "v1" and st["v2"] is None
+        assert st["soak"]["compared"] >= 1 and st["soak"]["disagree"] == 0 and st["soak"]["v2"]["connected"]
+        assert panel.ebus.sets == []                        # never a v2 write
+        assert [r for r in panel.v1_requests if r[1].startswith("/api/v1/circuits/")] == [("POST", "/api/v1/circuits/c-k")]
+    finally:
+        c.close()
+
+
+def test_soak_reports_a_disagreement(make, tmp_path):
+    panel, c = soak_client(make, state_dir=str(tmp_path))
+    try:
+        c._fetch_locked()
+        assert wait_for(lambda: c._soak.status()["synced"], 5)
+        panel.set("Air-Water 2", _v2_state="lost")          # v2 sees the circuit as not ready; v1 still reads it
+        panel.ebus.flush(c._soak)
+        c._fetch_locked()
+        d = c.transport_status()["soak"]
+        assert d["disagree"] == 1 and any("Air-Water 2: relayState" in x for x in d["last_disagreement"]["diffs"])
+    finally:
+        c.close()
+
+
+def test_a_broken_v2_never_slows_or_fails_the_v1_read(make, tmp_path):
+    panel, _ = make()
+    panel.ebus.stop()
+    c = SpanClient(panel_addr(panel), "pw", transport="v1", v2_soak=True, state_dir=str(tmp_path))
+    try:
+        t = time.monotonic()
+        for _ in range(3):
+            assert cid(c, "Air-Water 1")
+        assert time.monotonic() - t < 2.0
+        st = c.transport_status()
+        assert st["read"] == "v1" and st["soak"]["unavailable"] >= 1 and st["soak"]["compared"] == 0
+    finally:
+        c.close()

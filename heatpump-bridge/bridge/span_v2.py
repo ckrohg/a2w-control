@@ -375,7 +375,7 @@ class SpanV2:
             return f"no message from the panel for {age:.0f} s (stale)"
         return None
 
-    def _ensure_session(self) -> None:
+    def _ensure_session(self, wait: bool = True) -> None:
         """Start (or after an auth refusal, re-register and restart) the session; on a fresh start wait for the
         retained tree. Raises ConnectionError / V2AuthError when v2 cannot be started right now."""
         if self._client is not None and self._auth_failed:
@@ -405,6 +405,8 @@ class SpanV2:
                 self.last_error = str(e)
                 self._next_start = time.monotonic() + 60.0   # a dead panel must not cost every poll a timeout
                 raise ConnectionError(f"v2: {e}") if not isinstance(e, V2AuthError) else e
+            if not wait:
+                return
             deadline = time.monotonic() + CONNECT_WAIT_S
             with self._cv:
                 while not self._synced() and not self._auth_failed:
@@ -413,10 +415,12 @@ class SpanV2:
                         break
                     self._cv.wait(min(left, 0.25))
 
-    def fetch(self) -> dict:
-        self._ensure_session()
+    def fetch(self, wait: bool = True) -> dict:
+        """The tree in the v1 /circuits shape. wait=False (the soak) never blocks on a fresh session's retained tree:
+        it raises "not received yet" instead."""
+        self._ensure_session(wait)
         with self._cv:
-            why = self._usable_reason()
+            why = self._usable_reason() or (None if wait or self._synced() else "panel tree still arriving")
             if why:
                 raise ConnectionError(f"v2: {why}")
             return self.tree.circuits()

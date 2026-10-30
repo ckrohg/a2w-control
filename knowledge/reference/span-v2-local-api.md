@@ -19,12 +19,25 @@ cleared. Chain and hostname checks still apply. The cert verifies by the broker 
 ## How the bridge uses it
 
 `bridge/span_v2.py` holds one persistent MQTT session (paho, started on first use). `bridge/span_local.SpanClient`
-serves both transports behind the same interface: v2 first, v1 as the fallback while the panel still serves it.
-`span.transport` in the Pi config selects the mode: `auto` (the default), `v2`, or `v1` (v1 only to back out a v2
-problem before December). Every consumer keeps receiving the v1 `/circuits` shape.
+serves both transports behind the same interface, and every consumer keeps receiving the v1 `/circuits` shape.
+
+## Rollout (owner decision 2026-10-29) — the config keys
+
+Both keys live in the `span:` section of the Pi's live config, `~/bridge-data/config.yaml` (outside the repo: no
+merge, tag or deploy changes it; back it up first, then restart `heatpump-bridge`).
+
+| Step | Config | What it does |
+|---|---|---|
+| 1. Release (default) | `transport: v1` (or the key absent) | Exactly today's behaviour: v1 REST only, no v2 connection at all. |
+| 2. Soak, a few days | `transport: v1` + `v2_soak: true` | Still v1 for every read and write. After each v1 read the bridge also reads the v2 tree and compares name, relay state and controllable per circuit. It never writes over v2, and a v2 failure never slows or fails the v1 read. Watch `/api/health.span.soak` (`compared`, `agree`, `disagree`, `last_disagreement`) and drift-check `[10]`. |
+| 3. Flip, with the owner's OK | `transport: auto` (drop `v2_soak`) | v2 first for reads and writes, v1 as the fallback while the panel still serves it. |
+| Later, optional | `transport: v2` | v2 only (no v1 attempts). Not required: `auto` already works after v1 is removed. |
+
+drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a soak disagreement fails it; in
+`auto`/`v2`, a read answered by v1 fails it (v2 is failing).
 
 - **Which transport answered** is in `/api/health.span` and in the hub frame (`span.transport`: `read`, `write`,
-  `v2.connected`, `v2_error`). drift-check `[10]` fails on `read: v1`.
+  `v2.connected`, `v2_error`, `soak`).
 - **Writes are QoS 0.** paho re-sends QoS ≥ 1 publishes after a reconnect, even with a clean session, so a "lost"
   OPEN could land after the CLOSE that ended the cycle. Read-back and the CLOSE retries cover a lost QoS 0 write.
 - **An OPEN that may have reached the panel is never re-sent over v1.** v1 is tried for an OPEN only when v2
@@ -67,4 +80,5 @@ fake, once on a v2-only panel with v1 removed.
 
 ## Still to do on the real panel
 
-The owner's release tag, then the Air-Water 2 power-cycle test on v2 (issue #199, "Done when").
+The owner's release tag (no behaviour change), the soak, the flip to `auto`, then the Air-Water 2 power-cycle test
+on v2 (issue #199, "Done when").

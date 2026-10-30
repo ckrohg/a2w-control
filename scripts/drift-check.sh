@@ -320,18 +320,34 @@ fi
 
 echo
 echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199)"
-# The Pi reports which local API answered its last panel read in the hub state frame (span.transport). auto mode
-# prefers v2 (MQTT on the panel) and falls back to v1, so a "v1" here means v2 is failing — and on 2026-12-31 v1 goes.
+# The Pi reports its SPAN transport in the hub state frame (span.transport). Rollout (owner 2026-10-29): the release
+# ships pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
+# fallback). In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
 if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
   skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
 else
   [ -n "${STATE:-}" ] || STATE="$(curl -sf -m 20 -H "Authorization: Bearer $HUB_CLIENT_TOKEN" "$HUB/api/state" 2>/dev/null)" || STATE=""
-  SPANTX="$(jq -r 'if .span == null then "nospan" elif .span.transport == null then "absent" else (.span.transport.read // "none") end' <<<"${STATE:-null}" 2>/dev/null)"
+  SPANMODE="$(jq -r 'if .span == null then "nospan" elif .span.transport == null then "absent" else (.span.transport.mode // "absent") end' <<<"${STATE:-null}" 2>/dev/null)"
+  SPANTX="$(jq -r '.span.transport.read // "none"' <<<"${STATE:-null}" 2>/dev/null)"
   SPANV2ERR="$(jq -r '.span.transport.v2_error // empty' <<<"${STATE:-null}" 2>/dev/null)"
-  case "$SPANTX" in
-    v2)     pass "SPAN local reads come over v2 (MQTT eBus)" ;;
-    v1)     fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
-    none)   fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
+  SOAK="$(jq -r 'if .span.transport.soak == null then "" else (.span.transport.soak | "\(.compared) \(.disagree) \(.unavailable)") end' <<<"${STATE:-null}" 2>/dev/null)"
+  case "$SPANMODE" in
+    v1)
+      if [[ ! "$TODAY" < "2026-12-15" ]]; then
+        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; set span.transport: auto on the Pi"
+      elif [ -n "$SOAK" ] && [ "$(cut -d' ' -f2 <<<"$SOAK")" -gt 0 ]; then
+        fail "SPAN v2 soak: v2 disagreed with v1 on $(cut -d' ' -f2 <<<"$SOAK") of $(cut -d' ' -f1 <<<"$SOAK") reads — see /api/health.span.soak.last_disagreement"
+      elif [ -n "$SOAK" ]; then
+        pass "SPAN pinned to v1 (rollout); v2 soak agrees on $(cut -d' ' -f1 <<<"$SOAK") reads ($(cut -d' ' -f3 <<<"$SOAK") with v2 unavailable)"
+      else
+        pass "SPAN pinned to v1 by config (rollout step 1; next: span.v2_soak: true)"
+      fi ;;
+    auto|v2)
+      case "$SPANTX" in
+        v2) pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE" ;;
+        v1) fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
+        *)  fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
+      esac ;;
     absent) skip "the Pi's bridge predates #199 (no span.transport) — cut a release to assert it" ;;
     *)      skip "hub /api/state has no span frame (unreachable, or SPAN not configured on the Pi)" ;;
   esac

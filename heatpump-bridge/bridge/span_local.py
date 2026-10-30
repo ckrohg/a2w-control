@@ -12,9 +12,9 @@
 #     hourly-cloud record are all unaffected. urllib in a thread (no new dependency).
 # Relay writes are CLOSE-ONLY unless the caller holds an OpenPermit, which only the guarded
 # breaker controller (span_control.py) mints — see SpanClient._set_relay_sync.
-# Transport (#199): SPAN removes v1 REST on 2026-12-31. SpanClient prefers the v2 MQTT interface
-# (span_v2.py) and falls back to v1 while the panel still serves it; every consumer sees the v1
-# /circuits shape either way, and transport_status() says which transport answered.
+# Transport (#199): SPAN removes v1 REST on 2026-12-31. span.transport picks v1 (the default until the
+# owner flips it), auto (v2 MQTT first via span_v2.py, v1 fallback) or v2; v1 + v2_soak shadows v2
+# read-only. Every consumer sees the v1 /circuits shape, and transport_status() says which answered.
 from __future__ import annotations
 
 import asyncio
@@ -65,7 +65,7 @@ class SpanClient:
 
     def __init__(self, host: str, passphrase: str, *, ip_fallback: str | None = None,
                  token: str | None = None, token_path: str | None = None, timeout_s: float = 8.0,
-                 transport: str = "auto", state_dir: str | None = None):
+                 transport: str = "v1", state_dir: str | None = None, v2_soak: bool = False):
         if transport not in TRANSPORTS:
             raise ValueError(f"span transport must be one of {TRANSPORTS}, not {transport!r}")
         self.host = host
@@ -84,6 +84,12 @@ class SpanClient:
             state_dir = str(Path(token_path).parent)
         self.v2 = (SpanV2(host, passphrase, ip_fallback=ip_fallback, state_dir=state_dir, timeout_s=timeout_s)
                    if transport != "v1" else None)
+        # read-only v2 soak beside a v1-pinned client: compared, never used to decide or to write
+        self._soak = (SpanV2(host, passphrase, ip_fallback=ip_fallback, state_dir=state_dir, timeout_s=timeout_s)
+                      if transport == "v1" and v2_soak else None)
+        self._soak_stats = {"since": time.time(), "compared": 0, "agree": 0, "disagree": 0, "unavailable": 0,
+                            "last_disagreement": None, "last_error": None, "last_ts": None}
+        self._soak_last_diff: tuple = ()
         self._v1_ids: dict[str, str] = {}    # canonical id -> the id v1 spells it with
         self._answered: dict[str, dict] = {"read": {}, "write": {}}   # which transport answered, when
         self._errors: dict[str, str | None] = {"v1": None, "v2": None}
@@ -206,7 +212,40 @@ class SpanClient:
                 raise
             raise ConnectionError(f"v1: {e} | {v2_err}") from e
         self._note("read", "v1")
-        return {canon_id(c.get("id") or k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
+        out = {canon_id(c.get("id") or k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
+        if self._soak is not None:
+            self._soak_compare(out)
+        return out
+
+    def _soak_compare(self, v1: dict) -> None:
+        """Read-only v2 soak: compare the v2 tree with the v1 read just made. Never raises, never writes, never waits
+        for a starting session (a v2 problem must not slow or fail the v1 read it shadows)."""
+        st = self._soak_stats
+        st["last_ts"] = time.time()
+        try:
+            v2 = {canon_id(k): c for k, c in self._soak.fetch(wait=False).items()}
+        except Exception as e:  # noqa: BLE001
+            st["unavailable"] += 1
+            st["last_error"] = str(e)[:300]
+            return
+        diffs = []
+        for cid, a in v1.items():
+            b = v2.get(cid)
+            if b is None:
+                diffs.append(f"{a.get('name')}: missing on v2")
+                continue
+            for k in ("name", "relayState", "isUserControllable"):
+                if (a.get(k) or None) != (b.get(k) or None):
+                    diffs.append(f"{a.get('name')}: {k} v1={a.get(k)!r} v2={b.get(k)!r}")
+        st["compared"] += 1
+        if diffs:
+            st["disagree"] += 1
+            st["last_disagreement"] = {"ts": time.time(), "diffs": diffs[:10]}
+            if tuple(diffs) != self._soak_last_diff:   # log a new disagreement once, not every poll
+                log.warning("span v2 soak: v2 disagrees with v1 — %s", "; ".join(diffs[:5]))
+        else:
+            st["agree"] += 1
+        self._soak_last_diff = tuple(diffs)
 
     def _v1_circuits(self) -> dict:
         """A v1 /circuits read that also learns how v1 spells each circuit id (a v1 write needs that spelling)."""
@@ -231,11 +270,13 @@ class SpanClient:
                 "read": self._answered["read"].get("transport"), "read_ts": self._answered["read"].get("ts"),
                 "write": self._answered["write"].get("transport"), "write_ts": self._answered["write"].get("ts"),
                 "v2": self.v2.status() if self.v2 is not None else None,
-                "v2_error": self._errors["v2"], "v1_error": self._errors["v1"]}
+                "v2_error": self._errors["v2"], "v1_error": self._errors["v1"],
+                "soak": ({**self._soak_stats, "v2": self._soak.status()} if self._soak is not None else None)}
 
     def close(self) -> None:
-        if self.v2 is not None:
-            self.v2.close()
+        for v2 in (self.v2, self._soak):
+            if v2 is not None:
+                v2.close()
 
     def _v1_fetch_sync(self) -> dict:
         """Return {circuits} with a valid token, re-registering ONCE on an auth failure."""
@@ -455,7 +496,8 @@ class SpanLocalPoller:
         self.store = store
         self.notify = notify
         self.client = SpanClient(cfg.host, cfg.passphrase, ip_fallback=cfg.ip_fallback,
-                                 token_path=token_path, transport=getattr(cfg, "transport", "auto"))
+                                 token_path=token_path, transport=getattr(cfg, "transport", "v1"),
+                                 v2_soak=bool(getattr(cfg, "v2_soak", False)))
         self.arm_state_path = arm_state_path
         self._task: asyncio.Task | None = None
         self._last_ok = 0.0
