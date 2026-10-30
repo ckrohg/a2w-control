@@ -367,3 +367,104 @@ async def test_fallback_status_rides_the_hub_state_frame(rig):
     assert frame["span"]["backup_fallback"]["mode"] == "shadow"
     assert frame["span"]["backup_fallback"]["circuit"] == "Buffer Tank"
     json.dumps(frame)   # serialisable
+
+
+# --- #241 generator budget: the Pi always assumes it may be on the ~24 kW generator ----------------------------------
+def test_house_load_sums_every_circuit_but_the_element():
+    from bridge.span_local import house_load_w
+    circuits = {"a": {"name": "Air-Water 1", "instantPowerW": -5100.0}, "b": {"name": "Buffer Tank", "instantPowerW": -16400.0},
+                "c": {"name": "Kitchen", "instantPowerW": -50.0}, "d": {"name": "EV Charger", "instantPowerW": -7200.0}}
+    assert house_load_w(circuits) == 12350.0, "abs of every circuit, the element's own excluded"
+    # one circuit without a reading (a v2 session still filling in after a reconnect) makes the TOTAL unknown: summing
+    # the rest would read the 7.2 kW EV charger as 0 W and let the element "fit"
+    circuits["d"]["instantPowerW"] = None
+    assert house_load_w(circuits) is None
+    circuits["d"].pop("instantPowerW")
+    assert house_load_w(circuits) is None
+    circuits["d"]["instantPowerW"] = True
+    assert house_load_w(circuits) is None, "a bool is not a power"
+    # ... but the ELEMENT's own missing reading does not matter: the budget adds it at its full rating
+    circuits["d"]["instantPowerW"] = -7200.0
+    circuits["b"]["instantPowerW"] = None
+    assert house_load_w(circuits) == 12350.0
+    assert house_load_w({"b": {"name": "Buffer Tank", "instantPowerW": 0.0}}) is None
+    assert house_load_w({}) is None
+
+
+async def test_fallback_budget_fits_a_normal_house(rig):
+    fb = rig.fallback()
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(31):
+        await rig.step(fb)
+    assert await fb_events(rig.store) == ["would_close"], "both pumps idle at 8 W + a 50 W kitchen: the element fits"
+    assert rig.ctl.snapshot()["house_w"] == 66.0
+    b = fb.status()["budget"]
+    assert b["fits"] is True and b["projected_w"] == 66 + 16500 + 2400
+    events = await rig.store.get_events("span", 1)
+    assert events[0]["detail"]["budget"]["fits"] is True
+
+
+async def test_fallback_generator_budget_holds_the_element_off_until_the_load_drops(rig):
+    rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
+                                        "instantPowerW": -7200.0}
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(90):
+        await rig.step(fb)
+    await settle()
+    assert rig.panel.writes == [], "7.3 kW of house + 16.5 + 2.4 = 26.2 kW > 24: never closed, even live"
+    assert await fb_events(rig.store) == ["generator_budget"], "noted once per episode"
+    pages = [a for a in rig.alerts if a[0] == "push"]
+    assert len(pages) == 1 and "generator budget" in pages[0][1], "live: both pumps down with the element held off pages"
+    assert "26.2 kW exceeds the 24.0 kW generator cap" in fb.status()["last"]["message"]
+    # the EV stops: the next tick closes
+    rig.panel.set("EV Charger", instantPowerW=-2.0)
+    await rig.step(fb)
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+    assert (await fb_events(rig.store))[0] == "closed"
+
+
+async def test_fallback_shadow_budget_refusal_is_record_only(rig):
+    rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
+                                        "instantPowerW": -7200.0}
+    fb = rig.fallback()
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(40):
+        await rig.step(fb)
+    await settle()
+    assert await fb_events(rig.store) == ["generator_budget"]
+    assert any(a[0] == "log" and "generator budget says no" in a[1] for a in rig.alerts)
+    assert not any(a[0] in ("email", "push") for a in rig.alerts), "shadow stays record (alert-policy.md)"
+    assert rig.panel.writes == []
+
+
+async def test_fallback_one_unknown_circuit_never_closes(rig):
+    # the EV charger draws 7.2 kW but its reading is missing: the house must not read as 66 W
+    rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
+                                        "instantPowerW": None}
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(60):
+        await rig.step(fb)
+    assert rig.panel.writes == []
+    assert rig.ctl.snapshot()["house_w"] is None
+    assert fb.status()["budget"]["fits"] is False and fb.status()["budget"]["house_w"] is None
+
+
+async def test_fallback_unknown_house_load_never_closes(rig):
+    for name in list(rig.panel.circuits):
+        rig.panel.set(name, instantPowerW=None)
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(60):
+        await rig.step(fb)
+    assert rig.panel.writes == []
+    assert fb.status()["budget"] == {"fits": False, "house_w": None, "projected_w": None,
+                                     "why": "the live house load is unknown (no fresh panel read)"}
+
+
+def test_generator_budget_config_bounds():
+    c = BackupFallbackConfig()
+    assert (c.generator_cap_w, c.generator_margin_w, c.element_w) == (24000.0, 2400.0, 16500.0)
+    with pytest.raises(ValidationError):
+        BackupFallbackConfig(generator_cap_w=100000)
