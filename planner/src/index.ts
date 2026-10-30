@@ -135,6 +135,7 @@ const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 // so the day's charge is bought at the best outdoor COP. 0 (default) = off — plans identical
 // to before. Only ever ADDS heat above the DHW floor; clamped to a sane 0–15 °F.
 const BANK_F = Math.min(Math.max(Number(process.env.BANK_F ?? "0") || 0, 0), 15);
+console.log(`DHW-ready floor ${DEFAULT_OPTS.dhwFloorF} °F (idle ${DEFAULT_OPTS.idleF} °F)${process.env.DHW_FLOOR_F ? ` — from DHW_FLOOR_F=${process.env.DHW_FLOOR_F}` : " — default"}`);
 
 // #59 winter DP: the cost-optimal 24 h target trajectory. The solve itself is SHADOW-FIRST —
 // it runs (and lands in plan meta + /health) whenever the horizon dips below the compute
@@ -2716,6 +2717,8 @@ async function main(): Promise<void> {
                 pre_draw_median_f: w.preDrawMedianF, trough_median_f: w.troughMedianF,
                 boost_f: w.n >= MIN_PREBOOST_DRAWS && Math.round(w.sagP75F) >= MIN_PREBOOST_F ? Math.min(Math.round(w.sagP75F), MAX_PREBOOST_F) : 0,
               })),
+              // the DHW-ready floor in force (env DHW_FLOOR_F, default 120) — what the troughs above are judged against
+              floor_f: DEFAULT_OPTS.dhwFloorF,
               min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F, standby_f_per_h: STANDBY_F_PER_H,
               // peaks = hours where ≥ 50 % of observed days had a draw (unpadded); the floor windows are the padded 25 % ones
               peak_threshold: 0.5, floor_windows: learnedWindowsForHealth,

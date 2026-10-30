@@ -124,13 +124,31 @@ export const MAX_PREBOOST_F = 12;
  */
 export const STANDBY_F_PER_H = 2.4;
 
+/**
+ * DHW-ready floor (°F) — the number that sets the tank target in almost every hour (deep dive 2026-10-19 §2),
+ * and an assumption: 120 = delivery + an assumed 5–8 °F coil approach, never measured (#138.2). Owner decision
+ * 2026-10-29: step it to 116 for a week and watch the morning-draw troughs (/health.dhw). Env DHW_FLOOR_F,
+ * clamped to [DHW_FLOOR_MIN_F, DHW_FLOOR_MAX_F]; unset, empty or unparseable = 120 (behaviour unchanged).
+ * idleF follows it: the off-window target was set equal to the floor, so moving only dhwFloorF would leave
+ * the idle plan at 120. The I8 soak (sanitizeF) is independent and unchanged.
+ */
+export const DHW_FLOOR_DEFAULT_F = 120;
+export const DHW_FLOOR_MIN_F = 112;
+export const DHW_FLOOR_MAX_F = 125;
+export function parseDhwFloorF(raw: string | undefined): number {
+  const v = Number(raw);
+  if (raw == null || raw.trim() === "" || !Number.isFinite(v)) return DHW_FLOOR_DEFAULT_F;
+  return Math.min(DHW_FLOOR_MAX_F, Math.max(DHW_FLOOR_MIN_F, v));
+}
+export const DHW_FLOOR_F = parseDhwFloorF(process.env.DHW_FLOOR_F);
+
 export const DEFAULT_OPTS: ShadowOpts = {
   dhwWindows: [[6, 9], [17, 22]],
-  dhwFloorF: 120, // minimum DHW-ready buffer temp — below this an unexpected draw is lukewarm
+  dhwFloorF: DHW_FLOOR_F, // minimum DHW-ready buffer temp — below this an unexpected draw is lukewarm (env DHW_FLOOR_F)
   // Off-window target. The buffer feeds DHW and draws are unpredictable / year-round, so we never
   // coast below DHW-ready — a cold shower isn't worth the trivial standby saving of a 110°F idle.
   // Enforced ≥ dhwFloorF at the use site; raise this only to bank EXTRA capacity, never below it.
-  idleF: 120,
+  idleF: DHW_FLOOR_F, // follows the floor (env DHW_FLOOR_F) — see DHW_FLOOR_F above
   prechargeLookbackH: 3,
   i1MarginF: 5, // A-4-measured 2026-07-14: tank sensor terminated at +3.1°F; 5 keeps a cushion
   hpMinF: 113,
