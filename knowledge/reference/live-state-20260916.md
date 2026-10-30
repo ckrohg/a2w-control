@@ -93,7 +93,7 @@ nowhere, which is the exact failure class this file was created to prevent.
   >   it on a push. `railway config apply` writes its values into the service settings, so the toml
   >   and the settings carry identical values until the toml files are deleted.
   > - `classify_files()` is unchanged. Merging `.railway/**` is inert, and the APPLY is the step that
-  >   changes the services. `scripts/drift-check.sh` [10] asserts the files, plus, with a logged-in
+  >   changes the services. `scripts/drift-check.sh` [11] asserts the files, plus, with a logged-in
   >   railway CLI, the config the newest build actually ran with.
   > - Done when: the apply has landed, the toml-deletion PR's deploy records no `configFile` and has the
   >   declared values, and a docs-only commit after that is SKIPPED on both services. Until then the

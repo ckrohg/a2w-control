@@ -45,7 +45,7 @@ ck "mixed: the unknown one is STALE"   1 "$(grep -c 'pump2: unrecognised phase_b
 OUT="$(run_2a '{"pump1":"ok 61°C — ⚠ NO LEASE ARMED"}')"
 ck "no lease is still DRIFT"           1 "$(grep -c 'DRIFT.*armed NO lease' <<<"$OUT")"
 
-# ---- 3. [10]'s readers (#164) on the REAL files, so a PR that drops a watch pattern from either config fails CI here
+# ---- 3. [11]'s readers (#164) on the REAL files, so a PR that drops a watch pattern from either config fails CI here
 # rather than surfacing as a redeploy storm (or a missed deploy) after it lands.
 for pair in "a2w-planner:planner" "a2w-hub:hub"; do
   svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"

@@ -18,7 +18,7 @@
 //   `npm ci --prefix .railway` once before plan/apply. Railway's build never sees it: the services'
 //   root directories are /planner and /hub.
 // - While a railway.toml still exists, it overrides these values at deploy time. Keep the two
-//   identical until the toml files are deleted. scripts/drift-check.sh [10] asserts this.
+//   identical until the toml files are deleted. scripts/drift-check.sh [11] asserts this.
 //
 // Watch patterns. Without them every push to main redeploys both services, docs included, and
 // each planner redeploy is a writer-lease handover on live heating. Both spellings are kept
@@ -47,7 +47,7 @@ const nodeService = (name: string, rootDirectory: string, watchPatterns: string[
   });
 
 export default defineRailway(() => {
-  // Keep each list on ONE line: scripts/drift-check.sh [10] reads them with grep.
+  // Keep each list on ONE line: scripts/drift-check.sh [11] reads them with grep.
   const a2wPlanner = nodeService("a2w-planner", "/planner",
     ["planner/**", "src/**", "package.json", "package-lock.json", "tsconfig.json", "railway.toml"]);
   const a2wHub = nodeService("a2w-hub", "/hub",

@@ -76,7 +76,7 @@ phaseb_result_class() {
   esac
 }
 
-# [10]'s readers (#164). Each prints a service's watch patterns sorted and space-joined, so two sources compare as
+# [11]'s readers (#164). Each prints a service's watch patterns sorted and space-joined, so two sources compare as
 # strings. LC_ALL=C: a locale sort orders "package-lock.json" and "package.json" differently from jq's sort.
 # railway_watch_want <dir>: the DECLARED set -- both spellings on purpose (see .railway/railway.ts).
 railway_watch_want() { printf '%s\n' "$1/**" "src/**" package.json package-lock.json tsconfig.json railway.toml | LC_ALL=C sort | paste -sd' ' -; }
@@ -329,7 +329,7 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
-echo "[10] Railway deploy config — watch patterns, build, start, restart (#164: railway.toml stops being read 2026-12-01)"
+echo "[11] Railway deploy config — watch patterns, build, start, restart (#164: railway.toml stops being read 2026-12-01)"
 # The watch patterns are the only thing that stops a docs-, knowledge/- or scripts/-only push from redeploying the
 # planner (a writer-lease handover on live heating) and the hub. Until #164 they lived only in planner/ and
 # hub/railway.toml, which Railway stops reading on 2026-12-01, and nothing would go red when that happened.
