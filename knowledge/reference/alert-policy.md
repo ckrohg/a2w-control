@@ -70,6 +70,14 @@ These rules apply to every tier:
 | Planner down | hub planner dead-man | 2 h (was 15 min) |
 | Foreign HBX curve writer | planner `drift.ts` | Any confirmed foreign write; at most one page a day |
 | Heat pump left switched off (#212) | planner `stagewatch.ts` | A pump switched off outside A2W, still off 4 h while the HBX calls its stage: one reminder per stop |
+| Heat-pump safety net is off (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | A pump shows no 90-min revert countdown for > 30 min although A2W's setpoints were accepted. One email per episode; the all-clear "Safety net is back on" after 30 min with the countdown running on every pump |
+| A2W can't control the heat pumps (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | 7 failed setpoint cycles in a row on any pump (~35 min since the last write landed); all-clear after 30 min of every write landing |
+
+The two 2026-10-29 rows are worded for the owner (no "lease", "Phase B" or "writer"): what it means, whether anything
+is cold right now (tank and pumps), and what to do. Only the planner sends them. The Pi cannot: it sees "no countdown"
+whenever nobody is setting the pumps (dry-run, a planner that is down, a pump already reverted), so it cannot tell a
+missing failsafe from an idle one. Both close only after 30 min clear, so a flapping condition stays one email; a
+redeploy re-adopts an open one from `notify_latches` and still sends its all-clear.
 
 ## What emails (attention)
 
@@ -99,9 +107,10 @@ engineer or a Claude session can act, it is record-tier; it does not email the o
 ### Engineer-only: record, never emailed
 
 - **Planner internals:**
-  - Phase B tracking failing, and Phase B "no lease armed". The latter is now believed only after 3 consecutive
-    writes: one read is often the hub's pre-write snapshot. The 2026-10-21 08:19 ET email came 3 min after a 16 s Pi
-    dropout, with `baseline_setpoint_c` set all along.
+  - Phase B tracking failing, and Phase B "no lease armed", at their early thresholds (3 cycles). The latter is
+    believed only after 3 consecutive writes: one read is often the hub's pre-write snapshot. The 2026-10-21 08:19 ET
+    email came 3 min after a 16 s Pi dropout, with `baseline_setpoint_c` set all along. The sustained versions page
+    the owner in plain words (above, owner 2026-10-29).
   - writer lease unheld;
   - a second planner instance still live after 30 min;
   - HBX target not adopting;
