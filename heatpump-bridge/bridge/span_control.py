@@ -34,6 +34,7 @@ from pathlib import Path
 from . import notify
 from .config import BACKUP_ELEMENT_CIRCUIT, HEAT_PUMP_CIRCUITS
 from .span_local import OpenAborted, OpenPermit, read_arm_intent
+from .span_v2 import canon_id
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +133,8 @@ class BreakerController:
             "last": self.last,
             "min_off_s": self.cfg.min_off_s,
             "max_off_s": self.cfg.max_off_s,
+            # #199: which local API answered (v2 MQTT / v1 REST) — drift-check + the dashboard read it from the hub
+            "transport": (self.client.transport_status() if hasattr(self.client, "transport_status") else None),
         }
 
     def own_switching(self, name: str, within_s: float) -> str | None:
@@ -642,7 +645,8 @@ class BreakerController:
             try:
                 circuits = await self._read_panel()
                 c = find_circuit(circuits, name)
-                state = c["relay_state"] if c and c["circuit_id"] == cid else state
+                # canon_id: a cycle record written under v1 names the circuit as v1 spells it (#199)
+                state = c["relay_state"] if c and canon_id(c["circuit_id"]) == canon_id(cid) else state
             except Exception as exc:  # noqa: BLE001 — includes an ambiguous name: no state
                 log.warning("span breaker read-back failed (%s): %s", name, exc)
             if state == want:

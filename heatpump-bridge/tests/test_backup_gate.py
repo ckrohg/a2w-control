@@ -24,6 +24,9 @@ from bridge.span_local import SpanLocalPoller, write_arm_intent
 from bridge.store import Store
 from sim.fake_span import FakeSpan
 
+# #199: every test here runs against the v1 fake AND a v2-only (v1 removed) panel — tests/conftest.py
+pytestmark = pytest.mark.usefixtures("span_transport")
+
 
 class FakeTime:
     def __init__(self):
