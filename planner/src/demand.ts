@@ -33,6 +33,9 @@ export interface InsightZone {
   // up the local→learned range we actually need to be (#89 / #90 cost-first policy).
   roomF: number | null;
   setpointF: number | null;
+  /** the thermostat's mode from the same `demand` block ("heat", "off", …; null = not reported). #241 reads it to tell
+   *  an occupied zone from one switched OFF. Optional: synthetic and test zones omit it. */
+  mode?: string | null;
 }
 
 /** Live per-zone call state from TempIQ GET /api/insights/calls (TempIQ#1506). The
@@ -336,6 +339,7 @@ export async function fetchInsightZones(baseUrl: string, token: string): Promise
       ceilingSource: typeof rc.designSupplyFSource === "string" ? rc.designSupplyFSource : null,
       roomF: num(dem.currentTempF) ?? num(o.currentTempF),
       setpointF: num(dem.setpointF) ?? num(o.setpointF),
+      mode: typeof dem.mode === "string" ? dem.mode : null,
     };
   });
 }

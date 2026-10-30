@@ -4,7 +4,7 @@
 // shadow never reads as the real breaker; the real relay line is separate; blind → "not judged"; a planner without the
 // block → unavailable; the Pi fallback passes through; junk is tolerated. Run: npx tsx tests/backup-gate.test.ts
 import assert from "node:assert/strict";
-import { backupGateView, gateChip, relayLine } from "../lib/backup-gate";
+import { backupGateView, gateChip, generatorLine, relayLine } from "../lib/backup-gate";
 
 let n = 0;
 const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ✓ ${name}`); };
@@ -64,6 +64,22 @@ t("junk is tolerated", () => {
   assert.deepEqual(v.conditions.failed, ["p"]);
   assert.equal(v.piFallback, null);
   assert.equal(relayLine(v), "Breaker: unknown");
+});
+
+t("#241 generator: grid says so; on the generator the budget and the lockout show, and the chip says held OFF", () => {
+  const gen = (o: Record<string, unknown>) => ({ supply: "generator", supply_why: "National Grid reports an outage (6bb feed)",
+    budget_applies: true, cap_w: 24000, margin_w: 2400, element_w: 16500, house_w: 6311, projected_w: 25211, budget_fits: false,
+    comfort: { at_risk: true, coldest: { name: "Mom's room", room_f: 61.24, setpoint_f: 68 }, why: "x" },
+    element_allowed: false, element_why: "on the generator: … exceeds the 24.0 kW cap", shed: false, one_pump: false, ...o });
+  const grid = backupGateView({ ...sample, gate_state: "open", generator: gen({ supply: "grid" }) });
+  assert.equal(generatorLine(grid.generator!), "Grid — no generator limit.");
+  const v = backupGateView({ ...sample, gate_state: "open", generator: gen({}), generator_lockout: "on the generator: … exceeds the 24.0 kW cap" });
+  assert.equal(generatorLine(v.generator!), "ON GENERATOR: house 6.3 kW, with the element 25.2 of 24.0 kW. Element locked out · coldest Mom's room 61.2°.");
+  assert.deepEqual(gateChip(v), { cls: "warn", text: "held OFF (generator)" });
+  const unk = backupGateView({ ...sample, generator: gen({ supply: "unknown", house_w: null, projected_w: null }) });
+  assert.match(generatorLine(unk.generator!), /^Supply unknown \(treated as generator\): house \? kW/);
+  assert.equal(backupGateView({ ...sample, generator: { supply: "moon" } }).generator, null, "junk supply → no line");
+  assert.equal(backupGateView(sample).generator, null, "an older planner without the block → no line");
 });
 
 console.log(`backup-gate.test.ts: ${n} passed`);
