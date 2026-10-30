@@ -315,6 +315,18 @@ def extract_relay(circuits: dict, name: str) -> dict | None:
     return None
 
 
+def house_load_w(circuits: dict) -> float | None:
+    """#241: the whole-house draw from one /circuits read — every circuit's |instantPowerW| (consumption is negative on
+    this panel; abs also counts any producing circuit as load, the safe side) EXCEPT the backup element's own, which the
+    generator budget adds at its full rating. None when no circuit reported a power. Loads not on a SPAN circuit (none
+    known) are what generator_margin_w is for."""
+    from .config import BACKUP_ELEMENT_CIRCUIT
+    vals = [abs(float(c["instantPowerW"])) for c in circuits.values()
+            if (c.get("name") or "").strip() != BACKUP_ELEMENT_CIRCUIT
+            and isinstance(c.get("instantPowerW"), (int, float)) and not isinstance(c.get("instantPowerW"), bool)]
+    return round(sum(vals), 1) if vals else None
+
+
 # --- arm intent: owner-set, persisted on the bridge (default DISARMED) --------
 def read_arm_intent(path: str | None, default: bool) -> bool:
     """Read the owner's ARM intent. Missing/unreadable file → the config default (fail-safe:
@@ -391,6 +403,7 @@ class SpanLocalPoller:
         """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""
         self.latest_circuits = {b.name: extract_relay(circuits, b.name)
                                 for b in getattr(self.cfg, "breakers", [])}
+        self.latest_house_w = house_load_w(circuits)
         self.latest_circuits_ts = ts
         self.latest_circuits_mono = time.monotonic() if mono is None else mono
 

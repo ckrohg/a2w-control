@@ -124,6 +124,9 @@ class BreakerController:
             "ts": getattr(self.cache, "latest_circuits_ts", None),
             "mono": getattr(self.cache, "latest_circuits_mono", None),
             "circuits": circuits,
+            # #241: every circuit but the element's, from the same read (span_local.house_load_w); the planner's
+            # generator rule reads it from the hub frame
+            "house_w": getattr(self.cache, "latest_house_w", None),
             "busy": dict(self._busy) if self._busy else None,
             "pending_close": sorted(self._pending_close),
             "last": self.last,

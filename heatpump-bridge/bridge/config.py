@@ -348,6 +348,14 @@ class BackupFallbackConfig(BaseModel):
     hold_min: float = Field(default=30.0, ge=10, le=240)       # measured: both-stale with SPAN up never > 3.5 min
     running_power_w: float = Field(default=500.0, gt=0)        # SPAN draw that means "the compressor runs"
     cooldown_h: float = Field(default=6.0, ge=1, le=48)        # one decision (page / close) per this
+    # #241 generator budget. In an outage a whole-house transfer switch puts the house on a ~100 A / 240 V generator and
+    # neither the panel nor the Pi can tell (knowledge/reference/generator-outage-mode.md), so the Pi ALWAYS assumes it
+    # might be: it closes only when the live house load (every circuit but the element's, fresh panel read) + the
+    # element + the margin stays under the cap. Unknown load = no close. Both pumps down means they draw ~nothing, so a
+    # normal house fits; what it refuses is the element on top of an EV charger or mini-splits running hard.
+    generator_cap_w: float = Field(default=24000.0, ge=15000, le=40000)
+    generator_margin_w: float = Field(default=2400.0, ge=0, le=8000)
+    element_w: float = Field(default=16500.0, ge=10000, le=20000)
 
 
 class AppConfig(BaseModel):
