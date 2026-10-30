@@ -11,6 +11,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .discovery import normalize_mac   # stdlib + pymodbus only: no import cycle
 from .registers import COOLING_REGISTER_RANGE, HARD_MAX_SETPOINT_C, HARD_MIN_SETPOINT_C
 
 
@@ -442,8 +443,9 @@ def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) ->
     data = _read_state(cfg)
     pump = next((p for p in cfg.pumps if p.id == pump_id), None)
     prior = data["overrides"].get(pump_id, {})
+    # canonical MAC on disk (same form the poller's identity check uses)
     data["overrides"][pump_id] = {"host": host, "port": port,
-                                  "mac": pump.mac if pump else None}
+                                  "mac": normalize_mac(pump.mac) if pump and pump.mac else None}
     if "write_enabled" in prior:  # a gateway reassignment must not clobber the toggle
         data["overrides"][pump_id]["write_enabled"] = prior["write_enabled"]
     if pump and pump.added:  # keep the added-pump record current too
@@ -461,7 +463,7 @@ def save_write_enabled(cfg: AppConfig, pump_id: str, enabled: bool) -> None:
     entry = data["overrides"].setdefault(pump_id, {})
     entry["write_enabled"] = enabled
     if pump and pump.mac and not entry.get("mac"):
-        entry["mac"] = pump.mac  # same staleness guard as gateway overrides
+        entry["mac"] = normalize_mac(pump.mac)  # same staleness guard as gateway overrides
     if pump and pump.added:
         pump.write_enabled = enabled
         save_added_pump(cfg, pump, _data=data)
@@ -492,7 +494,11 @@ def apply_gateway_overrides(cfg: AppConfig) -> None:
         entry = data["overrides"].get(pump.id)
         if not entry:
             continue
-        if pump.mac and entry.get("mac") and pump.mac.lower() != entry["mac"].lower():
+        # Same comparison as the poller's identity check (normalize_mac: case, zero-pad,
+        # '-' separators). A formatting difference between config.yaml and the state file
+        # must never silently revert write_enabled or a gateway reassignment on restart.
+        if pump.mac and entry.get("mac") and \
+                normalize_mac(pump.mac) != normalize_mac(entry["mac"]):
             continue  # config points at a different physical unit now — override stale
         if "host" in entry:  # entry may be write_enabled-only (no gateway override yet)
             pump.host = entry["host"]
