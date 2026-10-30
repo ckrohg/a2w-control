@@ -5,7 +5,7 @@
  * lead) runs the soak exactly when the caller says a pasteurization is due — and skips it otherwise.
  */
 import assert from "node:assert/strict";
-import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
+import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, parseDhwFloorF, DHW_FLOOR_DEFAULT_F, DHW_FLOOR_MIN_F, DHW_FLOOR_MAX_F, type ForecastHour } from "./shadow";
 import { classifyKind } from "./tempiq-windows";
 import { planConflictAhead } from "./identify";
 
@@ -362,4 +362,21 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
   assert.doesNotMatch(mild.reason, /winter guard/);
   console.log("shadow.test.ts (#168 soak identity under the winter guard): all assertions passed");
+}
+
+// DHW_FLOOR_F (owner 2026-10-29): unset/garbage = 120 unchanged; clamped; idleF follows the floor.
+{
+  assert.equal(parseDhwFloorF(undefined), DHW_FLOOR_DEFAULT_F, "unset = 120");
+  assert.equal(parseDhwFloorF(""), DHW_FLOOR_DEFAULT_F, "empty = 120 (not 0 → clamp)");
+  assert.equal(parseDhwFloorF("  "), DHW_FLOOR_DEFAULT_F, "blank = 120");
+  assert.equal(parseDhwFloorF("abc"), DHW_FLOOR_DEFAULT_F, "garbage = 120");
+  assert.equal(parseDhwFloorF("116"), 116, "the owner's step");
+  assert.equal(parseDhwFloorF("100"), DHW_FLOOR_MIN_F, "clamped up to the minimum");
+  assert.equal(parseDhwFloorF("140"), DHW_FLOOR_MAX_F, "clamped down to the maximum");
+  if (!process.env.DHW_FLOOR_F) {
+    assert.equal(DEFAULT_OPTS.dhwFloorF, 120, "default floor unchanged when the env is unset");
+    assert.equal(DEFAULT_OPTS.idleF, 120, "default idle unchanged when the env is unset");
+  }
+  assert.equal(DEFAULT_OPTS.idleF, DEFAULT_OPTS.dhwFloorF, "idle follows the floor");
+  console.log("ok — DHW_FLOOR_F parse/clamp/follow");
 }
