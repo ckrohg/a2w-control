@@ -5,7 +5,9 @@
  *
  *   "Heat-pump safety net is off"           a pump's 90-min revert countdown has not been armed for > 30 min although
  *                                           A2W's setpoints were accepted (FINDING-1's failsafe is off)
- *   "A2W can't control the heat pumps"      Phase B writes failed 7 cycles in a row (~35 min since the last one landed)
+ *   "A2W can't control the heat pumps"      Phase B writes failed 7 cycles in a row (~35 min since the last one landed);
+ *                                           a person's choice (deliberate stop, write-disabled, hot-water/standby mode)
+ *                                           never counts, nor (CONTROL_PAGE_WHEN_PI_UNREACHABLE) a Pi that is unreachable
  *
  * The PLANNER sends both, the Pi neither: the Pi sees "no countdown" whenever nobody is setting the pumps (dry-run, a
  * planner that is down, the pump already back at its baseline), so it cannot tell a missing failsafe from an idle one.
@@ -16,7 +18,7 @@
  * min, so a flapping condition stays one episode instead of an email pair every cycle.
  */
 import { C, esc, factsTable, footer, paragraphs, shell } from "./alertemail";
-import type { HubPump } from "./hub";
+import type { HubPump, HubState } from "./hub";
 
 /** The Pi's guardrails.baseline_setpoint_c (CLAUDE.md, FINDING-1): what the countdown reverts a pump to. */
 export const BASELINE_C = 52;
@@ -26,6 +28,14 @@ export const SAFETY_NET_OFF_MS = 30 * 60_000;
 export const CONTROL_FAILING_STREAK = 7;
 /** An all-clear is sent only after the condition has been clear this long without a break. */
 export const ALL_CLEAR_MS = 30 * 60_000;
+
+/**
+ * THE SWITCH (owner decision pending, 2026-10-29). false: a failed write while the Pi itself is unreachable (the hub
+ * reports it disconnected, or answers "no Pi connected") does not count towards "A2W can't control the heat pumps".
+ * The planner's Pi-unreachable page owns that outage, at #224's thresholds (2 h below 32 °F, else 12 h), so a Wi-Fi
+ * dropout is not paged at 35 min by a second route. true: those cycles count, and a Pi outage pages here at ~35 min.
+ */
+export const CONTROL_PAGE_WHEN_PI_UNREACHABLE = false;
 
 export const SAFETY_NET_KEY = "safety-net-off";
 export const CONTROL_KEY = "control-failing";
@@ -59,6 +69,27 @@ export class SustainedEpisode {
     }
     return null;
   }
+}
+
+/** A refusal that is a person's choice, not a failure: the bridge's guardrail texts (guardrails.py, poller.py), relayed
+ *  by the hub as detail. The breaker-off case (#212) reads "offline" and is told apart by the pump's deliberate_stop. */
+const DELIBERATE_REFUSAL = /writes are disabled for|remote setpoint is only supported/i;
+
+/**
+ * One pump's Phase B cycle, for the owner's failure count:
+ *   ok        the write landed
+ *   excused   refused by a person's choice (deliberate stop, write-disabled, a mode the unit can't be set in)
+ *   unknown   not attempted, or (switch off) failed while the Pi itself was unreachable
+ *   fail      everything else
+ */
+export function controlOutcome(ok: boolean | null, detail: string, pump: HubPump | undefined, state: HubState | null,
+  pageWhenPiUnreachable = CONTROL_PAGE_WHEN_PI_UNREACHABLE): "ok" | "excused" | "unknown" | "fail" {
+  if (ok === true) return "ok";
+  if (ok === null) return "unknown";
+  if (pump?.deliberate_stop || pump?.write_enabled === false || DELIBERATE_REFUSAL.test(detail)) return "excused";
+  const piUnreachable = state?.pi_connected === false || /no Pi connected/i.test(detail);
+  if (piUnreachable && !pageWhenPiUnreachable) return "unknown";
+  return "fail";
 }
 
 /** What the owner's email needs: the heading, the plain text (push + text email), and the HTML. */
@@ -179,8 +210,8 @@ export function controlFailingMessage(a: {
     coldNow(a.tankF, a.floorF, a.pumps),
   ].join("\n\n");
   return message("A2W can't control the heat pumps", lead,
-    "Nothing to do at the house unless it gets cold. Ask Claude to check the Pi and its connection (the usual cause is the Pi " +
-      "being offline). You'll get an email when A2W is back in control.",
+    "Nothing to do at the house unless it gets cold. Ask Claude to find out why the Pi isn't accepting A2W's settings. " +
+      "You'll get an email when A2W is back in control.",
     [["Not reaching", whichPumps(names, a.allPumps.length)], ["For", minutes(a.sinceMs)], ...houseFacts(a.tankF, a.pumps, a.allPumps)], false);
 }
 

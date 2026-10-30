@@ -70,8 +70,8 @@ These rules apply to every tier:
 | Planner down | hub planner dead-man | 2 h (was 15 min) |
 | Foreign HBX curve writer | planner `drift.ts` | Any confirmed foreign write; at most one page a day |
 | Heat pump left switched off (#212) | planner `stagewatch.ts` | A pump switched off outside A2W, still off 4 h while the HBX calls its stage: one reminder per stop |
-| Heat-pump safety net is off (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | A pump shows no 90-min revert countdown for > 30 min although A2W's setpoints were accepted. One email per episode; the all-clear "Safety net is back on" after 30 min with the countdown running on every pump |
-| A2W can't control the heat pumps (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | 7 failed setpoint cycles in a row on any pump (~35 min since the last write landed); all-clear after 30 min of every write landing |
+| Heat-pump safety net is off (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | For > 30 min, every cycle's setpoint write to a pump LANDED but the Pi still showed no 90-min revert countdown. A failed or skipped write breaks the run. One email per episode; the all-clear "Safety net is back on" after 30 min with the countdown running on every pump |
+| A2W can't control the heat pumps (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | 7 counted write failures in a row on any pump (~35 min since the last write landed); all-clear after 30 min of every write landing. A person's choice never counts: a #212 deliberate stop, `write_enabled: false`, or a mode the unit can't be set in (the bridge's 409). Nor, by default, a cycle when the Pi itself is unreachable: the Pi-unreachable page owns that outage (switch `CONTROL_PAGE_WHEN_PI_UNREACHABLE`, owner decision pending) |
 
 The two 2026-10-29 rows are worded for the owner (no "lease", "Phase B" or "writer"): what it means, whether anything
 is cold right now (tank and pumps), and what to do. Only the planner sends them. The Pi cannot: it sees "no countdown"

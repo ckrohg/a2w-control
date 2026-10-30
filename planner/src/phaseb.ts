@@ -41,9 +41,9 @@ import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
 import { commandForBlock } from "./autopilot";
 import { staleReportedTarget, ADOPTION_TOLERANCE_F, type RecentPoll, type StaleReportVerdict } from "./stale-target";
-import type { HubPump } from "./hub";
+import type { HubPump, HubState } from "./hub";
 import {
-  SustainedEpisode, SAFETY_NET_OFF_MS, CONTROL_FAILING_STREAK, SAFETY_NET_KEY, CONTROL_KEY,
+  SustainedEpisode, SAFETY_NET_OFF_MS, CONTROL_FAILING_STREAK, SAFETY_NET_KEY, CONTROL_KEY, controlOutcome,
   safetyNetOffMessage, safetyNetBackMessage, controlFailingMessage, controlBackMessage, type OwnerMessage,
 } from "./owneralerts";
 
@@ -247,12 +247,18 @@ export class PhaseB {
   private leaseAlerted: Record<string, boolean> = {};
   /** consecutive verifies that saw no lease — one is usually the hub's pre-write snapshot (see verifyLeases) */
   private noLeaseStreak: Record<string, number> = {};
-  /** owner email (owner 2026-10-29, owneralerts.ts): when each pump was first seen without a lease after an accepted
-   *  write; cleared by any read that shows one armed */
+  /** owner email (owner 2026-10-29, owneralerts.ts): the start of the current run of cycles in which this pump's write
+   *  LANDED and the Pi still showed no lease. Any other cycle (armed, a failed or skipped write, no hub read) ends it. */
   private unarmedSince: Record<string, number | null> = {};
+  /** what this cycle's verify saw per pump: "unarmed" only after a write that landed */
+  private leaseSeen: Record<string, "armed" | "unarmed" | null> = {};
   /** this cycle's write outcome per pump: true landed, false failed, null not attempted (dry-run / no writer lease) */
   private cycleOk: Record<string, boolean | null> = {};
-  /** when the current failure run began (its first failed write) */
+  /** this cycle's failure detail per pump (the bridge's refusal text, relayed by the hub) */
+  private cycleDetail: Record<string, string> = {};
+  /** the owner's failure count: failStreak minus deliberate refusals, and (by default) minus cycles the Pi was unreachable */
+  private controlStreak: Record<string, number> = {};
+  /** when the current owner failure run began (its first counted failure) */
   private failingSince: Record<string, number> = {};
   private readonly safetyNet = new SustainedEpisode();
   private readonly control = new SustainedEpisode();
@@ -334,6 +340,7 @@ export class PhaseB {
     const latest = await this.store.getLatestSlx();
     if (!latest || latest.targetF == null || Date.now() - latest.ts.getTime() > SLX_FRESH_MS) {
       this.lastResults = { _skip: "no fresh HBX target — not tracking on stale data" };
+      this.unarmedSince = {}; // nothing written, nothing verified: a "safety net off" run must be unbroken
       return;
     }
     // Track the HIGHER of the operative target and the planned current-hour target so the setpoints
@@ -370,6 +377,8 @@ export class PhaseB {
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();
     this.cycleOk = {};
+    this.cycleDetail = {};
+    this.leaseSeen = {};
 
     for (const d of decisions) {
       if (this.dryRun) {
@@ -401,6 +410,7 @@ export class PhaseB {
         : `failed: ${res.detail}`;
       await this.store.insertPhaseBLog({ pumpId: d.pump_id, mode: "active", valueC: d.value_c, result: res.ok ? "sent" : `failed: ${res.detail}` }).catch(() => {});
       this.cycleOk[d.pump_id] = res.ok;
+      if (!res.ok) this.cycleDetail[d.pump_id] = res.detail;
       if (res.ok) {
         this.failStreak[d.pump_id] = 0;
         this.alerted[d.pump_id] = false;
@@ -411,7 +421,6 @@ export class PhaseB {
         }
       } else {
         this.failStreak[d.pump_id] = (this.failStreak[d.pump_id] ?? 0) + 1;
-        if (this.failStreak[d.pump_id] === 1) this.failingSince[d.pump_id] = Date.now();
         console.warn(`[phase-b] ${d.pump_id} write failed (${this.failStreak[d.pump_id]}): ${res.detail}`);
         // 3 consecutive cycle failures ≈ 15 min without a renewal — lease will lapse to
         // baseline on its own (safe); page once so a human knows tracking stopped.
@@ -431,16 +440,17 @@ export class PhaseB {
         }
       }
     }
-    const pumps = await this.verifyLeases(decisions.map((d) => d.pump_id));
-    await this.ownerAlerts(latest.tankF ?? null, pumps).catch((e) => console.error("[phase-b] owner alerts failed:", (e as Error).message));
+    const state = await this.verifyLeases(decisions.map((d) => d.pump_id));
+    await this.ownerAlerts(latest.tankF ?? null, state).catch((e) => console.error("[phase-b] owner alerts failed:", (e as Error).message));
   }
 
   /**
    * The two conditions the owner hears about by email (owneralerts.ts, owner 2026-10-29), in their words. Both are
    * SustainedEpisodes: one key each, so both pumps going wrong together (the usual case) is one email, not two.
    */
-  private async ownerAlerts(tankF: number | null, pumps: HubPump[] | null): Promise<void> {
+  private async ownerAlerts(tankF: number | null, state: HubState | null): Promise<void> {
     const now = Date.now();
+    const pumps = state?.pumps ?? null;
     if (!this.adopted) {
       this.adopted = true;
       for (const [key, ep] of [[SAFETY_NET_KEY, this.safetyNet], [CONTROL_KEY, this.control]] as const) {
@@ -452,11 +462,21 @@ export class PhaseB {
     const send = (m: OwnerMessage, key: string, resolved: boolean) => this.notify(m.title, m.body, resolved ? "default" : "high",
       resolved ? { tier: "page", resolved: true, key, html: m.html } : { tier: "page", key, action: m.action, facts: m.facts, html: m.html });
 
-    // "Heat-pump safety net is off": a pump without a countdown for > 30 min although its writes were accepted.
-    // Good = every pump's last read showed one. Anything in between (a pump briefly unarmed, a failed write that left
-    // nothing to verify, no hub read this cycle) is unknown: it neither opens nor counts towards the all-clear.
+    // This cycle per pump, for the control alert below: landed, refused by a person's choice, unknown, or failed.
+    const outcomes = this.pumpIds.map((id) => controlOutcome(this.cycleOk[id] ?? null, this.cycleDetail[id] ?? "",
+      pumps?.find((p) => p.id === id), state));
+
+    // "Heat-pump safety net is off": a pump without a countdown for > 30 min of cycles whose writes LANDED. The clock
+    // only runs across such cycles (a failed or skipped write, or no hub read, restarts it), so "A2W is still setting
+    // the heat pumps" is true when it fires; a Pi that drops off after one unarmed read is the control alert's business.
+    // Good = every pump's last read showed a countdown, or the pump is excused (a person stopped it or disabled writes).
+    // Anything in between is unknown: it neither opens nor counts towards the all-clear.
+    for (const id of this.pumpIds) {
+      if (this.leaseSeen[id] === "unarmed") this.unarmedSince[id] ??= now;
+      else this.unarmedSince[id] = null;
+    }
     const off = this.pumpIds.filter((id) => this.unarmedSince[id] != null && now - (this.unarmedSince[id] as number) > SAFETY_NET_OFF_MS);
-    const allArmed = pumps != null && this.pumpIds.every((id) => this.leaseArmed[id] === true);
+    const allArmed = pumps != null && this.pumpIds.every((id, i) => this.leaseArmed[id] === true || outcomes[i] === "excused");
     const net = this.safetyNet.step(off.length ? "bad" : allArmed ? "good" : "unknown", now);
     if (net === "open") {
       await send(safetyNetOffMessage({
@@ -467,11 +487,21 @@ export class PhaseB {
       await send(safetyNetBackMessage({ pumps, tankF, allPumps: this.pumpIds }), SAFETY_NET_KEY, true);
     }
 
-    // "A2W can't control the heat pumps": CONTROL_FAILING_STREAK failed cycles in a row on any pump. Good = every
-    // pump's write landed this cycle; a dry-run or skipped cycle proves nothing either way.
-    const failing = this.pumpIds.filter((id) => (this.failStreak[id] ?? 0) >= CONTROL_FAILING_STREAK);
-    const allOk = this.pumpIds.every((id) => this.cycleOk[id] === true);
-    const ctl = this.control.step(failing.length ? "bad" : allOk ? "good" : "unknown", now);
+    // "A2W can't control the heat pumps": CONTROL_FAILING_STREAK counted failures in a row on any pump. A person's
+    // choice is not a failure (#212 deliberate stop, write-disabled, a mode the unit can't be set in): it resets the
+    // count and counts as clear. A cycle the Pi is unreachable is the Pi-unreachable page's (owneralerts.ts switch).
+    // Good = every pump landed or was excused this cycle; a dry-run or skipped cycle proves nothing either way.
+    this.pumpIds.forEach((id, i) => {
+      const o = outcomes[i];
+      if (o === "ok" || o === "excused") this.controlStreak[id] = 0;
+      else if (o === "fail") {
+        this.controlStreak[id] = (this.controlStreak[id] ?? 0) + 1;
+        if (this.controlStreak[id] === 1) this.failingSince[id] = now;
+      }
+    });
+    const failing = this.pumpIds.filter((id) => (this.controlStreak[id] ?? 0) >= CONTROL_FAILING_STREAK);
+    const allClear = outcomes.every((o) => o === "ok" || o === "excused") && outcomes.includes("ok");
+    const ctl = this.control.step(failing.length ? "bad" : allClear ? "good" : "unknown", now);
     if (ctl === "open") {
       const since = Math.min(...failing.map((id) => this.failingSince[id] ?? now));
       const armed = failing.map((id) => this.leaseArmed[id]);
@@ -497,10 +527,11 @@ export class PhaseB {
    * Best-effort: a hub read failure must never break tracking, so we leave the provisional
    * string in place and try again next cycle.
    */
-  private async verifyLeases(pumpIds: string[]): Promise<HubPump[] | null> {
-    let pumps;
+  private async verifyLeases(pumpIds: string[]): Promise<HubState | null> {
+    let state: HubState, pumps: HubPump[];
     try {
-      pumps = (await this.hub.getState()).pumps;
+      state = await this.hub.getState();
+      pumps = state.pumps;
     } catch (e) {
       console.warn(`[phase-b] lease verify skipped (hub read failed): ${(e as Error).message}`);
       return null;
@@ -511,7 +542,7 @@ export class PhaseB {
       if (!p || p.remote_lease_until === undefined) continue;
       const armed = p.remote_lease_until !== null;
       this.leaseArmed[id] = armed;
-      if (armed) this.unarmedSince[id] = null; // any read showing a countdown ends the owner's "safety net off" clock
+      if (armed) this.leaseSeen[id] = "armed";
       const prev = this.lastResults[id] ?? "";
       if (!prev.startsWith("ok ")) continue; // the write itself failed; that message wins
       if (armed) {
@@ -526,7 +557,7 @@ export class PhaseB {
       } else {
         this.lastResults[id] = `${prev.replace(/ \(lease .*\)$/, "")} — ⚠ NO LEASE ARMED`;
         this.noLeaseStreak[id] = (this.noLeaseStreak[id] ?? 0) + 1;
-        this.unarmedSince[id] ??= Date.now();
+        this.leaseSeen[id] = "unarmed";
         console.warn(`[phase-b] ${id}: wrote setpoint but the hub shows NO lease (${this.noLeaseStreak[id]} in a row)`);
         // The hub serves the Pi's LAST push, which can predate the write this verify follows: right after a Pi
         // reconnect or bridge restart (the lease lives in the bridge's memory) one verify reads "no lease" although the
@@ -546,6 +577,6 @@ export class PhaseB {
         }
       }
     }
-    return pumps;
+    return state;
   }
 }

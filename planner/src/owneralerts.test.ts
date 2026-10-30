@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { PhaseB } from "./phaseb";
-import { SustainedEpisode, coldNow, SAFETY_NET_KEY, CONTROL_KEY } from "./owneralerts";
+import { SustainedEpisode, coldNow, controlOutcome, SAFETY_NET_KEY, CONTROL_KEY } from "./owneralerts";
 
 const CYCLE = 5 * 60_000;
 let now = Date.UTC(2026, 9, 29, 12, 0);
@@ -16,19 +16,25 @@ type Note = { title: string; body: string; tier: string; resolved: boolean; key?
 function rig(opts: { latches?: Record<string, string>; dryRun?: boolean } = {}) {
   const armed: Record<string, boolean> = { pump1: true, pump2: true };
   let writesOk = true;
+  /** per-pump failure detail (the bridge's refusal text relayed by the hub); overrides writesOk for that pump */
+  const fail: Record<string, string | null> = { pump1: null, pump2: null };
+  const extra: Record<string, Record<string, unknown>> = { pump1: {}, pump2: {} };
+  const hubSt = { piConnected: true, slxFresh: true };
   const store = {
-    getLatestSlx: async () => ({ ts: new Date(now), targetF: 120, outdoorF: 40, tankF: 128 }),
+    getLatestSlx: async () => ({ ts: new Date(hubSt.slxFresh ? now : now - 3_600_000), targetF: 120, outdoorF: 40, tankF: 128 }),
     recentPlans: async () => [],
     insertPhaseBLog: async () => {},
     latestConfig: async () => null,
     getNotifyLatch: async (k: string) => (opts.latches?.[k] ? { tier: opts.latches[k], notifiedAt: new Date(now - 3_600_000) } : null),
   } as any;
   const hub = {
-    sendSetpoint: async () => (writesOk ? { ok: true } : { ok: false, detail: "hub 503: pump offline" }),
+    sendSetpoint: async (id: string) => (!hubSt.piConnected ? { ok: false, detail: "no Pi connected" }
+      : fail[id] ? { ok: false, detail: fail[id] } : writesOk ? { ok: true } : { ok: false, detail: "Modbus timeout reading back reg 2004" }),
     getState: async () => ({
+      pi_connected: hubSt.piConnected, ts: now / 1000,
       pumps: ["pump1", "pump2"].map((id, i) => ({
         id, name: `Heat Pump ${i + 1}`, online: true, setpoint_c: 55, state: i ? "idle" : "heating",
-        remote_lease_until: armed[id] ? now / 1000 + 85 * 60 : null,
+        remote_lease_until: armed[id] ? now / 1000 + 85 * 60 : null, ...extra[id],
       })),
     }),
   } as any;
@@ -37,7 +43,7 @@ function rig(opts: { latches?: Record<string, string>; dryRun?: boolean } = {}) 
     async (title: string, body: string, _p: string, o: any) => { notes.push({ title, body, tier: o.tier, resolved: !!o.resolved, key: o.key, html: o.html }); });
   const cycle = async (n = 1) => { for (let i = 0; i < n; i++) { now += CYCLE; await pb.runOnce(); } };
   const pages = () => notes.filter((n) => n.tier === "page");
-  return { pb, notes, pages, cycle, armed, setWrites: (ok: boolean) => { writesOk = ok; } };
+  return { pb, notes, pages, cycle, armed, fail, extra, hubSt, setWrites: (ok: boolean) => { writesOk = ok; } };
 }
 const setBoth = (a: Record<string, boolean>, v: boolean) => { a.pump1 = v; a.pump2 = v; };
 const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
@@ -174,6 +180,92 @@ const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
     const r = rig();
     for (let i = 0; i < 72; i++) { r.setWrites(i % 3 !== 0); await r.cycle(); }   // a failure every third cycle
     assert.equal(r.pages().length, 0, "intermittent failures never page");
+  }
+
+  // ── review of #243: one unarmed read, then the Pi drops off for 40 min while the hub serves that last push ─────
+  {
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);   // the bridge restarted: one normal "no countdown" read
+    await r.cycle();
+    r.hubSt.piConnected = false; // …then the Pi drops off; the hub keeps serving the unarmed frame
+    await r.cycle(9);          // 45 min
+    assert.equal(r.pages().length, 0, "no 'safety net off' (nothing landed) and no 'can't control' (the Pi-unreachable page owns it)");
+    r.hubSt.piConnected = true;
+    setBoth(r.armed, true);
+    await r.cycle(12);
+    assert.equal(r.pages().length, 0, "and nothing on the way back");
+  }
+  {
+    // the same, but the Pi is connected and the writes fail for another reason: only the control email, and the
+    // safety-net clock never ran (it needs landed writes)
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle();
+    r.setWrites(false);
+    await r.cycle(9);
+    assert.deepEqual(r.pages().map((n) => n.title), ["A2W can't control the heat pumps"]);
+    assert.doesNotMatch(r.pages()[0].body, /still setting/);
+  }
+  {
+    // the switch flipped: a Pi outage counts
+    const st = { pi_connected: false, ts: null, pumps: [] };
+    assert.equal(controlOutcome(false, "no Pi connected", undefined, st), "unknown", "default: the Pi-unreachable page owns it");
+    assert.equal(controlOutcome(false, "no Pi connected", undefined, st, true), "fail");
+    assert.equal(controlOutcome(false, "ack timeout", undefined, { ...st, pi_connected: true }), "fail", "a connected Pi that does not answer is a failure");
+    assert.equal(controlOutcome(false, "W610 (MAC mismatch); refusing to write to what may be the wrong pump", undefined, null), "fail",
+      "a gateway identity mismatch is a fault, not a choice");
+  }
+
+  // ── a person's choice is not a failure ────────────────────────────────────────────────────────────────────
+  {
+    // #212: Heat Pump 2's breaker switched off by hand; the bridge refuses its writes as offline
+    const r = rig();
+    await r.cycle(2);
+    r.extra.pump2 = { deliberate_stop: { circuit: "Air-Water 2", since: now / 1000 } };
+    r.fail.pump2 = "pump2 is offline — refusing to queue a stale write";
+    r.armed.pump2 = false;
+    await r.cycle(36);
+    assert.equal(r.pages().length, 0, "a deliberate stop never pages, as 'can't control' or as 'safety net off'");
+  }
+  {
+    // the unit switched to hot-water / standby mode at the wall controller: the bridge's 409
+    const r = rig();
+    r.fail.pump1 = "unit is in DHW mode — remote setpoint is only supported for heating and cooling; use the wall controller";
+    r.armed.pump1 = false;
+    await r.cycle(36);
+    assert.equal(r.pages().length, 0, "a mode refusal never pages");
+  }
+  {
+    // write_enabled: false on the Pi: the bridge's 403
+    const r = rig();
+    r.extra.pump1 = { write_enabled: false };
+    r.fail.pump1 = "writes are disabled for pump1 (write_enabled: false)";
+    await r.cycle(36);
+    assert.equal(r.pages().length, 0, "write-disabled never pages");
+  }
+  {
+    // a real refusal still counts: the W610 identity mismatch
+    const r = rig();
+    r.fail.pump2 = "W610 (MAC mismatch); refusing to write to what may be the wrong pump";
+    await r.cycle(7);
+    assert.equal(r.pages().length, 1);
+    assert.match(r.pages()[0].body, /reached Heat Pump 2\./);
+  }
+
+  // ── a SensorLinx gap does not age the safety-net clock ────────────────────────────────────────────────────
+  {
+    const r = rig();
+    setBoth(r.armed, false);
+    await r.cycle(3);          // 10 min unarmed
+    r.hubSt.slxFresh = false;
+    await r.cycle(24);         // 2 h with no fresh HBX target: Phase B writes nothing
+    r.hubSt.slxFresh = true;
+    await r.cycle();
+    assert.equal(r.pages().length, 0, "the run restarts after the gap instead of reading 2 h old");
+    await r.cycle(7);
+    assert.equal(r.pages().length, 1, "and fires after 30+ min of landed, unarmed writes");
   }
 
   // ── dry-run proves nothing either way ──────────────────────────────────────────────────────────────────────
