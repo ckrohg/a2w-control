@@ -263,6 +263,16 @@ class SpanClient:
     def _note(self, kind: str, transport: str) -> None:
         self._answered[kind] = {"transport": transport, "ts": time.time()}
 
+    def v2_auth_alarm(self) -> dict | None:
+        """The v2 session (active or soak) has registered AUTH_ALARM_STRIKES times without getting a session: the
+        broker keeps refusing what the panel issues. None while that is not the case."""
+        for v2 in (self.v2, self._soak):
+            if v2 is not None:
+                st = v2.status()
+                if st["auth_alarm"]:
+                    return st
+        return None
+
     def transport_status(self) -> dict:
         """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
         frame. `read` falling back to v1 means v2 is failing — v1 is removed 2026-12-31."""
@@ -502,6 +512,7 @@ class SpanLocalPoller:
         self._task: asyncio.Task | None = None
         self._last_ok = 0.0
         self._down_alerted = False
+        self._v2_alarmed = False
         self._last_arm_action = 0.0
         # Latest arm/relay snapshot for the exporter + /api/span/arm (in-memory; cheap).
         self.latest_arm: dict = {}
@@ -524,6 +535,33 @@ class SpanLocalPoller:
                 pass
         await asyncio.to_thread(self.client.close)
 
+    async def _check_v2_auth(self) -> None:
+        """#239 F2: a v2 broker that keeps refusing the credentials the panel just issued is recorded once per episode
+        (record tier: an events row + the log channel, not a page) and shown in /api/health.span (auth_alarm)."""
+        alarm = self.client.v2_auth_alarm()
+        if alarm and not self._v2_alarmed:
+            self._v2_alarmed = True
+            msg = (f"SPAN v2: {alarm['register_strikes']} registrations in a row did not get a broker session "
+                   f"({alarm['error']}); re-registering is backing off (next in {alarm['register_backoff_s']} s, "
+                   f"capped at 6 h). v1 is unaffected.")
+            log.warning("%s", msg)
+            if self.store is not None:
+                try:
+                    await self.store.add_event("span", "span_v2", code="v2_register_backoff", severity="warning",
+                                               message=msg, detail=alarm)
+                except Exception as e:  # noqa: BLE001 — a record must never break the poller
+                    log.warning("span v2 alarm record failed: %s", e)
+            if self.notify:
+                await self.notify("SPAN v2 keeps refusing A2W", msg, tier="record")
+        elif not alarm and self._v2_alarmed:
+            self._v2_alarmed = False
+            if self.store is not None:
+                try:
+                    await self.store.add_event("span", "span_v2", code="v2_register_ok", severity="info",
+                                               message="SPAN v2: a broker session came up again; backoff reset.")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("span v2 alarm record failed: %s", e)
+
     async def poll_once(self) -> list[dict]:
         circuits = await self.client.fetch_circuits()
         rows = extract_powers(circuits, self.cfg.circuits)
@@ -532,6 +570,7 @@ class SpanLocalPoller:
         for r in rows:
             await self.store.add_span_sample(ts, r["circuit_id"], r["name"], r["power_w"])
         await self._evaluate_arm(circuits, ts)
+        await self._check_v2_auth()
         self._last_ok = ts
         if self._down_alerted:
             self._down_alerted = False
@@ -612,6 +651,10 @@ class SpanLocalPoller:
             except Exception as e:  # noqa: BLE001 — a SPAN outage must never break the bridge
                 log.warning("span local poll failed: %s", e)
                 await self._maybe_alert_down(str(e))
+                try:
+                    await self._check_v2_auth()
+                except Exception as e2:  # noqa: BLE001
+                    log.warning("span v2 alarm check failed: %s", e2)
             await asyncio.sleep(self.cfg.poll_interval_s)
 
     async def _maybe_alert_down(self, detail: str) -> None:

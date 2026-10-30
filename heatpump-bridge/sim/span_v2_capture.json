@@ -1,16 +1,18 @@
 {
  "source": "SPAN panel nj-2312-003t6 (firmware spanos3/r202639/04), ebus/5 tree recorded READ-ONLY 2026-10-29 (subscribe-only, nothing published). Postal code and Wi-Fi SSID redacted.",
  "serial": "nj-2312-003t6",
- "register_keys_source": "the keys 6bb's local-bridge/span.mjs reads from POST /api/v2/auth/register on this panel (registration succeeded 2026-10-20); the full response was not recorded",
  "register_keys": [
   "accessToken",
-  "ebusBrokerHost",
-  "ebusBrokerMqttsPort",
-  "ebusBrokerPassword",
-  "ebusBrokerUsername",
+  "tokenType",
+  "iatMs",
   "hostname",
   "serialNumber",
-  "tokenType"
+  "ebusBrokerUsername",
+  "ebusBrokerPassword",
+  "ebusBrokerHost",
+  "ebusBrokerMqttsPort",
+  "ebusBrokerWsPort",
+  "ebusBrokerWssPort"
  ],
  "panel": {
   "$description": {
@@ -520,5 +522,11 @@
    "nj-2312-003t6-lugs-up",
    "nj-2312-003t6-lugs-dn"
   ]
+ },
+ "register_keys_source": "AuthOut in the panel's own GET /api/openapi.json (r202639, read 2026-10-29): the required keys plus ebusBrokerPassword (nullable; present on r202639, per 6bb's live registration)",
+ "client_api": {
+  "list": "GET /api/v2/auth/clients -> {\"clients\": {name: Client}}",
+  "delete": "DELETE /api/v2/auth/clients/{name} -> Client",
+  "auth": "HTTPBearer (accessToken)"
  }
 }

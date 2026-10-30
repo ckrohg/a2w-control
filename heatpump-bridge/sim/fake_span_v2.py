@@ -117,6 +117,8 @@ class FakeEbus:
         self.rejected: list[tuple[str, str]] = []   # /sets the panel's own $description does not allow
         self.password = BROKER_PASSWORD
         self.silent = False                     # the panel stops publishing (stale tree) but the session lives
+        self.hold_retained = False              # a new SUBSCRIBE gets its SUBACK but no retained tree (yet)
+        self.refuse_all = False                 # every CONNECT is refused "not authorised", whatever the creds
         self._published: dict[str, bytes] = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -272,6 +274,20 @@ class FakeEbus:
                 f.circuits[name]["relayState"] = val
 
     # --- the broker ---------------------------------------------------------------------
+    def _send_retained(self, s: dict, filters: list[str]) -> None:
+        with self._lock:
+            retained = list(self.retained.items())
+        for topic, payload in retained:
+            if any(topic_matches(flt, topic) for flt in filters):
+                self._send(s, _packet(0x31, _str(topic.encode()) + payload))
+
+    def resend_retained(self) -> None:
+        """Release a held retained tree to every live session (hold_retained=False first)."""
+        with self._lock:
+            sessions = list(self.sessions)
+        for s in sessions:
+            self._send_retained(s, s["subs"])
+
     def _route(self, topic: str, payload: bytes, *, retain: bool) -> None:
         with self._lock:
             if retain:
@@ -316,7 +332,7 @@ class FakeEbus:
             if first >> 4 != 1:
                 return
             user, pw = self._parse_connect(body)
-            ok = user == BROKER_USER and pw == self.password.encode()
+            ok = user == BROKER_USER and pw == self.password.encode() and not self.refuse_all
             self.connects.append({"username": user, "password_ok": ok})
             if self.fake.down:
                 return
@@ -338,11 +354,8 @@ class FakeEbus:
                     if not self.silent:
                         self._publish_tree()   # the retained tree reflects the panel as of this moment
                     self._send(s, _packet(0x90, pid + bytes(len(filters))))
-                    with self._lock:
-                        retained = list(self.retained.items())
-                    for topic, payload in retained:
-                        if any(topic_matches(flt, topic) for flt in filters):
-                            self._send(s, _packet(0x31, _str(topic.encode()) + payload))
+                    if not self.hold_retained:
+                        self._send_retained(s, filters)
                 elif kind == 3:    # PUBLISH
                     qos = (first >> 1) & 3
                     n = struct.unpack("!H", body[:2])[0]

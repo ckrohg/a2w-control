@@ -9,8 +9,11 @@
 #     land after the CLOSE that was meant to end it. At-most-once + read-back + CLOSE retries is the safe pairing.
 #   - A write is NOT SENT (V2NotSent) only when paho refused it before it reached the socket; once handed over it
 #     may have landed, and the caller must never fall back to v1 for that OPEN.
-#   - Stale or partial data is never "down": a disconnected or silent session, or a circuit not "ready", reads as
-#     unknown (fetch raises, or relayState/instantPowerW are None), never as OPEN or 0 W.
+#   - Stale or partial data is never "down": a disconnected or silent session, a session whose retained tree has not
+#     fully arrived since its latest (re)connect, or a circuit not "ready", reads as unknown (fetch raises, or
+#     relayState/instantPowerW are None), never as OPEN or 0 W. The tree is rebuilt from scratch on every reconnect.
+#   - Registration backs off exponentially (REGISTER_BACKOFF_MAX_S) and deletes this bridge's own stale
+#     a2w-bridge-v2-* clients, so a broker that keeps refusing cannot fill the panel's client list.
 from __future__ import annotations
 
 import json
@@ -20,6 +23,7 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -28,13 +32,17 @@ log = logging.getLogger(__name__)
 T_CIRCUIT = "energy.ebus.device.circuit"
 T_PANEL = "energy.ebus.device.distribution-enclosure"
 _CLIENT_PREFIX = "a2w-bridge"
-_REREGISTER_COOLDOWN_S = 600.0
+_REREGISTER_COOLDOWN_S = 600.0     # the gap after the first registration that did not lead to a session…
+REGISTER_BACKOFF_MAX_S = 6 * 3600.0  # …doubling per further one, capped (never ~144 new panel clients a day)
+AUTH_ALARM_STRIKES = 3             # this many registrations without a session → /health + a record-tier event
 CONNECT_WAIT_S = 15.0     # first use: how long a fetch waits for the session + the retained tree
+TREE_GRACE_S = 5.0        # after a SUBACK: a declared property the panel never publishes is tolerated after this
 STALE_AFTER_S = 90.0      # no message from the panel for this long → the tree is stale (unknown)
 NEVER_UP_S = 60.0         # a session that never connected for this long is restarted (other address, fresh CA)
 ECHO_WAIT_S = 5.0         # after a /set: wait this long for switch/relay to show the new state
 CREDS_FILE = "span-v2-creds.json"
 CA_FILE = "span-v2-ca.pem"
+REGISTER_FILE = "span-v2-register.json"   # backoff state, so a restart does not reset it
 
 
 class V2NotSent(ConnectionError):
@@ -146,6 +154,7 @@ class SpanV2:
         self.mqtt_port = mqtt_port          # tests: override the port the panel advertises
         self.tree = HomieTree()
         self._cv = threading.Condition()    # guards tree + session flags; notified on every message
+        self._good_session = False           # set by on_connect; consumed by _ensure_session (resets the backoff)
         self._client = None
         self._connected = False
         self._subscribed = False
@@ -156,7 +165,11 @@ class SpanV2:
         self._starts = 0                     # sessions started (alternates host / ip_fallback)
         self._started_at = 0.0
         self._next_start = 0.0               # after a failed start, wait before trying again
-        self._last_register = 0.0
+        self._tree_complete = False          # this connection's retained tree has fully arrived (latched)
+        self._reg = {"last": 0.0, "strikes": 0}   # registrations since the last good session (persisted)
+        self._reg_loaded = False
+        self._bg_lock = threading.Lock()     # one background start at a time (the soak)
+        self._closed = False
         self._creds: dict | None = None
         self._ca: str | None = None
         self.last_error: str | None = None
@@ -192,12 +205,16 @@ class SpanV2:
     def _bases(self) -> list[str]:
         return [f"http://{h}" for h in (self.host, self.ip_fallback) if h]
 
-    def _http(self, path: str, *, body: dict | None = None) -> tuple[int, bytes]:
+    def _http(self, path: str, *, body: dict | None = None, method: str | None = None,
+              token: str | None = None) -> tuple[int, bytes]:
         last = "no reachable base"
         for base in self._bases():
             data = json.dumps(body).encode() if body is not None else None
-            req = urllib.request.Request(f"{base}{path}", data=data, method="POST" if body is not None else "GET",
-                                         headers={"Content-Type": "application/json"} if body is not None else {})
+            headers = {"Content-Type": "application/json"} if body is not None else {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(f"{base}{path}", data=data, headers=headers,
+                                         method=method or ("POST" if body is not None else "GET"))
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
                     return r.status, r.read()
@@ -207,11 +224,37 @@ class SpanV2:
                 last = f"{base}: {e}"
         raise ConnectionError(f"panel unreachable ({last})")
 
+    def _load_reg(self) -> None:
+        if self._reg_loaded:
+            return
+        self._reg_loaded = True
+        try:
+            r = json.loads(self._read(REGISTER_FILE) or "null") or {}
+            self._reg = {"last": float(r.get("last", 0.0)), "strikes": int(r.get("strikes", 0))}
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    def _save_reg(self) -> None:
+        self._write(REGISTER_FILE, json.dumps(self._reg))
+
+    def register_backoff_s(self) -> float:
+        """Seconds until another registration is allowed (0 = now)."""
+        self._load_reg()
+        n = self._reg["strikes"]
+        if n <= 0:
+            return 0.0
+        gap = min(_REREGISTER_COOLDOWN_S * 2 ** (n - 1), REGISTER_BACKOFF_MAX_S)
+        return max(0.0, self._reg["last"] + gap - time.time())
+
     def _register(self) -> dict:
-        since = time.time() - self._last_register
-        if since < _REREGISTER_COOLDOWN_S:
-            raise ConnectionError(f"v2 re-register on cooldown ({_REREGISTER_COOLDOWN_S - since:.0f}s left)")
-        self._last_register = time.time()
+        left = self.register_backoff_s()
+        if left > 0:
+            raise ConnectionError(f"v2 re-register backing off ({left:.0f}s left, "
+                                  f"{self._reg['strikes']} registrations without a session)")
+        # counted BEFORE the attempt and cleared only by a good session: a broker that keeps refusing what the
+        # panel just issued backs off exponentially instead of minting a new panel client every 10 minutes
+        self._reg = {"last": time.time(), "strikes": self._reg["strikes"] + 1}
+        self._save_reg()
         name = f"{_CLIENT_PREFIX}-v2-{os.urandom(4).hex()}"   # the panel refuses a duplicate name
         status, raw = self._http("/api/v2/auth/register", body={
             "name": name, "description": "A2W bridge — circuit power + breaker control",
@@ -228,10 +271,32 @@ class SpanV2:
             raise V2AuthError("v2 register returned no broker credentials")
         creds = {"name": name, "serial": j.get("serialNumber"), "username": j["ebusBrokerUsername"],
                  "password": j["ebusBrokerPassword"], "broker_host": j.get("ebusBrokerHost") or j.get("hostname"),
-                 "port": int(j.get("ebusBrokerMqttsPort") or 8883), "registered_at": time.time()}
+                 "port": int(j.get("ebusBrokerMqttsPort") or 8883), "registered_at": time.time(),
+                 "token": j.get("accessToken")}
         self._write(CREDS_FILE, json.dumps(creds))
         log.info("span v2: registered with the panel as %s", name)
+        self._delete_stale_clients(name, j.get("accessToken"))
         return creds
+
+    def _delete_stale_clients(self, keep: str, token: str | None) -> None:
+        """Delete this bridge's OWN earlier v2 clients (a2w-bridge-v2-*, never another prefix: not the v1 client,
+        not 6bb's, not a probe) through the panel's DELETE /api/v2/auth/clients/{name}. Best effort."""
+        if not token:
+            return
+        try:
+            status, raw = self._http("/api/v2/auth/clients", token=token)
+            names = list((json.loads(raw or b"null") or {}).get("clients", {})) if status == 200 else []
+        except (ConnectionError, ValueError, AttributeError) as e:
+            log.info("span v2: listing panel clients failed: %s", e)
+            return
+        for name in names:
+            if name.startswith(f"{_CLIENT_PREFIX}-v2-") and name != keep:
+                try:
+                    status, _ = self._http(f"/api/v2/auth/clients/{urllib.parse.quote(name, safe='')}",
+                                           method="DELETE", token=token)
+                    log.info("span v2: deleted stale panel client %s (HTTP %s)", name, status)
+                except ConnectionError as e:
+                    log.info("span v2: deleting stale panel client %s failed: %s", name, e)
 
     def _ensure_creds(self) -> dict:
         if self._creds is None:
@@ -282,6 +347,7 @@ class SpanV2:
         self.broker = f"{host}:{port}"
         with self._cv:
             self._connected = self._subscribed = self._auth_failed = self._ever_connected = False
+            self._tree_complete = False
             self.tree = HomieTree()
             self._last_msg = None
         self._client = c
@@ -301,6 +367,7 @@ class SpanV2:
             self._cv.notify_all()
 
     def close(self) -> None:
+        self._closed = True
         self._stop()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
@@ -313,6 +380,12 @@ class SpanV2:
                 return
             self._connected = self._ever_connected = True
             self.last_error = None
+            # A new session starts from nothing: the tree, the message clock and the completeness latch from before
+            # the outage must not pass for current between this SUBACK and the panel's retained re-send.
+            self.tree = HomieTree()
+            self._last_msg = None
+            self._subscribed = self._tree_complete = False
+            self._good_session = True
             self._cv.notify_all()
         client.subscribe("ebus/5/#", qos=0)
 
@@ -368,9 +441,18 @@ class SpanV2:
             return self.last_error or "broker refused the credentials"
         if not self._connected:
             return self.last_error or "not connected to the panel broker"
-        if not self._subscribed or self.tree.panel() is None:
-            return "panel tree not received yet"
-        age = time.monotonic() - (self._last_msg or 0.0)
+        if not self._subscribed or self._last_msg is None or self.tree.panel() is None:
+            return "panel tree not received yet on this connection"
+        if not self._tree_complete:
+            # latched per connection: once the retained tree is complete, a property that later goes away reads
+            # as unknown on its circuit, it does not make the whole panel unreadable. A declared property the panel
+            # never publishes is tolerated TREE_GRACE_S after this connection's SUBACK (the real retained burst
+            # takes ~0.12 s).
+            if self._synced() or time.monotonic() - self._subscribed_at >= TREE_GRACE_S:
+                self._tree_complete = True
+            else:
+                return "panel tree still arriving on this connection"
+        age = time.monotonic() - self._last_msg
         if age > STALE_AFTER_S:
             return f"no message from the panel for {age:.0f} s (stale)"
         return None
@@ -378,6 +460,12 @@ class SpanV2:
     def _ensure_session(self, wait: bool = True) -> None:
         """Start (or after an auth refusal, re-register and restart) the session; on a fresh start wait for the
         retained tree. Raises ConnectionError / V2AuthError when v2 cannot be started right now."""
+        if self._good_session:          # a session came up: the registration that made it is good
+            self._good_session = False
+            self._load_reg()
+            if self._reg["strikes"]:
+                self._reg["strikes"] = 0
+                self._save_reg()
         if self._client is not None and self._auth_failed:
             log.info("span v2: broker refused our credentials — re-registering from the passphrase")
             self._stop()
@@ -403,31 +491,49 @@ class SpanV2:
                 self._start()
             except (V2AuthError, ConnectionError, OSError, ValueError, ssl.SSLError) as e:
                 self.last_error = str(e)
-                self._next_start = time.monotonic() + 60.0   # a dead panel must not cost every poll a timeout
+                # a dead panel must not cost every poll a timeout; a registration backoff sets its own time
+                self._next_start = time.monotonic() + (self.register_backoff_s() or 60.0)
                 raise ConnectionError(f"v2: {e}") if not isinstance(e, V2AuthError) else e
             if not wait:
                 return
             deadline = time.monotonic() + CONNECT_WAIT_S
             with self._cv:
-                while not self._synced() and not self._auth_failed:
+                while self._usable_reason() is not None and not self._auth_failed:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break
                     self._cv.wait(min(left, 0.25))
 
     def fetch(self, wait: bool = True) -> dict:
-        """The tree in the v1 /circuits shape. wait=False (the soak) never blocks on a fresh session's retained tree:
-        it raises "not received yet" instead."""
-        self._ensure_session(wait)
+        """The tree in the v1 /circuits shape. wait=False (the soak) never blocks at all: starting, re-registering
+        or restarting the session (HTTP to the panel, up to timeout_s per address) runs on a background thread, and
+        until it has a complete tree the read raises."""
+        if wait:
+            self._ensure_session(True)
+        else:
+            self._kick()
         with self._cv:
-            why = self._usable_reason() or (None if wait or self._synced() else "panel tree still arriving")
+            why = self._usable_reason()
             if why:
                 raise ConnectionError(f"v2: {why}")
             return self.tree.circuits()
 
-    def device_id(self, canon: str) -> str | None:
-        with self._cv:
-            return next((did for did in self.tree.devs if canon_id(did) == canon), None)
+    def _kick(self) -> None:
+        """Run _ensure_session on a daemon thread unless one is already running. Never blocks the caller."""
+        if self._closed or not self._bg_lock.acquire(blocking=False):
+            return
+
+        def run():
+            try:
+                if not self._closed:
+                    self._ensure_session(False)
+            except Exception as e:  # noqa: BLE001 — reported through status()/the next read
+                self.last_error = str(e)[:300]
+            finally:
+                if self._closed:
+                    self._stop()
+                self._bg_lock.release()
+        threading.Thread(target=run, name="span-v2-start", daemon=True).start()
 
     def set_relay(self, circuit_id: str, want: str, before_send=None) -> str | None:
         """Publish OPEN|CLOSED, then wait up to ECHO_WAIT_S for switch/relay to show it. Returns the relay state
@@ -463,9 +569,13 @@ class SpanV2:
                 self._cv.wait(min(left, 0.25))
 
     def status(self) -> dict:
+        self._load_reg()
         with self._cv:
             age = None if self._last_msg is None else round(time.monotonic() - self._last_msg, 1)
+            strikes = self._reg["strikes"]
             return {"started": self._client is not None, "connected": self._connected,
                     "synced": self._synced() if self._client is not None else False,
                     "broker": self.broker, "last_message_age_s": age,
-                    "serial": (self._creds or {}).get("serial"), "error": self.last_error}
+                    "serial": (self._creds or {}).get("serial"), "error": self.last_error,
+                    "register_strikes": strikes, "register_backoff_s": round(self.register_backoff_s()),
+                    "auth_alarm": strikes >= AUTH_ALARM_STRIKES}

@@ -45,6 +45,7 @@ def schema_errors(value, schema: dict, loc: str = "body") -> list[str]:
 
 class FakeSpan:
     TOKEN = "fake-span-token"
+    V2_TOKEN = "fake-v2-jwt"
 
     # tests/conftest.py's span_transport fixture flips these to run a whole suite against a v2-only panel
     DEFAULT_V1 = True
@@ -81,6 +82,8 @@ class FakeSpan:
             from .fake_span_v2 import FakeEbus
             self.ebus = FakeEbus(self)
         self.v2_registrations: list[dict] = []        # every v2 register body
+        self.v2_clients: dict[str, dict] = {}         # the panel's client list (name -> Client), v1 + v2 share it
+        self.v2_deleted: list[str] = []               # every DELETE /api/v2/auth/clients/{name}
         self.v1_requests: list[tuple[str, str]] = []  # every v1 request (method, path) that reached the panel
         self.passphrase: str | None = None            # None: any passphrase registers
 
@@ -123,6 +126,11 @@ class FakeSpan:
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     return self.wfile.write(data)
+                if self.path == "/api/v2/auth/clients" and fake.ebus is not None:
+                    if self.headers.get("Authorization") != f"Bearer {FakeSpan.V2_TOKEN}":
+                        return self._send(401, {"detail": "auth"})
+                    with fake.lock:
+                        return self._send(200, {"clients": dict(fake.v2_clients)})
                 if self.path.startswith("/api/v1/"):
                     fake.v1_requests.append(("GET", self.path))
                 if self.path != "/api/v1/circuits" or not fake.v1:
@@ -147,10 +155,13 @@ class FakeSpan:
                     if fake.passphrase is not None and body.get("hopPassphrase") != fake.passphrase:
                         return self._send(401, {"detail": "invalid passphrase"})
                     # exactly the keys the real panel answers with (span_v2_capture.json)
-                    vals = {"accessToken": "fake-v2-jwt", "tokenType": "Bearer", "serialNumber": SERIAL,
+                    vals = {"accessToken": FakeSpan.V2_TOKEN, "tokenType": "bearer", "iatMs": 0, "serialNumber": SERIAL,
                             "hostname": f"span-{SERIAL}.local", "ebusBrokerHost": f"span-{SERIAL}.local",
                             "ebusBrokerUsername": BROKER_USER, "ebusBrokerPassword": fake.ebus.password,
-                            "ebusBrokerMqttsPort": fake.ebus.port}
+                            "ebusBrokerMqttsPort": fake.ebus.port, "ebusBrokerWsPort": 80, "ebusBrokerWssPort": 443}
+                    with fake.lock:
+                        fake.v2_clients[body.get("name")] = {"description": body.get("description", ""),
+                                                             "issued_at": len(fake.v2_clients)}
                     return self._send(200, {k: vals.get(k) for k in CAPTURE["register_keys"]})
                 if self.path.startswith("/api/v1/"):
                     fake.v1_requests.append(("POST", self.path))
@@ -188,6 +199,20 @@ class FakeSpan:
                         fake.circuits[name]["relayState"] = want
                     state = fake.circuits[name]["relayState"]
                 return self._send(200, {"relayState": state})
+
+        def do_DELETE(handler):
+            from urllib.parse import unquote
+            prefix = "/api/v2/auth/clients/"
+            if fake.ebus is None or not handler.path.startswith(prefix):
+                return handler._send(404, {"detail": "Not Found"})
+            if handler.headers.get("Authorization") != f"Bearer {FakeSpan.V2_TOKEN}":
+                return handler._send(401, {"detail": "auth"})
+            name = unquote(handler.path[len(prefix):])
+            with fake.lock:
+                fake.v2_deleted.append(name)
+                c = fake.v2_clients.pop(name, None)
+            return handler._send(200, c) if c is not None else handler._send(422, {"detail": "no such client"})
+        Handler.do_DELETE = do_DELETE
 
         if self.ebus is not None:
             self.ebus.start()

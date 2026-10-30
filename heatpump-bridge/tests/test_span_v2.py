@@ -5,6 +5,7 @@
 # possibly-delivered v2 OPEN, QoS 0 writes, stale or not-ready data reading as unknown, re-registration, TLS.
 from __future__ import annotations
 
+import asyncio
 import os
 import ssl
 import time
@@ -23,6 +24,7 @@ from sim.fake_span import FakeSpan
 def quick(monkeypatch):
     monkeypatch.setattr(span_v2, "ECHO_WAIT_S", 0.5)
     monkeypatch.setattr(span_v2, "CONNECT_WAIT_S", 3.0)
+    monkeypatch.setattr(span_v2, "TREE_GRACE_S", 1.0)
 
 
 @pytest.fixture
@@ -386,7 +388,9 @@ def test_api_health_reports_the_span_transport(tmp_path):
                         span=SpanConfig(host=addr, passphrase="pw", transport="auto"), db_path=str(tmp_path / "b.db"),
                         ui_dir="ui")
         with TestClient(create_app(cfg)) as c:
-            assert wait_for(lambda: (c.get("/api/health").json()["span"] or {}).get("read") == "v2", 10)
+            # read is noted inside the fetch; last_ok_ts once the poll has stored its samples — wait for both
+            assert wait_for(lambda: (lambda h: h.get("read") == "v2" and h.get("last_ok_ts"))(
+                c.get("/api/health").json()["span"] or {}), 10)
             h = c.get("/api/health").json()["span"]
             assert h["mode"] == "auto" and h["last_ok_ts"] and h["v2"]["connected"] and h["v1_error"] is None
     finally:
@@ -451,3 +455,113 @@ def test_a_broken_v2_never_slows_or_fails_the_v1_read(make, tmp_path):
         assert st["read"] == "v1" and st["soak"]["unavailable"] >= 1 and st["soak"]["compared"] == 0
     finally:
         c.close()
+
+
+# --- #239 review: F1 the soak never delays v1 / F2 registration backoff / F3 no pre-outage tree --------------------
+def test_a_slow_v2_soak_start_never_delays_a_v1_read_or_close(make, tmp_path, monkeypatch):
+    """F1: starting the soak session makes blocking HTTP calls (register, CA: up to timeout_s per address). They run
+    on a background thread, never under the client lock a v1 read or a relay write needs."""
+    panel, _ = make()
+    real_start = span_v2.SpanV2._start
+    started = []
+
+    def slow_start(self):
+        started.append(time.monotonic())
+        time.sleep(3.0)                                   # a panel answering HTTP slowly
+        real_start(self)
+    monkeypatch.setattr(span_v2.SpanV2, "_start", slow_start)
+    c = SpanClient(panel_addr(panel), "pw", transport="v1", v2_soak=True, state_dir=str(tmp_path))
+    try:
+        t = time.monotonic()
+        k = cid(c, "Kitchen")                             # the first read kicks the soak start
+        assert wait_for(lambda: started, 2)
+        panel.set("Kitchen", relayState="OPEN")
+        assert c._set_relay_sync(k, "CLOSED") == "CLOSED"     # while the soak start is still sleeping
+        c._fetch_locked()
+        assert time.monotonic() - t < 1.5 and time.monotonic() - started[0] < 3.0
+        assert panel.relay("Kitchen") == "CLOSED"
+        assert wait_for(lambda: c._soak.status()["synced"], 8)    # and the soak does come up afterwards
+    finally:
+        c.close()
+
+
+def test_register_backoff_doubles_to_a_cap_and_survives_a_restart(tmp_path, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(span_v2.time, "time", lambda: now[0])
+    v = span_v2.SpanV2("h", "p", state_dir=str(tmp_path))
+    assert v.register_backoff_s() == 0                     # never registered: go
+    gaps = []
+    for strikes in range(1, 9):
+        v._reg = {"last": now[0], "strikes": strikes}
+        v._save_reg()
+        gaps.append(span_v2.SpanV2("h", "p", state_dir=str(tmp_path)).register_backoff_s())   # a fresh process
+    assert gaps[:6] == [600, 1200, 2400, 4800, 9600, 19200] and gaps[6:] == [21600, 21600]
+    assert span_v2.SpanV2("h", "p", state_dir=str(tmp_path)).status()["auth_alarm"] is True
+
+
+async def test_a_broker_that_keeps_refusing_backs_off_alarms_once_and_cleans_up(tmp_path, monkeypatch):
+    """F2: every registration after a refusal used to mint a new panel client every 10 min (~144/day)."""
+    monkeypatch.setattr(span_v2, "_REREGISTER_COOLDOWN_S", 0.2)
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 600.0)
+    panel = FakeSpan(v1=True, v2=True)
+    addr = panel.start()
+    panel.v2_clients.update({"a2w-bridge-1a2b3c4d": {}, "6bb-bridge-mvg7k4s1": {}, "a2w-probe-abc123": {},
+                             "a2w-bridge-v2-deadbeef": {}})        # v1 client, 6bb, a probe, a stale v2 client
+    panel.ebus.refuse_all = True
+    store = Store(str(tmp_path / "b.db"))
+    await store.open()
+    sent = []
+
+    async def notify(title, message, priority="default", *, tier, resolved=False, action=None):
+        sent.append((tier, title))
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", v2_soak=True), store, notify=notify,
+                             token_path=str(tmp_path / "span-local-token"))
+    try:
+        for _ in range(40):                                  # ~4 s of polls (v1 answers every one)
+            await poller.poll_once()
+            await asyncio.sleep(0.1)
+        regs = len(panel.v2_registrations)
+        # with a 0.2 s base: registrations at ~0, 0.2, 0.6, 1.4, 3.0 s — not one per poll
+        assert 3 <= regs <= 6, regs
+        st = poller.status()
+        assert st["read"] == "v1" and st["soak"]["v2"]["auth_alarm"] and st["soak"]["v2"]["register_strikes"] == regs
+        assert [s for s in sent if s[0] == "record"] == [("record", "SPAN v2 keeps refusing A2W")]   # once
+        ev = [e for e in await store.get_events("span", 1) if e["type"] == "span_v2"]
+        assert [e["code"] for e in ev] == ["v2_register_backoff"]
+        # only this bridge's own earlier v2 clients were deleted; the v1 client, 6bb and the probe stay
+        assert "a2w-bridge-v2-deadbeef" in panel.v2_deleted
+        assert set(panel.v2_clients) >= {"a2w-bridge-1a2b3c4d", "6bb-bridge-mvg7k4s1", "a2w-probe-abc123"}
+        assert [n for n in panel.v2_clients if n.startswith("a2w-bridge-v2-")] == [panel.v2_registrations[-1]["name"]]
+        # the broker accepts again: a session comes up, the backoff resets and the all-clear is recorded
+        panel.ebus.refuse_all = False
+        for _ in range(100):                                 # keep polling: the soak retries when its backoff allows
+            await poller.poll_once()
+            if not poller.client.v2_auth_alarm():
+                break
+            await asyncio.sleep(0.2)
+        await poller.poll_once()
+        assert poller.status()["soak"]["v2"]["register_strikes"] == 0
+        ev = [e for e in await store.get_events("span", 1) if e["type"] == "span_v2"]
+        assert sorted(e["code"] for e in ev) == ["v2_register_backoff", "v2_register_ok"]
+    finally:
+        await poller.stop()
+        await store.close()
+        panel.stop()
+
+
+def test_after_a_reconnect_the_pre_outage_tree_is_never_served(make):
+    """F3: between the new SUBACK and the panel's retained re-send, the tree from before the outage is gone."""
+    panel, c = make(v1=False)
+    assert next(x for x in c._fetch_locked().values() if x["name"] == "Air-Water 2")["relayState"] == "CLOSED"
+    panel.ebus.silent = True                               # the panel publishes nothing new…
+    panel.ebus.hold_retained = True                        # …and a new session gets no retained tree yet
+    panel.ebus.drop_sessions()
+    assert wait_for(lambda: not c.v2._connected, 3)
+    assert wait_for(lambda: c.v2._connected and c.v2._subscribed, 10)    # paho reconnected + SUBACK
+    with pytest.raises(ConnectionError, match="not received yet on this connection"):
+        c._fetch_locked()                                   # NOT the pre-outage CLOSED
+    panel.ebus.hold_retained = False
+    panel.ebus.silent = False
+    panel.ebus.resend_retained()
+    assert wait_for(lambda: c.v2.status()["synced"], 5)
+    assert next(x for x in c._fetch_locked().values() if x["name"] == "Air-Water 2")["relayState"] == "CLOSED"

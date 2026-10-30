@@ -45,7 +45,19 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
 - **The OpenPermit choke point is unchanged.** `SpanClient._set_relay_sync` checks the permit once. Its recheck
   (expiry + guard) runs at whichever transport's dispatch boundary actually sends.
 - **Unknown is never "down".** A silent session (no message for 90 s), a disconnected one, or a circuit whose
-  `$state` is not `ready` reads as an error or `None`, never as OPEN or 0 W.
+  `$state` is not `ready` reads as an error or `None`, never as OPEN or 0 W. Every (re)connect starts from an empty
+  tree: until that connection's retained tree is complete (or 5 s after its SUBACK, for a declared property the
+  panel never publishes), a read raises. Relay states from before an outage are never served as current.
+- **Registration backs off.** A broker that refuses what the panel just issued used to mean a new panel client every
+  10 minutes. Re-registering now waits 10 min, then 20, 40 … capped at 6 h. The state is persisted in
+  `span-v2-register.json`, so a restart doesn't reset it. After 3 registrations in a row without a session,
+  `/api/health.span…v2.auth_alarm` turns true and one record-tier event is written (`span_v2` /
+  `v2_register_backoff`; `v2_register_ok` when it clears). After each registration the bridge deletes its own older
+  `a2w-bridge-v2-*` clients (`DELETE /api/v2/auth/clients/{name}`); never the v1 client, 6bb's, or a probe.
+- **The soak never delays v1.** Starting, re-registering or restarting the soak session (HTTP to the panel) runs on
+  a background thread, never under the client lock that a v1 read or a relay write needs.
+- **The CA is trust-on-first-use.** `GET /api/v2/certificate/ca` is plain HTTP; the PEM is pinned on disk after the
+  first fetch, and re-fetched only when a session never comes up (a re-issued CA).
 - **Circuit ids.** v2's device id for a circuit is the same 32-hex id v1 used (verified 2026-10-29: Air-Water 1
   `32a6a2a2…`, Air-Water 2 `c7f7ca8b…`, Buffer Tank `dfbc1200…`, identical in `span_readings` and on the eBus tree).
   Ids are still compared with dashes removed (`canon_id`), so a power-cycle record written under v1 recovers under v2
