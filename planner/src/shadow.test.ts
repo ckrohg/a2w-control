@@ -253,8 +253,20 @@ console.log("shadow.test.ts: all assertions passed ✓");
   // A contaminated sag cannot chase strictCap: the boost is capped at MAX_PREBOOST_F and says so.
   const huge = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 40, sagP75F: 40, n: 8 }] };
   const b4 = computeShadowPlan(fc, null, huge, null, false).filter((x) => x.boost)[0];
-  assert.equal(b4.tank_target_f, 132, "120 + 12 (cap), placed at 16:00 with no standby allowance");
-  assert.match(b4.reason, /capped at \+12/);
+  assert.equal(b4.tank_target_f, 135, "120 + 16 (cap) = 136, then strictCap 135; placed at 16:00 with no standby allowance");
+  assert.match(b4.reason, /capped at \+16/);
+
+  // 2026-10-30: sized from the p90 sag — the reason names p90 when the pre-boost carries it.
+  const p90 = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 13, sagP75F: 8.1, sagP90F: 13.2, n: 20 }] };
+  const b5 = computeShadowPlan(fc, null, p90, null, false).filter((x) => x.boost)[0];
+  assert.equal(b5.tank_target_f, 133, "120 + 13 (p90), hour right before the bell");
+  assert.match(b5.reason, /sag p90 13.2°F over 20 draws/);
+  // A declared 06:30–10:00 shower window, merged into the learned [8,10] peak → [6,10): the boost is in force by 06:00.
+  const morning = { ...opts, dhwWindows: [[0, 24]] as [number, number][], preBoosts: [{ windowStart: 6, windowEnd: 10, boostF: 12, sagP75F: 8, sagP90F: 12, n: 30 }] };
+  const b6 = computeShadowPlan(fc, null, morning, null, false).filter((x) => x.boost)[0];
+  assert.ok(b6, "the declared morning window gets a pre-boost");
+  assert.ok(new Date(b6.ts).getHours() <= 5, `boost lands before the 06:00 block (got ${new Date(b6.ts).getHours()}:00)`);
+  assert.match(b6.reason, /for 06:00 window \(sag p90 12°F/);
 
   // A soak in the lead interval IS the pre-boost: with the soak due it lands at the day's warmest hour
   // (h=23 here, not in the lead) → the boost still happens; force the soak into the lead and it is suppressed.
