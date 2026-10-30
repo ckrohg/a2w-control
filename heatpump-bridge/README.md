@@ -142,15 +142,18 @@ the dashboard reaches the panel through hub → Pi → LAN. Three actions on a c
 Guards, all re-checked on a fresh panel read immediately before the OPEN: allowlist,
 `isUserControllable`, an unambiguous panel name, **one action at a time** (a global lock that
 includes background re-closes), **never two heat-pump circuits off at once**, and a read-back
-of `relayState` after every write. The backup element is close-only by name regardless of the
-allowlist. `min_off_s` has a hard floor of 60 s and `max_off_s` caps a single hold. Before any
+of `relayState` after every write. The backup element is never power-cycled and is close-only
+by name regardless of the allowlist, unless `span.backup_reopen` is set (default off, owner OK
+required): then an OPEN is allowed only while the element draws under `backup_open_max_w` and
+the owner's arm intent is not ARMED. `min_off_s` has a hard floor of 60 s and `max_off_s` caps a single hold. Before any
 OPEN a cycle record is fsync'd next to the DB (or the cycle is refused); a restart that
 interrupted a cycle finds it and finishes the CLOSE after the rest of the hold, the full hold
 when the OPEN's timing is unknown. Cancellation never shortens a hold. Every attempt, accepted
 or refused, is an audit event mirrored to the cloud plus a push/email line.
 
 Config keys (`span:`): `breakers` (list of `name`, `allow_cycle`, `allow_open`, `heat_pump`),
-`min_off_s`, `max_off_s`, `close_attempts`, `close_retry_delay_s`, `reclose_interval_s`.
+`min_off_s`, `max_off_s`, `close_attempts`, `close_retry_delay_s`, `reclose_interval_s`,
+`backup_reopen`, `backup_open_max_w`.
 
 ## Self-heal
 
