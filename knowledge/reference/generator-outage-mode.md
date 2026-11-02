@@ -63,8 +63,8 @@ Candidate signals:
 | Heat pumps' AC input voltage (Modbus 2067/2077, read in diagnostics) | Same voltage-only limit | Reads 231 V now. Only the latest snapshot is kept, so there is no history. |
 | ATS auxiliary contact / generator "running" dry contact → Pi GPIO | **Yes, instantly, locally** | Hardware. The only direct signal. **Recommended.** |
 
-**Conclusion:** there is no measured local signal today. The supply decision uses the email feed, and anything uncertain
-is treated as the generator.
+**Conclusion:** there is no measured local signal today. The supply decision uses the email feed. A silent feed is
+treated as the generator only while an outage is plausible; otherwise the grid is assumed (owner 2026-11-01, below).
 
 ## The rule (planner: `planner/src/generator.ts` + `backupgate.ts`)
 
@@ -72,8 +72,11 @@ is treated as the generator.
   - **generator:** the feed reports an outage, or reported one < 30 min ago (an ATS waits before retransfer, and the
     restored email can come first);
   - **grid:** a fresh (≤ 15 min) "no outage" answer;
-  - **unknown:** the feed is unreachable, stale or has not answered since the planner started. **Treated as the
-    generator.**
+  - **feed silent** (unreachable, stale, or no answer since the planner started):
+    - **unknown, treated as the generator,** if the last answer was an active outage, an outage was seen < 6 h ago,
+      or the planner started < 30 min ago and the feed has not answered yet;
+    - otherwise **grid, assumed**: `assumed: true` in the supply and in /health `generator.feed`, with a why such as
+      "the outage feed has not answered for N min; assuming the grid (no outage seen in the last 6 h)".
 - **On the generator or unknown, the gate may close the element only if both hold:**
   - **budget:** house load (every SPAN circuit except the element's, from a fresh Pi panel read) + 16.5 kW + margin ≤
     cap. An unknown load fails.
@@ -148,17 +151,19 @@ domain and is not built.
   - Nothing re-opens it, and the Pi can only close.
   - Automatic shedding needs an OPEN on the generator: either `BACKUP_GATE_REOPEN=1` plus `span.backup_reopen` with a
     generator trigger, or 6bb's shedding.
-- **A stale outage feed blocks the element on the grid too.**
-  - Unknown supply is treated as the generator. In normal winter use the floor rule fires only while every available
-    pump runs: at least 5.1 kW of house, so the budget fails.
-  - So if 6bb's feed is silent for more than 15 min, the backup gate cannot close the element even on the grid.
-  - How often that happens is **not knowable from A2W's data**: the planner never persisted feed answers, and this feed
-    went live on 2026-10-29.
-  - The precedent is bad: the previous feed (OutageWatch) was dead from 2026-03-15 to 2026-10-29 unnoticed, which
-    under this rule would have meant the whole season.
-  - drift-check [5] now asserts the feed daily (#242).
-  - Options: trust the last "no outage" answer for hours instead of 15 min, or treat unknown as the grid unless an
-    outage was seen recently.
+- **~~A stale outage feed blocks the element on the grid too.~~ Resolved (owner decision 2026-11-01).**
+  - The gap: unknown supply was treated as the generator, and in normal winter use the floor rule fires only while
+    every available pump runs (at least 5.1 kW of house), so the budget fails. A feed silent for more than 15 min would
+    have kept the gate from closing the element on the grid. The previous feed (OutageWatch) was dead from 2026-03-15 to
+    2026-10-29 unnoticed: under that rule, the whole season.
+  - **The rule now:** a silent feed assumes the grid (flagged `assumed`) unless the last answer was an active outage,
+    an outage was seen < 6 h ago (`GEN.SILENT_OUTAGE_RECENT_MS`), or the planner started < 30 min ago with no answer yet
+    (`GEN.FEED_STARTUP_GRACE_MS`; every deploy restarts the planner). A fresh answer is used as before.
+  - **Remaining risk:** an outage that starts while the feed is silent leaves the planner gate believing it is on the
+    grid, so for that window the planner gate skips its budget check. Like the email-lag window (Residual risk 1),
+    this needs a gate episode to reach its close while the house is on the generator. The Pi fallback has no outage
+    input and always applies its budget check, so it is unaffected.
+  - drift-check [5] asserts the feed daily (#242); `assumed: true` in /health shows when the grid is a guess.
 - **The feed's latency at outage start has never been measured** (see Detection).
 
 ## Residual risks (owner should know)
@@ -183,7 +188,8 @@ domain and is not built.
 - **Decide the defaults:**
   - the cap: 24 kW, or the generator's real continuous rating;
   - the 2.4 kW margin;
-  - unknown supply → generator, given the stale-feed gap above;
+  - ~~unknown supply → generator~~ decided 2026-11-01: a silent feed assumes the grid unless an outage is plausible
+    (above);
   - unknown comfort → at risk;
   - which zones count for comfort (`COMFORT_EXCLUDE_ZONES`; the mini-split rooms?);
   - the pre-live gaps above.

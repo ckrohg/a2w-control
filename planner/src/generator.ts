@@ -8,9 +8,12 @@
  * Pure (no I/O). index.ts feeds it every SensorLinx poll and hands `element_allowed` to the backup gate, which then
  * refuses a close it would otherwise make (backupgate.ts `generator`). Three inputs:
  *   - SUPPLY from 6bb's National Grid email feed (planner OUTAGEWATCH_URL). An outage, or < RESTORE_TAIL after one, is
- *     the generator; a fresh "no outage" answer is the grid; anything else (feed unreachable, stale, never answered) is
- *     UNKNOWN and is treated as the generator — "if unsure, assume we are". The feed is email-based: it cannot see the
- *     first minutes of an outage (the doc covers what that leaves open).
+ *     the generator; a fresh "no outage" answer is the grid. A SILENT feed (unreachable, stale, never answered) is
+ *     UNKNOWN, treated as the generator, only while an outage is plausible: the last answer said one is active, one was
+ *     seen < SILENT_OUTAGE_RECENT_MS ago, or the planner started < FEED_STARTUP_GRACE_MS ago with no answer yet.
+ *     Otherwise it is the grid, flagged `assumed` (owner 2026-11-01: a dead feed must not block the element on normal
+ *     grid power all season). The feed is email-based: it cannot see the first minutes of an outage, nor one that
+ *     starts while it is silent (the doc covers what that leaves open).
  *   - BUDGET: house load (every SPAN circuit but the element's, from a fresh Pi panel read) + the element's 16.5 kW +
  *     MARGIN must stay ≤ CAP. Unknown load = does not fit.
  *   - COMFORT from TempIQ (the planner's demand feed): every OCCUPIED zone (comfortRisk), the coldest driving it. At
@@ -36,6 +39,11 @@ export const GEN = {
   /** after the feed says the outage is over, stay on "generator" this long: an ATS waits minutes before retransfer,
    *  and the restored email can arrive before it */
   RESTORE_TAIL_MS: 30 * 60_000,
+  /** a silent feed stays "unknown" (= the generator) if an outage was seen this recently; older, it assumes the grid */
+  SILENT_OUTAGE_RECENT_MS: 6 * 3600_000,
+  /** no answer yet since the planner started: "unknown" this long (the first poll normally answers within minutes;
+   *  every deploy restarts the planner), then the grid is assumed */
+  FEED_STARTUP_GRACE_MS: 30 * 60_000,
   /** a panel read older than this (Pi clock, relative to the frame) is not a live load */
   HOUSE_FRESH_S: 120,
   FLOOR_F: 60,
@@ -67,6 +75,9 @@ export class OutageFeed {
   private active: boolean | null = null;
   private lastActiveMs: number | null = null;
 
+  /** startMs = when the planner started (the FEED_STARTUP_GRACE_MS clock) */
+  constructor(private readonly startMs: number = Date.now()) {}
+
   note(active: boolean | null, nowMs: number): void {
     if (active == null) return; // no answer: the last one ages out by FEED_FRESH_MS
     this.answerMs = nowMs;
@@ -74,17 +85,25 @@ export class OutageFeed {
     if (active) this.lastActiveMs = nowMs;
   }
 
-  supply(nowMs: number): { supply: Supply; why: string } {
+  /** `assumed` = the grid answer comes from the feed's silence, not from the feed */
+  supply(nowMs: number): { supply: Supply; why: string; assumed: boolean } {
     if (this.answerMs != null && nowMs - this.answerMs <= GEN.FEED_FRESH_MS) {
-      if (this.active) return { supply: "generator", why: "National Grid reports an outage (6bb feed)" };
+      if (this.active) return { supply: "generator", why: "National Grid reports an outage (6bb feed)", assumed: false };
       if (this.lastActiveMs != null && nowMs - this.lastActiveMs < GEN.RESTORE_TAIL_MS) {
         return { supply: "generator", why: `the outage ended ${Math.round((nowMs - this.lastActiveMs) / 60_000)} min ago; ` +
-          `assumed on the generator for ${GEN.RESTORE_TAIL_MS / 60_000} min after (transfer-switch retransfer)` };
+          `assumed on the generator for ${GEN.RESTORE_TAIL_MS / 60_000} min after (transfer-switch retransfer)`, assumed: false };
       }
-      return { supply: "grid", why: "no outage reported (6bb feed)" };
+      return { supply: "grid", why: "no outage reported (6bb feed)", assumed: false };
     }
-    return { supply: "unknown", why: this.answerMs == null ? "the outage feed has not answered since the planner started"
-      : `the outage feed has not answered for ${Math.round((nowMs - this.answerMs) / 60_000)} min` };
+    const min = (ms: number) => Math.round(ms / 60_000);
+    const silent = this.answerMs == null ? `the outage feed has not answered in the ${min(nowMs - this.startMs)} min since the planner started`
+      : `the outage feed has not answered for ${min(nowMs - this.answerMs)} min`;
+    if (this.answerMs == null && nowMs - this.startMs < GEN.FEED_STARTUP_GRACE_MS) return { supply: "unknown", why: silent, assumed: false };
+    if (this.active) return { supply: "unknown", why: `${silent}; its last answer was an active outage`, assumed: false };
+    if (this.lastActiveMs != null && nowMs - this.lastActiveMs < GEN.SILENT_OUTAGE_RECENT_MS) {
+      return { supply: "unknown", why: `${silent}; an outage was seen ${min(nowMs - this.lastActiveMs)} min ago`, assumed: false };
+    }
+    return { supply: "grid", why: `${silent}; assuming the grid (no outage seen in the last ${GEN.SILENT_OUTAGE_RECENT_MS / 3600_000} h)`, assumed: true };
   }
 
   status(nowMs: number): Record<string, unknown> {

@@ -32,6 +32,10 @@
  * hours and set 62–63 °C on half of them; the proof clears 19 of the 39 (the rest: the tank still above the old
  * threshold, or a call in progress) and 6 of the 10 report-dominated winter-guard hours. The device-curve term and
  * the plan term stay in the max, so the lead never drops below what the device is actually driving to.
+ *
+ * The pending-boost term (#231): a dashboard boost above the lead is armed rather than refused — writes.ts publishes
+ * it here (setPendingBoost), it joins the max for at most 20 min, and the writer lands the boost once the setpoints
+ * cover it (the identification up-probe's arming, applied to a human boost).
  */
 
 import { HubClient } from "./hub";
@@ -40,6 +44,7 @@ import { Store } from "./store";
 import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
 import { commandForBlock } from "./autopilot";
+import { PENDING_BOOST_MAX_MS } from "./writes";
 import { staleReportedTarget, ADOPTION_TOLERANCE_F, type RecentPoll, type StaleReportVerdict } from "./stale-target";
 import type { HubPump, HubState } from "./hub";
 import {
@@ -298,6 +303,26 @@ export class PhaseB {
   setProbeTarget(t: number | null): void { this.probeTargetF = t; }
   get probeTarget(): number | null { return this.probeTargetF; }
 
+  // #231: a dashboard boost above the current lead (writes.ts boost() → 202 arming) is LED the same way an up-probe
+  // is: published here, carried in the max() below, and the writer's poll-loop retry writes it once the setpoints
+  // cover it. Time-bounded (PENDING_BOOST_MAX_MS from the moment it is set, whatever the caller asks) so an abandoned
+  // request — a crashed retry, a refusal nobody cleared — cannot hold the setpoints up; an expired term is ignored
+  // and cleared on the next read. It only ever raises the setpoint, like every other term.
+  private pendingBoost: { targetF: number; expiresAtMs: number } | null = null;
+  setPendingBoost(targetF: number | null, expiresAtMs: number = Date.now() + PENDING_BOOST_MAX_MS): void {
+    this.pendingBoost = targetF == null || !Number.isFinite(targetF)
+      ? null
+      : { targetF, expiresAtMs: Math.min(expiresAtMs, Date.now() + PENDING_BOOST_MAX_MS) };
+  }
+  /** The pending boost's target, or null — none, or past its expiry (then cleared). */
+  get pendingBoostF(): number | null {
+    if (this.pendingBoost && Date.now() >= this.pendingBoost.expiresAtMs) {
+      console.log(`[phase-b] pending boost to ${this.pendingBoost.targetF} °F expired — its lead is released`);
+      this.pendingBoost = null;
+    }
+    return this.pendingBoost?.targetF ?? null;
+  }
+
   /** The plan's lead terms from the latest shadow plan (planLeadF at the live outdoor, in this instance's shaped-curve
    *  mode — the same SHAPED_CURVE flag index.ts hands the AutoPilot, so the lead reads the block the way the auto-pilot
    *  writes it). Setpoints must LEAD the plan up (esp. the daily 140°F sanitize), or a rising target would deadlock
@@ -333,7 +358,8 @@ export class PhaseB {
     /** the operative term in the max — the report, or the curve in force's output when the report is provably frozen */
     operative_f: number; operative_basis: OperativeLead["basis"]; reported_f: number; stale_proof: string | null;
     plan_f: number | null; plan_basis: PlanLead["basis"]; plan_declared_f: number | null; next_f: number | null;
-    probe_f: number | null; device_curve_f: number | null;
+    /** #231: the pending boost's target (setPendingBoost), null when none is armed */
+    probe_f: number | null; boost_f: number | null; device_curve_f: number | null;
   } | null = null;
 
   async runOnce(): Promise<void> {
@@ -366,13 +392,14 @@ export class PhaseB {
         : `[phase-b] leading the SensorLinx report again (${reportedF} °F${op.verdict.kind === "unproven" ? `; stale-report proof: ${op.verdict.why}` : ""})`);
     }
     this.lastBasis = op.basis;
-    const effectiveTarget = Math.max(op.f, plan.nowF ?? -Infinity, plan.nextF ?? -Infinity, this.probeTargetF ?? -Infinity, curveLead ?? -Infinity);
+    const boostF = this.pendingBoostF;
+    const effectiveTarget = Math.max(op.f, plan.nowF ?? -Infinity, plan.nextF ?? -Infinity, this.probeTargetF ?? -Infinity, boostF ?? -Infinity, curveLead ?? -Infinity);
     const r1 = (v: number | null): number | null => (v == null ? null : Math.round(v * 10) / 10);
     this.lastLead = {
       at: new Date().toISOString(), effective_f: r1(effectiveTarget) as number,
       operative_f: r1(op.f) as number, operative_basis: op.basis, reported_f: reportedF, stale_proof: staleProofNote(op.verdict),
       plan_f: r1(plan.nowF), plan_basis: plan.basis, plan_declared_f: plan.declaredF, next_f: r1(plan.nextF),
-      probe_f: this.probeTargetF, device_curve_f: r1(curveLead),
+      probe_f: this.probeTargetF, boost_f: boostF, device_curve_f: r1(curveLead),
     };
     const decisions = computeTracking(effectiveTarget, this.pumpIds);
     this.lastRunAt = new Date().toISOString();

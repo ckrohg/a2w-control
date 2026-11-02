@@ -3,17 +3,21 @@
  * an auto-pilot write still in flight when the owner taps a boost (or the reverse) cannot ALSO land: the second
  * writer sees the first's lastWriteAt and is refused 429 — before, both passed the rate-limit check and the later
  * PATCH replaced the boost. (b) expireBoosts() retires an overdue row without restoring while a newer boost is active.
- * (c) A rejected write does not poison the chain. Plain node:assert under tsx: npx tsx planner/src/writes-boost.test.ts
+ * (c) A rejected write does not poison the chain. (m) #231: a dashboard boost the pump setpoints do not cover is armed
+ * (202) — Phase B leads it, the poll loop writes it once covered — while every other refusal stays one; an abandoned
+ * boost releases its lead within 20 min. Plain node:assert under tsx: npx tsx planner/src/writes-boost.test.ts
  */
 import assert from "node:assert/strict";
-import { HbxWriter, WriteError, isBoostYield } from "./writes";
+import { HbxWriter, WriteError, isBoostYield, PENDING_BOOST_MAX_MS } from "./writes";
 import { AutoPilot } from "./autopilot";
+import { PhaseB } from "./phaseb";
 
 type Boost = { targetF: number; restoreAt: Date };
-function harness(planTargetF = 126) {
+function harness(planTargetF = 126, cfg: Record<string, number> = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 }) {
   const patches: Array<Record<string, number>> = [];
-  const audits: Array<{ source: string; action: string; result: string }> = [];
-  const cfg = { dot: 10, wwsd: 65, dbt: 130, mbt: 126 };
+  const audits: Array<{ source: string; action: string; result: string; detail?: string }> = [];
+  // #231: what the hub shows for both pumps (60 °C = 140 °F covers every boost here unless a case lowers it)
+  const pi = { setpointC: 60, connected: true, tsS: () => Math.floor(Date.now() / 1000) - 10, fail: false };
   let live: Record<string, number> = { ...cfg };
   const boosts: Array<{ id: number; targetF: number; restoreAt: Date; restored: boolean; createdAt?: Date }> = [];
   const apLogs: Array<{ targetF: number | null; reason: string; result: string }> = [];
@@ -53,12 +57,20 @@ function harness(planTargetF = 126) {
     patches.push(fields); live = { ...live, ...fields };
     return { syncCode: "x", ...live, temps: { temp1: { actual: 120, target: 128 }, temp3: { actual: 30 } } };
   } } as any;
-  const hub = { getState: async () => ({ pi_connected: true, ts: Math.floor(Date.now() / 1000) - 10, pumps: [{ id: "pump1", name: "P1", online: true, setpoint_c: 60 }] }) } as any;
+  const hub = { getState: async () => {
+    if (pi.fail) throw new Error("ECONNREFUSED");
+    return { pi_connected: pi.connected, ts: pi.tsS(), pumps: [{ id: "pump1", name: "P1", online: true, setpoint_c: pi.setpointC }, { id: "pump2", name: "P2", online: true, setpoint_c: pi.setpointC }] };
+  } } as any;
   const writer = new HbxWriter(slx, store, hub, "b", "s", async () => {});
+  // #231: a fake Phase B lead — records every term the writer publishes
+  const lead = { can: true, terms: [] as Array<number | null>, expiries: [] as Array<number | undefined> };
+  writer.setBoostLead({ canLead: () => lead.can, set: (t, exp) => { lead.terms.push(t); lead.expiries.push(exp); } });
   const hold = () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return () => { gate = null; release(); }; };
   const autopilot = new AutoPilot(store, writer, false, async () => {});
-  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, insertGate, store, slx, hub, live: () => live };
+  return { writer, autopilot, patches, audits, boosts, hold, apLogs, failRetire, failConfig, insertGate, store, slx, hub, pi, lead, live: () => live };
 }
+/** #231: the July as-found curve (165/145) as the baseline: at 30 °F outdoor the I4 ceiling is the 135 °F cap itself. */
+const AS_FOUND = { dot: 10, wwsd: 65, dbt: 165, mbt: 145 };
 const settle = () => new Promise((r) => setImmediate(r));
 async function status(p: Promise<unknown>): Promise<number | "ok"> {
   try { await p; return "ok"; } catch (e) { if (e instanceof WriteError) return e.status; throw e; }
@@ -371,6 +383,170 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     const r = await bo;
     assert.equal(r.boost_superseded, true);
     assert.equal(h.boosts.length, 1); assert.equal(h.boosts[0].restored, true, "the late row is retired");
+  }
+  // ── #231: a boost above the pump setpoints is ARMED (202), led by Phase B, and written once they cover it ────────
+  // (m1) acceptance: 135 °F / 60 min with the setpoints at 52 °C (125.6 °F) → arming; a REAL Phase B leads the pumps to
+  //      60 °C on its next cycle; the poll after (the Pi's frame shows them) writes it — one accepted set_target, one
+  //      hbx_boosts row; lead.boost_f reads 135 while pending and null after
+  {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 52;
+    const sent: number[] = [];
+    const pbStore = { ...h.store, insertPhaseBLog: async () => {}, getRecentSeries: async () => [], getNotifyLatch: async () => null, upsertNotifyLatch: async () => {} };
+    const pbHub = { sendSetpoint: async (_p: string, c: number) => { sent.push(c); return { ok: true, detail: "" }; }, getState: h.hub.getState };
+    const pb = new PhaseB(pbStore as any, pbHub as any, ["pump1", "pump2"], false, async () => {}, false, async () => true);
+    h.writer.setBoostLead({ canLead: () => !pb.isDryRun, set: (t, exp) => pb.setPendingBoost(t, exp) });
+    const r = await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    assert.equal(r.arming, true); assert.equal(r.setpoints_needed_f, 140); assert.equal(r.target_f, 135);
+    assert.equal(h.patches.length, 0, "nothing written while arming");
+    assert.equal(h.boosts.length, 0, "no boost row while arming");
+    assert.equal(pb.pendingBoostF, 135, "Phase B carries the boost term");
+    const st = await h.writer.status() as any;
+    assert.equal(st.pending_boost?.target_f, 135); assert.equal(st.pending_boost?.setpoints_needed_f, 140);
+    assert.equal(h.audits.at(-1)?.action, "boost"); assert.equal(h.audits.at(-1)?.result, "arming");
+    // poll 1: Phase B sends 60 °C; the hub still shows the Pi's previous frame → not written yet
+    await pb.runOnce();
+    assert.deepEqual(sent, [60, 60], "135 + 5 = 140 °F → 60 °C");
+    assert.equal(pb.lastLead?.boost_f, 135);
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 0, "the hub does not show the raised setpoints yet");
+    // the Pi pushes its next frame; poll 2: the retry sees every online pump ≥ 140 °F and writes
+    h.pi.setpointC = 60;
+    await pb.runOnce();
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "the boost landed");
+    assert.equal(h.audits.filter((a) => a.action === "set_target" && a.result === "accepted").length, 1, "audited as ONE set_target");
+    assert.equal(h.audits.filter((a) => a.result === "rejected").length, 0, "no rejected attempts on the way");
+    assert.equal(h.boosts.length, 1, "ONE hbx_boosts row"); assert.equal(h.boosts[0].targetF, 135);
+    assert.ok(Math.abs(h.boosts[0].restoreAt.getTime() - (Date.now() + 60 * 60_000)) < 5_000, "the 60-min timer runs from the write");
+    assert.equal(pb.pendingBoostF, null, "the term is cleared once the boost is written");
+    const st2 = await h.writer.status() as any;
+    assert.equal(st2.pending_boost, null); assert.equal(st2.pending_boost_ended?.outcome, "landed");
+    assert.equal(st2.active_boost?.target_f, 135);
+    await pb.runOnce();
+    assert.equal(pb.lastLead?.boost_f, null);
+  }
+  // (m2) a boost the setpoints already cover writes at once — no arming, no Phase B term (no behaviour change)
+  {
+    const h = harness(126, AS_FOUND);
+    const r = await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    assert.equal(r.arming, undefined); assert.equal(r.ok, true); assert.ok(typeof r.boost_restore_at === "string");
+    assert.equal(h.patches.length, 1); assert.equal(h.boosts.length, 1);
+    assert.deepEqual(h.lead.terms, [], "Phase B never asked to lead");
+  }
+  // (m3) every OTHER refusal is still a refusal — same status as before, nothing pending, no Phase B term
+  {
+    const cases: Array<[string, (h: ReturnType<typeof harness>) => void, number, number]> = [
+      ["above the 135 °F cap", () => {}, 136, 422],
+      ["below the I4 floor", () => {}, 100, 422],
+      ["Pi disconnected", (h) => { h.pi.connected = false; }, 135, 503],
+      ["Pi frame stale", (h) => { h.pi.tsS = () => Math.floor(Date.now() / 1000) - 3600; }, 135, 503],
+      ["hub unreachable", (h) => { h.pi.fail = true; }, 135, 503],
+      ["rate limited (I1 meets it first: 409 as today)", (h) => { (h.writer as any).lastWriteAt = Date.now(); }, 135, 409],
+      ["Phase B in dry-run cannot lead (409 as today)", (h) => { h.lead.can = false; }, 135, 409],
+      ["writer lease not held (409 as today)", (h) => {
+        h.store.holdsWriterLease = async () => false;
+        const w = new HbxWriter(h.slx, h.store, h.hub, "b", "s", async () => {}, false, { instanceId: "a", staleMs: 60_000 });
+        w.setBoostLead({ canLead: () => true, set: (t) => { h.lead.terms.push(t); } });
+        h.writer = w;
+      }, 135, 409],
+    ];
+    for (const [name, setup, target, want] of cases) {
+      const h = harness(126, AS_FOUND);
+      h.pi.setpointC = 52;
+      setup(h);
+      assert.equal(await status(h.writer.boost(target, 60, "dashboard", undefined, { armIfLow: true })), want, name);
+      assert.equal((await h.writer.status() as any).pending_boost, null, `${name}: nothing pending`);
+      assert.deepEqual(h.lead.terms, [], `${name}: Phase B not asked to lead`);
+      assert.equal(h.patches.length, 0); assert.equal(h.boosts.length, 0);
+      assert.equal(h.audits.at(-1)?.result, "rejected", `${name}: audited as a rejection, as before`);
+    }
+    // without armIfLow (the rehearsal script, any non-dashboard caller) the short-setpoint boost is the old 409
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 52;
+    assert.equal(await status(h.writer.boost(135, 60, "dashboard")), 409);
+    assert.deepEqual(h.lead.terms, []);
+  }
+  // (m4) an abandoned boost releases within the 20-min bound: the setpoints never rise; past PENDING_BOOST_MAX_MS the
+  //      retry drops it, releases the Phase B term and audits "expired" — and Phase B's own bound releases it anyway
+  {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 52;
+    const pb = new PhaseB({} as any, {} as any, ["pump1"], false, async () => {});
+    h.writer.setBoostLead({ canLead: () => true, set: (t, exp) => pb.setPendingBoost(t, exp) });
+    const r = await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    assert.equal(r.arming, true);
+    assert.ok(Date.parse(String(r.expires_at)) - Date.now() <= PENDING_BOOST_MAX_MS);
+    await h.writer.retryPendingBoost();
+    assert.equal(pb.pendingBoostF, 135, "still arming inside the bound");
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + PENDING_BOOST_MAX_MS + 1000;
+      assert.equal(pb.pendingBoostF, null, "Phase B's own bound releases the term with nobody clearing it");
+      pb.setPendingBoost(135, realNow() + 60_000); // re-published (as if the writer had not noticed yet)
+      await h.writer.retryPendingBoost();
+      assert.equal(pb.pendingBoostF, null, "the writer's retry releases it");
+      const st = await h.writer.status() as any;
+      assert.equal(st.pending_boost, null); assert.equal(st.pending_boost_ended?.outcome, "expired");
+    } finally { Date.now = realNow; }
+    assert.equal(h.audits.at(-1)?.result, "expired"); assert.equal(h.audits.at(-1)?.action, "boost");
+    h.pi.setpointC = 60;
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 0, "an expired boost is never written late");
+    assert.equal(h.boosts.length, 0);
+  }
+  // (m5) the owner's restore (endsBoost) while a boost is arming cancels it — the term is released, nothing lands later
+  {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 52;
+    assert.equal((await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true })).arming, true);
+    assert.equal(await status(h.writer.restore("dashboard", { endsBoost: true })), "ok");
+    assert.equal(h.lead.terms.at(-1), null, "Phase B's term released");
+    h.pi.setpointC = 60;
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "only the restore reached the device");
+    assert.equal(h.boosts.length, 0);
+    // a new boost request replaces an armed one
+    const k = harness(126, AS_FOUND);
+    k.pi.setpointC = 52;
+    await k.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    await k.writer.boost(134, 30, "dashboard", undefined, { armIfLow: true });
+    assert.deepEqual(k.lead.terms, [135, null, 134]);
+    assert.equal((await k.writer.status() as any).pending_boost?.target_f, 134);
+  }
+  // (m6) a transient refusal at the retry keeps it pending: the auto-pilot wrote while it was arming (rate limit) — the
+  //      boost is not dropped, and lands once the window has passed (still inside the 20-min bound)
+  {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 55; // 131 °F: covers the auto-pilot's 126, short of the boost's 140
+    assert.equal((await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true })).arming, true);
+    assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok");
+    h.pi.setpointC = 60;
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "rate-limited: not written yet");
+    assert.equal((await h.writer.status() as any).pending_boost?.target_f, 135, "still pending");
+    (h.writer as any).lastWriteAt = 0; // the 15-min window passes
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 2); assert.equal(h.boosts.length, 1);
+  }
+  // (m7) identification-arming parity (identify.ts continueArming, #167): high setpoints in a frozen frame from a
+  //      dropped Pi are NOT coverage — the retry waits; an envelope that moved under the boost drops it (not transient)
+  {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 52;
+    await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    h.pi.setpointC = 60; h.pi.connected = false;
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 0, "a disconnected Pi's last frame does not count");
+    assert.equal((await h.writer.status() as any).pending_boost?.target_f, 135);
+    h.pi.connected = true;
+    h.store.baselineConfig = async () => ({ dot: 10, wwsd: 65, dbt: 130, mbt: 126 }); // the I4 ceiling drops under 135
+    h.store.latestConfig = async () => ({ dot: 10, wwsd: 65, dbt: 130, mbt: 126 });
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 0);
+    const st = await h.writer.status() as any;
+    assert.equal(st.pending_boost, null); assert.equal(st.pending_boost_ended?.outcome, "refused");
+    assert.equal(h.lead.terms.at(-1), null);
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

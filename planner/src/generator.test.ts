@@ -34,14 +34,20 @@ const PUMP_W = 5_100;  // measured p50 heating draw
 
 // ── 2. supply: the outage feed → grid / generator / unknown ───────────────────────────────────────────────────────────
 {
-  const f = new OutageFeed();
   const t = Date.parse("2026-12-20T12:00:00Z");
+  const f = new OutageFeed(t);
   assert.equal(f.supply(t).supply, "unknown", "no answer yet = unknown");
   f.note(false, t);
-  assert.equal(f.supply(t + 60_000).supply, "grid");
+  assert.deepEqual(f.supply(t + 60_000), { supply: "grid", why: "no outage reported (6bb feed)", assumed: false });
   f.note(null, t + 5 * 60_000); // unreachable: the last answer ages out
   assert.equal(f.supply(t + 14 * 60_000).supply, "grid");
-  assert.equal(f.supply(t + 16 * 60_000).supply, "unknown", "a feed silent for > 15 min is unknown, never grid");
+  assert.equal(f.supply(t + 14 * 60_000).assumed, false, "a fresh answer is not assumed");
+  // owner 2026-11-01: silent after a "no outage" answer, no outage seen recently → the grid, flagged assumed
+  const quiet = f.supply(t + 16 * 60_000);
+  assert.equal(quiet.supply, "grid");
+  assert.equal(quiet.assumed, true);
+  assert.equal(quiet.why, "the outage feed has not answered for 16 min; assuming the grid (no outage seen in the last 6 h)");
+  assert.equal(f.status(t + 16 * 60_000).assumed, true, "/health shows the assumption");
   f.note(true, t + 20 * 60_000);
   assert.equal(f.supply(t + 21 * 60_000).supply, "generator");
   f.note(true, t + 55 * 60_000);
@@ -51,6 +57,51 @@ const PUMP_W = 5_100;  // measured p50 heating draw
   f.note(false, t + 80 * 60_000);
   assert.equal(f.supply(t + 84 * 60_000).supply, "generator");
   assert.equal(f.supply(t + 86 * 60_000).supply, "grid", "30 min after the last outage answer: grid");
+  assert.equal(f.supply(t + 86 * 60_000).assumed, false);
+}
+
+// ── 2b. supply when the feed goes SILENT (owner 2026-11-01): the grid unless an outage is plausible ──────────────────
+{
+  const t = Date.parse("2026-12-20T12:00:00Z");
+  const H = 3600_000, M = 60_000;
+  // an outage seen within 6 h: a silent feed stays unknown (= the generator)
+  const r = new OutageFeed(t);
+  r.note(true, t);
+  r.note(true, t + 55 * M);
+  r.note(false, t + 60 * M);
+  assert.equal(r.supply(t + 70 * M).supply, "generator", "restore tail unchanged while the feed is fresh");
+  assert.match(r.supply(t + 70 * M).why, /ended 15 min ago/);
+  assert.equal(r.supply(t + 86 * M).supply, "unknown", "tail over, but silent with an outage 31 min ago: unknown");
+  const recent = r.supply(t + 2 * H);
+  assert.equal(recent.supply, "unknown", "silent 1 h after a restore, outage seen 65 min ago: unknown");
+  assert.equal(recent.assumed, false);
+  assert.match(recent.why, /has not answered for 60 min; an outage was seen 65 min ago/);
+  assert.equal(r.supply(t + 55 * M + 6 * H - 1).supply, "unknown", "just under 6 h since the outage: still unknown");
+  const old = r.supply(t + 55 * M + 6 * H);
+  assert.equal(old.supply, "grid", "6 h since the last outage was seen: assume the grid");
+  assert.equal(old.assumed, true);
+  // the last answer was an active outage: never the grid, however long the silence
+  const a = new OutageFeed(t);
+  a.note(true, t);
+  assert.equal(a.supply(t + 10 * M).supply, "generator");
+  assert.equal(a.supply(t + 16 * M).supply, "unknown");
+  assert.equal(a.supply(t + 48 * H).supply, "unknown", "last answer active: never assumed grid");
+  assert.match(a.supply(t + 48 * H).why, /its last answer was an active outage/);
+  assert.equal(a.status(t + 48 * H).assumed, false);
+  // never answered since the planner started: unknown for 30 min, then the grid is assumed
+  const n = new OutageFeed(t);
+  assert.equal(n.supply(t + 29 * M).supply, "unknown", "startup grace");
+  assert.equal(n.supply(t + 29 * M).assumed, false);
+  const late = n.supply(t + 30 * M);
+  assert.equal(late.supply, "grid", "never answered after the 30-min grace: assume the grid");
+  assert.equal(late.assumed, true);
+  assert.equal(late.why, "the outage feed has not answered in the 30 min since the planner started; assuming the grid (no outage seen in the last 6 h)");
+  assert.equal(n.status(t + 30 * M).assumed, true);
+  // an outage reported during the grace keeps a silent feed unknown after it
+  const n2 = new OutageFeed(t);
+  n2.note(true, t + 5 * M);
+  assert.equal(n2.supply(t + 25 * M).supply, "unknown");
+  assert.equal(n2.supply(t + 40 * M).supply, "unknown", "the outage it reported keeps a silent feed unknown past the grace");
 }
 
 // ── 3. comfort: every OCCUPIED zone counts, the coldest decides; a zone with no / a stale temperature is unknown ──────
