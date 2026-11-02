@@ -18,7 +18,8 @@
  * as temp1.target moves onto the new band; status() reports commanded-vs-operative.
  * A dashboard boost the pump setpoints do not yet cover (#231) is ARMED rather than refused when I1 is its only
  * obstacle: Phase B leads the setpoints up to it for at most 20 min, and the poll loop writes it — every guard
- * re-run — once the hub shows them covering it.
+ * re-run — once the hub shows them covering it. A dashboard boost refused only by the rate limit is armed the same
+ * way (owner, 2026-11-02): it waits, and the poll loop writes it once the 15-min window has passed — never inside it.
  */
 
 import { SensorLinxClient } from "./sensorlinx";
@@ -142,11 +143,16 @@ export interface BoostLead {
   canLead(): boolean;
   set(targetF: number | null, expiresAtMs?: number): void;
 }
-/** A boost waiting for the setpoints to cover it (boost() with armIfLow → 202). In memory: a restart forgets it. */
-export type PendingBoost = { targetF: number; minutes: number; source: string; capF: number; requiredF: number; requestedAt: Date; expiresAt: Date };
-/** Thrown inside setTargetSerial when the ONLY refusal would be I1 setpoints below target + margin (armable). */
-class I1ShortOnly {
-  constructor(public readonly requiredF: number, public readonly offenders: string[]) {}
+/** What an armed boost waits for: the setpoints to cover it, or the rate-limit window to pass. */
+export type ArmReason = "setpoints" | "rate_limit";
+/** A boost waiting for the setpoints or the rate limit (boost() with armIfLow → 202). In memory: a restart forgets it. */
+export type PendingBoost = { targetF: number; minutes: number; source: string; capF: number; requiredF: number; reason: ArmReason; requestedAt: Date; expiresAt: Date };
+/**
+ * Thrown inside setTargetSerial when the ONLY refusal would be I1 setpoints below target + margin, or the rate limit
+ * with every earlier guard passed (armable). `offenders` is empty for the rate limit.
+ */
+class ArmableOnly {
+  constructor(public readonly reason: ArmReason, public readonly requiredF: number, public readonly offenders: string[]) {}
 }
 export function isBoostYield(e: unknown): e is BoostYieldError { return e instanceof BoostYieldError; }
 
@@ -356,7 +362,7 @@ export class HbxWriter {
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
       // #231: a boost waiting for Phase B to raise the pump setpoints (202 arming), and how the last one ended
       pending_boost: pending ? { target_f: pending.targetF, minutes: pending.minutes, setpoints_needed_f: pending.requiredF,
-        requested_at: pending.requestedAt.toISOString(), expires_at: pending.expiresAt.toISOString() } : null,
+        reason: pending.reason, requested_at: pending.requestedAt.toISOString(), expires_at: pending.expiresAt.toISOString() } : null,
       pending_boost_ended: this.pendingBoostEnded,
       boost_cancel_pending: this.retirePending,
       auto_sanitize_enabled: this.autoSanitizeEnabled,
@@ -402,13 +408,13 @@ export class HbxWriter {
   }
 
   /**
-   * #231: would every guard AFTER the I1 cross-check pass right now — the rate limit, the write barrier, the
-   * single-writer lease? Only then is a boost short of the setpoints armed; otherwise it is refused 409 exactly as
-   * before (I1 is the first refusal it would meet). The guards still run for real when the armed boost is written.
+   * #231: can a refused dashboard boost be armed right now — Phase B able to lead, no write barrier, the single-writer
+   * lease held? Only then is a boost short of the setpoints (409) or inside the rate-limit window (429) armed;
+   * otherwise it is refused exactly as before. The rate limit is NOT checked here: a boost it holds waits for the
+   * window (owner, 2026-11-02). Every guard still runs for real when the armed boost is written.
    */
   private async armable(): Promise<boolean> {
     if (!this.boostLead?.canLead() || writeBarrier) return false;
-    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) return false;
     if (this.writerLease) {
       try { if (!(await this.store.holdsWriterLease(this.writerLease.instanceId, this.writerLease.staleMs))) return false; }
       catch { return false; }
@@ -441,7 +447,7 @@ export class HbxWriter {
    * row still says set_target: the device got a near-flat target curve, which is what the TempIQ window poster must
    * see (a set_target both closes the boost's window and opens the excursion's).
    */
-  private async setTargetSerial(targetF: number, source: string, capF: number, asRestore = false, armIfShort = false): Promise<Record<string, unknown>> {
+  private async setTargetSerial(targetF: number, source: string, capF: number, asRestore = false, armIfLow = false): Promise<Record<string, unknown>> {
     const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
@@ -482,16 +488,19 @@ export class HbxWriter {
         if (offenders.length) {
           // #231: a dashboard boost whose ONLY obstacle is the setpoints is armed (boost() records it, Phase B leads
           // it), not refused. Nothing is written and no rejection is audited here — boost() audits the arming.
-          if (armIfShort && !asRestore && (await this.armable())) throw new I1ShortOnly(required, offenders);
+          if (armIfLow && !asRestore && (await this.armable())) throw new ArmableOnly("setpoints", required, offenders);
           await reject(409, `I1 conflict: ${offenders.join("; ")} — raise pump setpoint(s) first or pick a lower target`);
         }
       } catch (e) {
-        if (e instanceof WriteError || e instanceof I1ShortOnly) throw e;
+        if (e instanceof WriteError || e instanceof ArmableOnly) throw e;
         await reject(503, `hub unreachable — cannot verify I1: ${(e as Error).message}`);
       }
     }
 
     if (!asRestore && Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) {
+      // A dashboard boost the rate limit alone refuses waits instead (owner, 2026-11-02): armed, nothing written, no
+      // rejection audited — boost() audits the arming. Its write later comes back through here, window enforced.
+      if (armIfLow && (await this.armable())) throw new ArmableOnly("rate_limit", targetF + DEFAULT_OPTS.i1MarginF, []);
       await reject(429, `rate limited: one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min (restore is always allowed)`);
     }
 
@@ -608,11 +617,13 @@ export class HbxWriter {
    * the restore is exempt from the rate limit (returning the plant is never blocked).
    *
    * #231 `armIfLow` (the dashboard route): when the I1 cross-check would refuse ONLY because the pump setpoints sit
-   * below target + margin — every other guard (envelope / cap, fresh reading, Pi live, hub reachable, rate limit,
-   * write barrier, lease) passing — the boost is ARMED instead of refused: recorded as pending, published to Phase B
-   * as a lead term, and answered `{ arming: true, setpoints_needed_f }` (202). retryPendingBoost() writes it once the
-   * hub shows the setpoints covering it, through this same path with every guard re-run. Any other refusal is thrown
-   * exactly as before and nothing is recorded. A boost the setpoints already cover writes at once, unchanged.
+   * below target + margin — envelope / cap, fresh reading, Pi live, hub reachable, write barrier and lease passing —
+   * the boost is ARMED instead of refused: recorded as pending, published to Phase B as a lead term, and answered
+   * `{ arming: true, reason: "setpoints", setpoints_needed_f }` (202). A boost refused ONLY by the rate limit (every
+   * guard before it passed) is armed the same way with `reason: "rate_limit"`, setpoints covered or not (owner,
+   * 2026-11-02). retryPendingBoost() writes it once the setpoints cover it and the window has passed, through this
+   * same path with every guard re-run. Any other refusal is thrown exactly as before and nothing is recorded. Without
+   * armIfLow (rehearsal script, auto-pilot, any other caller) the 409 and the 429 are unchanged.
    */
   async boost(targetF: number, minutes: number, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: { armIfLow?: boolean } = {}): Promise<Record<string, unknown>> {
     if (!Number.isFinite(minutes) || minutes < 15 || minutes > 120) {
@@ -626,17 +637,17 @@ export class HbxWriter {
       try {
         return await this.boostSerial(targetF, minutes, source, capF, opts.armIfLow === true);
       } catch (e) {
-        if (!(e instanceof I1ShortOnly)) throw e;
+        if (!(e instanceof ArmableOnly)) throw e;
         return this.armBoost(Math.round(targetF), minutes, source, capF, e);
       }
     });
   }
 
   /** The boost's write and its hbx_boosts row — runs inside a serial slot (boost(), retryPendingBoost()). */
-  private async boostSerial(targetF: number, minutes: number, source: string, capF: number, armIfShort: boolean): Promise<Record<string, unknown>> {
+  private async boostSerial(targetF: number, minutes: number, source: string, capF: number, armIfLow: boolean): Promise<Record<string, unknown>> {
     await this.retryPendingRetire();
     const before = this.deviceWrites;
-    const result = await this.setTargetSerial(targetF, source, capF, false, armIfShort); // envelope (capF) + I1 + rate limit
+    const result = await this.setTargetSerial(targetF, source, capF, false, armIfLow); // envelope (capF) + I1 + rate limit
     // The boost's PATCH is device write before+1 (the in-lock epoch check guarantees none landed ahead of it). Any
     // later one is a restore that overtook this slot while it was stuck after the PATCH (ntfy, audit): the owner
     // replaced the boost, so recording it now would hold the auto-pilot on the restored curve (codex pass 10).
@@ -657,34 +668,41 @@ export class HbxWriter {
     return { ...result, boost_restore_at: restoreAt.toISOString() };
   }
 
-  /** #231: record an armable boost as pending and hand Phase B its lead term. Audited as action boost / result arming. */
-  private async armBoost(targetF: number, minutes: number, source: string, capF: number, short: I1ShortOnly): Promise<Record<string, unknown>> {
+  /**
+   * #231: record an armable boost as pending and hand Phase B its lead term (for a rate-limit wait too: it keeps the
+   * setpoints covering the boost until it is written). Audited ONCE, as action boost / result arming.
+   */
+  private async armBoost(targetF: number, minutes: number, source: string, capF: number, why: ArmableOnly): Promise<Record<string, unknown>> {
     const now = Date.now();
     const expiresAt = new Date(now + PENDING_BOOST_MAX_MS);
-    this.pendingBoost = { targetF, minutes, source, capF, requiredF: short.requiredF, requestedAt: new Date(now), expiresAt };
+    this.pendingBoost = { targetF, minutes, source, capF, requiredF: why.requiredF, reason: why.reason, requestedAt: new Date(now), expiresAt };
     this.pendingBoostEnded = null;
     this.boostLead!.set(targetF, expiresAt.getTime());
-    const detail = `arming: ${short.offenders.join("; ")} — Phase B raises the setpoints to ≥ ${short.requiredF}°F first; the boost is written once they cover it (gives up at ${expiresAt.toISOString()})`;
+    const detail = why.reason === "setpoints"
+      ? `arming: ${why.offenders.join("; ")} — Phase B raises the setpoints to ≥ ${why.requiredF}°F first; the boost is written once they cover it (gives up at ${expiresAt.toISOString()})`
+      : `arming: rate limited (one HBX write per ${WRITE_MIN_INTERVAL_MS / 60000} min) — the boost is written once the window passes at ${new Date(this.lastWriteAt + WRITE_MIN_INTERVAL_MS).toISOString()} (gives up at ${expiresAt.toISOString()})`;
     console.log(`[boost] ${targetF}°F for ${minutes} min ${detail}`);
     await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "arming", detail }).catch((e) =>
       console.error(`[boost] arming audit row failed: ${(e as Error).message}`));
-    return { arming: true, target_f: targetF, minutes, setpoints_needed_f: short.requiredF, expires_at: expiresAt.toISOString(), detail };
+    return { arming: true, reason: why.reason, target_f: targetF, minutes, setpoints_needed_f: why.requiredF, expires_at: expiresAt.toISOString(), detail };
   }
 
   /**
    * #231: called every poll after Phase B. A pending boost past PENDING_BOOST_MAX_MS is dropped (its lead released);
    * otherwise, once the hub shows every online pump ≥ target + margin from a live Pi, the boost is written through
    * boostSerial in its own serial slot — every guard re-run, the hbx_boosts row recorded as for any boost — and the
-   * pending term cleared. Setpoints not there yet, or a transient refusal (rate limit, an I1 race), leave it pending
-   * for the next poll; any other refusal drops it.
+   * pending term cleared. Setpoints not there yet, the rate-limit window not passed yet (no write is attempted, so no
+   * rejected row piles up each poll; the reason then reads rate_limit), or a transient refusal (a 429, an I1 race)
+   * leave it pending for the next poll; any other refusal drops it.
    */
   async retryPendingBoost(): Promise<void> {
     const p = this.pendingBoost;
     if (!p) return;
     if (Date.now() >= p.expiresAt.getTime()) {
-      this.clearPendingBoost(`the pump setpoints did not reach ${p.requiredF}°F within ${PENDING_BOOST_MAX_MS / 60_000} min — not started`, "expired");
+      const why = p.reason === "rate_limit" ? "it could not be written" : `the pump setpoints did not reach ${p.requiredF}°F`;
+      this.clearPendingBoost(`${why} within ${PENDING_BOOST_MAX_MS / 60_000} min — not started`, "expired");
       await this.store.insertHbxWrite({ source: p.source, action: "boost", requested: { target_f: p.targetF, minutes: p.minutes }, result: "expired",
-        detail: `armed boost not started: the setpoints did not reach ${p.requiredF}°F within ${PENDING_BOOST_MAX_MS / 60_000} min` }).catch(() => {});
+        detail: `armed boost not started: ${why} within ${PENDING_BOOST_MAX_MS / 60_000} min` }).catch(() => {});
       return;
     }
     if (this.hub) {
@@ -696,6 +714,7 @@ export class HbxWriter {
       } catch { covered = false; }
       if (!covered) return;
     }
+    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) { p.reason = "rate_limit"; return; }
     await this.serial(async () => {
       if (this.pendingBoost !== p) return; // replaced or cancelled while this slot was queued
       try {

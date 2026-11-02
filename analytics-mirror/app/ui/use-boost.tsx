@@ -123,12 +123,13 @@ export function useBoost() {
         body: JSON.stringify(req),
         signal: AbortSignal.timeout(30_000),
       });
-      const out: { error?: string; detail?: string; boost_restore_at?: string; arming?: boolean; setpoints_needed_f?: number; expires_at?: string } = await res.json().catch(() => ({}));
+      const out: { error?: string; detail?: string; boost_restore_at?: string; arming?: boolean; setpoints_needed_f?: number; expires_at?: string; reason?: string } = await res.json().catch(() => ({}));
       if (!res.ok) setPhase({ phase: "rejected", req, status: res.status, error: out.error || out.detail || "" });
       // #231: 202 — the planner raises the pump setpoints first and writes the boost once they cover it
       else if (out.arming === true) setPhase({ phase: "arming", req, atMs: Date.now(),
         setpointsNeededF: typeof out.setpoints_needed_f === "number" ? out.setpoints_needed_f : null,
-        expiresAt: typeof out.expires_at === "string" ? out.expires_at : null });
+        expiresAt: typeof out.expires_at === "string" ? out.expires_at : null,
+        reason: out.reason === "rate_limit" || out.reason === "setpoints" ? out.reason : null });
       else setPhase({ phase: "accepted", req, atMs: Date.now(), restoreAt: typeof out.boost_restore_at === "string" ? out.boost_restore_at : null });
     } catch {
       setPhase({ phase: "rejected", req, status: 0, error: "network error — the request may not have reached the planner; check the writer status before retrying" });

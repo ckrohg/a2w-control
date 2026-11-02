@@ -2835,7 +2835,7 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.restore("dashboard", { endsBoost: true, to })); // the owner cancelled any boost
           }
           if (req.url === "/api/hbx/boost") {
-            // #231: 202 { arming: true, setpoints_needed_f } when I1 setpoints are the boost's only obstacle
+            // #231: 202 { arming: true, reason, setpoints_needed_f } when I1 setpoints or the rate limit are the only obstacle
             const out = await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard", undefined, { armIfLow: true });
             return json(res, out.arming === true ? 202 : 200, out);
           }
