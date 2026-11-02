@@ -20,7 +20,7 @@ from bridge import span_control
 from bridge.backup_fallback import BackupFallback
 from bridge.config import BackupFallbackConfig, BreakerCircuit, SpanConfig
 from bridge.span_control import BreakerController, BreakerRefused
-from bridge.span_local import SpanLocalPoller, write_arm_intent
+from bridge.span_local import SpanLocalPoller, house_load, write_arm_intent
 from bridge.store import Store
 from sim.fake_span import FakeSpan
 
@@ -374,24 +374,40 @@ async def test_fallback_status_rides_the_hub_state_frame(rig):
 
 # --- #241 generator budget: the Pi always assumes it may be on the ~24 kW generator ----------------------------------
 def test_house_load_sums_every_circuit_but_the_element():
-    from bridge.span_local import house_load_w
     circuits = {"a": {"name": "Air-Water 1", "instantPowerW": -5100.0}, "b": {"name": "Buffer Tank", "instantPowerW": -16400.0},
                 "c": {"name": "Kitchen", "instantPowerW": -50.0}, "d": {"name": "EV Charger", "instantPowerW": -7200.0}}
-    assert house_load_w(circuits) == 12350.0, "abs of every circuit, the element's own excluded"
-    # one circuit without a reading (a v2 session still filling in after a reconnect) makes the TOTAL unknown: summing
-    # the rest would read the 7.2 kW EV charger as 0 W and let the element "fit"
+    assert house_load(circuits) == {"w": 12350.0, "partial_w": 12350.0, "unread": [], "source": "circuits"}, \
+        "abs of every circuit, the element's own excluded"
+    # one circuit without a reading makes the TOTAL unknown: summing the rest would read the 7.2 kW EV charger as 0 W
+    # and let the element "fit". The sum and the name are kept so the refusal can say what is missing.
+    unknown = {"w": None, "partial_w": 5150.0, "unread": ["EV Charger"], "source": None}
     circuits["d"]["instantPowerW"] = None
-    assert house_load_w(circuits) is None
+    assert house_load(circuits) == unknown
     circuits["d"].pop("instantPowerW")
-    assert house_load_w(circuits) is None
+    assert house_load(circuits) == unknown
     circuits["d"]["instantPowerW"] = True
-    assert house_load_w(circuits) is None, "a bool is not a power"
+    assert house_load(circuits) == unknown, "a bool is not a power"
     # ... but the ELEMENT's own missing reading does not matter: the budget adds it at its full rating
     circuits["d"]["instantPowerW"] = -7200.0
     circuits["b"]["instantPowerW"] = None
-    assert house_load_w(circuits) == 12350.0
-    assert house_load_w({"b": {"name": "Buffer Tank", "instantPowerW": 0.0}}) is None
-    assert house_load_w({}) is None
+    assert house_load(circuits)["w"] == 12350.0
+    assert house_load({"b": {"name": "Buffer Tank", "instantPowerW": 0.0}})["w"] is None
+    assert house_load({})["w"] is None
+
+
+def test_house_load_falls_back_to_the_panels_site_power():
+    circuits = {"a": {"name": "Air-Water 1", "instantPowerW": -5100.0}, "b": {"name": "Buffer Tank", "instantPowerW": -16400.0},
+                "d": {"name": "EV Charger", "instantPowerW": None}}
+    assert house_load(circuits, 28_700.0) == {"w": 12_300.0, "partial_w": 5100.0, "unread": ["EV Charger"], "source": "site"}, \
+        "site power counts the element too: it comes back out, the budget adds it at full rating"
+    assert house_load(circuits, 100.0 + 16400.0) == {"w": None, "partial_w": 5100.0, "unread": ["EV Charger"], "source": None}, \
+        "site power below the readable circuits contradicts them (wrong unit, retained): unknown, not a number that fits"
+    assert house_load(circuits, 5100.0 + 16400.0)["w"] == 5100.0, "exactly the readable sum is consistent: an idle circuit"
+    circuits["b"]["instantPowerW"] = None
+    assert house_load(circuits, 20_000.0)["w"] == 20_000.0, "element unread: it stays in, the safe side"
+    circuits["d"]["instantPowerW"] = -7200.0
+    assert house_load(circuits, 1.0) == {"w": 12300.0, "partial_w": 12300.0, "unread": [], "source": "circuits"}, \
+        "every circuit read: site power is not consulted"
 
 
 async def test_fallback_budget_fits_a_normal_house(rig):
@@ -441,29 +457,162 @@ async def test_fallback_shadow_budget_refusal_is_record_only(rig):
     assert rig.panel.writes == []
 
 
-async def test_fallback_one_unknown_circuit_never_closes(rig):
-    # the EV charger draws 7.2 kW but its reading is missing: the house must not read as 66 W
+def add_ev(rig, power):
     rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
-                                        "instantPowerW": None}
+                                        "instantPowerW": power}
+
+
+async def test_fallback_one_unknown_circuit_never_closes_and_says_which(rig):
+    # the EV charger draws 7.2 kW but its reading is missing: the house must not read as 66 W. The page sends the
+    # owner to that circuit, not to the Pi's network.
+    add_ev(rig, None)
+    if rig.panel.ebus is not None:
+        rig.panel.ebus.site_power = ""                     # no panel-level reading to stand in
     fb = rig.fallback(live=True)
     rig.p1.fault(); rig.p2.fault()
     for _ in range(60):
         await rig.step(fb)
+    await settle()
     assert rig.panel.writes == []
-    assert rig.ctl.snapshot()["house_w"] is None
-    assert fb.status()["budget"]["fits"] is False and fb.status()["budget"]["house_w"] is None
+    assert rig.ctl.snapshot()["house_w"] is None and rig.ctl.snapshot()["house"]["unread"] == ["EV Charger"]
+    budget = fb.status()["budget"]
+    assert budget["fits"] is False and budget["house_w"] is None
+    assert budget["why"] == ("the live house load is unknown: the panel gives no power reading for EV Charger "
+                             "(the other circuits add up to 0.1 kW)")
+    assert budget["why"] in fb.status()["last"]["message"] and "no fresh panel read" not in fb.status()["last"]["message"]
+
+
+async def test_fallback_uses_the_panels_site_power_when_a_circuit_has_no_reading(rig):
+    """Under v2 a circuit whose $state is lost reads None on every poll: without this the fallback never closes."""
+    if rig.panel.ebus is None:
+        pytest.skip("site power is a v2 value")
+    add_ev(rig, None)
+    rig.panel.ebus.site_power = 9_000.0                    # 9 + 16.5 + 2.4 = 27.9 kW: over the cap
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(40):
+        await rig.step(fb)
+    assert rig.panel.writes == []
+    assert rig.ctl.snapshot()["house"]["source"] == "site" and rig.ctl.snapshot()["house_w"] == 9000.0
+    assert "27.9 kW exceeds the 24.0 kW generator cap (panel site power: no reading for EV Charger)" in fb.status()["budget"]["why"]
+    rig.panel.ebus.site_power = 1_500.0                    # the load drops: the circuit is still unread, the budget is not
+    await rig.step(fb)
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
 
 
 async def test_fallback_unknown_house_load_never_closes(rig):
     for name in list(rig.panel.circuits):
         rig.panel.set(name, instantPowerW=None)
+    if rig.panel.ebus is not None:
+        rig.panel.ebus.site_power = ""
     fb = rig.fallback(live=True)
     rig.p1.fault(); rig.p2.fault()
     for _ in range(60):
         await rig.step(fb)
     assert rig.panel.writes == []
+    budget = fb.status()["budget"]
+    assert budget["fits"] is False and budget["house_w"] is None and "Air-Water 1, Air-Water 2, Kitchen" in budget["why"]
+
+
+async def test_fallback_with_no_panel_read_says_so(rig):
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(31):
+        await rig.step(fb, span=False)
     assert fb.status()["budget"] == {"fits": False, "house_w": None, "projected_w": None,
                                      "why": "the live house load is unknown (no fresh panel read)"}
+
+
+async def test_fallback_close_rechecks_the_budget_on_the_fresh_read(rig):
+    """The tick judges a read up to 120 s old: a 7.2 kW EV charger starting after it must not get a 31 kW close."""
+    add_ev(rig, -2.0)
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(30):
+        await rig.step(fb)
+    assert rig.panel.writes == []
+    rig.panel.set("EV Charger", instantPowerW=-7200.0)
+    await rig.step(fb, span=False)                         # the cached read still fits; the controller's own does not
+    await settle()
+    assert rig.panel.writes == [] and rig.panel.relay("Buffer Tank") == "OPEN"
+    assert await fb_events(rig.store) == ["generator_budget"], "a budget hold, not an urgent 'close refused'"
+    assert fb.status()["budget"]["fits"] is False
+    assert not any("close refused" in a[1] for a in rig.alerts if a[0] == "push")
+    # re-checked on the next tick, not after RETRY_S
+    rig.panel.set("EV Charger", instantPowerW=-2.0)
+    await rig.step(fb)
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_fallback_close_applies_the_ticks_rule_to_a_load_the_fresh_read_cannot_see(rig):
+    """Unknown load = no close, at the tick and at the close alike: which of the two saw the read must not decide."""
+    add_ev(rig, -2.0)
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(30):
+        await rig.step(fb)
+    rig.panel.set("EV Charger", instantPowerW=None)
+    if rig.panel.ebus is not None:
+        rig.panel.ebus.site_power = ""
+    await rig.step(fb, span=False)
+    await settle()
+    assert rig.panel.writes == [] and await fb_events(rig.store) == ["generator_budget"]
+    assert "no power reading for EV Charger" in fb.status()["budget"]["why"]
+    rig.panel.set("EV Charger", instantPowerW=-2.0)        # the reading is back: the next tick closes
+    await rig.step(fb)
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_fallback_a_new_hold_after_a_fit_pages_again(rig):
+    """The owner sheds the load on the first page, the tick fits, the close is held: silence would read as fixed."""
+    add_ev(rig, -7200.0)
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+
+    async def fits_then_held():
+        rig.panel.set("EV Charger", instantPowerW=-2.0)
+        await rig.prime()                                  # the tick's cached read fits…
+        rig.panel.set("EV Charger", instantPowerW=-7200.0)
+        await rig.step(fb, seconds=30.0, span=False)       # …the fresh one at the close does not
+        await settle()
+
+    def pages():
+        return [a for a in rig.alerts if a[0] == "push"]
+    for _ in range(36):
+        await rig.step(fb)
+    await settle()
+    assert len(pages()) == 1
+    await fits_then_held()
+    assert len(pages()) == 2 and rig.panel.writes == []
+    await fits_then_held()                                 # flapping across the cap does not page every minute
+    assert len(pages()) == 2
+    for _ in range(6):
+        await rig.step(fb)
+    await fits_then_held()                                 # past RETRY_S a new hold pages again
+    await settle()
+    assert len(pages()) == 3
+
+
+async def test_fallback_live_with_no_breaker_control_pages_the_manual_close(rig):
+    fb = BackupFallback(BackupFallbackConfig(live=True), {"pump1": rig.p1, "pump2": rig.p2}, None, rig.store,
+                        clock=rig.ft.clock, mono=rig.ft.clock)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(31):
+        await rig.step(fb)
+    await settle()
+    assert await fb_events(rig.store) == ["unavailable"], "not 'generator budget': there is no panel read to budget on"
+    assert [a[1] for a in rig.alerts if a[0] == "push"] == ["URGENT: both heat pumps down — turn the element breaker ON"]
+
+
+async def test_fallback_shadow_with_no_breaker_control_stays_record_only(rig):
+    fb = BackupFallback(BackupFallbackConfig(), {"pump1": rig.p1, "pump2": rig.p2}, None, rig.store,
+                        clock=rig.ft.clock, mono=rig.ft.clock)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(31):
+        await rig.step(fb)
+    await settle()
+    assert await fb_events(rig.store) == ["would_close"]
+    assert not any(a[0] in ("email", "push") for a in rig.alerts)
 
 
 def test_generator_budget_config_bounds():

@@ -646,3 +646,10 @@ class SpanV2:
                     "register_strikes": strikes, "register_backoff_s": round(self.register_backoff_s()),
                     "ca_replaced_at": self.ca_replaced_at,
                     "auth_alarm": strikes >= AUTH_ALARM_STRIKES}
+
+    def site_power_w(self) -> float | None:
+        """The panel's own whole-site draw (power-flows/site, W, consumption positive; the element's included). None when
+        the panel is not `ready` or has not published it."""
+        with self._cv:
+            panel = self.tree.panel()
+            return _num(panel["props"].get("power-flows/site")) if panel and panel["state"] == "ready" else None

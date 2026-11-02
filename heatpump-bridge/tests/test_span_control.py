@@ -374,6 +374,21 @@ async def test_panel_unreachable_is_a_clean_refusal(rig):
     assert e.value.status_code == 503 and panel.writes == []
 
 
+async def test_close_precheck_runs_on_the_fresh_read_and_can_refuse(rig):
+    panel, ctl, ft, store, alerts, _ = rig
+    panel.set("Kitchen", relayState="OPEN")
+    seen = []
+
+    def no(circ):
+        seen.append(circ["relay_state"])
+        return "over the generator budget"
+    with pytest.raises(BreakerRefused, match="precheck: over the generator budget"):
+        await ctl.execute("Kitchen", "close", precheck=no)
+    assert seen == ["OPEN"] and panel.writes == [] and panel.relay("Kitchen") == "OPEN"
+    assert (await ctl.execute("Kitchen", "close", precheck=lambda c: None))["ok"]
+    assert panel.relay("Kitchen") == "CLOSED"
+
+
 async def test_precheck_runs_on_the_fresh_read_and_can_refuse(rig):
     panel, ctl, *_ = rig
     seen = []

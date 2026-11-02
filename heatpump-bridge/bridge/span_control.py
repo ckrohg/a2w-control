@@ -126,9 +126,10 @@ class BreakerController:
             "ts": getattr(self.cache, "latest_circuits_ts", None),
             "mono": getattr(self.cache, "latest_circuits_mono", None),
             "circuits": circuits,
-            # #241: every circuit but the element's, from the same read (span_local.house_load_w); the planner's
-            # generator rule reads it from the hub frame
+            # #241: every circuit but the element's, from the same read (span_local.house_load); the planner's
+            # generator rule reads house_w from the hub frame
             "house_w": getattr(self.cache, "latest_house_w", None),
+            "house": getattr(self.cache, "latest_house", None),
             "busy": dict(self._busy) if self._busy else None,
             "pending_close": sorted(self._pending_close),
             "last": self.last,
@@ -164,8 +165,10 @@ class BreakerController:
         a controller-owned task behind a shield, so a caller that goes away (a closed browser
         tab, a dropped hub link) can never abandon a circuit half-way through a cycle.
         `precheck(circ)` (optional, sync) runs on the FRESH panel read immediately before an OPEN
-        is dispatched — no await in between — and refuses the action by returning a reason. The
-        self-heal uses it to re-validate pump state at the last possible moment."""
+        or a CLOSE is dispatched — no await in between — and refuses the action by returning a
+        reason. The self-heal uses it to re-validate pump state at the last possible moment; on a
+        close it stands between a circuit and its write, so it must never touch I/O, and only a
+        caller with its own rule for the circuit passes one (backup_fallback's generator budget)."""
         name = circuit.strip() if isinstance(circuit, str) else ""
         label = name or repr(circuit)
         try:
@@ -383,6 +386,9 @@ class BreakerController:
                     raise BreakerRefused(
                         f"'{', '.join(off)}' is not confirmed ON — never two heat pumps off at once", 409)
             if action == "close":
+                why = precheck(circ) if precheck is not None else None
+                if why:
+                    raise BreakerRefused(f"precheck: {why}", 409)
                 return await self._do_close(spec, circ, source)
             if circ["relay_state"] != "CLOSED":
                 raise BreakerRefused(

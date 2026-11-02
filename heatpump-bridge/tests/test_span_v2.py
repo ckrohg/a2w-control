@@ -295,6 +295,19 @@ def test_missing_power_is_none_not_zero(make):
     assert a["instantPowerW"] is None and a["relayState"] == "CLOSED"
 
 
+def test_site_power_reads_the_panels_own_value_and_only_from_a_v2_read(make):
+    panel, c = make()
+    c._fetch_locked()
+    assert c.site_power_w() == pytest.approx(1210.88, abs=0.01)   # the real panel's value, from the capture
+    panel.ebus.site_power = ""
+    sync(panel, c)
+    assert c.site_power_w() is None
+    panel.ebus.stop()
+    assert wait_for(lambda: not c.v2._connected)
+    c._fetch_locked()
+    assert c.transport_status()["read"] == "v1" and c.site_power_w() is None
+
+
 def test_relays_switched_by_someone_else_show_up(make):
     """6bb switches these breakers too (owner decision): the live tree, not A2W's last write, is the truth."""
     panel, c = make(v1=False)
