@@ -1,0 +1,532 @@
+{
+ "source": "SPAN panel nj-2312-003t6 (firmware spanos3/r202639/04), ebus/5 tree recorded READ-ONLY 2026-10-29 (subscribe-only, nothing published). Postal code and Wi-Fi SSID redacted.",
+ "serial": "nj-2312-003t6",
+ "register_keys": [
+  "accessToken",
+  "tokenType",
+  "iatMs",
+  "hostname",
+  "serialNumber",
+  "ebusBrokerUsername",
+  "ebusBrokerPassword",
+  "ebusBrokerHost",
+  "ebusBrokerMqttsPort",
+  "ebusBrokerWsPort",
+  "ebusBrokerWssPort"
+ ],
+ "panel": {
+  "$description": {
+   "homie": "5.0",
+   "version": 1792784053073,
+   "type": "energy.ebus.device.distribution-enclosure",
+   "name": "SPAN Panel eBus Adapter",
+   "nodes": {
+    "info": {
+     "name": "info",
+     "type": "energy.ebus.capability.info",
+     "properties": {
+      "vendor-name": {
+       "name": "Vendor name",
+       "datatype": "string"
+      },
+      "model": {
+       "name": "Model",
+       "datatype": "enum",
+       "format": "MAIN_16,MLO_24,MAIN_32,MAIN_40,MLO_48"
+      },
+      "serial-number": {
+       "name": "Serial number",
+       "datatype": "string"
+      },
+      "hardware-version": {
+       "name": "Hardware version",
+       "datatype": "string"
+      },
+      "firmware-version": {
+       "name": "Firmware version",
+       "datatype": "string"
+      },
+      "data-model-version": {
+       "name": "eBus data-model version (parent/child schema discriminator)",
+       "datatype": "string"
+      }
+     }
+    },
+    "door": {
+     "name": "door",
+     "type": "energy.ebus.capability.door",
+     "properties": {
+      "state": {
+       "name": "Door state",
+       "datatype": "enum",
+       "format": "UNKNOWN,OPEN,CLOSED"
+      }
+     }
+    },
+    "status": {
+     "name": "status",
+     "type": "energy.ebus.capability.status",
+     "properties": {
+      "relay": {
+       "name": "Main relay",
+       "datatype": "enum",
+       "format": "UNKNOWN,OPEN,CLOSED"
+      },
+      "ethernet": {
+       "name": "Is Ethernet network interface operational?",
+       "datatype": "boolean"
+      },
+      "wifi": {
+       "name": "Is Wi-Fi network interface operational?",
+       "datatype": "boolean"
+      },
+      "wifi-ssid": {
+       "name": "SSID to which Wi-Fi network interface is connected",
+       "datatype": "string"
+      },
+      "cloud-connection": {
+       "name": "Device connected to vendor cloud?",
+       "datatype": "enum",
+       "format": "UNKNOWN,UNCONNECTED,CONNECTED"
+      },
+      "postal-code": {
+       "name": "Postal (Zip) code",
+       "datatype": "string"
+      },
+      "time-zone": {
+       "name": "Time zone",
+       "datatype": "string"
+      }
+     }
+    },
+    "meter": {
+     "name": "meter",
+     "type": "energy.ebus.capability.meter",
+     "properties": {
+      "voltage-a": {
+       "name": "L1 voltage",
+       "datatype": "float",
+       "unit": "V"
+      },
+      "voltage-b": {
+       "name": "L2 voltage",
+       "datatype": "float",
+       "unit": "V"
+      }
+     }
+    },
+    "breaker": {
+     "name": "breaker",
+     "type": "energy.ebus.capability.breaker",
+     "properties": {
+      "rating": {
+       "name": "Main breaker rating",
+       "datatype": "integer",
+       "unit": "A"
+      }
+     }
+    },
+    "pcs": {
+     "name": "pcs",
+     "type": "energy.ebus.capability.pcs",
+     "properties": {
+      "enabled": {
+       "name": "PCS system enabled",
+       "datatype": "boolean"
+      },
+      "active": {
+       "name": "PCS system actively controlling one (or more) loads",
+       "datatype": "boolean"
+      },
+      "import-limit": {
+       "name": "The power import limit currently being managed to",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "binding-constraint": {
+       "name": "Which constraint class currently sets the import limit",
+       "datatype": "enum",
+       "format": "FSR,DOE,VOLTAGE,OFF_GRID,REQUESTED,OPERATOR,NONE,UNKNOWN"
+      },
+      "feed-import-limit": {
+       "name": "Limit of maximum power feeding the distribution enclosure",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "feed-import-limit-enablement": {
+       "name": "Enablement status of the feed-import-limit",
+       "datatype": "enum",
+       "format": "UNSPECIFIED,UNCONFIGURED,DISABLED,ENABLED"
+      },
+      "feed-import-limit-active": {
+       "name": "Is feed-import-limit currently being enforced?",
+       "datatype": "boolean"
+      },
+      "operator-import-limit": {
+       "name": "Operator-imposed maximum import limit",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "operator-import-limit-enablement": {
+       "name": "Enablement status of the operator-import-limit",
+       "datatype": "enum",
+       "format": "UNSPECIFIED,UNCONFIGURED,DISABLED,ENABLED"
+      },
+      "operator-import-limit-active": {
+       "name": "Is operator-import-limit currently being enforced?",
+       "datatype": "boolean"
+      },
+      "off-grid-import-limit": {
+       "name": "Off-Grid limit maximum import power",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "off-grid-import-limit-enablement": {
+       "name": "Enablement status of the off-grid-import-limit",
+       "datatype": "enum",
+       "format": "UNSPECIFIED,UNCONFIGURED,DISABLED,ENABLED"
+      },
+      "off-grid-import-limit-active": {
+       "name": "Is off-grid-import-limit currently being enforced?",
+       "datatype": "boolean"
+      },
+      "requested-import-limit": {
+       "name": "Requested limit maximum import power",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "requested-import-limit-enablement": {
+       "name": "Enablement status of the requested-import-limit",
+       "datatype": "enum",
+       "format": "UNSPECIFIED,UNCONFIGURED,DISABLED,ENABLED"
+      },
+      "requested-import-limit-active": {
+       "name": "Is requested-import-limit currently being enforced?",
+       "datatype": "boolean"
+      }
+     }
+    },
+    "power-flows": {
+     "name": "power-flows",
+     "type": "energy.ebus.capability.power-flows",
+     "properties": {
+      "pv": {
+       "name": "PV power flow",
+       "datatype": "float",
+       "unit": "W"
+      },
+      "battery": {
+       "name": "Battery/BESS power flow",
+       "datatype": "float",
+       "unit": "W"
+      },
+      "grid": {
+       "name": "Grid power flow",
+       "datatype": "float",
+       "unit": "W"
+      },
+      "site": {
+       "name": "Site power flow",
+       "datatype": "float",
+       "unit": "W"
+      }
+     }
+    }
+   },
+   "children": [],
+   "extensions": []
+  },
+  "properties": {
+   "info/vendor-name": "SPAN",
+   "info/model": "MAIN_32",
+   "info/serial-number": "nj-2312-003t6",
+   "info/hardware-version": "2.0",
+   "info/firmware-version": "spanos3/r202639/04",
+   "info/data-model-version": "1.0",
+   "status/cloud-connection": "UNKNOWN",
+   "status/postal-code": "redacted",
+   "status/time-zone": "America/New_York",
+   "status/relay": "CLOSED",
+   "status/ethernet": "false",
+   "status/wifi": "true",
+   "status/wifi-ssid": "redacted",
+   "pcs/binding-constraint": "FSR",
+   "pcs/requested-import-limit": "200.0",
+   "pcs/requested-import-limit-enablement": "UNCONFIGURED",
+   "pcs/requested-import-limit-active": "false",
+   "pcs/enabled": "false",
+   "pcs/active": "false",
+   "pcs/import-limit": "160.0",
+   "pcs/feed-import-limit": "160.0",
+   "pcs/feed-import-limit-enablement": "ENABLED",
+   "pcs/feed-import-limit-active": "true",
+   "door/state": "UNKNOWN",
+   "breaker/rating": "200",
+   "power-flows/pv": "0",
+   "power-flows/battery": "0",
+   "power-flows/grid": "-1210.8843083679676",
+   "power-flows/site": "1210.8843083679676",
+   "meter/voltage-a": "119.6",
+   "meter/voltage-b": "119.0"
+  },
+  "heartbeat": "power-flows/grid"
+ },
+ "circuit": {
+  "$description": {
+   "homie": "5.0",
+   "version": 1792784052177,
+   "type": "energy.ebus.device.circuit",
+   "name": "32a6a2a2db3d4158948b00cc2335c81b",
+   "nodes": {
+    "info": {
+     "name": "info",
+     "type": "energy.ebus.capability.info",
+     "properties": {
+      "name": {
+       "name": "Circuit name",
+       "datatype": "string"
+      },
+      "spaces": {
+       "name": "Physical panel position(s) the circuit occupies",
+       "datatype": "string"
+      }
+     }
+    },
+    "switch": {
+     "name": "switch",
+     "type": "energy.ebus.capability.switch",
+     "properties": {
+      "relay": {
+       "name": "Circuit relay state",
+       "datatype": "enum",
+       "format": "UNKNOWN,OPEN,CLOSED",
+       "settable": true
+      },
+      "relay-requester": {
+       "name": "Actor requesting the relay state",
+       "datatype": "enum",
+       "format": "UNKNOWN,NONE,LOAD_SHED,USER,PCS,CONFIGURATION,FAULT"
+      },
+      "relay-controllable": {
+       "name": "Can the circuit's relay be commanded by the user?",
+       "datatype": "boolean"
+      }
+     }
+    },
+    "breaker": {
+     "name": "breaker",
+     "type": "energy.ebus.capability.breaker",
+     "properties": {
+      "rating": {
+       "name": "Circuit breaker rating",
+       "datatype": "integer",
+       "unit": "A"
+      },
+      "poles": {
+       "name": "Number of breaker poles",
+       "datatype": "integer",
+       "format": "1:4:1"
+      }
+     }
+    },
+    "meter": {
+     "name": "meter",
+     "type": "energy.ebus.capability.meter",
+     "properties": {
+      "current": {
+       "name": "Measured current",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "active-power": {
+       "name": "Measured active power",
+       "datatype": "float",
+       "unit": "W"
+      },
+      "imported-energy": {
+       "name": "Measured energy imported",
+       "datatype": "float",
+       "unit": "Wh"
+      },
+      "exported-energy": {
+       "name": "Measured energy exported",
+       "datatype": "float",
+       "unit": "Wh"
+      }
+     }
+    },
+    "load-shed": {
+     "name": "load-shed",
+     "type": "energy.ebus.capability.load-shed",
+     "properties": {
+      "priority": {
+       "name": "Configured priority of circuit shedding when off-grid (dominant-power-source != GRID)",
+       "datatype": "enum",
+       "format": "UNKNOWN,OFF_GRID,SOC_THRESHOLD,NEVER",
+       "settable": true
+      }
+     }
+    },
+    "pcs": {
+     "name": "pcs",
+     "type": "energy.ebus.capability.pcs",
+     "properties": {
+      "managed": {
+       "name": "Is circuit managed by PCS?",
+       "datatype": "boolean"
+      },
+      "priority": {
+       "name": "Circuit PCS priority ranking",
+       "datatype": "integer"
+      }
+     }
+    },
+    "connection": {
+     "name": "connection",
+     "type": "energy.ebus.capability.connection",
+     "properties": {
+      "feeds-device-id": {
+       "name": "Homie device-id of the downstream device fed by this circuit",
+       "datatype": "string"
+      },
+      "feeds-device-type": {
+       "name": "Homie $type of the downstream device",
+       "datatype": "string"
+      },
+      "feeds-device-status": {
+       "name": "Panel's view of comm health to the downstream device",
+       "datatype": "enum",
+       "format": "OK,LOST,DEGRADED"
+      },
+      "count": {
+       "name": "Number of physical units aggregated downstream (e.g. microinverters, packs)",
+       "datatype": "integer"
+      }
+     }
+    }
+   },
+   "children": [],
+   "root": "nj-2312-003t6",
+   "parent": "nj-2312-003t6",
+   "extensions": []
+  },
+  "properties": {
+   "info/name": "Air-Water 1",
+   "info/spaces": "13,15",
+   "switch/relay": "CLOSED",
+   "switch/relay-controllable": "true",
+   "switch/relay-requester": "NONE",
+   "breaker/rating": "40",
+   "breaker/poles": "2",
+   "meter/current": "0.4",
+   "meter/active-power": "-5.9",
+   "meter/imported-energy": "81.8",
+   "meter/exported-energy": "9447335.0",
+   "load-shed/priority": "NEVER",
+   "pcs/managed": "true",
+   "pcs/priority": "20"
+  }
+ },
+ "lugs": {
+  "$description": {
+   "homie": "5.0",
+   "version": 1792783992477,
+   "type": "energy.ebus.device.lugs",
+   "name": "nj-2312-003t6-lugs-up",
+   "nodes": {
+    "info": {
+     "name": "info",
+     "type": "energy.ebus.capability.info",
+     "properties": {
+      "direction": {
+       "name": "Lugs feed direction: upstream or downstream",
+       "datatype": "enum",
+       "format": "UPSTREAM,DOWNSTREAM"
+      }
+     }
+    },
+    "meter": {
+     "name": "meter",
+     "type": "energy.ebus.capability.meter",
+     "properties": {
+      "current-a": {
+       "name": "L1 current",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "current-b": {
+       "name": "L2 current",
+       "datatype": "float",
+       "unit": "A"
+      },
+      "active-power": {
+       "name": "Active power",
+       "datatype": "float",
+       "unit": "W"
+      },
+      "imported-energy": {
+       "name": "Imported energy",
+       "datatype": "float",
+       "unit": "Wh"
+      },
+      "exported-energy": {
+       "name": "Exported energy",
+       "datatype": "float",
+       "unit": "Wh"
+      }
+     }
+    },
+    "connection": {
+     "name": "connection",
+     "type": "energy.ebus.capability.connection",
+     "properties": {
+      "fed-by-device-id": {
+       "name": "Homie device-id of the upstream device feeding this lugs",
+       "datatype": "string"
+      },
+      "fed-by-device-type": {
+       "name": "Homie $type of the upstream device",
+       "datatype": "string"
+      },
+      "fed-by-device-status": {
+       "name": "Panel's view of comm health to the upstream device",
+       "datatype": "enum",
+       "format": "OK,LOST,DEGRADED"
+      },
+      "feeds-device-id": {
+       "name": "Homie device-id of the downstream device fed by this lugs",
+       "datatype": "string"
+      },
+      "feeds-device-type": {
+       "name": "Homie $type of the downstream device",
+       "datatype": "string"
+      },
+      "feeds-device-status": {
+       "name": "Panel's view of comm health to the downstream device",
+       "datatype": "enum",
+       "format": "OK,LOST,DEGRADED"
+      },
+      "count": {
+       "name": "Number of physical units aggregated up/downstream",
+       "datatype": "integer"
+      }
+     }
+    }
+   },
+   "children": [],
+   "root": "nj-2312-003t6",
+   "parent": "nj-2312-003t6",
+   "extensions": []
+  },
+  "ids": [
+   "nj-2312-003t6-lugs-up",
+   "nj-2312-003t6-lugs-dn"
+  ]
+ },
+ "register_keys_source": "AuthOut in the panel's own GET /api/openapi.json (r202639, read 2026-10-29): the required keys plus ebusBrokerPassword (nullable; present on r202639, per 6bb's live registration)",
+ "client_api": {
+  "list": "GET /api/v2/auth/clients -> {\"clients\": {name: Client}}",
+  "delete": "DELETE /api/v2/auth/clients/{name} -> Client",
+  "auth": "HTTPBearer (accessToken)"
+ }
+}

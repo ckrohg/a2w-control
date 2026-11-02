@@ -55,6 +55,9 @@ ck "whitespace-only list is UNKNOWN"         "unknown"   "$(printf '  \n' | clas
 ck "the exact #129 list is DEPLOYING"        "deploying" "$(printf 'planner/src/storm.test.ts\nplanner/src/storm.ts\n' | classify_files)"
 ck "hub/ is DEPLOYING"                       "deploying" "$(printf 'hub/src/index.ts\n' | classify_files)"
 ck "docs + scripts are INERT"                "inert"     "$(printf 'knowledge/reference/x.md\nscripts/y.sh\n.github/workflows/z.yml\n' | classify_files)"
+# #164: Railway never reads .railway/ at deploy, and no watch pattern matches it, so its MERGE deploys nothing.
+# `railway config apply` is the step that changes the services. Bracket that by hand (see .railway/railway.ts).
+ck ".railway/ IaC is INERT at merge"         "inert"     "$(printf '.railway/railway.ts\n.railway/package.json\n.railway/package-lock.json\n' | classify_files)"
 
 # ---- 6. #166 dropout counts on the detail line. Absent (pre-#166 hub) must render EMPTY so the
 #         probe output is unchanged until the hub actually deploys; present must show the counts;

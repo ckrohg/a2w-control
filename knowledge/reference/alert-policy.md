@@ -46,9 +46,21 @@ These rules apply to every tier:
   - "no heat" (planner all-idle check) is the incident; the per-stage unserved/fault-called episodes and a cold
     tank during it are its symptoms;
   - "Pi unreachable" (planner) is the incident; the hub dead-man, SPAN-local stale and I8-blind are its symptoms.
+- **A page counts once someone has heard it.** Planner `housepages.ts` (freeze risk, no heat, tank cold, Pi unreachable)
+  and Phase B's two pages:
+  - A page no owner channel acknowledged goes out again every cycle the condition still holds, with that cycle's numbers.
+  - A condition that clears first owes no all-clear, because the owner never heard the alert.
+  - A symptom is record-only only while its incident's page has been heard: if "no heat" failed on every channel, a cold
+    tank still pages.
+  - An all-clear no channel acknowledged goes out again every cycle the condition stays clear (`housepages.ts` only;
+    Phase B's two are sent once). One the email acknowledged counts as heard even if the 6bb push failed, so the phone
+    can still show an alert that is over.
+  - `housepages.ts` sends run one at a time off the poll, so a channel that is timing out can't delay the writer lease
+    or Phase B through them.
 - **Restarts never re-alert.**
-  - Planner: keyed alerts are latched in `notify_latches`. A redeploy's re-fire is suppressed, and a condition
-    still true is re-sent at most once per 24 h.
+  - Planner: keyed alerts are latched in `notify_latches` once an owner channel (6bb push, email) has acknowledged
+    them; a ntfy 200 does not count, because nobody subscribes to that topic. A redeploy's re-fire is suppressed, and a
+    condition still true is re-sent at most once per 24 h. A page nobody heard leaves no latch, so it is owed no all-clear.
   - Bridge: sustained-fault pages are recorded as `alert` events and re-adopted on restart.
 - **Shadow mode never notifies.** Neither do the owner's own dashboard actions (breaker clicks, write-enable,
   mode toggles).
@@ -59,16 +71,25 @@ These rules apply to every tier:
 
 | Incident | Source | Threshold |
 |---|---|---|
-| Freeze risk | planner | Outdoor ≤ 5 °F and tank < 105 °F |
-| No heat being made | planner `checkUnservedCall` | A stage called with no pump heating for 45 min (9 polls) |
-| Tank cold | planner `checkDHWShortfall` | Tank < 113 °F for 60 min, unless a no-heat page is already open |
+| Freeze risk | planner `housepages.ts` | Outdoor ≤ 5 °F and tank < 105 °F |
+| No heat being made | planner `housepages.ts` | A stage called with no pump heating for 45 min (9 polls) |
+| Tank cold | planner `housepages.ts` | Tank < 113 °F for 60 min, unless a no-heat page has been heard |
 | Pump fault that sticks | bridge `poller._check_sustained_faults` | Any non-INFO fault except PC (weather) still set after 30 min |
 | Breaker left OFF | bridge `span_control` | A close not confirmed, a re-close failed, or an unreadable cycle record |
 | Both pumps down, element unavailable | bridge `backup_fallback` (live) | No breaker control, close refused, or close unconfirmed |
 | Backup gate could not close | planner backup gate (live) | The close command failed |
-| Pi unreachable | planner `checkLeaseAndPi` | 2 h when outdoor < 32 °F, else 12 h |
+| Pi unreachable | planner `housepages.ts` | 2 h when outdoor < 32 °F, else 12 h |
 | Planner down | hub planner dead-man | 2 h (was 15 min) |
 | Foreign HBX curve writer | planner `drift.ts` | Any confirmed foreign write; at most one page a day |
+| Heat pump left switched off (#212) | planner `stagewatch.ts` | A pump switched off outside A2W, still off 4 h while the HBX calls its stage: one reminder per stop |
+| Heat-pump safety net is off (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | For > 30 min, every cycle's setpoint write to a pump LANDED but the Pi still showed no 90-min revert countdown. A failed or skipped write breaks the run. One email per episode; the all-clear "Safety net is back on" after 30 min with the countdown running on every pump |
+| A2W can't control the heat pumps (owner 2026-10-29) | planner `owneralerts.ts` (Phase B) | 7 counted write failures in a row on any pump (~35 min since the last write landed); all-clear after 30 min of every write landing. A person's choice never counts: a #212 deliberate stop, `write_enabled: false`, or a mode the unit can't be set in (the bridge's 409). Nor, by default, a cycle when the Pi itself is unreachable: the Pi-unreachable page owns that outage (switch `CONTROL_PAGE_WHEN_PI_UNREACHABLE`, owner decision pending) |
+
+The two 2026-10-29 rows are worded for the owner (no "lease", "Phase B" or "writer"): what it means, whether anything
+is cold right now (tank and pumps), and what to do. Only the planner sends them. The Pi cannot: it sees "no countdown"
+whenever nobody is setting the pumps (dry-run, a planner that is down, a pump already reverted), so it cannot tell a
+missing failsafe from an idle one. Both close only after 30 min clear, so a flapping condition stays one email; a
+redeploy re-adopts an open one from `notify_latches` and still sends its all-clear.
 
 ## What emails (attention)
 
@@ -76,7 +97,17 @@ The test (owner, 2026-10-21): **can the owner do something about it with their h
 engineer or a Claude session can act, it is record-tier; it does not email the owner. Those items still surface on
 `/health`, in drift-check (daily) and in the Monday digest.
 
+- **Outage feed silent (owner's decision, 2026-11-02):** 2 h with no answer from 6bb's feed (planner `housepages.ts`). One
+  email per silence, sent again until a channel acknowledges it. The fix usually needs a Claude session, so the test above
+  alone would make this record-tier. The owner chose an alert, because until the feed answers the planner can't see an outage.
+- **Element alarm blind (owner's decision, 2026-11-02):** an hour with no SPAN reading of the element's circuit (planner
+  `housepages.ts`, `spanwatch.ts` `blindness`). One email per blind spell, sent again until a channel acknowledges it. Same
+  exception as the outage feed: an alarm that can't read can't say so, and #257 proved it.
 - **Pumps and faults:**
+  - a heat-pump breaker switched off outside A2W (#212: 6bb, the SPAN app or the panel), once it has stayed off
+    3 min: switch it back on if that was not meant. Then quiet until it is back; the back-on note is record-only.
+    While it lasts it is not a fault: self-heal stands down for that pump, its offline escalation, the per-stage
+    episodes and the "no heat" page don't fire for it (bridge `deliberate_stop.py`);
   - the same fault code 3+ times in 7 days: book a service visit;
   - a pump that never answered since boot, or comm offline 60+ min: power-cycle the gateway or pump.
 - **Pi:** CPU ≥ 80 °C (give it airflow).
@@ -94,9 +125,10 @@ engineer or a Claude session can act, it is record-tier; it does not email the o
 ### Engineer-only: record, never emailed
 
 - **Planner internals:**
-  - Phase B tracking failing, and Phase B "no lease armed". The latter is now believed only after 3 consecutive
-    writes: one read is often the hub's pre-write snapshot. The 2026-10-21 08:19 ET email came 3 min after a 16 s Pi
-    dropout, with `baseline_setpoint_c` set all along.
+  - Phase B tracking failing, and Phase B "no lease armed", at their early thresholds (3 cycles). The latter is
+    believed only after 3 consecutive writes: one read is often the hub's pre-write snapshot. The 2026-10-21 08:19 ET
+    email came 3 min after a 16 s Pi dropout, with `baseline_setpoint_c` set all along. The sustained versions page
+    the owner in plain words (above, owner 2026-10-29).
   - writer lease unheld;
   - a second planner instance still live after 30 min;
   - HBX target not adopting;

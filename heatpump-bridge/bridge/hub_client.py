@@ -31,12 +31,25 @@ _BACKOFF_MIN_S = 1.0
 _BACKOFF_MAX_S = 30.0
 
 
+def wire_faults(faults) -> list[dict]:
+    """#190: the pump's active faults as the hub frame carries them — {code, message, severity}, plain strings
+    (faults.FaultDef; P17 anti-freeze stays "info"). Older bridges sent only the COUNT, so the hub and the planner
+    accept both an integer and this list."""
+    out = []
+    for f in faults or []:
+        sev = f.get("severity")
+        out.append({"code": str(f.get("code", "")), "message": str(f.get("message", "")),
+                    "severity": str(getattr(sev, "value", sev) or "")})
+    return out
+
+
 class HubClient:
     def __init__(self, cfg: HubConfig, pollers: dict[str, PumpPoller]):
         self.cfg = cfg
         self.pollers = pollers
         self.span = None   # span_control.BreakerController when SPAN local is configured
         self.backup_fallback = None   # backup_fallback.BackupFallback — its status rides frame["span"]
+        self.stops = None             # deliberate_stop.DeliberateStops — per pump "deliberate_stop" (#212)
         self._task: asyncio.Task | None = None
         self._breaker_tasks: set[asyncio.Task] = set()
 
@@ -252,7 +265,7 @@ class HubClient:
     def _state_payload(self) -> dict:
         """Latest per-pump state pushed to the hub. Same fields the analytics mirror
         exports (exporter.snapshot) PLUS remote_lease_until so the dashboard can show an
-        active optimizer lease."""
+        active optimizer lease. active_faults is the fault LIST (wire_faults, #190); the mirror keeps its count."""
         pumps = []
         for p in self.pollers.values():
             s = p.snapshot
@@ -267,10 +280,13 @@ class HubClient:
                 "outlet_c": s.get("outlet_c"),
                 "ambient_c": s.get("ambient_c"),
                 "power_w": (s.get("power_sys1") or 0) + (s.get("power_sys2") or 0),
-                "active_faults": len(s.get("active_faults", [])),
+                "active_faults": wire_faults(s.get("active_faults")),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
                 "remote_lease_until": s.get("remote_lease_until"),
                 "write_enabled": p.cfg.write_enabled,
+                # #212: {circuit, since (Pi wall s), announced} while a PERSON has its breaker OFF, else null. The
+                # planner's stage watch / "no heat" / pump health read it; the hub relays pumps unchanged.
+                "deliberate_stop": self._deliberate(p.cfg.id),
             })
         frame = {"type": "state", "ts": time.time(), "pumps": pumps}
         if self.span is not None:
@@ -284,6 +300,15 @@ class HubClient:
                 except Exception as exc:  # noqa: BLE001 — a status bug never costs the state frame
                     log.warning("hub: backup fallback status failed: %s", exc)
         return frame
+
+    def _deliberate(self, pid: str) -> dict | None:
+        if self.stops is None:
+            return None
+        try:
+            return self.stops.stopped(pid)
+        except Exception as exc:  # noqa: BLE001 — a status bug never costs the state frame
+            log.warning("hub: deliberate-stop status failed: %s", exc)
+            return None
 
     async def _send_state(self, ws) -> None:
         await self._safe_send(ws, self._state_payload())

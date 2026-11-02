@@ -17,7 +17,7 @@ from websockets.exceptions import ConnectionClosed
 
 from bridge import registers as R
 from bridge.config import AppConfig, GuardrailConfig, HubConfig, PumpConfig
-from bridge.hub_client import HubClient
+from bridge.hub_client import HubClient, wire_faults
 from bridge.guardrails import SetpointGuard
 from bridge.poller import PumpPoller
 from bridge.store import Store
@@ -135,6 +135,21 @@ async def test_hub_client_authenticates_and_pushes_state_on_connect(hubrig):
     assert "remote_lease_until" in p          # hub-specific extra beyond exporter.snapshot
     # the Pi dialed out with its bearer token
     assert hub.auth_header == "Bearer pi-token"
+    # #190: the fault LIST, not a count (the hub and planner accept both while the Pi lags a release)
+    assert p["active_faults"] == []
+
+
+def test_wire_faults_plain_english_and_p17_is_info():
+    from bridge.faults import FAULTS
+    p17 = next(d for d in FAULTS.values() if d.code == "P17")
+    e21 = next(d for d in FAULTS.values() if d.code == "E21")
+    snap = [{"key": "2114.10", "code": p17.code, "message": p17.message, "severity": p17.severity, "since": 1.0},
+            {"key": "2111.13", "code": e21.code, "message": e21.message, "severity": e21.severity, "since": 2.0}]
+    wire = wire_faults(snap)
+    assert wire == [{"code": "P17", "message": p17.message, "severity": "info"},
+                    {"code": "E21", "message": e21.message, "severity": "warning"}]
+    assert json.loads(json.dumps(wire)) == wire       # plain JSON, no enum or `since`/`key` leaking out
+    assert wire_faults(None) == [] and wire_faults([]) == []
 
 
 async def test_hub_setpoint_command_writes_and_acks_ok(hubrig):

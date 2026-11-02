@@ -26,6 +26,8 @@ export type NotifyOpts = {
   resolved?: boolean;
   /** latch key (notify_latches): suppresses a redeploy's re-fire and replaces the 6bb push on resolve */
   key?: string;
+  /** an all-clear whose alert the caller knows reached the owner (housepages.ts): due at `tier`, even with no latch to prove it */
+  heard?: boolean;
   /** email only (alertemail.ts): what the owner should do — boxed at the top. Required in spirit for page/attention. */
   action?: string;
   /** email only: a short label/value table under the action */
@@ -33,7 +35,19 @@ export type NotifyOpts = {
   /** email only: a complete custom HTML body (the pump-health digest) instead of the standard layout */
   html?: string;
 };
+/** A delivery-aware sender resolves false when nobody heard it (index.ts ntfyDelivered); fire-and-log senders resolve nothing. */
 export type Notify = (title: string, body: string, priority: string, opts: NotifyOpts) => Promise<unknown>;
+
+/**
+ * Did the alert reach anyone? Nobody subscribes to the ntfy topic, so when the tier has an owner channel configured
+ * (6bb push, email) only that channel's acknowledgement counts: a ntfy 200 with the push and the email both failing is
+ * a page nobody heard. With no owner channel ntfy is all there is; with nothing configured (rehearsal, local) the log
+ * line is the delivery.
+ */
+export function acknowledged(a: { ownerConfigured: boolean; ownerAcked: boolean; ntfyConfigured: boolean; ntfyAcked: boolean }): boolean {
+  if (a.ownerConfigured) return a.ownerAcked;
+  return a.ntfyAcked || !a.ntfyConfigured;
+}
 
 export function route(tier: Tier, resolved = false): Route {
   if (resolved) return tier === "page" ? { push: true, email: true } : { push: false, email: false };
@@ -64,27 +78,42 @@ export interface LatchStore {
 export class Latches {
   constructor(private readonly store: LatchStore, private readonly log: (m: string) => void = (m) => console.error(m)) {}
 
-  /** True when this open should reach the owner's channels. A DB failure fails OPEN: a duplicate beats a lost page. */
-  async claim(key: string, tier: Tier, nowMs = Date.now()): Promise<boolean> {
+  /**
+   * True when this open should reach the owner's channels. Writes nothing: record() latches it once someone has heard
+   * it. A DB failure fails OPEN: a duplicate beats a lost page.
+   */
+  async due(key: string, nowMs = Date.now()): Promise<boolean> {
     try {
       const row = await this.store.getNotifyLatch(key);
-      if (row && nowMs - row.notifiedAt.getTime() < RENOTIFY_MS) return false;
-      await this.store.upsertNotifyLatch(key, tier);
-      return true;
+      return !(row && nowMs - row.notifiedAt.getTime() < RENOTIFY_MS);
     } catch (e) {
-      this.log(`notify latch claim failed for ${key} (sending anyway): ${(e as Error).message}`);
+      this.log(`notify latch read failed for ${key} (sending anyway): ${(e as Error).message}`);
       return true;
     }
   }
 
   /**
-   * Release on resolve. Returns the tier the alert was SENT at, or null when nothing was sent for it (so no all-clear
-   * is due). A DB failure returns the caller's tier: an extra all-clear beats a page left hanging.
+   * A channel acknowledged this page. Latched only now (post-merge review of #243): a page nobody heard must be sent
+   * again, must not read as open after a redeploy, and is owed no all-clear.
    */
-  async release(key: string, fallback: Tier): Promise<Tier | null> {
+  async record(key: string, tier: Tier): Promise<void> {
+    try {
+      await this.store.upsertNotifyLatch(key, tier);
+    } catch (e) {
+      this.log(`notify latch write failed for ${key}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * Release on resolve. Returns the tier the alert was SENT at, or null when nothing was sent for it (so no all-clear
+   * is due). A DB failure returns the caller's tier: an extra all-clear beats a page left hanging. `heard` is the caller's
+   * own proof the page reached the owner when there is no row: a first all-clear attempt took it, or its write failed.
+   * The latch goes before the send on purpose: a caller that does not retry must not leave one to swallow the next page.
+   */
+  async release(key: string, fallback: Tier, heard = false): Promise<Tier | null> {
     try {
       const row = await this.store.deleteNotifyLatch(key);
-      return row ? (row.tier as Tier) : null;
+      return row ? (row.tier as Tier) : heard ? fallback : null;
     } catch (e) {
       this.log(`notify latch release failed for ${key}: ${(e as Error).message}`);
       return fallback;
@@ -108,6 +137,9 @@ export class PageBudget {
 export function episodeTier(kind: string): Tier {
   if (kind.startsWith("pump_")) return "attention";       // promoted pump-health checks: a real equipment trend
   if (kind === "backup_gate") return "attention";          // A2W closed the element breaker itself: worth knowing, not acting
+  // #241 on the generator: the element was wanted but held off (lockout), or is ON without headroom (shed). The owner
+  // can act — shed a load, flip the breaker — so one email per episode, shadow or live
+  if (kind === "generator" || kind === "generator_shadow") return "attention";
   // #212: a pump a person switched off is still off hours later while the HBX calls for it — the one reminder per stop
   // (a forgotten switch-off in January): someone has to switch it back on
   if (kind === "stopped_reminder") return "page";
