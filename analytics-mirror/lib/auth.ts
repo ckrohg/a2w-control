@@ -20,7 +20,8 @@ export function isAuthed(): boolean {
 /** Key for the armed cookie, derived from VIEW_PASSWORD and VIEW_SESSION_SECRET so the
  *  a2w_view cookie (which is the raw session secret) cannot sign it. "" if either is unset. */
 export function armedKey(): string {
-  return armedKeyFrom(process.env);
+  const { VIEW_PASSWORD, VIEW_SESSION_SECRET } = process.env;
+  return armedKeyFrom({ VIEW_PASSWORD, VIEW_SESSION_SECRET });
 }
 
 /** The armed-state cookie value: `${expMs}.${hmac}` signed by armedKey(). Expires server-side
