@@ -15,9 +15,12 @@
 # Transport (#199): SPAN removes v1 REST on 2026-12-31. span.transport picks v1 (the default until the
 # owner flips it), auto (v2 MQTT first via span_v2.py, v1 fallback) or v2; v1 + v2_soak shadows v2
 # read-only. Every consumer sees the v1 /circuits shape, and transport_status() says which answered.
+# In auto nothing waits on v2 while v1 can answer, a CLOSE above all: only the first read of a process gives the session
+# time to come up, outside the client lock; every later (re)start runs in the background (#239 review).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -90,6 +93,7 @@ class SpanClient:
         self._soak_stats = {"since": time.time(), "compared": 0, "agree": 0, "disagree": 0, "unavailable": 0,
                             "last_disagreement": None, "last_error": None, "last_ts": None}
         self._soak_last_diff: tuple = ()
+        self._first_read = True              # auto: this process has not given v2 its one wait yet
         self._v1_ids: dict[str, str] = {}    # canonical id -> the id v1 spells it with
         self._answered: dict[str, dict] = {"read": {}, "write": {}}   # which transport answered, when
         self._errors: dict[str, str | None] = {"v1": None, "v2": None}
@@ -196,7 +200,7 @@ class SpanClient:
         v2_err = None
         if self.v2 is not None:
             try:
-                circuits = self.v2.fetch()
+                circuits = self.v2.fetch(wait=self.transport == "v2")
             except (ConnectionError, V2AuthError, OSError) as e:
                 v2_err = self._errors["v2"] = str(e)
             else:
@@ -283,6 +287,13 @@ class SpanClient:
                 "v2_error": self._errors["v2"], "v1_error": self._errors["v1"],
                 "soak": ({**self._soak_stats, "v2": self._soak.status()} if self._soak is not None else None)}
 
+    def read_age_s(self) -> float | None:
+        """How old the last read's data may be. None for a v1 read (a REST answer is as fresh as the request); a v2 read
+        serves the live tree, which is only as fresh as the panel's last message."""
+        if self.v2 is None or self._answered["read"].get("transport") != "v2":
+            return None
+        return self.v2.message_age_s()
+
     def close(self) -> None:
         for v2 in (self.v2, self._soak):
             if v2 is not None:
@@ -300,6 +311,12 @@ class SpanClient:
             return self._circuits_sync(self._token)
 
     def _fetch_locked(self) -> dict:
+        if self._first_read and self.transport == "auto":
+            # Outside the client lock, so a restart's CLOSE never queues behind it. A bridge's first read must not land
+            # on v1 (or, once v1 is gone, fail and page "link down since startup") because the session is 0.2 s away.
+            self._first_read = False
+            with contextlib.suppress(ConnectionError, V2AuthError, OSError):   # the read below reports it
+                self.v2.fetch()
         with self._lock:
             return self._fetch_sync()
 
@@ -326,7 +343,7 @@ class SpanClient:
         v2_err = None
         if self.v2 is not None:
             try:   # an OPEN's permit recheck (expiry + guard) runs at v2's dispatch boundary; OpenAborted propagates
-                state = self.v2.set_relay(circuit_id, want,
+                state = self.v2.set_relay(circuit_id, want, wait=want == "OPEN" or self.transport == "v2",
                                           before_send=open_permit.recheck if want == "OPEN" else None)
             except V2NotSent as e:      # never reached the panel: v1 may try (OPEN rechecks again)
                 v2_err = self._errors["v2"] = str(e)

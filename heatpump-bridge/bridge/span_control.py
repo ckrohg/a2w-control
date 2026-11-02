@@ -46,6 +46,7 @@ READBACK_GAP_S = 1.0
 CYCLE_FILE = "span-breaker-cycle.json"
 RECORD_RETRY_S = 30.0                    # re-read an unreadable (I/O error) cycle record this often
 OPENS_FILE = "span-breaker-opens.json"   # bare OPENs: when, so the min-off survives a restart
+DISPATCH_MAX_AGE_S = 3.0                 # an element OPEN's fresh read: a v2 tree older than this is not fresh
 
 
 def read_boot_id() -> str | None:
@@ -406,6 +407,9 @@ class BreakerController:
                         fresh = self.client._fetch_locked()
                     except Exception as exc:  # noqa: BLE001 — no fresh read, no OPEN
                         return f"could not re-read the panel before the OPEN ({exc})"
+                    age = self.client.read_age_s() if hasattr(self.client, "read_age_s") else None
+                    if age is not None and age > DISPATCH_MAX_AGE_S:
+                        return f"the panel's last message is {age:.0f} s old — not switching it off on a frozen read"
                     return self._backup_open_refusal(spec.name, fresh) or (_g() if _g else None)
             if action == "open":
                 return await self._do_open(spec, circ, source, guard)

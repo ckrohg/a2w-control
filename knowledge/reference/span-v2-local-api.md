@@ -44,10 +44,19 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
   provably sent nothing (no session, or paho refused before the socket). A CLOSE does fall back to v1.
 - **The OpenPermit choke point is unchanged.** `SpanClient._set_relay_sync` checks the permit once. Its recheck
   (expiry + guard) runs at whichever transport's dispatch boundary actually sends.
-- **Unknown is never "down".** A silent session (no message for 90 s), a disconnected one, or a circuit whose
-  `$state` is not `ready` reads as an error or `None`, never as OPEN or 0 W. Every (re)connect starts from an empty
-  tree: until that connection's retained tree is complete (or 5 s after its SUBACK, for a declared property the
-  panel never publishes), a read raises. Relay states from before an outage are never served as current.
+- **Unknown is never "down".** A silent session (no message for 10 s; the panel streams about 30 a second and paho
+  needs up to ~60 s to notice a half-open link), a disconnected one, or a circuit whose `$state` is not `ready` reads
+  as an error or `None`, never as OPEN or 0 W. Every (re)connect starts from an empty tree: until that connection's
+  retained tree is complete, a read raises. Complete means every child the panel lists has a description and a
+  state, with no exception: a child without them would be a whole circuit missing from the read, not one reading
+  unknown. Only a declared property the panel never publishes is forgiven, 5 s after the SUBACK. Relay states from
+  before an outage are never served as current. An OPEN of the backup element also refuses a tree whose last message
+  is more than 3 s old.
+- **Nothing waits on v2 while v1 can answer.** In `auto` a CLOSE never waits for the session: if v2 is not usable
+  right now it starts on a background thread and the CLOSE goes to v1 at once. Reads behave the same, except the first
+  read of a process, which waits outside the client lock so a bridge restart doesn't land on v1 or, once v1 is gone,
+  page "link down since startup". An OPEN still waits (it is not a safety write), and so does everything under
+  `transport: v2`, which has nowhere else to go.
 - **Registration backs off.** A broker that refuses what the panel just issued used to mean a new panel client every
   10 minutes. Re-registering now waits 10 min, then 20, 40 … capped at 6 h. The state is persisted in
   `span-v2-register.json`, so a restart doesn't reset it. After 3 registrations in a row without a session,
@@ -57,14 +66,16 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
 - **The soak never delays v1.** Starting, re-registering or restarting the soak session (HTTP to the panel) runs on
   a background thread, never under the client lock that a v1 read or a relay write needs.
 - **The CA is trust-on-first-use.** `GET /api/v2/certificate/ca` is plain HTTP; the PEM is pinned on disk after the
-  first fetch, and re-fetched only when a session never comes up (a re-issued CA).
+  first fetch, and re-fetched only after 60 s with no session, new or long-running (a re-issued CA). The panel
+  rebooted itself on 2026-10-14, probably for a firmware update, and after v1 is removed a stale CA would leave it
+  unreadable.
 - **Circuit ids.** v2's device id for a circuit is the same 32-hex id v1 used (verified 2026-10-29: Air-Water 1
   `32a6a2a2…`, Air-Water 2 `c7f7ca8b…`, Buffer Tank `dfbc1200…`, identical in `span_readings` and on the eBus tree).
   Ids are still compared with dashes removed (`canon_id`), so a power-cycle record written under v1 recovers under v2
   even if a firmware update starts spelling them as dashed UUIDs.
 - **Credentials** persist next to the v1 token (`bridge-data/span-v2-creds.json`, 0600; `span-v2-ca.pem`). A broker
-  refusal re-registers from the passphrase (10-minute cooldown). A session that never connects is restarted after
-  60 s on the other address with a freshly fetched CA.
+  refusal re-registers from the passphrase (10-minute cooldown). A session with no broker connection for 60 s, whether
+  it never connected or lost one paho cannot get back, is restarted on the other address with a freshly fetched CA.
 - **6bb switches these breakers too** (owner decision). The tree is live, so a relay someone else switched shows up
   on the next read.
 

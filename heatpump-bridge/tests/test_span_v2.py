@@ -8,12 +8,14 @@ from __future__ import annotations
 import asyncio
 import os
 import ssl
+import threading
 import time
 
 import pytest
 
-from bridge import span_local, span_v2
-from bridge.config import SpanConfig
+from bridge import span_control, span_local, span_v2
+from bridge.config import BreakerCircuit, SpanConfig
+from bridge.span_control import BreakerController, BreakerRefused
 from bridge.span_local import OpenAborted, OpenPermit, SpanClient, SpanLocalPoller
 from bridge.store import Store
 from sim import fake_span_v2
@@ -63,6 +65,15 @@ def wait_for(pred, timeout=3.0):
     return False
 
 
+def reads(client):
+    """A read landed, on whichever transport (a panel with no v1 raises until v2 is back)."""
+    try:
+        client._fetch_locked()
+    except ConnectionError:
+        return False
+    return True
+
+
 # --- which transport answers --------------------------------------------------------------
 def test_auto_prefers_v2_and_never_touches_v1(make):
     panel, c = make()
@@ -88,12 +99,13 @@ def test_auto_falls_back_to_v1_when_the_panel_has_no_v2(make):
 def test_auto_falls_back_to_v1_when_the_broker_goes_away(make):
     panel, c = make()
     c._fetch_locked()
-    assert c.transport_status()["read"] == "v2"
+    assert c.transport_status()["read"] == "v2" and c.read_age_s() < 5
     panel.ebus.stop()                                 # the broker is gone; v1 REST still answers
     assert wait_for(lambda: not c.v2._connected)
     assert cid(c, "Air-Water 1")
     st = c.transport_status()
     assert st["read"] == "v1" and st["v2_error"] and not st["v2"]["connected"]
+    assert c.read_age_s() is None                     # a REST answer is as fresh as the request
 
 
 def test_a_rotated_broker_password_re_registers_and_v2_answers_again(make, monkeypatch):
@@ -103,7 +115,7 @@ def test_a_rotated_broker_password_re_registers_and_v2_answers_again(make, monke
     panel.ebus.password = "rotated"                   # the panel forgot us: reconnects are refused…
     panel.ebus.drop_sessions()
     assert wait_for(lambda: c.v2._auth_failed, 5)
-    c._fetch_locked()                                 # …so the next read re-registers and reconnects
+    assert wait_for(lambda: reads(c), 5)              # …so the next read re-registers and reconnects, in the background
     assert c.transport_status()["read"] == "v2" and len(panel.v2_registrations) == 2
 
 
@@ -329,8 +341,8 @@ def test_the_wrong_ca_fails_tls_falls_back_and_heals(make, tmp_path, monkeypatch
     # a session that never comes up is restarted with a freshly fetched CA (a re-issued panel CA heals itself)
     monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.0)
     c.v2._next_start = 0.0
-    c._fetch_locked()                     # restart: drops the stale CA, fetches the panel's, connects
-    assert c.transport_status()["read"] == "v2"
+    # restart: drops the stale CA, fetches the panel's, connects
+    assert wait_for(lambda: reads(c) and c.transport_status()["read"] == "v2", 5)
     assert (sd / span_v2.CA_FILE).read_text() == panel.ebus.ca_pem
 
 
@@ -565,3 +577,176 @@ def test_after_a_reconnect_the_pre_outage_tree_is_never_served(make):
     panel.ebus.resend_retained()
     assert wait_for(lambda: c.v2.status()["synced"], 5)
     assert next(x for x in c._fetch_locked().values() if x["name"] == "Air-Water 2")["relayState"] == "CLOSED"
+
+
+# --- post-merge review of #239 ---------------------------------------------------------------------------------------
+def slow_starts(monkeypatch, seconds=1.5):
+    """A panel answering register/CA slowly: _start takes `seconds`. → the list of start times."""
+    real_start = span_v2.SpanV2._start
+    started = []
+
+    def slow_start(self):
+        started.append(time.monotonic())
+        time.sleep(seconds)
+        real_start(self)
+    monkeypatch.setattr(span_v2.SpanV2, "_start", slow_start)
+    return started
+
+
+def test_a_running_session_heals_a_reissued_ca(make, tmp_path, monkeypatch):
+    """Finding 1: it connected once, then a firmware update re-issues the broker cert. Every reconnect fails TLS, so
+    only a restart with a fresh CA heals it. With v1 removed this is the whole panel going unreadable."""
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.3)
+    sd = tmp_path / "reissued"
+    sd.mkdir()
+    panel, c = make(v1=False, state_dir=sd)
+    c._fetch_locked()
+    pinned = (sd / span_v2.CA_FILE).read_text()
+    new_ca = tmp_path / "newca"
+    new_ca.mkdir()
+    panel.ebus.reissue_ca(str(new_ca))
+    assert wait_for(lambda: not c.v2._connected)
+    assert wait_for(lambda: reads(c), 8), c.transport_status()["v2_error"]
+    assert c.transport_status()["read"] == "v2"
+    assert (sd / span_v2.CA_FILE).read_text() == panel.ebus.ca_pem != pinned
+    assert len(panel.v2_registrations) == 1           # the credentials were fine: no new panel client
+
+
+def test_a_session_paho_got_back_is_not_restarted(make, tmp_path, monkeypatch):
+    sd = tmp_path / "brief"
+    sd.mkdir()
+    panel, c = make(v1=False, state_dir=sd)
+    c._fetch_locked()
+    starts = c.v2._starts
+    panel.ebus.drop_sessions()
+    assert wait_for(lambda: not c.v2._connected)
+    assert wait_for(lambda: c.v2._connected and reads(c), 8)
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.0)   # a reconnect clears the outage clock, however short the limit
+    assert wait_for(lambda: reads(c))
+    time.sleep(0.2)                                    # the background kick has run
+    assert c.v2._starts == starts and (sd / span_v2.CA_FILE).exists()
+
+
+def test_a_close_never_waits_on_v2_bring_up_while_v1_can_take_it(make, monkeypatch):
+    """Finding 2: a safety write held by transport bring-up, with working v1 sitting idle."""
+    panel, c = make()
+    started = slow_starts(monkeypatch)
+    panel.set("Kitchen", relayState="OPEN")
+    t = time.monotonic()
+    assert c._set_relay_sync("c-k", "CLOSED") == "CLOSED"
+    assert time.monotonic() - t < 1.0
+    assert c.transport_status()["write"] == "v1" and panel.ebus.sets == []
+    assert wait_for(lambda: started, 1)               # and the session is coming up behind it
+    assert wait_for(lambda: c.v2.status()["synced"], 5)
+
+
+def test_a_read_bringing_v2_up_never_holds_a_close(make, monkeypatch):
+    """The first read's wait runs outside the client lock: a restart's CLOSE must not queue behind it."""
+    panel, c = make()
+    started = slow_starts(monkeypatch)
+    reader = threading.Thread(target=c._fetch_locked)
+    reader.start()
+    assert wait_for(lambda: started, 1)
+    panel.set("Kitchen", relayState="OPEN")
+    t = time.monotonic()
+    assert c._set_relay_sync("c-k", "CLOSED") == "CLOSED"
+    assert time.monotonic() - t < 1.0
+    reader.join(8)
+    assert c.transport_status()["read"] == "v2"       # the first read did get its wait
+
+
+def test_a_restart_never_slows_a_read_while_v1_can_answer(make, monkeypatch):
+    """Finding 1 adds restarts to a long-running session: they must not stall the poll, or a CLOSE behind it."""
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.1)
+    panel, c = make()
+    c._fetch_locked()
+    started = slow_starts(monkeypatch)
+    panel.ebus.stop()
+    assert wait_for(lambda: not c.v2._connected)
+    time.sleep(0.2)
+    t = time.monotonic()
+    assert cid(c, "Air-Water 1")
+    assert time.monotonic() - t < 1.0 and c.transport_status()["read"] == "v1"
+    assert wait_for(lambda: started, 1)
+
+
+def test_pinned_v2_still_waits_for_the_session_before_a_close(make):
+    panel, c = make(v1=False, transport="v2")
+    panel.set("Kitchen", relayState="OPEN")
+    assert c._set_relay_sync("c-k", "CLOSED") == "CLOSED"
+    assert c.transport_status()["write"] == "v2" and panel.relay("Kitchen") == "CLOSED"
+
+
+def test_an_open_in_auto_still_waits_for_the_session(make):
+    panel, c = make()
+    assert c._set_relay_sync("c-k", "OPEN", open_permit=OpenPermit("c-k", "Kitchen", "t")) == "OPEN"
+    assert c.transport_status()["write"] == "v2" and panel.v1_requests == []
+
+
+def test_no_second_paho_client_when_a_background_start_races_an_inline_one(make, monkeypatch):
+    panel, c = make()
+    started = slow_starts(monkeypatch, 0.5)
+    c.v2._kick()                                       # a CLOSE's background start…
+    assert wait_for(lambda: started, 1)
+    c._set_relay_sync("c-k", "OPEN", open_permit=OpenPermit("c-k", "Kitchen", "t"))   # …and an OPEN's inline one
+    assert len(started) == 1
+
+
+@pytest.mark.parametrize("topic", ["$description", "$state"])
+def test_the_grace_never_forgives_a_child_with_no_description_or_state(make, monkeypatch, topic):
+    """Finding 3: 16 of 17 descriptions in time used to latch the tree complete with a whole circuit absent, and
+    house load undercount with nothing to show for it."""
+    monkeypatch.setattr(span_v2, "TREE_GRACE_S", 0.2)
+    monkeypatch.setattr(span_v2, "CONNECT_WAIT_S", 0.8)
+    panel, c = make(v1=False)
+    panel.ebus.withheld = {f"ebus/5/c-k/{topic}"}
+    with pytest.raises(ConnectionError, match="1 of 6 children not described yet, e.g. c-k"):
+        c._fetch_locked()
+    panel.ebus.release_withheld()
+    assert wait_for(lambda: reads(c))
+    assert "Kitchen" in {x["name"] for x in c._fetch_locked().values()}
+
+
+def test_the_grace_still_tolerates_a_declared_property_that_never_publishes(make, monkeypatch):
+    monkeypatch.setattr(span_v2, "TREE_GRACE_S", 0.2)
+    panel, c = make(v1=False)
+    panel.ebus.withheld = {"ebus/5/c-k/meter/active-power"}
+    k = next(x for x in c._fetch_locked().values() if x["name"] == "Kitchen")
+    assert k["instantPowerW"] is None and k["relayState"] == "CLOSED"
+
+
+def test_ten_seconds_of_silence_is_stale(make):
+    """Finding 4: the panel streams ~30 messages a second, so 90 s served a frozen tree long after paho's keepalive."""
+    panel, c = make(v1=False)
+    c._fetch_locked()
+    panel.ebus.silent = True
+    time.sleep(0.1)
+    c.v2._last_msg -= 11.0
+    with pytest.raises(ConnectionError, match="stale"):
+        c._fetch_locked()
+
+
+async def test_the_element_open_refuses_a_frozen_tree_at_dispatch(tmp_path, monkeypatch):
+    """Finding 4: a half-open link serves the last tree until STALE_AFTER_S; the 16.5 kW element's guard wants better."""
+    monkeypatch.setattr(span_control, "DISPATCH_MAX_AGE_S", 0.2)
+    panel = FakeSpan(v1=False, v2=True)
+    panel.set("Buffer Tank", relayState="CLOSED", instantPowerW=0.0)
+    addr = panel.start()
+    store = Store(str(tmp_path / "b.db"))
+    await store.open()
+    cfg = SpanConfig(host=addr, passphrase="pw", transport="auto", backup_reopen=True,
+                     breakers=[BreakerCircuit(name="Buffer Tank")])
+    poller = SpanLocalPoller(cfg, store, token_path=str(tmp_path / "span-local-token"))
+    ctl = BreakerController(cfg, poller.client, store, cache=poller, state_dir=str(tmp_path))
+    try:
+        await poller.client.fetch_circuits()
+        panel.ebus.silent = True
+        await asyncio.sleep(0.4)
+        with pytest.raises(BreakerRefused, match="last message is .* old"):
+            await ctl.execute("Buffer Tank", "open")
+        assert panel.writes == [] and panel.ebus.sets == []
+    finally:
+        await ctl.stop()
+        await poller.stop()
+        await store.close()
+        panel.stop()

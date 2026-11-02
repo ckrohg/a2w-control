@@ -12,6 +12,10 @@
 #   - Stale or partial data is never "down": a disconnected or silent session, a session whose retained tree has not
 #     fully arrived since its latest (re)connect, or a circuit not "ready", reads as unknown (fetch raises, or
 #     relayState/instantPowerW are None), never as OPEN or 0 W. The tree is rebuilt from scratch on every reconnect.
+#     A child the panel lists is never skipped: until it has a description and a state the tree is not complete.
+#   - A session down for NEVER_UP_S, new or long-running, is restarted on the other address with a fresh CA, so a
+#     firmware update that re-issues the broker cert heals without a bridge restart once v1 is gone.
+#   - A CLOSE that v1 can still take never waits for v2 to come up (set_relay(wait=False)).
 #   - Registration backs off exponentially (REGISTER_BACKOFF_MAX_S) and deletes this bridge's own stale
 #     a2w-bridge-v2-* clients, so a broker that keeps refusing cannot fill the panel's client list.
 from __future__ import annotations
@@ -37,8 +41,9 @@ REGISTER_BACKOFF_MAX_S = 6 * 3600.0  # …doubling per further one, capped (neve
 AUTH_ALARM_STRIKES = 3             # this many registrations without a session → /health + a record-tier event
 CONNECT_WAIT_S = 15.0     # first use: how long a fetch waits for the session + the retained tree
 TREE_GRACE_S = 5.0        # after a SUBACK: a declared property the panel never publishes is tolerated after this
-STALE_AFTER_S = 90.0      # no message from the panel for this long → the tree is stale (unknown)
-NEVER_UP_S = 60.0         # a session that never connected for this long is restarted (other address, fresh CA)
+STALE_AFTER_S = 10.0      # no message for this long → stale (unknown): the panel streams ~30/s, paho needs ~60 s to
+                          # notice a half-open link
+NEVER_UP_S = 60.0         # no session for this long (never came up, or lost) → restart (other address, fresh CA)
 ECHO_WAIT_S = 5.0         # after a /set: wait this long for switch/relay to show the new state
 CREDS_FILE = "span-v2-creds.json"
 CA_FILE = "span-v2-ca.pem"
@@ -161,14 +166,14 @@ class SpanV2:
         self._auth_failed = False
         self._last_msg: float | None = None  # monotonic
         self._subscribed_at = 0.0
-        self._ever_connected = False         # this session has connected at least once
+        self._down_since: float | None = None  # monotonic: no broker session since then (None: connected)
         self._starts = 0                     # sessions started (alternates host / ip_fallback)
-        self._started_at = 0.0
         self._next_start = 0.0               # after a failed start, wait before trying again
         self._tree_complete = False          # this connection's retained tree has fully arrived (latched)
         self._reg = {"last": 0.0, "strikes": 0}   # registrations since the last good session (persisted)
         self._reg_loaded = False
-        self._bg_lock = threading.Lock()     # one background start at a time (the soak)
+        self._bg_lock = threading.Lock()     # one background start at a time
+        self._session_lock = threading.Lock()   # one bring-up at a time, inline or background
         self._closed = False
         self._creds: dict | None = None
         self._ca: str | None = None
@@ -343,10 +348,10 @@ class SpanV2:
         hosts = [h.rsplit(":", 1)[0] if h.count(":") == 1 else h for h in (self.host, self.ip_fallback) if h]
         host = hosts[self._starts % len(hosts)]
         self._starts += 1
-        self._started_at = time.monotonic()
         self.broker = f"{host}:{port}"
         with self._cv:
-            self._connected = self._subscribed = self._auth_failed = self._ever_connected = False
+            self._connected = self._subscribed = self._auth_failed = False
+            self._down_since = time.monotonic()
             self._tree_complete = False
             self.tree = HomieTree()
             self._last_msg = None
@@ -378,7 +383,8 @@ class SpanV2:
                 self._auth_failed = reason_code.value in (4, 5, 134, 135)
                 self._cv.notify_all()
                 return
-            self._connected = self._ever_connected = True
+            self._connected = True
+            self._down_since = None
             self.last_error = None
             # A new session starts from nothing: the tree, the message clock and the completeness latch from before
             # the outage must not pass for current between this SUBACK and the panel's retained re-send.
@@ -397,6 +403,8 @@ class SpanV2:
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
         with self._cv:
             self._connected = self._subscribed = False
+            if self._down_since is None:
+                self._down_since = time.monotonic()
             if reason_code is not None and getattr(reason_code, "is_failure", False):
                 self.last_error = f"broker session lost: {reason_code}"
             self._cv.notify_all()
@@ -414,24 +422,34 @@ class SpanV2:
             self._cv.notify_all()
 
     # --- state ---------------------------------------------------------------------
-    def _synced(self) -> bool:
-        """The retained tree has arrived: subscribed, the panel device is `ready`, and every child it lists is
-        described (a circuit child also has every property A2W reads that its own $description declares). A panel description without a children list falls
-        back to a beat after the SUBACK (the broker sends the retained tree right behind it). Not a quiet-period
-        test: the panel streams power continuously, so the burst never goes quiet."""
-        if not (self._connected and self._subscribed):
-            return False
+    def _children(self) -> list[str]:
         panel = self.tree.panel()
-        if panel is None or panel["state"] != "ready":
-            return False
-        children = [str(x.get("id") if isinstance(x, dict) else x)
-                    for x in ((panel["desc"] or {}).get("children") or [])]
+        return [str(x.get("id") if isinstance(x, dict) else x)
+                for x in (((panel or {}).get("desc") or {}).get("children") or [])]
+
+    def _undescribed(self) -> list[str] | None:
+        """The panel's children still missing a description or a state; None until there is a `ready` panel to ask.
+        The TREE_GRACE_S grace never forgives these: a child with no description is a whole circuit absent from
+        circuits() (not present-with-None), so house load would undercount with nothing to show for it. A panel
+        description without a children list counts as complete a beat after the SUBACK (the broker sends the retained
+        tree right behind it)."""
+        panel = self.tree.panel()
+        if not (self._connected and self._subscribed) or panel is None or panel["state"] != "ready":
+            return None
+        children = self._children()
         if not children:
-            return time.monotonic() - self._subscribed_at >= 1.0
-        for cid in children:
-            d = self.tree.devs.get(cid)
-            if d is None or d["desc"] is None or d["state"] is None:
-                return False
+            return [] if time.monotonic() - self._subscribed_at >= 1.0 else None
+        devs = self.tree.devs
+        return [c for c in children if c not in devs or devs[c]["desc"] is None or devs[c]["state"] is None]
+
+    def _synced(self) -> bool:
+        """The retained tree has arrived: every child the panel lists is described (_undescribed), and a circuit child
+        has every property A2W reads that its own $description declares. Not a quiet-period test: the panel streams
+        power continuously, so the burst never goes quiet."""
+        if self._undescribed() != []:
+            return False
+        for cid in self._children():
+            d = self.tree.devs[cid]
             if d["desc"].get("type") == T_CIRCUIT and any(k not in d["props"] for k in _declared(d["desc"], READS)):
                 return False
         return True
@@ -447,9 +465,14 @@ class SpanV2:
             # latched per connection: once the retained tree is complete, a property that later goes away reads
             # as unknown on its circuit, it does not make the whole panel unreadable. A declared property the panel
             # never publishes is tolerated TREE_GRACE_S after this connection's SUBACK (the real retained burst
-            # takes ~0.12 s).
-            if self._synced() or time.monotonic() - self._subscribed_at >= TREE_GRACE_S:
+            # takes ~0.12 s); a child with no description or state is not.
+            missing = self._undescribed()
+            grace_over = time.monotonic() - self._subscribed_at >= TREE_GRACE_S
+            if self._synced() or (missing == [] and grace_over):
                 self._tree_complete = True
+            elif missing:
+                return (f"panel tree still arriving on this connection ({len(missing)} of "
+                        f"{len(self._children())} children not described yet, e.g. {missing[0]})")
             else:
                 return "panel tree still arriving on this connection"
         age = time.monotonic() - self._last_msg
@@ -460,6 +483,10 @@ class SpanV2:
     def _ensure_session(self, wait: bool = True) -> None:
         """Start (or after an auth refusal, re-register and restart) the session; on a fresh start wait for the
         retained tree. Raises ConnectionError / V2AuthError when v2 cannot be started right now."""
+        with self._session_lock:        # inline (a read, an OPEN) or on _kick's thread: never two paho clients
+            self._bring_up(wait)
+
+    def _bring_up(self, wait: bool) -> None:
         if self._good_session:          # a session came up: the registration that made it is good
             self._good_session = False
             self._load_reg()
@@ -473,11 +500,11 @@ class SpanV2:
             p = self._path(CREDS_FILE)
             if p:
                 p.unlink(missing_ok=True)
-        elif (self._client is not None and not self._ever_connected
-              and time.monotonic() - self._started_at > NEVER_UP_S):
-            # Never came up: rotate to the other address, and re-fetch the CA (a firmware update may have
-            # re-issued it; a stale cached CA would otherwise fail TLS forever).
-            log.warning("span v2: no session on %s after %.0f s (%s) — restarting", self.broker, NEVER_UP_S,
+        elif (self._client is not None and self._down_since is not None
+              and time.monotonic() - self._down_since > NEVER_UP_S):
+            # Never came up, or lost and paho cannot get it back: rotate to the other address, and re-fetch the CA (a
+            # firmware update may have re-issued it; a stale cached CA would otherwise fail TLS forever).
+            log.warning("span v2: no session on %s for %.0f s (%s) — restarting", self.broker, NEVER_UP_S,
                         self.last_error)
             self._stop()
             self._ca = None
@@ -486,6 +513,8 @@ class SpanV2:
                 p.unlink(missing_ok=True)
         if self._client is None:
             if time.monotonic() < self._next_start:
+                if not wait:            # _kick's thread: the read reports last_error as it stands
+                    return
                 raise ConnectionError(f"v2: waiting to retry ({self.last_error})")
             try:
                 self._start()
@@ -505,9 +534,9 @@ class SpanV2:
                     self._cv.wait(min(left, 0.25))
 
     def fetch(self, wait: bool = True) -> dict:
-        """The tree in the v1 /circuits shape. wait=False (the soak) never blocks at all: starting, re-registering
-        or restarting the session (HTTP to the panel, up to timeout_s per address) runs on a background thread, and
-        until it has a complete tree the read raises."""
+        """The tree in the v1 /circuits shape. wait=False (the soak, and `auto` after its first read) never blocks at
+        all: starting, re-registering or restarting the session (HTTP to the panel, up to timeout_s per address) runs
+        on a background thread, and until it has a complete tree the read raises."""
         if wait:
             self._ensure_session(True)
         else:
@@ -535,15 +564,20 @@ class SpanV2:
                 self._bg_lock.release()
         threading.Thread(target=run, name="span-v2-start", daemon=True).start()
 
-    def set_relay(self, circuit_id: str, want: str, before_send=None) -> str | None:
+    def set_relay(self, circuit_id: str, want: str, before_send=None, wait: bool = True) -> str | None:
         """Publish OPEN|CLOSED, then wait up to ECHO_WAIT_S for switch/relay to show it. Returns the relay state
         seen (None = unknown). Raises V2NotSent when nothing can have reached the panel, ConnectionError when the
         write may have been delivered but the outcome is unknown. `before_send` (the OpenPermit recheck) runs last,
-        immediately before the publish, outside every v2 lock; whatever it raises propagates with nothing sent."""
-        try:
-            self._ensure_session()
-        except Exception as e:  # noqa: BLE001 — could not even start: nothing sent
-            raise V2NotSent(str(e)) from e
+        immediately before the publish, outside every v2 lock; whatever it raises propagates with nothing sent.
+        wait=False (a CLOSE that v1 can still take) never waits on bring-up: a session that is not usable right now
+        is started on a background thread and this raises V2NotSent at once."""
+        if wait:
+            try:
+                self._ensure_session()
+            except Exception as e:  # noqa: BLE001 — could not even start: nothing sent
+                raise V2NotSent(str(e)) from e
+        else:
+            self._kick()
         with self._cv:
             why = self._usable_reason()
             did = next((d for d in self.tree.devs if canon_id(d) == canon_id(circuit_id)), None)
@@ -553,7 +587,10 @@ class SpanV2:
             raise V2NotSent(f"v2: circuit {circuit_id!r} is not on the panel's eBus tree")
         if before_send is not None:
             before_send()
-        info = self._client.publish(f"ebus/5/{did}/switch/relay/set", want, qos=0, retain=False)
+        c = self._client
+        if c is None:           # a background restart took the session down meanwhile
+            raise V2NotSent("v2: session restarting")
+        info = c.publish(f"ebus/5/{did}/switch/relay/set", want, qos=0, retain=False)
         if info.rc != 0:
             raise V2NotSent(f"v2: publish refused before sending (rc={info.rc})")
         deadline = time.monotonic() + ECHO_WAIT_S
@@ -568,10 +605,16 @@ class SpanV2:
                     return state if state in ("OPEN", "CLOSED") else None
                 self._cv.wait(min(left, 0.25))
 
+    def message_age_s(self) -> float | None:
+        """Seconds since the panel's last message (None: none on this connection)."""
+        with self._cv:
+            return None if self._last_msg is None else time.monotonic() - self._last_msg
+
     def status(self) -> dict:
         self._load_reg()
         with self._cv:
-            age = None if self._last_msg is None else round(time.monotonic() - self._last_msg, 1)
+            age = self.message_age_s()
+            age = None if age is None else round(age, 1)
             strikes = self._reg["strikes"]
             return {"started": self._client is not None, "connected": self._connected,
                     "synced": self._synced() if self._client is not None else False,
