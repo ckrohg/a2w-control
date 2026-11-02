@@ -1,6 +1,7 @@
 // @purpose node:assert suite for lib/boost-state.ts (#186): no success text before read-back;
 // "commanded X °F · adopts on the next reheat cycle" → "in force"; planner rejections verbatim and
-// classified; preflight warns on limits the planner enforces; estimates start from the CURRENT tank.
+// classified; preflight warns on limits the planner enforces; estimates start from the CURRENT tank;
+// #231 arming read-back, including the rate-limit wait (reason "rate_limit") that never claims warming.
 // Run: npx tsx tests/boost-state.test.ts
 import assert from "node:assert/strict";
 import {
@@ -205,6 +206,26 @@ t("arming → it never started: expired / cancelled / refused / planner restarte
   assert.match(boostView(arming, ended("refused", "target 135°F outside the I4 envelope"), NOW + 60_000).text, /refused the boost: target 135°F outside/);
   const gone = boostView(arming, before, NOW + 60_000);
   assert.equal(gone.key, "not_started"); assert.match(gone.text, /may have restarted/);
+});
+
+t("arming inside the rate-limit window (owner 2026-11-02): waits, and never claims the heat pumps are warming", () => {
+  const WAIT = "Waiting a few minutes for the last heating change to settle, the boost starts after that";
+  const waiting: BoostPhase = { ...arming, reason: "rate_limit" } as BoostPhase;
+  const waitSt: WriterStatus = { ...pendingSt, pending_boost: { ...pendingSt.pending_boost!, reason: "rate_limit" } };
+  for (const v of [boostView(waiting, waitSt, NOW + 5_000), boostView(waiting, null, NOW + 5_000), boostView({ phase: "idle" }, waitSt, NOW)]) {
+    assert.equal(v.key, "arming"); assert.equal(v.tone, "pending");
+    assert.equal(v.text, WAIT);
+    assert.doesNotMatch(v.text, /warm/i);
+    assert.equal(chartShowsBoost(v), false);
+  }
+  // a setpoints boost whose pumps are now covered but the window holds: the planner's reason wins over the 202's
+  assert.equal(boostView(arming, waitSt, NOW + 600_000).text, WAIT);
+  assert.match(boostView(arming, { ...pendingSt, pending_boost: { ...pendingSt.pending_boost!, reason: "setpoints" } }, NOW + 5_000).text, /^Warming up the heat pumps first/);
+  // how a rate-limit wait ends: no warming claim either
+  const ended = (outcome: "expired" | "refused" | "landed"): WriterStatus => ({ ...before, pending_boost: null,
+    pending_boost_ended: { target_f: 135, outcome, detail: "x", at: new Date(NOW + 20 * 60_000).toISOString() } });
+  for (const o of ["expired", "refused", "landed"] as const) assert.doesNotMatch(boostView(waiting, ended(o), NOW + 21 * 60_000).text, /warm/i, o);
+  assert.match(boostView(waiting, ended("expired"), NOW + 21 * 60_000).text, /could not start within 20 minutes.*The tank was not changed/);
 });
 
 t("preflight: stale Pi state is called out (the planner refuses I1 on it)", () => {

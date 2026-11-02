@@ -5,7 +5,9 @@
  * PATCH replaced the boost. (b) expireBoosts() retires an overdue row without restoring while a newer boost is active.
  * (c) A rejected write does not poison the chain. (m) #231: a dashboard boost the pump setpoints do not cover is armed
  * (202) — Phase B leads it, the poll loop writes it once covered — while every other refusal stays one; an abandoned
- * boost releases its lead within 20 min. Plain node:assert under tsx: npx tsx planner/src/writes-boost.test.ts
+ * boost releases its lead within 20 min. (m8) A dashboard boost inside the 15-min rate-limit window is armed too and
+ * written only after the window, one arming row and no rejected row per poll; other callers keep the 429.
+ * Plain node:assert under tsx: npx tsx planner/src/writes-boost.test.ts
  */
 import assert from "node:assert/strict";
 import { HbxWriter, WriteError, isBoostYield, PENDING_BOOST_MAX_MS } from "./writes";
@@ -442,7 +444,6 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
       ["Pi disconnected", (h) => { h.pi.connected = false; }, 135, 503],
       ["Pi frame stale", (h) => { h.pi.tsS = () => Math.floor(Date.now() / 1000) - 3600; }, 135, 503],
       ["hub unreachable", (h) => { h.pi.fail = true; }, 135, 503],
-      ["rate limited (I1 meets it first: 409 as today)", (h) => { (h.writer as any).lastWriteAt = Date.now(); }, 135, 409],
       ["Phase B in dry-run cannot lead (409 as today)", (h) => { h.lead.can = false; }, 135, 409],
       ["writer lease not held (409 as today)", (h) => {
         h.store.holdsWriterLease = async () => false;
@@ -547,6 +548,103 @@ async function status(p: Promise<unknown>): Promise<number | "ok"> {
     const st = await h.writer.status() as any;
     assert.equal(st.pending_boost, null); assert.equal(st.pending_boost_ended?.outcome, "refused");
     assert.equal(h.lead.terms.at(-1), null);
+  }
+  // ── #231 follow-up (owner, 2026-11-02): a dashboard boost inside the 15-min window WAITS, then starts ────────────
+  // A clock the cases can move: Date.now() is the writer's (and the harness's) only clock.
+  const realNow = Date.now;
+  const at = (offsetMs: number) => { Date.now = () => realNow() + offsetMs; };
+  const rejectedSetTargets = (h: ReturnType<typeof harness>) => h.audits.filter((a) => a.action === "set_target" && a.result === "rejected").length;
+  // (m8a) setpoints already covering it: the auto-pilot wrote a moment ago → 202 rate_limit, nothing written in the
+  //       window (several polls), no rejected row per poll, written on the first poll after it — inside the 20-min term
+  try {
+    const h = harness(126, AS_FOUND);
+    assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok");
+    const r = await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    assert.equal(r.arming, true); assert.equal(r.reason, "rate_limit"); assert.equal(r.setpoints_needed_f, 140);
+    assert.ok(typeof r.expires_at === "string" && typeof r.detail === "string");
+    assert.match(String(r.detail), /rate limited/);
+    assert.equal(Date.parse(String(r.expires_at)) - Date.now() <= PENDING_BOOST_MAX_MS, true, "the term is the usual 20 min");
+    assert.deepEqual(h.lead.terms, [135], "Phase B holds the setpoints on the boost while it waits");
+    const st = await h.writer.status() as any;
+    assert.equal(st.pending_boost?.reason, "rate_limit"); assert.equal(st.pending_boost?.setpoints_needed_f, 140);
+    for (const m of [1, 5, 10, 14.9]) { at(m * 60_000); await h.writer.retryPendingBoost(); }
+    assert.equal(h.patches.length, 1, "no device write inside the window — only the auto-pilot's");
+    assert.equal(rejectedSetTargets(h), 0, "no rejected set_target row per poll while the window holds");
+    assert.equal(h.audits.filter((a) => a.action === "boost" && a.result === "arming").length, 1, "ONE arming row");
+    at(15 * 60_000 + 1000);
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 2, "written once the window has passed");
+    assert.equal(h.boosts.length, 1); assert.equal(h.boosts[0].targetF, 135);
+    assert.ok(Math.abs(h.boosts[0].restoreAt.getTime() - (Date.now() + 60 * 60_000)) < 5_000, "the 60-min timer runs from the write");
+    const st2 = await h.writer.status() as any;
+    assert.equal(st2.pending_boost, null); assert.equal(st2.pending_boost_ended?.outcome, "landed");
+    assert.equal(h.lead.terms.at(-1), null, "the lead is released");
+    assert.equal(rejectedSetTargets(h), 0);
+  } finally { Date.now = realNow; }
+  // (m8b) setpoints short AND inside the window: armed at I1 (reason setpoints); Phase B covers them while the window
+  //       still holds → no write, no rejected row, the reason now reads rate_limit; written after the window
+  try {
+    const h = harness(126, AS_FOUND);
+    h.pi.setpointC = 55; // 131 °F: covers the auto-pilot's 126, short of the boost's 140
+    assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok");
+    const r = await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true });
+    assert.equal(r.arming, true); assert.equal(r.reason, "setpoints"); assert.equal(r.setpoints_needed_f, 140);
+    at(5 * 60_000); await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "setpoints still short");
+    h.pi.setpointC = 60;
+    at(10 * 60_000); await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "covered, but still inside the window: not written");
+    assert.equal((await h.writer.status() as any).pending_boost?.reason, "rate_limit", "the dashboard now says what it waits for");
+    assert.equal(rejectedSetTargets(h), 0);
+    at(15 * 60_000 + 1000); await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 2); assert.equal(h.boosts.length, 1);
+    assert.equal(rejectedSetTargets(h), 0);
+  } finally { Date.now = realNow; }
+  // (m8c) the term still expires at PENDING_BOOST_MAX_MS: a rate-limited boost whose polls never got to write it is
+  //       dropped, its lead released, "expired" audited, and never written late
+  try {
+    const h = harness(126, AS_FOUND);
+    assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok");
+    assert.equal((await h.writer.boost(135, 60, "dashboard", undefined, { armIfLow: true })).reason, "rate_limit");
+    at(PENDING_BOOST_MAX_MS + 1000);
+    await h.writer.retryPendingBoost();
+    const st = await h.writer.status() as any;
+    assert.equal(st.pending_boost, null); assert.equal(st.pending_boost_ended?.outcome, "expired");
+    assert.equal(h.lead.terms.at(-1), null);
+    assert.equal(h.audits.at(-1)?.result, "expired");
+    await h.writer.retryPendingBoost();
+    assert.equal(h.patches.length, 1, "only the auto-pilot's write"); assert.equal(h.boosts.length, 0);
+  } finally { Date.now = realNow; }
+  // (m8d) callers without armIfLow keep today's 429; a boost that cannot arm (Phase B dry-run, lease not held) is the
+  //       429 too — audited as a rejection, nothing pending, no lead term
+  {
+    const cases: Array<[string, (h: ReturnType<typeof harness>) => void, { armIfLow?: boolean }]> = [
+      ["no armIfLow (rehearsal / any other caller)", () => {}, {}],
+      ["Phase B in dry-run cannot lead", (h) => { h.lead.can = false; }, { armIfLow: true }],
+      ["writer lease not held", (h) => {
+        let lease = true;
+        h.store.holdsWriterLease = async () => lease;
+        const w = new HbxWriter(h.slx, h.store, h.hub, "b", "s", async () => {}, false, { instanceId: "a", staleMs: 60_000 });
+        w.setBoostLead({ canLead: () => true, set: (t) => { h.lead.terms.push(t); } });
+        h.writer = w;
+        (h as any).dropLease = () => { lease = false; };
+      }, { armIfLow: true }],
+    ];
+    for (const [name, setup, opts] of cases) {
+      const h = harness(126, AS_FOUND);
+      setup(h);
+      assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok", `${name}: the earlier write`);
+      (h as any).dropLease?.();
+      assert.equal(await status(h.writer.boost(135, 60, "dashboard", undefined, opts)), 429, name);
+      assert.equal((await h.writer.status() as any).pending_boost, null, `${name}: nothing pending`);
+      assert.deepEqual(h.lead.terms, [], `${name}: Phase B not asked to lead`);
+      assert.equal(h.patches.length, 1); assert.equal(h.boosts.length, 0);
+      assert.equal(h.audits.at(-1)?.result, "rejected"); assert.match(h.audits.at(-1)?.detail ?? "", /^rate limited/);
+    }
+    // and the auto-pilot itself is still refused 429 inside a window
+    const h = harness(126, AS_FOUND);
+    assert.equal(await status(h.writer.setTarget(126, "autopilot")), "ok");
+    assert.equal(await status(h.writer.setTarget(127, "autopilot")), 429);
   }
   console.log("writes-boost.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
