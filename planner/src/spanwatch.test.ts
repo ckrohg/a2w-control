@@ -246,5 +246,40 @@ const r3 = (x: number) => Math.round(x * 1000) / 1000;
   }
 }
 
+// ── the alarm says when it can't read: timed from the last good reading, so brief cloud errors stay quiet ──────
+{
+  const w = new FakeSpan("2026-11-02T18:00:00Z");
+  assert.equal(w.blindness(), null, "the first look starts the clock");
+  w.nowMs += 59 * 60_000;
+  assert.equal(w.blindness(), null, "59 min with no poll yet");
+  w.nowMs += 60_000;
+  assert.deepEqual(w.blindness(), { minutes: 60, error: null }, "never read since the start: it counts from there");
+  await w.poll(0, 0);
+  assert.equal(w.blindness(), null, "a good reading clears it");
+  w.unit = "PARSECS"; // what #257 did: every poll answers, none can be read
+  for (let m = 0; m < 59; m++) await w.poll(1, 0);
+  assert.equal(w.blindness(), null, "59 min blind: still quiet");
+  await w.poll(1, 0);
+  const b = w.blindness()!;
+  assert.equal(b.minutes, 60);
+  assert.match(b.error!, /PARSECS/, "it says why");
+  assert.equal(w.failStreak, 60);
+  w.unit = "KILO_WATT_HOUR";
+  await w.poll(1, 0);
+  assert.equal(w.blindness(), null, "readable again");
+  // a poll that hangs never bumps failStreak, so the clock can't depend on it
+  w.nowMs += 61 * 60_000;
+  assert.equal(w.failStreak, 0);
+  assert.equal(w.blindness()!.minutes, 61, "no poll came back at all");
+  // SPAN's brief errors: one bad poll in many never adds up
+  const q = new FakeSpan("2026-11-02T18:00:00Z");
+  await q.poll(0, 0);
+  for (let m = 0; m < 180; m++) {
+    q.unit = m % 10 === 9 ? undefined : "KILO_WATT_HOUR";
+    await q.poll(1, 0);
+    assert.equal(q.blindness(), null, "an occasional failure resets on the next good poll");
+  }
+}
+
 console.log("spanwatch.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -14,6 +14,8 @@
  * circuits' day-cumulative value into span_energy for the realized-savings ledger (#207).
  * #124: `value` is normalized by the `unit` SPAN reports beside it (Wh or kWh, any case). A missing or unknown unit, or a
  * non-numeric value, is never guessed: the alarm path reports itself blind (lastError, failStreak) and logs it once.
+ * An alarm that cannot read is silent by nature, so blindness() is the separate check that tells the owner (#257 ran
+ * blind for 25 minutes with nothing but /health to show it).
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
 import type { Notify } from "./alertpolicy";
@@ -27,6 +29,8 @@ const API_BASE = "https://app-api.prod.span-csp.com";
 export const BACKUP_WINDOW_MS = 60 * 60_000;
 /** lastError's prefix while the backup circuit's energy cannot be read (#124) — /health.span.cloud.last_error */
 export const BACKUP_BLIND = "backup-element alarm blind: ";
+/** No reading this long and the owner hears about it: a whole alarm window gone, and past SPAN's brief cloud errors. */
+export const BLIND_ALERT_MS = BACKUP_WINDOW_MS;
 
 /** #124: SPAN's energy aggregate in kWh, by the unit it reports — or why it cannot be read (nothing is guessed). */
 export function energyKwh(m: { value?: unknown; unit?: unknown } | null | undefined): { kwh: number } | { error: string } {
@@ -81,6 +85,7 @@ export class SpanWatch {
   // The day counter at the previous poll, and the per-poll increments still inside the window.
   private prevDayKwh: number | null = null;
   private increments: { t: number; kwh: number }[] = [];
+  private startedAtMs: number | null = null;
 
   constructor(
     private readonly username: string,
@@ -93,6 +98,17 @@ export class SpanWatch {
     private readonly pumpMatch?: string,    // case-insensitive substring for the pump circuits (Air-Water)
   ) {
     if (fixedBuildingId) this.buildingId = fixedBuildingId;
+  }
+
+  /**
+   * No reading of the element's circuit for BLIND_ALERT_MS, else null. Timed from the last good reading, not failStreak,
+   * so a hung poll counts too, and a restart restarts the clock. The first call starts it if no poll has yet.
+   */
+  blindness(): { minutes: number; error: string | null } | null {
+    const nowMs = this.now().getTime();
+    this.startedAtMs ??= nowMs;
+    const blindMs = nowMs - (this.lastOkAt ? Date.parse(this.lastOkAt) : this.startedAtMs);
+    return blindMs < BLIND_ALERT_MS ? null : { minutes: Math.round(blindMs / 60_000), error: this.lastError };
   }
 
   /** The clock — overridable so spanwatch.test.ts can walk a scripted sequence through hour and day boundaries. */
@@ -179,6 +195,7 @@ export class SpanWatch {
 
   /** Poll once. Alarms when the backup circuit drew more than alarmKwh in the trailing 60 minutes. */
   async tick(): Promise<void> {
+    this.startedAtMs ??= this.now().getTime();
     try {
       const buildingId = await this.findBuilding();
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });

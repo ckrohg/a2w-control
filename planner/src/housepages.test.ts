@@ -544,6 +544,32 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     assert.equal(clears().length, 1, "a quiet feed sends nothing");
   }
 
+  // ── the element alarm can't read: one email, not a page; an email nobody got goes again ──────────
+  {
+    const r = rig();
+    const blind = { minutes: 61, error: 'backup-element alarm blind: energy unit "PARSECS" is not Wh or kWh' };
+    r.channels.up = false;
+    await r.cycles(2, async () => r.pages.elementAlarm(blind));
+    assert.equal(r.heard.length, 0);
+    assert.equal(r.tried.length, 2, "nobody got it: it goes out again");
+    r.channels.up = true;
+    await r.cycles(3, async () => r.pages.elementAlarm({ ...blind, minutes: 76 }));
+    assert.equal(r.heard.length, 1, "once per blind spell");
+    const n = r.heard[0];
+    assert.equal(n.tier, "attention", "an email: the breaker is OPEN, nothing is drawing");
+    assert.equal(n.key, "element-alarm-blind");
+    assert.match(n.body, /PARSECS/);
+    assert.match(n.body, /~76 min/, "the newest numbers");
+    await r.cycles(2, async () => r.pages.elementAlarm(null));
+    const clears = () => [...r.heard, ...r.logged].filter((l) => l.resolved && l.key === "element-alarm-blind");
+    assert.equal(clears().length, 1, "one all-clear");
+    assert.equal(r.rows.has("element-alarm-blind"), false, "the latch is released, so the next blind spell emails again");
+    await r.cycles(2, async () => r.pages.elementAlarm(null));
+    assert.equal(clears().length, 1, "a reading alarm sends nothing");
+    await r.cycles(1, async () => r.pages.elementAlarm({ minutes: 60, error: "x".repeat(500) }));
+    assert.ok(!r.heard.at(-1)!.body.includes("x".repeat(201)), "an error can't fill the email");
+  }
+
   finished = true;
   console.log("housepages.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
