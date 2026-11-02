@@ -15,7 +15,7 @@ only. `POST /api/drill` fires one page-tier and one attention-tier drill; its re
 
 ## The drill
 
-### 1. Planner channels — freeze-risk (email) + backup element (ntfy-only)
+### 1. Planner channels: one page-tier and one attention-tier alert
 
 ```bash
 # PLANNER_URL + PLANNER_API_TOKEN via: cd analytics-mirror && vercel env pull --environment=production
@@ -23,28 +23,26 @@ curl -s -X POST "$PLANNER_URL/api/drill" -H "Authorization: Bearer $PLANNER_API_
 ```
 
 Expect within ~1 min:
-- **[DRILL] Freeze-risk advisory** — ntfy push **AND** email. Email missing → the one
-  house-threatening email path is broken; fix before winter.
-- **[DRILL] Backup element called** — ntfy push **only**. If this arrives as an email,
-  the tiering regressed (planner EMAIL_PRIORITIES must be urgent/max only).
+- **🚨 A2W — [DRILL] Freeze-risk advisory**: 6bb phone push **AND** email. Either one missing means the
+  house-threatening alert path is broken; fix before winter.
+- **A2W needs a look — [DRILL] Needs a look**: email **only**. A phone push here means the tiering regressed.
 
-### 2. Hub dead-man — Pi silent > 3 min (email + ntfy w/ retry)
+### 2. Hub dead-man: Pi silent > 3 min
 
 ```bash
-ssh -i ~/.ssh/6bb_bridge_ed25519 admin@6bb-a2w-control.local \
+ssh -F ~/.ssh/a2w-pi.conf a2w-pi \
   'sudo systemctl stop heatpump-bridge; sleep 270; sudo systemctl start heatpump-bridge'
 ```
 
-Expect: "A2W: heat-pump bridge offline" email (+ ntfy, best-effort with 3× retry — the
-Railway→ntfy.sh path is known-intermittent, #66) at ~3 min, and the "back online" pair
-after restart. Note: the bridge restart re-edges any active faults → those email too.
+Expect: "A2W: heat-pump bridge offline" email at ~3 min, and the "back online" pair after restart. The SSH session
+needs a fresh Tailscale approval first. Confirm afterwards that both leases read `armed` in planner `/health.phase_b`. Note: the bridge restart re-edges any active faults → those email too.
 
 ### 3. Bridge fault email — inject nothing; verify the canaries instead
 
 Fault-code emails were proven live (E21, 2026-08-06). Verify the path is still armed:
 
 ```bash
-curl -s http://6bb-a2w-control.local:8000/api/health | grep -o '"email_configured":[a-z]*'
+ssh -F ~/.ssh/a2w-pi.conf a2w-pi "curl -s http://localhost:8000/api/health" | grep -o '"email_configured":[a-z]*'
 ```
 
 `true` required. (A real end-to-end refire happens for free at step 2's restart if any
@@ -52,11 +50,11 @@ fault is latched.)
 
 ### 4. Physical checklist (no code)
 
-- SPAN app: the **Buffer Tank** (backup element) breaker is ON and the SPAN backup alarm
-  armed (dashboard → Control).
-- ntfy app installed + subscribed on the phone that will be in a pocket in January.
-- Pi health card (Advanced) green; hub `A2W hub online` self-test present in the ntfy
-  list from the latest deploy.
+- The **Buffer Tank** (backup element) breaker reads **OPEN** in planner `/health.backup_gate.relay`. It is kept OPEN
+  on purpose; see the live safety layer in `CLAUDE.md`.
+- The 6bb app is signed in, with notifications on, on the phone that will be in a pocket in January. Nobody subscribes
+  to the ntfy topic, so ntfy is not a check here.
+- Pi health card (Advanced) green.
 - HBX wall controller reachable (CN23 bus) — E21 history means comm degradation shows
   there first.
 

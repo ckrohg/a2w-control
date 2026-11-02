@@ -33,6 +33,9 @@ jobs:
       - name: Run drift check
         env:
           HUB_CLIENT_TOKEN: ${{ secrets.HUB_CLIENT_TOKEN }}
+          # storm mode's grid-outage input: 6bb's National Grid email feed since 2026-10-29 (#194); the URL embeds
+          # the feed key, so it is a secret. Same value as the planner's OUTAGEWATCH_URL on Railway.
+          OUTAGEWATCH_URL: ${{ secrets.OUTAGEWATCH_URL }}
         # tee so the email step can quote the output; exit with the SCRIPT's code, not tee's
         run: |
           bash scripts/drift-check.sh 2>&1 | tee drift.out

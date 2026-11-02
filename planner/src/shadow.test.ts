@@ -5,7 +5,7 @@
  * lead) runs the soak exactly when the caller says a pasteurization is due — and skips it otherwise.
  */
 import assert from "node:assert/strict";
-import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, type ForecastHour } from "./shadow";
+import { computeShadowPlan, DEFAULT_OPTS, parseForecastBody, forecastWithFallback, FORECAST_CACHE_MAX_AGE_MS, parseDhwFloorF, DHW_FLOOR_DEFAULT_F, DHW_FLOOR_MIN_F, DHW_FLOOR_MAX_F, type ForecastHour } from "./shadow";
 import { classifyKind } from "./tempiq-windows";
 import { planConflictAhead } from "./identify";
 
@@ -253,8 +253,20 @@ console.log("shadow.test.ts: all assertions passed ✓");
   // A contaminated sag cannot chase strictCap: the boost is capped at MAX_PREBOOST_F and says so.
   const huge = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 40, sagP75F: 40, n: 8 }] };
   const b4 = computeShadowPlan(fc, null, huge, null, false).filter((x) => x.boost)[0];
-  assert.equal(b4.tank_target_f, 132, "120 + 12 (cap), placed at 16:00 with no standby allowance");
-  assert.match(b4.reason, /capped at \+12/);
+  assert.equal(b4.tank_target_f, 135, "120 + 16 (cap) = 136, then strictCap 135; placed at 16:00 with no standby allowance");
+  assert.match(b4.reason, /capped at \+16/);
+
+  // 2026-10-30: sized from the p90 sag — the reason names p90 when the pre-boost carries it.
+  const p90 = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 13, sagP75F: 8.1, sagP90F: 13.2, n: 20 }] };
+  const b5 = computeShadowPlan(fc, null, p90, null, false).filter((x) => x.boost)[0];
+  assert.equal(b5.tank_target_f, 133, "120 + 13 (p90), hour right before the bell");
+  assert.match(b5.reason, /sag p90 13.2°F over 20 draws/);
+  // A declared 06:30–10:00 shower window, merged into the learned [8,10] peak → [6,10): the boost is in force by 06:00.
+  const morning = { ...opts, dhwWindows: [[0, 24]] as [number, number][], preBoosts: [{ windowStart: 6, windowEnd: 10, boostF: 12, sagP75F: 8, sagP90F: 12, n: 30 }] };
+  const b6 = computeShadowPlan(fc, null, morning, null, false).filter((x) => x.boost)[0];
+  assert.ok(b6, "the declared morning window gets a pre-boost");
+  assert.ok(new Date(b6.ts).getHours() <= 5, `boost lands before the 06:00 block (got ${new Date(b6.ts).getHours()}:00)`);
+  assert.match(b6.reason, /for 06:00 window \(sag p90 12°F/);
 
   // A soak in the lead interval IS the pre-boost: with the soak due it lands at the day's warmest hour
   // (h=23 here, not in the lead) → the boost still happens; force the soak into the lead and it is suppressed.
@@ -362,4 +374,21 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.equal(mild.tank_target_f, DEFAULT_OPTS.sanitizeF);
   assert.doesNotMatch(mild.reason, /winter guard/);
   console.log("shadow.test.ts (#168 soak identity under the winter guard): all assertions passed");
+}
+
+// DHW_FLOOR_F (owner 2026-10-29): unset/garbage = 120 unchanged; clamped; idleF follows the floor.
+{
+  assert.equal(parseDhwFloorF(undefined), DHW_FLOOR_DEFAULT_F, "unset = 120");
+  assert.equal(parseDhwFloorF(""), DHW_FLOOR_DEFAULT_F, "empty = 120 (not 0 → clamp)");
+  assert.equal(parseDhwFloorF("  "), DHW_FLOOR_DEFAULT_F, "blank = 120");
+  assert.equal(parseDhwFloorF("abc"), DHW_FLOOR_DEFAULT_F, "garbage = 120");
+  assert.equal(parseDhwFloorF("116"), 116, "the owner's step");
+  assert.equal(parseDhwFloorF("100"), DHW_FLOOR_MIN_F, "clamped up to the minimum");
+  assert.equal(parseDhwFloorF("140"), DHW_FLOOR_MAX_F, "clamped down to the maximum");
+  if (!process.env.DHW_FLOOR_F) {
+    assert.equal(DEFAULT_OPTS.dhwFloorF, 120, "default floor unchanged when the env is unset");
+    assert.equal(DEFAULT_OPTS.idleF, 120, "default idle unchanged when the env is unset");
+  }
+  assert.equal(DEFAULT_OPTS.idleF, DEFAULT_OPTS.dhwFloorF, "idle follows the floor");
+  console.log("ok — DHW_FLOOR_F parse/clamp/follow");
 }

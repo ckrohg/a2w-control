@@ -125,6 +125,7 @@ Thresholds come from 97 days of Pi data plus the Postgres restore (for the tank)
 | `idle_draw` | reports idle/off ≥ 10 min while the circuit's 9-min mean is > 1 kW (measured maximum 672 W) |
 | `defrost_overlong` | reports defrost continuously for > 20 min. Normal is 4–9 min. stagewatch suspends its clock in defrost, so pump1's 83-min stuck "defrost" on 2026-10-18 paged nothing |
 | `called_tank_flat` | a stage is called and its pump is engaged (heating or defrost) ≥ 90 % of 45 min, the tank's net rise plus standby loss is ≤ 2 °F **and** the unit's mean ΔT over it is < 1.5 °C, held for 30 min. A flat tank alone is house load: a healthy single pump at ≤ 45 °F routinely loses ground (measured, doc §5) |
+| `stage_never_called` | #172: the tank sits more than 3 °F under the **curve in force** (not SensorLinx's `tank_target_f`, which freezes while the HBX idles) at every HBX poll for 2 h, and stage 2 is never called. Not judged while either pump is deliberately switched off (#212) or when a curve change in the window lowered the target by > 3 °F (a setback); stale or gappy HBX data, or an unknown curve, is "unknown" |
 
 Data comes from the mirror's `readings` and `span_readings`. SPAN consumption is negative, so the checks use its
 magnitude. Gating follows stagewatch: no live Pi frame, or no measured Pi clock offset, means nothing moves. A stale
@@ -205,6 +206,21 @@ tagged `changed_fields._source` → an audit row in `hbx_writes` for **every** a
 (accepted *or* rejected). Adoption is asynchronous (next reheat cycle); `status()` reports
 commanded-vs-operative.
 
+**Restore goes to the plan, not to July (#232).** A boost expiry (`expireBoosts`, every poll) and
+`POST /api/hbx/restore` return the plant to what the auto-pilot commands for the block in force
+*right now* (`AutoPilot.planCommand` → `planCommandForBlock`: the shaped curve on a curve hour, the
+flat excursion target under its identity's cap otherwise), through the same I4 / I1 / lease guards,
+rate-limit exempt. The auto-pilot's next tick then reads "already commanded", so the 15-min rate
+limit never holds the plan off. The July as-found endpoints (`hbx_config_versions` row 1, ≈ 158 °F at
+46 °F outdoor — an I1 violation against 52 °C setpoints that Phase B would chase to the 140 °F cap)
+are written only when nothing of the plan is being commanded (no auto-pilot, Off/shadow, no plan
+block) or on an explicit `{"to":"as-found"}`. A refused plan restore (I1 short, Pi unverifiable, no
+lease) throws instead of falling back: the device keeps the boost's own guarded target and the next
+poll retries. The identification driver's cleanup (`identify.ts`) takes the same plan restore once its
+guarded base re-command is refused (most often a 429 inside 15 min of the probe write); only an *abort*
+whose plan restore is refused too falls back to the as-found curve, by name, because an abort must end
+with a landed write — a window that ended normally stays pending and retries instead.
+
 **Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
 planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
 integration) MUST call the planner so the guardrails apply:
@@ -212,7 +228,8 @@ integration) MUST call the planner so the guardrails apply:
 ```
 POST /api/hbx/target   {"target_f": 128}     Authorization: Bearer $PLANNER_API_TOKEN
 POST /api/hbx/boost    {"target_f": 140, "minutes": 90}
-POST /api/hbx/restore
+POST /api/hbx/restore                        → the plan's command for the block in force (#232)
+POST /api/hbx/restore  {"to": "as-found"}    → the July as-found endpoints, unguarded (emergency only)
 GET  /api/hbx/target                          → writer.status()
 ```
 
@@ -281,16 +298,48 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
 | `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `PLANNER_READ_TOKEN` | no | READ-ONLY bearer for the 6bb home app (#190) — opens `GET /api/status` and nothing else; see §Read-only status. Unset = that route is a plain 404, as before. |
 | `STAGE_PUMP_MAP` | no | JSON map of HBX stage relay → hub pump id, default `{"1":"pump1","2":"pump2"}`. The PHYSICAL wiring the per-stage unserved alarm (#185) checks against — verify it at the panel (§Per-stage unserved alarm). |
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
+| `COP_OVERLAP_DAYS` | no | how far behind the newest mirrored TempIQ COP point each hourly read re-reads (upsert), default `3` — see §TempIQ COP mirror. `0` is the pre-TempIQv2#2124 cursor and misses every completed row. |
 | `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
 | `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
 | `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. `shadow` computes and stamps the curve and reports it at `/health.curve.plan_implies` (with `would_write`) but writes nothing — the step before `1` on a live auto-pilot. Default off = the flat per-hour target. |
 | `FLOOR_CADENCE` | no | `0` disables the per-poll demand-floor re-check (#136). Default on: every poll the floor is recomputed and, if it exceeds the plan's current block by ≥ 3 °F (below the winter guard, never over a soak, band-clamped), the block is raised in place so Phase B leads it and the auto-pilot writes it on the same poll. Raises only. Escalation is per elapsed HOUR of unbroken calling (was per cycle), so the cadence change does not steepen it. `/health.demand_floor_cadence`. |
 | *(forecast cache)* | — | The hourly plan reads open-meteo; on failure (HTTP 429 after a deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed) so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`; the plan's `meta.forecast_source` records which. No cache → the hour fails as before. |
 | `PORT` | no | Railway injects it; default 8080 |
+
+## Read-only status for the 6bb app (#190, `readstatus.ts`)
+
+`GET /api/status` with `Authorization: Bearer $PLANNER_READ_TOKEN` (HEAD too) feeds the 6bb Heating card:
+
+```json
+{ "backup":   { "called": false, "spanBufferTankKwhLastHour": 0.02 },
+  "failsafe": { "armed": true, "leaseUntil": "2026-11-01T14:30:00.000Z" },
+  "thermal":  { "at": "…", "tank_f": 128, "tank_target_f": 130, "outdoor_f": 31, "setpoints_f": {}, "dhw_floor_f": 120, "dhw_ready": true, "coast_h": 9.1, "tank_ua": 0.04 },
+  "storm":    { "state": "idle", "trigger": null, "windowEnd": null, "enabled": false, "lastTriggerPollAt": "…" },
+  "outageSignal": "ok" }
+```
+
+- `backup.called` is the HBX's own backup-element call at the last poll; `spanBufferTankKwhLastHour` is the SPAN cloud
+  reading of the element circuit over the trailing 60 min (`null` while `SPAN_USERNAME` is unset).
+- `failsafe.armed`: `true` the Pi shows a live revert lease on every pump in `PHASE_B_PUMPS`, `false` any pump has none or
+  an expired one, or a write landed and the Pi showed none (FINDING-1), `null` Phase B off or no pump seen yet;
+  `leaseUntil` is the earliest expiry across the pumps, `null` if any has none.
+- `thermal` and `storm` are exactly `/health.thermal` and `/health.storm`. `outageSignal` is `unavailable` when the 6bb
+  outage feed has not answered recently, whether supply reads `unknown` or the grid is only assumed (generator.ts), else
+  `ok`.
+
+Reads cached state only — no DB, hub or SensorLinx call, no side effect, no secrets. Answers: `200`; `401` for no,
+empty or wrong bearer (including `PLANNER_API_TOKEN`); `405` for any other method. The read token opens no other route
+and `PLANNER_API_TOKEN` does not open this one. While `PLANNER_READ_TOKEN` is unset the route is the planner's usual
+empty `404`. If it equals another planner secret (`PLANNER_API_TOKEN`, `HUB_CLIENT_TOKEN`, `HUB_ARM_TOKEN`,
+`TEMPIQ_SURFACE_TOKEN`, `SIXBB_ALERT_KEY`, `RESEND_API_KEY`, `SENSORLINX_PASSWORD`, `SPAN_PASSWORD`, `DATABASE_URL`) the
+planner logs `ERROR: PLANNER_READ_TOKEN equals …` and keeps the route at 404 — it does **not** exit, because it controls
+the house. The token is trimmed at startup, before the clash check and matching. Generate it with
+`openssl rand -hex 32`. The hub's read-only side is `HUB_READONLY_TOKEN` (hub/README.md).
 
 ## Deploy to Railway
 
@@ -406,6 +455,31 @@ Tables: `zone_floor_snapshots` (one row per shadow run when a floor was proposed
 analysis say whether a zone was drawing during a 5–20 min charge, which the hourly snapshot cannot).
 `/health.winter_solver` = off | shadow | degraded.
 
+## TempIQ COP mirror (`tempiq-read.ts` → `tempiq_cop_points`)
+
+The hourly read mirrors TempIQ's hydronic COP measurements (`GET /api/insights/cop-measurements`) into
+`tempiq_cop_points`; that table is the measured anchor for the winter DP (`getCopAnchor`), the realized-savings
+ledger (`getRealizedDayInputs`) and the `/curve` chart. Since TempIQv2#2124 TempIQ's writer **defers** a point
+until the charge's end is observable and **re-upserts its overlap day** on every hourly run, so the newest
+mirrored point is not a safe cursor and a mirrored row can legitimately change. The mirror therefore:
+
+- re-reads from `newest stored measured_at − COP_OVERLAP_DAYS` (default 3; 7 days back on an empty table),
+- pages backwards with `before=<oldest received + 1 ms>` until a short page, so the endpoint's 2000-row cap never
+  truncates (a row from the other pump that shares a page-boundary timestamp repeats and upserts as unchanged),
+- UPSERTs on `(measured_at, system)`, touching a row only when a mirrored field moved; `lastResult` reads
+  `cop: +3 new / 2 updated / 41 seen`.
+
+A backfill older than the window (TempIQ wrote Sep 29 → Oct 27 on 2026-10-27) needs the one-off:
+
+```
+POST /api/tempiq/cop-refetch  {"since": "2026-09-29", "before"?: ISO}   Authorization: Bearer $PLANNER_API_TOKEN
+  → {fetched, inserted, updated, pages, oldest, newest, truncated, durationMs, error}
+  401 no bearer · 422 malformed / future / > 400-day since, before ≤ since · 503 reader off · 409 one running · 502 a page failed
+```
+
+It runs inline on the request (same 20 s per-page timeout, 50-page bound) and the summary stays on
+`/health.tempiq_read.lastCopRefetch`. Never a cron: the hourly window covers steady state.
+
 ## TempIQ perturbation windows (a2w#137, FLAG-OFF)
 
 `tempiq-windows.ts` tells TempIQ WHEN we were driving the buffer, so its passive thermal
@@ -452,8 +526,10 @@ through `writer.setTarget` with the identification ceiling (owner decision 2026-
 exceed the everyday 135 °F cap up to `sanitizeCapF` 145; I1 + the rate limit still guard) → the
 auto-pilot is **held** for the window → abort checks every poll (I1 violated, room deficit on a
 down-probe, DHW draw on a down-probe, hub/SLX stale, storm, boost) → on the window's end the hold
-is released and the auto-pilot re-commands its plan. A down-probe abort **restores the as-found
-curve immediately** (the one write the rate limit never blocks; hotter is the safe direction).
+is released and the auto-pilot re-commands its plan. The driver's own cleanup returns the plant to the
+base through the guarded writer; when that is refused (a 429 inside 15 min of the probe write) it takes
+the rate-limit-exempt **plan restore** (#232), and only an abort whose plan restore is refused too falls
+back to the as-found curve (hotter is the safe direction; a normal end stays pending and retries).
 
 Windows persist in `identification_windows` (restart-safe) and are posted to TempIQ as kind
 `awt_identification` **with the drawn assignment** — the only kind U4 may fit. The quarantine
@@ -530,7 +606,7 @@ LOCAL_DATABASE_URL=postgres://$(whoami)@localhost:5432/a2w_local npx tsx ../scri
 
 ## Cold-day rehearsal (`scripts/rehearsal/`)
 
-Runs the **real planner** (`POLL_ONCE=1`, three polls) against a **local** Postgres with every upstream faked
+Runs the **real planner** (`POLL_ONCE=1`, three polls — four when the scenario injects a boost) against a **local** Postgres with every upstream faked
 — SensorLinx (device read + PATCH echo), the hub (state + leased commands), TempIQ (zones, calls,
 identification plan, posts), open-meteo, NWS, OutageWatch — from a scenario JSON, then asserts what the
 planner *did* (DB ledgers + the fake's request log), not what it logged.
@@ -542,6 +618,9 @@ scripts/rehearsal/run.sh tempiq-down      # cold morning, every /api/insights ro
 scripts/rehearsal/run.sh forecast-down    # cold morning, open-meteo 503 → cached / no plan, nothing written blind
 scripts/rehearsal/run.sh pi-offline       # hub unreachable (/api/state 503) → every write refused, no probe
 scripts/rehearsal/run.sh pi-dropped-hub-up # hub UP, Pi gone 2 h: stale pumps[] + pi_connected:false → refused 503 (#167)
+scripts/rehearsal/run.sh boost-expiry     # #232: as-found 165/145 in force at 40 °F, SHAPED_CURVE live; poll 2 writes the plan
+                                          # curve, a real 128 °F boost is injected and expires → poll 3 restores the PLAN's
+                                          # curve (never the as-found), auto-pilot holds, poll 4 Phase B leads 52 °C (four polls)
 ```
 
 **Hour-independent by construction** (eval 2026-09-30, F1): the plan's daily 140 °F soak goes to the warmest

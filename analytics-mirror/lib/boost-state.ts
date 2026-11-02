@@ -4,6 +4,9 @@
 // imports — so scripts/test-*.ts can run it under tsx. The planner is the authority on every limit
 // here (writes.ts boost(): 15–120 min, I4 envelope ≤ strictCapF, I1, 15-min rate limit); these
 // constants only shape the UI so it never offers something the planner is certain to refuse.
+// #231: a boost above the pump setpoints is no longer refused — the planner answers 202 "arming", raises the
+// setpoints first (≤ 20 min) and then writes it; the `arming` phase reads that back between sending and commanded.
+// A boost inside the planner's 15-min rate-limit window is armed the same way (reason "rate_limit") and waits.
 
 /** writes.ts DEFAULT_OPTS.strictCapF — the everyday ceiling on a dashboard boost. */
 export const STRICT_CAP_F = 135;
@@ -31,7 +34,16 @@ export type WriterStatus = {
   adoption_pending?: boolean;
   band?: { lo: number; hi: number } | null; // I4 envelope at the live outdoor
   i1_margin_f?: number;
+  /** the HBX hot-tank differential in force (writes.ts status(); null until a config version is recorded) — the
+   *  HBX reheats ht_dif/2 under its target, which is where the Boost card's coast line ends (lib/tank-coast.ts) */
+  ht_dif_f?: number | null;
   active_boost?: { target_f: number; restore_at: string } | null;
+  /** #231: a boost the planner accepted but has not written yet — Phase B is raising the pump setpoints to
+   *  setpoints_needed_f first (the planner's 202 "arming" answer), or (reason rate_limit) the last HBX write's
+   *  15-min window is passing. In planner memory; gone after a restart. */
+  pending_boost?: { target_f: number; minutes: number; setpoints_needed_f: number; reason?: ArmReason; requested_at: string; expires_at: string } | null;
+  /** #231: how the last pending boost ended (landed / expired / refused / replaced) */
+  pending_boost_ended?: { target_f: number; outcome: "landed" | "expired" | "refused" | "replaced"; detail: string; at: string } | null;
   /** in-memory time of the writer's last accepted HBX write (null after a planner restart) */
   last_write_at?: string | null;
   /** the curve on the device; output_at_live_outdoor_f is what setTarget solved to equal the target */
@@ -45,9 +57,13 @@ export type HubPump = { id: string; name?: string | null; online?: boolean; stat
 export type HubState = { pi_connected?: boolean; ts?: number | null; pumps?: HubPump[] };
 
 export type BoostRequest = { target_f: number; minutes: number };
+/** writes.ts ArmReason: what an armed boost waits for. */
+export type ArmReason = "setpoints" | "rate_limit";
 
 /** writes.ts PI_STATE_FRESH_MS — the planner refuses I1 against hub state older than this. */
 const PI_FRESH_S = 10 * 60;
+/** writes.ts PENDING_BOOST_MAX_MS (#231) — how long the planner waits for the setpoints before dropping a boost. */
+export const ARMING_MAX_MIN = 20;
 
 const cToF = (c: number) => (c * 9) / 5 + 32;
 const r0 = (v: number) => Math.round(v);
@@ -118,8 +134,9 @@ export function preflight(req: BoostRequest, st: WriterStatus | null, hub: HubSt
     } else if (st?.i1_margin_f != null) {
       const need = req.target_f + st.i1_margin_f;
       for (const p of hub.pumps ?? []) {
+        // #231: no longer a refusal — the planner raises the setpoints first (Phase B) and starts the boost after
         if (p.online && p.setpoint_c != null && cToF(p.setpoint_c) < need) {
-          out.push(`I1: ${p.name ?? p.id} setpoint ${cToF(p.setpoint_c).toFixed(1)} °F is below ${need} °F (target + ${st.i1_margin_f} °F margin) — the planner will refuse unless the setpoints rise first.`);
+          out.push(`I1: ${p.name ?? p.id} setpoint ${cToF(p.setpoint_c).toFixed(1)} °F is below ${need} °F (target + ${st.i1_margin_f} °F margin) — the planner will warm the heat pumps up first and start the boost when they reach ${need} °F (it gives up after ${ARMING_MAX_MIN} min).`);
         }
       }
     }
@@ -135,8 +152,10 @@ export function confirmText(req: BoostRequest, nowMs: number): string {
     `If the planner accepts, it sets the HBX reset curve so the tank target is ${req.target_f} °F, and at about ` +
     `${until.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ` +
     `(${fmtMinutes(req.minutes)} from now) it restores the curve automatically — that timer is stored in the database, ` +
-    `so a planner restart does not strand it. The HBX adopts the new target only at its next reheat cycle. ` +
-    `It does not change pump setpoints, staging or the element breaker.`
+    `so a planner restart does not strand it. If the heat pumps are not warm enough for ${req.target_f} °F yet, the ` +
+    `planner raises them first and starts the boost when they get there (it gives up after ${ARMING_MAX_MIN} min); ` +
+    `the timer starts when the boost does. The HBX adopts the new target only at its next reheat cycle. ` +
+    `It does not change staging or the element breaker.`
   );
 }
 
@@ -175,12 +194,14 @@ export type BoostPhase =
   | { phase: "idle" }
   | { phase: "sending"; req: BoostRequest }
   | { phase: "rejected"; req: BoostRequest; status: number; error: string }
+  // #231: the planner answered 202 — it is raising the pump setpoints first and writes the boost once they cover it
+  | { phase: "arming"; req: BoostRequest; atMs: number; setpointsNeededF: number | null; expiresAt: string | null; reason?: ArmReason | null }
   // seen = the read-back has shown this boost at least once (set by the caller from boostView);
   // writeAt = the writer's last_write_at in that first matching read-back — our write's own stamp, so
   // any later stamp is another write (planner clock vs planner clock: no browser-skew problem)
   | { phase: "accepted"; req: BoostRequest; atMs: number; restoreAt: string | null; seen?: boolean; writeAt?: string | null };
 
-export type BoostView = { key: "idle" | "sending" | "rejected" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale" | "unverified"; tone: Tone; text: string };
+export type BoostView = { key: "idle" | "sending" | "rejected" | "arming" | "not_started" | "verifying" | "unconfirmed" | "commanded" | "in_force" | "superseded" | "ended" | "expired_unrestored" | "stale" | "unverified"; tone: Tone; text: string };
 
 /** Only a read-back that positively identifies the boost may be drawn on the plan chart. */
 export function chartShowsBoost(v: BoostView): boolean {
@@ -211,9 +232,36 @@ export function boostView(p: BoostPhase, st: WriterStatus | null, nowMs: number,
   return v;
 }
 
+/** #231: the arming read-back, worded for the household — no planner jargon. A rate-limit wait never claims warming. */
+function armingView(needF: number | null, reason: ArmReason | null | undefined): BoostView {
+  if (reason === "rate_limit") return { key: "arming", tone: "pending", text: "Waiting a few minutes for the last heating change to settle, the boost starts after that" };
+  return { key: "arming", tone: "pending", text: `Warming up the heat pumps first, the boost starts when they reach ${needF != null ? `${r0(needF)} °F` : "the temperature it needs"}` };
+}
+
+/**
+ * #231: a 202 boost, from read-back. The planner's pending_boost says it is still waiting; an active_boost with our
+ * target says it landed (the caller then moves the phase to accepted); pending_boost_ended says why it stopped waiting.
+ */
+function armingViewFresh(p: Extract<BoostPhase, { phase: "arming" }>, st: WriterStatus | null, nowMs: number): BoostView {
+  const ab = st?.active_boost ?? null;
+  if (ab && ab.target_f === p.req.target_f) return activeView(ab, st!, nowMs, null);
+  const pb = st?.pending_boost ?? null;
+  if (st == null || (pb && pb.target_f === p.req.target_f)) return armingView(pb?.setpoints_needed_f ?? p.setpointsNeededF, pb?.reason ?? p.reason);
+  const ended = st.pending_boost_ended ?? null;
+  if (ended && ended.target_f === p.req.target_f && Date.parse(ended.at) >= p.atMs - 60_000) {
+    const waited = p.reason === "rate_limit"; // the 202's reason: the heat pumps were already warm
+    if (ended.outcome === "landed") return { key: "verifying", tone: "pending", text: waited ? "the boost was sent — reading back the writer status…" : "the heat pumps are warm and the boost was sent — reading back the writer status…" };
+    if (ended.outcome === "expired") return { key: "not_started", tone: "bad", text: waited ? `The boost could not start within ${ARMING_MAX_MIN} minutes, so it did not start. The tank was not changed.` : `The heat pumps did not warm up within ${ARMING_MAX_MIN} minutes, so the boost did not start. The tank was not changed.` };
+    if (ended.outcome === "replaced") return { key: "not_started", tone: "neutral", text: "The boost was cancelled before it started. The tank was not changed." };
+    return { key: "not_started", tone: "bad", text: `${waited ? "The planner refused the boost when it came to start it" : "The heat pumps warmed up, but the planner then refused the boost"}: ${ended.detail}` };
+  }
+  return { key: "not_started", tone: "bad", text: "The boost is no longer waiting and did not start (the planner may have restarted). The tank was not changed." };
+}
+
 function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): BoostView {
   if (p.phase === "idle") {
     if (st?.active_boost) return activeView(st.active_boost, st, nowMs, null);
+    if (st?.pending_boost) return armingView(st.pending_boost.setpoints_needed_f, st.pending_boost.reason); // a reload while a boost is arming
     return { key: "idle", tone: "neutral", text: "no boost active" };
   }
   if (p.phase === "sending") return { key: "sending", tone: "pending", text: `sending boost to ${p.req.target_f} °F…` };
@@ -221,6 +269,7 @@ function boostViewFresh(p: BoostPhase, st: WriterStatus | null, nowMs: number): 
     const r = classifyRejection(p.status, p.error);
     return { key: "rejected", tone: "bad", text: `${r.label}: ${r.text}` };
   }
+  if (p.phase === "arming") return armingViewFresh(p, st, nowMs);
   // accepted — confirm from read-back only
   const ab = st?.active_boost ?? null;
   const ours = ab != null && ab.target_f === p.req.target_f && (p.restoreAt == null || sameRestore(ab.restore_at, p.restoreAt));
