@@ -26,13 +26,22 @@ stay human-only on the direct LAN/Funnel path and are never relayed by the hub.
 | Method | Path           | Auth                    | Purpose |
 | ------ | -------------- | ----------------------- | ------- |
 | GET    | `/health`      | open                    | `{ok, pi_connected, last_state_ts}` + Pi dropout episodes (#166): `pi_dropouts_24h`, `pi_dropouts_7d`, `longest_dropout_min`, `last_dropout {start,end,minutes}`, `current_dropout_min` (null while connected), `tracking_since` — in-memory, reset on every hub boot |
-| GET    | `/api/state`   | Bearer `HUB_CLIENT_TOKEN` | latest state the Pi pushed |
+| GET    | `/api/state`   | Bearer `HUB_CLIENT_TOKEN` or `HUB_READONLY_TOKEN` | latest state the Pi pushed (no `span` for `HUB_READONLY_TOKEN`) |
 | POST   | `/api/command` | Bearer `HUB_CLIENT_TOKEN` | relay a setpoint to the Pi, await ack |
 | POST   | `/api/write-enable` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | arm/disarm a pump's write path (owner 2026-07-14); Pi applies audit + push ceremony |
 | POST   | `/api/breaker` | Bearer `HUB_CLIENT_TOKEN` **+ `X-Arm-Token: HUB_ARM_TOKEN`** | switch an allowlisted SPAN circuit through the panel's LOCAL API (owner 2026-10-18) — see below |
 
 `GET /api/state` also returns `span` (allowlisted circuits' live relay state + power, any breaker
 action in flight) when the bridge sends it; `null` from a bridge that predates breaker control.
+The read-only role never gets this key: it holds the panel serial, the LAN broker host:port and
+transport error strings.
+
+Each pump carries `write_enabled` (its write path is armed on the Pi) and `active_faults`, relayed
+unchanged in **one of two shapes** (#190): bridges from that release send the list
+`[{code, message, severity}]` (plain English from `heatpump-bridge/bridge/faults.py`; severity
+`info` | `warning` | `high` | `critical`, and P17 anti-freeze is always `info` — normal, never alert on
+it); older bridges send only the integer count. The Pi updates only on a release tag, so the hub and
+planner run ahead of it for days: **every reader must accept both** (planner `hub.ts` `faultList`).
 
 `POST /api/breaker` body `{"circuit":"Air-Water 2","action":"power_cycle"|"close"|"open","off_s":60}`
 (`off_s` only for `power_cycle`; default and floor 60, max 600). The bridge enforces every safety
@@ -65,6 +74,7 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | `HUB_PI_TOKEN`     | Bearer token the Pi presents on its WS handshake. Wrong/absent → WS close `4401`. |
 | `HUB_CLIENT_TOKEN` | Bearer token the optimizer + dashboard present on HTTP. |
 | `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both off). Held only by the dashboard's server, released only after a fresh password re-entry. |
+| `HUB_READONLY_TOKEN` | Optional. Read-only bearer for the 6bb home app (#190) — see below. Unset = off, nothing changes. |
 | `PORT`             | HTTP + WS port. Railway injects this automatically; defaults to `8080`. |
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
 | `NTFY_SERVER`      | Optional. ntfy base URL (default `https://ntfy.sh`). |
@@ -72,7 +82,28 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | `RESEND_API_KEY` / `RESEND_TO` | Optional. Also email the dead-man alerts via Resend. No verified domain → delivers only to your Resend account email (set `RESEND_TO` to it). |
 | `RESEND_FROM` | Optional sender (default `A2W Alerts <onboarding@resend.dev>`). |
 
-Tokens are compared constant-time. Generate them with e.g. `openssl rand -hex 32`.
+Tokens are compared constant-time; `HUB_READONLY_TOKEN` is trimmed at startup, before the clash
+check and matching. Generate them with e.g. `openssl rand -hex 32`.
+
+**Read-only token (#190).** `Authorization: Bearer <HUB_READONLY_TOKEN>` lets the 6bb home app
+show heat-pump status with no write or control access. Allowed, exactly:
+
+- `GET /api/state` (and `HEAD`) → `200`, without the `span` block
+- `GET /health` is open to everyone anyway
+
+Refused with `403`: every non-GET request under `/api/` (`POST /api/command`,
+`POST /api/write-enable`, `POST /api/breaker` even with a valid `X-Arm-Token`, and any
+PUT/DELETE/PATCH, including routes added later), and the Pi WebSocket `/pi` (HTTP 403 before any
+upgrade). The token never counts as `HUB_CLIENT_TOKEN`, `HUB_ARM_TOKEN` or `HUB_PI_TOKEN`: if it
+equals any of them, the hub logs `FATAL: HUB_READONLY_TOKEN equals …` and refuses to start.
+
+The 6bb Heating card reads the pumps (online, mode, setpoint, leaving water, faults, `write_enabled`)
+from here, and the rest — backup element state, failsafe lease, tank vs target, storm, outage feed —
+from the planner's `GET /api/status` with its own `PLANNER_READ_TOKEN` (planner/README.md §Read-only
+status). Never give the 6bb app `PLANNER_API_TOKEN`: it authorizes writes.
+
+`HUB_E2E_CLIENT_ONLY_GET=1` adds a client-only test route for `readonly.e2e.test.ts`; never set it
+in production.
 
 **Dead-man watchdog:** the Pi checks in over its WebSocket every ~15 s, so with `NTFY_TOPIC`
 set the hub pushes an ntfy alert when the Pi drops (power / WiFi / internet / bridge down) and

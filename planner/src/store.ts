@@ -1094,7 +1094,8 @@ export class Store {
 
   /**
    * #185: active fault CODES per pump from the mirror's pump_snapshots (the Pi attaches each pump's full snapshot every
-   * ~5 min, including active_faults [{code, message, severity, since}]). The hub's state frame carries only a COUNT.
+   * ~5 min, including active_faults [{code, message, severity, since}]). The hub's state frame carried only a COUNT before
+   * #190; checkStages now reads the frame's own list when the bridge sends one and falls back to this.
    * Non-info severities only. Read-only; an absent table (rehearsal DB) → {}.
    */
   async pumpFaultCodes(): Promise<Record<string, { codes: string[]; ts: number }>> {

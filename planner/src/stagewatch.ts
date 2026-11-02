@@ -14,8 +14,10 @@
  *   stopped_reminder — stage N called while its pump has been switched off outside A2W for ≥ STOPPED_REMIND_MS: once
  *                      per stop (a forgotten switch-off in January matters); it closes when the pump is back.
  * Pure (no I/O): index.ts feeds it the poll's HBX stages, the hub's pump states (only when piStateUnverifiable says
- * they are live), fault codes from the mirror's pump_snapshots, and lagT from the HBX config.
+ * they are live), fault codes (from the hub's fault list on #190 bridges, else the mirror's pump_snapshots), and lagT
+ * from the HBX config.
  */
+import { faultList, type HubActiveFaults } from "./hub";
 
 export const STAGE_START_GRACE_MS = 10 * 60 * 1000;
 /**
@@ -59,12 +61,30 @@ export interface StagePump {
   online: boolean;
   /** the bridge's derived state: heating | idle | off | defrost | fault | cooling | offline */
   state?: string | null;
-  /** count of active faults (the hub's state frame) */
-  active_faults?: number | null;
+  /** the hub's state frame: a count (older bridges) or the fault list (#190) — StageWatch never reads it; `state` is the signal */
+  active_faults?: HubActiveFaults;
   /** codes from the mirror's pump_snapshots, when known */
   fault_codes?: string[];
   /** #212: set by the Pi while a PERSON has this pump's breaker off — since = Pi wall seconds */
   deliberate_stop?: { circuit?: string; since: number; announced?: boolean } | null;
+}
+
+/** A pump's codes from the frame's own list on #190 bridges (non-info only: P17 is normal); null = an older bridge's count. */
+export function liveCodes(p: StagePump): string[] | null {
+  const list = faultList(p.active_faults);
+  return list ? [...new Set(list.filter((f) => f.severity !== "info").map((f) => f.code))] : null;
+}
+
+/** Codes only ANNOTATE a live fault: the frame's own, else (an older bridge's count) a mirror snapshot ≤ 15 min old (the
+ *  Pi attaches one every ~5 min). `mirror` is store.pumpFaultCodes(); {} when it failed or was not needed. */
+export function annotateFaultCodes(pumps: StagePump[], mirror: Record<string, { codes: string[]; ts: number }>, nowS: number): StagePump[] {
+  return pumps.map((p) => {
+    if (p.state !== "fault") return p;
+    const own = liveCodes(p);
+    if (own) return { ...p, fault_codes: own };
+    const c = mirror[p.id];
+    return c && Math.abs(nowS - c.ts) <= 15 * 60 ? { ...p, fault_codes: c.codes } : p;
+  });
 }
 
 export type StageEpisodeKind = "stage_unserved" | "fault_called" | "stopped_reminder";

@@ -31,6 +31,18 @@ _BACKOFF_MIN_S = 1.0
 _BACKOFF_MAX_S = 30.0
 
 
+def wire_faults(faults) -> list[dict]:
+    """#190: the pump's active faults as the hub frame carries them — {code, message, severity}, plain strings
+    (faults.FaultDef; P17 anti-freeze stays "info"). Older bridges sent only the COUNT, so the hub and the planner
+    accept both an integer and this list."""
+    out = []
+    for f in faults or []:
+        sev = f.get("severity")
+        out.append({"code": str(f.get("code", "")), "message": str(f.get("message", "")),
+                    "severity": str(getattr(sev, "value", sev) or "")})
+    return out
+
+
 class HubClient:
     def __init__(self, cfg: HubConfig, pollers: dict[str, PumpPoller]):
         self.cfg = cfg
@@ -253,7 +265,7 @@ class HubClient:
     def _state_payload(self) -> dict:
         """Latest per-pump state pushed to the hub. Same fields the analytics mirror
         exports (exporter.snapshot) PLUS remote_lease_until so the dashboard can show an
-        active optimizer lease."""
+        active optimizer lease. active_faults is the fault LIST (wire_faults, #190); the mirror keeps its count."""
         pumps = []
         for p in self.pollers.values():
             s = p.snapshot
@@ -268,7 +280,7 @@ class HubClient:
                 "outlet_c": s.get("outlet_c"),
                 "ambient_c": s.get("ambient_c"),
                 "power_w": (s.get("power_sys1") or 0) + (s.get("power_sys2") or 0),
-                "active_faults": len(s.get("active_faults", [])),
+                "active_faults": wire_faults(s.get("active_faults")),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
                 "remote_lease_until": s.get("remote_lease_until"),
                 "write_enabled": p.cfg.write_enabled,

@@ -11,6 +11,9 @@
  *  - Pi -> hub WS handshake: header "Authorization: Bearer <HUB_PI_TOKEN>".
  *    Hub closes with WS code 4401 otherwise.
  *  - optimizer/dashboard -> hub HTTP: header "Authorization: Bearer <HUB_CLIENT_TOKEN>".
+ *  - Optional HUB_READONLY_TOKEN (#190, the 6bb app): GET /api/state only, without its `span` block;
+ *    403 on every other /api call and on the Pi WS. Must differ from every other secret or the hub
+ *    refuses to start.
  *  - Secrets are env vars: HUB_PI_TOKEN, HUB_CLIENT_TOKEN, PORT. Constant-time compare.
  *
  * The hub holds AT MOST ONE Pi WS (new connection replaces old), buffers only the
@@ -19,7 +22,8 @@
  */
 
 import { renderAlertEmail, type Tier as AlertTier } from "./alertemail";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { bearerRole, constantTimeEqual, extractBearer, readonlyTokenClash } from "./auth";
 import express, { type Request, type Response } from "express";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
@@ -39,6 +43,19 @@ if (!HUB_PI_TOKEN) {
 }
 if (!HUB_CLIENT_TOKEN) {
   console.warn("[hub] WARNING: HUB_CLIENT_TOKEN is not set — all HTTP client requests will be rejected.");
+}
+
+// #190: optional read-only bearer for the 6bb home app — GET /api/state only, never control.
+// Equal to any other secret would hand that app control, so refuse to start rather than guess.
+// Trimmed first, so a pasted trailing newline neither hides a clash nor fails to match (extractBearer trims).
+const HUB_READONLY_TOKEN = (process.env.HUB_READONLY_TOKEN ?? "").trim();
+const readonlyClash = readonlyTokenClash(HUB_READONLY_TOKEN, {
+  HUB_CLIENT_TOKEN, HUB_ARM_TOKEN: process.env.HUB_ARM_TOKEN ?? "", HUB_PI_TOKEN,
+});
+if (readonlyClash) {
+  console.error(`[hub] FATAL: HUB_READONLY_TOKEN equals ${readonlyClash} — the read-only app would get control. `
+    + "Set a different secret (openssl rand -hex 32). Refusing to start.");
+  process.exit(1);
 }
 
 // Env-overridable (like WATCHDOG_INTERVAL_MS) so the link e2e test can exercise the missed-pong
@@ -74,29 +91,6 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const RESEND_TO = process.env.RESEND_TO ?? "";
 const RESEND_FROM = process.env.RESEND_FROM ?? "A2W Alerts <onboarding@resend.dev>";
 const RESEND_API_URL = process.env.RESEND_API_URL ?? "https://api.resend.com/emails";
-
-// ---------------------------------------------------------------------------
-// Constant-time token comparison
-// ---------------------------------------------------------------------------
-
-/**
- * Constant-time string comparison. Hashes both sides to fixed-length buffers so
- * timingSafeEqual never throws on length mismatch and length is not leaked.
- * Returns false when the expected secret is empty (unconfigured).
- */
-function constantTimeEqual(provided: string, expected: string): boolean {
-  if (!expected) return false;
-  const a = createHash("sha256").update(provided).digest();
-  const b = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(a, b);
-}
-
-/** Extract a bearer token from an Authorization header value, or "" if absent. */
-function extractBearer(headerValue: string | undefined): string {
-  if (!headerValue) return "";
-  const m = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
-  return m ? m[1].trim() : "";
-}
 
 /** Flatten a fetch error to its real network story: unwrap undici's .cause and expand
  *  AggregateError (happy-eyeballs) into per-attempt `CODE addr:port` entries. */
@@ -225,6 +219,13 @@ function alert(tier: Tier, title: string, body: string,
 // Message types (per CONTRACT)
 // ---------------------------------------------------------------------------
 
+/** One active fault in plain English (bridge faults.py FaultDef). P17 anti-freeze is "info": normal, never alert. */
+interface ActiveFault {
+  code: string;
+  message: string;
+  severity: "info" | "warning" | "high" | "critical" | string;
+}
+
 interface PumpState {
   id: string;
   name: string;
@@ -236,9 +237,13 @@ interface PumpState {
   outlet_c: number | null;
   ambient_c: number | null;
   power_w: number | null;
-  active_faults: unknown;
+  /** #190: bridges from that release send the fault LIST; older ones send only the COUNT. The Pi updates only on
+   *  a release tag, so both shapes are live for days — relayed unchanged, and every reader takes either. */
+  active_faults: number | ActiveFault[] | null;
   error_rate: number | null;
   remote_lease_until: number | null;
+  /** the pump's write path is armed on the Pi (bridge hub_client.py); absent from very old bridges */
+  write_enabled?: boolean;
 }
 
 interface StateMessage {
@@ -334,26 +339,55 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-/** Middleware: require Bearer HUB_CLIENT_TOKEN (constant-time). */
+const roleOf = (req: Request) =>
+  bearerRole(extractBearer(req.header("authorization") ?? undefined), HUB_CLIENT_TOKEN, HUB_READONLY_TOKEN);
+
+/** #190: the read-only token never gets past a non-GET on /api — including routes that do not
+ *  exist yet, so a future write route cannot forget the check. */
+app.use("/api", (req: Request, res: Response, next: () => void) => {
+  if (roleOf(req) === "readonly" && req.method !== "GET" && req.method !== "HEAD") {
+    res.status(403).json({ ok: false, detail: "read-only token" });
+    return;
+  }
+  next();
+});
+
+/** Middleware: require Bearer HUB_CLIENT_TOKEN (constant-time). The read-only token gets 403. */
 function requireClientAuth(req: Request, res: Response, next: () => void): void {
-  const token = extractBearer(req.header("authorization") ?? undefined);
-  if (!constantTimeEqual(token, HUB_CLIENT_TOKEN)) {
+  const role = roleOf(req);
+  if (role !== "client") {
+    res.status(role === "readonly" ? 403 : 401).json({ ok: false, detail: role === "readonly" ? "read-only token" : "unauthorized" });
+    return;
+  }
+  next();
+}
+
+/** Middleware: Bearer HUB_CLIENT_TOKEN or HUB_READONLY_TOKEN — read endpoints only. */
+function requireReadAuth(req: Request, res: Response, next: () => void): void {
+  if (roleOf(req) === "none") {
     res.status(401).json({ ok: false, detail: "unauthorized" });
     return;
   }
   next();
 }
 
-/** GET /api/state — latest state the Pi pushed. */
-app.get("/api/state", requireClientAuth, (_req: Request, res: Response) => {
+/** GET /api/state — latest state the Pi pushed. #190: no `span` for the read-only role: it holds
+ *  the panel serial, the LAN broker host:port and transport error strings. */
+app.get("/api/state", requireReadAuth, (req: Request, res: Response) => {
   const connected = piSocket !== null && piSocket.readyState === WebSocket.OPEN;
-  res.status(200).json({
+  const frame = {
     pi_connected: connected,
     ts: lastState ? lastState.ts : null,
     pumps: lastState ? lastState.pumps : [],
-    span: lastState?.span ?? null,
-  });
+  };
+  res.status(200).json(roleOf(req) === "readonly" ? frame : { ...frame, span: lastState?.span ?? null });
 });
+
+// Test-only: readonly.e2e.test.ts needs a client-only GET to cover requireClientAuth's 403 for the read-only token
+// (every real GET is a read route). Never set in production.
+if (process.env.HUB_E2E_CLIENT_ONLY_GET === "1") {
+  app.get("/api/e2e-client-only", requireClientAuth, (_req: Request, res: Response) => { res.status(200).json({ ok: true }); });
+}
 
 /**
  * POST /api/command — body {pump_id, value_c, lease_minutes?, source?}.
@@ -735,6 +769,11 @@ server.on("upgrade", (req: IncomingMessage, socket, head) => {
   }
 
   const token = extractBearer(req.headers["authorization"]);
+  if (constantTimeEqual(token, HUB_READONLY_TOKEN)) {
+    // #190: the read-only token is refused outright, before any upgrade.
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    return;
+  }
   if (!constantTimeEqual(token, HUB_PI_TOKEN)) {
     // Reject the handshake, then close with the contract's 4401 code once open.
     wss.handleUpgrade(req, socket, head, (ws) => {
