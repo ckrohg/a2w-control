@@ -117,6 +117,7 @@ class FakeEbus:
         self.rejected: list[tuple[str, str]] = []   # /sets the panel's own $description does not allow
         self.password = BROKER_PASSWORD
         self.silent = False                     # the panel stops publishing (stale tree) but the session lives
+        self.site_power: float | str | None = None   # power-flows/site, if not the capture's ("" = no value)
         self.hold_retained = False              # a new SUBSCRIBE gets its SUBACK but no retained tree (yet)
         self.refuse_all = False                 # every CONNECT is refused "not authorised", whatever the creds
         self._published: dict[str, bytes] = {}
@@ -194,6 +195,8 @@ class FakeEbus:
             out[f"ebus/5/{lid}/$state"] = b"ready"
         for prop, sample in CAPTURE["panel"]["properties"].items():
             out[f"ebus/5/{SERIAL}/{prop}"] = str(sample).encode()
+        if self.site_power is not None:
+            out[f"ebus/5/{SERIAL}/power-flows/site"] = str(self.site_power).encode()
         for cid, n, c in circuits:
             out.update(self._circuit_topics(cid, n, c))
         return out

@@ -273,6 +273,12 @@ class SpanClient:
                     return st
         return None
 
+    def site_power_w(self) -> float | None:
+        """The panel's own whole-site draw, when v2 answered the last read (v1 has no such value)."""
+        if self.v2 is None or self._answered["read"].get("transport") != "v2":
+            return None
+        return self.v2.site_power_w()
+
     def transport_status(self) -> dict:
         """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
         frame. `read` falling back to v1 means v2 is failing — v1 is removed 2026-12-31."""
@@ -475,24 +481,34 @@ def extract_relay(circuits: dict, name: str) -> dict | None:
     return None
 
 
-def house_load_w(circuits: dict) -> float | None:
+def house_load(circuits: dict, site_w: float | None = None) -> dict:
     """#241: the whole-house draw from one /circuits read — every circuit's |instantPowerW| (consumption is negative on
     this panel; abs also counts any producing circuit as load, the safe side) EXCEPT the backup element's own, which the
-    generator budget adds at its full rating. None (= unknown, the element stays locked out) when ANY other circuit has
-    no power reading: summing the rest would read a 7 kW EV charger whose value is missing (a v2 session still filling
-    in after a reconnect, #239) as 0 W. Loads not on a SPAN circuit (none known) are what generator_margin_w is for."""
+    generator budget adds at its full rating. Loads not on a SPAN circuit (none known) are what generator_margin_w is for.
+    A circuit with no reading is never 0 W: summing the rest would read a 7 kW EV charger whose value is missing as nothing.
+    With any unread, `w` comes from `site_w`, the panel's own site power (v2), less the element's draw; never below what
+    the readable circuits add up to. No site power either: `w` is None (= unknown, the element stays locked out).
+    → {w, partial_w: the sum of the circuits that have a reading, unread: their names, source: circuits | site | None}."""
     from .config import BACKUP_ELEMENT_CIRCUIT
-    total = 0.0
+    total, element = 0.0, 0.0
     seen = 0
+    unread = []
     for c in circuits.values():
-        if (c.get("name") or "").strip() == BACKUP_ELEMENT_CIRCUIT:
-            continue
+        name = (c.get("name") or "").strip()
         v = c.get("instantPowerW")
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            return None
-        total += abs(float(v))
-        seen += 1
-    return round(total, 1) if seen else None
+        known = isinstance(v, (int, float)) and not isinstance(v, bool)
+        if name == BACKUP_ELEMENT_CIRCUIT:
+            element = abs(float(v)) if known else 0.0   # unknown: site power keeps it in, the safe side
+            continue
+        if known:
+            total += abs(float(v))
+            seen += 1
+        else:
+            unread.append(name or str(c.get("id")))
+    w, source = (round(total, 1), "circuits") if seen and not unread else (None, None)
+    if unread and site_w is not None:
+        w, source = round(max(abs(site_w) - element, total), 1), "site"
+    return {"w": w, "partial_w": round(total, 1), "unread": sorted(unread), "source": source}
 
 
 # --- arm intent: owner-set, persisted on the bridge (default DISARMED) --------
@@ -606,7 +622,8 @@ class SpanLocalPoller:
         """Cache the allowlisted breakers' relay/power from a fresh /circuits read."""
         self.latest_circuits = {b.name: extract_relay(circuits, b.name)
                                 for b in getattr(self.cfg, "breakers", [])}
-        self.latest_house_w = house_load_w(circuits)
+        self.latest_house = house_load(circuits, self.client.site_power_w())
+        self.latest_house_w = self.latest_house["w"]
         self.latest_circuits_ts = ts
         self.latest_circuits_mono = time.monotonic() if mono is None else mono
 

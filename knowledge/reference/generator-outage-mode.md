@@ -118,9 +118,15 @@ is treated as the generator.
     mini-splits included.
   - On the grid that same load is mostly heat already being made (the mini-splits). The notice tells the owner to switch
     the breaker ON themselves if the house is on the grid.
-- **Unknown load = no close.**
+- **Unknown load = no close.** When a circuit has no power reading, the v2 panel-level site power (`power-flows/site`,
+  less the element's draw) stands in for the sum. With neither, the refusal names the circuit, because the fix is at the
+  panel and not on the Pi's network. No generator sample of `power-flows/site` exists yet; the ATS is upstream of the
+  panel, so it should read the same on either supply.
 - **Re-checks:** a refused episode is re-checked every 30 s and noted once. In shadow that note is record-only (as every
   shadow fallback notice); live, it is a page.
+- **At the close:** the 30 s tick can judge a panel read up to 120 s old, so the close re-runs the budget on the
+  controller's fresh read. A fresh over-budget verdict holds it as a budget refusal. A fresh unknown does not: this is a
+  safety close and is never held for want of a number.
 - **Knobs:** `backup_fallback.generator_cap_w` (24000), `generator_margin_w` (2400), `element_w` (16500).
 - **House load source:** the bridge now computes `house_w` from each `/circuits` read and puts it in the hub frame
   (`span.house_w`). Until the bridge release carrying this lands, the planner sees no house load. On the generator or

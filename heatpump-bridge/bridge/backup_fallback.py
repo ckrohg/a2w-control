@@ -13,7 +13,10 @@
 # GENERATOR BUDGET (#241): the Pi cannot tell the grid from the generator (the transfer switch is upstream of the panel
 # and no outage information reaches the Pi), so it always applies the generator rule: no close unless the live house
 # load (every circuit but the element's, from a fresh panel read) + element_w + generator_margin_w ≤ generator_cap_w.
-# Unknown load = no close. A refused episode is re-checked every tick (the load may drop) and noted once.
+# Unknown load = no close. A refused episode is re-checked every tick (the load may drop) and noted once. With a circuit
+# unread, v2's panel-level site power stands in; with neither, the refusal names the circuit, because the fix is at the
+# panel, not the Pi's network. The tick judges a read up to SPAN_FRESH_S old, so the close re-runs the budget on the
+# controller's fresh read (precheck): a fresh over-budget verdict holds it, a fresh unknown does not.
 # Default SHADOW: audit + record "would close" once per cooldown (never a phone push) and switch nothing until
 # backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
@@ -165,15 +168,50 @@ class BackupFallback:
         """#241: would the element fit on a ~24 kW generator right now? {fits, house_w, projected_w, why}."""
         snap = self._span()
         house = snap.get("house_w") if snap else None
+        detail = (snap.get("house") if snap else None) or {}
+        unread = ", ".join(detail.get("unread") or [])
         if not isinstance(house, (int, float)) or isinstance(house, bool):
-            return {"fits": False, "house_w": None, "projected_w": None,
-                    "why": "the live house load is unknown (no fresh panel read)"}
+            return {"fits": False, "house_w": None, "projected_w": None, "why": (
+                f"the live house load is unknown: the panel gives no power reading for {unread} (the other circuits add "
+                f"up to {detail.get('partial_w', 0) / 1000:.1f} kW)" if unread
+                else "the live house load is unknown (no fresh panel read)")}
         projected = house + self.cfg.element_w + self.cfg.generator_margin_w
         fits = projected <= self.cfg.generator_cap_w
         return {"fits": fits, "house_w": round(house), "projected_w": round(projected),
                 "why": (f"house {house / 1000:.1f} kW + element {self.cfg.element_w / 1000:.1f} kW + margin "
                         f"{self.cfg.generator_margin_w / 1000:.1f} kW = {projected / 1000:.1f} kW "
-                        f"{'fits under' if fits else 'exceeds'} the {self.cfg.generator_cap_w / 1000:.1f} kW generator cap")}
+                        f"{'fits under' if fits else 'exceeds'} the {self.cfg.generator_cap_w / 1000:.1f} kW generator cap"
+                        + (f" (panel site power: no reading for {unread})" if unread else ""))}
+
+    def _budget_precheck(self, circ: dict) -> str | None:
+        """The close's last look: the budget again, on the read the controller took an instant ago (it refreshed the
+        snapshot this reads, so no I/O). Only a fresh "does not fit" refuses: a load this read cannot see leaves the
+        tick's verdict standing, because a safety close is never held for want of a number."""
+        fresh = self.budget_check()
+        if fresh["house_w"] is None:
+            return None
+        self.budget = fresh
+        return None if fresh["fits"] else fresh["why"]
+
+    async def _note_budget(self, held_min: float, relay) -> None:
+        """The element stays off for the generator budget: noted once per all-down episode."""
+        if self._budget_noted:
+            return
+        self._budget_noted = True
+        await self._decide(
+            "generator_budget", "high" if self.cfg.live else "info",
+            f"{'' if self.cfg.live else 'SHADOW — nothing was switched. '}Every heat pump has been down "
+            f"{held_min:.0f} min ({self._why_down()}), but the element stays OFF: {self.budget['why']}. The Pi cannot "
+            "tell the grid from the generator, so it always keeps the generator inside its budget. If the "
+            f"house is on the grid, switch the '{BACKUP_ELEMENT_CIRCUIT}' breaker ON yourself; on the "
+            "generator, shed a big load (EV charger, mini-splits). A2W re-checks every 30 s.", relay,
+            title=("Both heat pumps down — element held OFF (generator budget)" if self.cfg.live
+                   else "Backup fallback (shadow): would close, but the generator budget says no"),
+            priority="urgent" if self.cfg.live else "default", tier="page" if self.cfg.live else "record")
+
+    def _why_down(self) -> str:
+        return "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
+                         for p, d in self.down.items())
 
     # --- the decision -----------------------------------------------------------
     async def tick(self) -> None:
@@ -202,28 +240,14 @@ class BackupFallback:
             return
         backup = self._backup()
         relay = (backup or {}).get("relay_state")
-        if relay != "CLOSED":
+        if relay != "CLOSED" and self.breakers is not None:   # no breaker control: no panel read to budget on
             self.budget = self.budget_check()
             if not self.budget["fits"]:
-                if not self._budget_noted:
-                    self._budget_noted = True
-                    why = "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
-                                    for p, d in self.down.items())
-                    await self._decide(
-                        "generator_budget", "high" if self.cfg.live else "info",
-                        f"{'' if self.cfg.live else 'SHADOW — nothing was switched. '}Every heat pump has been down "
-                        f"{held_min:.0f} min ({why}), but the element stays OFF: {self.budget['why']}. The Pi cannot "
-                        "tell the grid from the generator, so it always keeps the generator inside its budget. If the "
-                        f"house is on the grid, switch the '{BACKUP_ELEMENT_CIRCUIT}' breaker ON yourself; on the "
-                        "generator, shed a big load (EV charger, mini-splits). A2W re-checks every 30 s.", relay,
-                        title=("Both heat pumps down — element held OFF (generator budget)" if self.cfg.live
-                               else "Backup fallback (shadow): would close, but the generator budget says no"),
-                        priority="urgent" if self.cfg.live else "default", tier="page" if self.cfg.live else "record")
+                await self._note_budget(held_min, relay)
                 return
         self._decided = True
         self._next_ok = now + self.cfg.cooldown_h * 3600
-        why = "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
-                        for p, d in self.down.items())
+        why = self._why_down()
         budget = f" ({self.budget['why']})" if self.budget else ""
         if relay == "CLOSED":
             await self._decide("already_available", "info",
@@ -246,7 +270,8 @@ class BackupFallback:
                                priority="urgent", tier="page")
             return
         try:
-            res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback")
+            res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback",
+                                              precheck=self._budget_precheck)
             ok = bool(res.get("ok"))
             await self._decide("closed" if ok else "close_unverified", "high" if ok else "critical",
                                f"Every heat pump has been down {held_min:.0f} min ({why}){budget}. A2W closed the "
@@ -258,6 +283,10 @@ class BackupFallback:
         except Exception as exc:  # noqa: BLE001 — a refusal (BreakerRefused) or any error: retried, never latched
             # refused before anything was switched: retry in RETRY_S, page the first refusal of the episode
             self._decided = False
+            if not self.budget["fits"]:      # the fresh read does not fit: a budget hold, re-checked next tick
+                self._next_ok = None
+                await self._note_budget(held_min, relay)
+                return
             self._next_ok = now + RETRY_S
             await self._decide("refused", "critical",
                                f"Every heat pump has been down {held_min:.0f} min ({why}) but closing the "
