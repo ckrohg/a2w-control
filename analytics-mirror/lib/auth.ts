@@ -6,7 +6,7 @@
 // The armed cookie's mint/verify live in lib/armed.ts (pure, testable); these are wrappers.
 import { cookies } from "next/headers";
 import crypto from "crypto";
-import { ARMED_TTL_S, mintArmed, verifyArmed } from "./armed";
+import { ARMED_TTL_S, armedKeyFrom, mintArmed, verifyArmed } from "./armed";
 
 export function isAuthed(): boolean {
   const secret = process.env.VIEW_SESSION_SECRET ?? "";
@@ -17,16 +17,22 @@ export function isAuthed(): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-/** The armed-state cookie value: `${expMs}.${hmac}` signed by the session secret, never the
- *  secret itself. Expires server-side after ARMED_TTL_S — set by /api/hub/arm after a fresh
- *  password re-entry. Throws if VIEW_SESSION_SECRET is unset. */
+/** Key for the armed cookie, derived from VIEW_PASSWORD and VIEW_SESSION_SECRET so the
+ *  a2w_view cookie (which is the raw session secret) cannot sign it. "" if either is unset. */
+export function armedKey(): string {
+  return armedKeyFrom(process.env);
+}
+
+/** The armed-state cookie value: `${expMs}.${hmac}` signed by armedKey(). Expires server-side
+ *  after ARMED_TTL_S — set by /api/hub/arm after a fresh password re-entry. Throws if either
+ *  auth env var is unset. */
 export function armedValue(nowMs: number = Date.now()): string {
-  return mintArmed(process.env.VIEW_SESSION_SECRET ?? "", nowMs, ARMED_TTL_S);
+  return mintArmed(armedKey(), nowMs, ARMED_TTL_S);
 }
 
 /** Gate 1 of the write-mode toggle: a valid session alone is NOT enough — the caller
  *  must also hold the short-lived armed cookie from a fresh password re-entry. */
 export function isArmed(nowMs: number = Date.now()): boolean {
   const cookie = cookies().get("a2w_armed")?.value ?? "";
-  return verifyArmed(process.env.VIEW_SESSION_SECRET ?? "", cookie, nowMs, ARMED_TTL_S);
+  return verifyArmed(armedKey(), cookie, nowMs, ARMED_TTL_S);
 }

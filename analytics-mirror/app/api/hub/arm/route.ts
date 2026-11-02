@@ -1,11 +1,12 @@
 // @purpose Gate 1 of the remote write-mode toggle: exchange a FRESH password re-entry
 // for a 5-minute armed cookie. A stolen session cookie alone can never arm — the
 // password is required again here, verified constant-time server-side. The cookie value
-// is `${expMs}.${hmac}` signed by the session secret (lib/armed.ts), and the server checks
-// that expiry on every use.
+// is `${expMs}.${hmac}` signed by armedKey() — derived from the password and session secret,
+// so the session cookie cannot sign it (lib/armed.ts) — and the server checks that expiry on
+// every use.
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { isAuthed } from "@/lib/auth";
+import { armedKey, isAuthed } from "@/lib/auth";
 import { ARMED_TTL_S, mintArmed } from "@/lib/armed";
 
 export const runtime = "nodejs";
@@ -16,8 +17,8 @@ const ARM_SECONDS = ARMED_TTL_S;
 export async function POST(req: Request) {
   if (!isAuthed()) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const expected = process.env.VIEW_PASSWORD;
-  const secret = process.env.VIEW_SESSION_SECRET;
-  if (!expected || !secret) return NextResponse.json({ error: "auth not configured" }, { status: 500 });
+  const key = armedKey();
+  if (!expected || !key) return NextResponse.json({ error: "auth not configured" }, { status: 500 });
   let password: unknown = "";
   try {
     password = (await req.json())?.password;
@@ -33,7 +34,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "incorrect password" }, { status: 401 });
   }
   const res = NextResponse.json({ ok: true, armed_seconds: ARM_SECONDS });
-  res.cookies.set("a2w_armed", mintArmed(secret, Date.now(), ARM_SECONDS), {
+  res.cookies.set("a2w_armed", mintArmed(key, Date.now(), ARM_SECONDS), {
     httpOnly: true, sameSite: "strict", secure: true, path: "/", maxAge: ARM_SECONDS,
   });
   return res;

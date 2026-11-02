@@ -1,12 +1,24 @@
 // @purpose Pure mint/verify for the 5-minute "armed" cookie (Gate 1 of remote write-enable
 // and breaker control). The value carries its own expiry — `${expMs}.${hmacHex}`, HMAC-SHA256
-// keyed by VIEW_SESSION_SECRET over `armed:${expMs}` — and the server checks that expiry on
-// every use. No next/headers here so tests can import it; lib/auth.ts wraps it.
+// over `armed:${expMs}` keyed by armedKeyFrom() — and the server checks that expiry on every
+// use. The key is derived from VIEW_PASSWORD too, never VIEW_SESSION_SECRET alone: the a2w_view
+// session cookie IS that secret, so a stolen session cookie must not be enough to sign.
+// No next/headers here so tests can import it; lib/auth.ts wraps it.
 import crypto from "crypto";
 
 export const ARMED_TTL_S = 300;
 /** Slack beyond now + ttl a value may claim before it is treated as forged. */
 const FUTURE_SLACK_S = 60;
+
+/** The armed-cookie signing key: HMAC-SHA256(VIEW_PASSWORD, VIEW_SESSION_SECRET + ":armed").
+ *  "" when either is unset, which mintArmed refuses and verifyArmed rejects — arming fails
+ *  closed. Never throws. */
+export function armedKeyFrom(env: { VIEW_PASSWORD?: string; VIEW_SESSION_SECRET?: string }): string {
+  const password = env.VIEW_PASSWORD ?? "";
+  const secret = env.VIEW_SESSION_SECRET ?? "";
+  if (!password || !secret) return "";
+  return crypto.createHmac("sha256", password).update(`${secret}:armed`).digest("hex");
+}
 
 function sign(secret: string, expMs: number): string {
   return crypto.createHmac("sha256", secret).update(`armed:${expMs}`).digest("hex");

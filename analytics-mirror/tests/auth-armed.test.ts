@@ -1,9 +1,10 @@
 // @purpose node:assert suite for lib/armed.ts — the 5-minute armed cookie must expire on the
 // SERVER: round trip ok, expired rejected, tampered HMAC or exp rejected, wrong secret rejected,
-// garbage rejected, far-future exp rejected, empty secret rejected. No next/headers import.
+// garbage rejected, far-future exp rejected, empty secret rejected; armedKeyFrom refuses a
+// cookie signed with the session secret alone and fails closed on missing env. No next/headers import.
 // Run: npx tsx tests/auth-armed.test.ts
 import assert from "node:assert/strict";
-import { ARMED_TTL_S, mintArmed, verifyArmed } from "../lib/armed";
+import { ARMED_TTL_S, armedKeyFrom, mintArmed, verifyArmed } from "../lib/armed";
 
 const SECRET = "test-view-session-secret-0123456789";
 const NOW = 1_800_000_000_000;
@@ -88,6 +89,48 @@ t("mint refuses non-finite or non-positive ttl/now", () => {
   assert.throws(() => mintArmed(SECRET, NaN, 300));
   assert.throws(() => mintArmed(SECRET, NOW, 0));
   assert.throws(() => mintArmed(SECRET, NOW, -5));
+});
+
+// --- armedKeyFrom: the signing key must not be derivable from the a2w_view session cookie ---
+const ENV = { VIEW_PASSWORD: "test-view-password", VIEW_SESSION_SECRET: SECRET };
+
+t("key: a cookie signed with VIEW_SESSION_SECRET alone (the session cookie) is refused", () => {
+  const key = armedKeyFrom(ENV);
+  assert.notEqual(key, SECRET);
+  const forged = mintArmed(SECRET, NOW, 300);
+  assert.equal(verifyArmed(key, forged, NOW), false);
+});
+
+t("key: a correctly signed unexpired cookie passes; an expired one is refused", () => {
+  const key = armedKeyFrom(ENV);
+  const v = mintArmed(key, NOW, 300);
+  assert.equal(verifyArmed(armedKeyFrom({ ...ENV }), v, NOW), true);
+  assert.equal(verifyArmed(key, v, NOW + 300_000), false);
+});
+
+t("key: depends on both the password and the session secret", () => {
+  const v = mintArmed(armedKeyFrom(ENV), NOW, 300);
+  assert.equal(verifyArmed(armedKeyFrom({ ...ENV, VIEW_PASSWORD: "other" }), v, NOW), false);
+  assert.equal(verifyArmed(armedKeyFrom({ ...ENV, VIEW_SESSION_SECRET: "other" }), v, NOW), false);
+});
+
+t("key: missing VIEW_PASSWORD or VIEW_SESSION_SECRET yields \"\" and refuses, never throws", () => {
+  const v = mintArmed(armedKeyFrom(ENV), NOW, 300);
+  const missing = [
+    {},
+    { VIEW_SESSION_SECRET: SECRET },
+    { VIEW_PASSWORD: ENV.VIEW_PASSWORD },
+    { VIEW_PASSWORD: "", VIEW_SESSION_SECRET: SECRET },
+    { VIEW_PASSWORD: ENV.VIEW_PASSWORD, VIEW_SESSION_SECRET: "" },
+  ];
+  for (const env of missing) {
+    assert.doesNotThrow(() => armedKeyFrom(env));
+    const key = armedKeyFrom(env);
+    assert.equal(key, "", JSON.stringify(Object.keys(env)));
+    assert.doesNotThrow(() => verifyArmed(key, v, NOW));
+    assert.equal(verifyArmed(key, v, NOW), false);
+    assert.equal(verifyArmed(key, mintArmed(SECRET, NOW, 300), NOW), false);
+  }
 });
 
 console.log(`auth-armed: ${n} passed`);
