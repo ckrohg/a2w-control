@@ -15,7 +15,8 @@
  *
  * Both are SustainedEpisodes: they open only after the condition has held (so the one "no countdown" read after a Pi
  * restart, or a write that fails once, never reaches the owner) and close only after the all-clear has held for 30
- * min, so a flapping condition stays one episode instead of an email pair every cycle.
+ * min, so a flapping condition stays one episode instead of an email pair every cycle. An open that no channel
+ * acknowledged does not count as open (phaseb.ts): it is sent again while the condition holds, and owes no all-clear.
  */
 import { C, esc, factsTable, footer, paragraphs, shell } from "./alertemail";
 import type { HubPump, HubState } from "./hub";
@@ -110,21 +111,23 @@ export function pumpWords(p: HubPump | undefined): string {
   if (!p) return "no report";
   if (p.deliberate_stop) return "switched off by hand";
   if (!p.online || p.state === "offline") return "not answering";
-  const fault = (p.active_faults ?? 0) > 0 ? ", showing a fault" : "";
-  if (p.state === "heating") return `heating${fault}`;
-  if (p.state === "idle") return `on, resting${fault}`;
-  return `on${fault}`;
+  // the bridge's derived state, never active_faults: that count includes info-level faults, and P17 anti-freeze is normal
+  if (p.state === "fault") return "showing a fault";
+  if (p.state === "off") return "switched off";
+  if (p.state === "heating") return "heating";
+  if (p.state === "idle") return "on, resting";
+  return "on";
 }
 
 /** "Is anything cold right now?" — one sentence from the tank and the pumps. */
 export function coldNow(tankF: number | null, floorF: number, pumps: HubPump[] | null): string {
   const ps = pumps ?? [];
-  const down = ps.filter((p) => !p.online || p.state === "offline" || (p.active_faults ?? 0) > 0);
+  const down = ps.filter((p) => !p.online || ["offline", "fault", "off"].includes(p.state ?? ""));
   const pumpsLine = !pumps
     ? "A2W couldn't read the heat pumps' state just now."
     : down.length === 0
       ? ps.length > 1 ? "Both heat pumps are running normally." : "The heat pump is running normally."
-      : `${down.map(pumpLabel).join(" and ")} ${down.length > 1 ? "are" : "is"} ${down.length > 1 ? "not answering or showing a fault" : pumpWords(down[0])}.`;
+      : `${down.map((p) => `${pumpLabel(p)} is ${pumpWords(p)}`).join(" and ")}.`;
   if (tankF == null) return `A2W couldn't read the tank temperature just now. ${pumpsLine}`;
   return tankF >= floorF
     ? `Nothing is cold right now: the tank is ${fmtF(tankF)} (hot water needs about ${fmtF(floorF)}). ${pumpsLine}`
@@ -202,8 +205,12 @@ export function controlFailingMessage(a: {
   const names = a.failing.map((id) => a.pumps?.find((p) => p.id === id)?.name || id);
   const recovery = a.safetyNet === "off"
     ? `The safety net is off too, so the pumps will stay at their last setting until this is fixed.`
-    : `Within 90 minutes of A2W's last successful setting, the Pi puts the pumps back to a safe warm ${BASELINE_C} °C on ` +
-      `its own, so the house keeps heating, just less efficiently.`;
+    : a.safetyNet === "on"
+      ? `Within 90 minutes of A2W's last successful setting, the Pi puts the pumps back to a safe warm ${BASELINE_C} °C on ` +
+        `its own, so the house keeps heating, just less efficiently.`
+      : `A2W can't tell right now whether the Pi's automatic recovery is running. If it is, the pumps go back to a safe ` +
+        `warm ${BASELINE_C} °C within 90 minutes of A2W's last successful setting; if it isn't, they stay at their last ` +
+        `setting until this is fixed.`;
   const lead = [
     `A2W tries to set the heat pumps every 5 minutes. For about ${minutes(a.sinceMs)} none of its settings have reached ` +
       `${whichPumps(names, a.allPumps.length)}. ${recovery}`,

@@ -47,8 +47,9 @@ These rules apply to every tier:
     tank during it are its symptoms;
   - "Pi unreachable" (planner) is the incident; the hub dead-man, SPAN-local stale and I8-blind are its symptoms.
 - **Restarts never re-alert.**
-  - Planner: keyed alerts are latched in `notify_latches`. A redeploy's re-fire is suppressed, and a condition
-    still true is re-sent at most once per 24 h.
+  - Planner: keyed alerts are latched in `notify_latches` once an owner channel (6bb push, email) has acknowledged
+    them; a ntfy 200 does not count, because nobody subscribes to that topic. A redeploy's re-fire is suppressed, and a
+    condition still true is re-sent at most once per 24 h. A page nobody heard leaves no latch, so it is owed no all-clear.
   - Bridge: sustained-fault pages are recorded as `alert` events and re-adopted on restart.
 - **Shadow mode never notifies.** Neither do the owner's own dashboard actions (breaker clicks, write-enable,
   mode toggles).
