@@ -247,8 +247,8 @@ export class PhaseB {
   private leaseAlerted: Record<string, boolean> = {};
   /** consecutive verifies that saw no lease — one is usually the hub's pre-write snapshot (see verifyLeases) */
   private noLeaseStreak: Record<string, number> = {};
-  /** owner email (owner 2026-10-29, owneralerts.ts): the start of the current run of cycles in which this pump's write
-   *  LANDED and the Pi still showed no lease. Any other cycle (armed, a failed or skipped write, no hub read) ends it. */
+  /** owner email (owner 2026-10-29, owneralerts.ts): when a write of this pump's LANDED and the Pi showed no lease, the
+   *  start of that run. A write that fails against a connected Pi leaves it running; ownerAlerts lists what ends it. */
   private unarmedSince: Record<string, number | null> = {};
   /** what this cycle's verify saw per pump: "unarmed" only after a write that landed */
   private leaseSeen: Record<string, "armed" | "unarmed" | null> = {};
@@ -459,30 +459,47 @@ export class PhaseB {
     }
     const floorF = DEFAULT_OPTS.dhwFloorF;
     const name = (id: string) => pumps?.find((p) => p.id === id)?.name || id;
-    const send = (m: OwnerMessage, key: string, resolved: boolean) => this.notify(m.title, m.body, resolved ? "default" : "high",
-      resolved ? { tier: "page", resolved: true, key, html: m.html } : { tier: "page", key, action: m.action, facts: m.facts, html: m.html });
+    const send = async (m: OwnerMessage, key: string, resolved: boolean): Promise<boolean> => {
+      const sent = await this.notify(m.title, m.body, resolved ? "default" : "high",
+        resolved ? { tier: "page", resolved: true, key, html: m.html } : { tier: "page", key, action: m.action, facts: m.facts, html: m.html })
+        .catch((e) => { console.error("[phase-b] owner page failed:", (e as Error).message); return false; });
+      return sent !== false;
+    };
+    // An open nobody heard did not happen (post-merge review of #243): the episode stays shut, so the next cycle that
+    // still sees the condition sends it again with fresh numbers, and a condition that clears first owes no all-clear.
+    const openEpisode = async (ep: SustainedEpisode, m: OwnerMessage, key: string): Promise<void> => {
+      if (await send(m, key, false)) return;
+      ep.open = false;
+      console.error(`[phase-b] no channel acknowledged "${m.title}": sending it again next cycle`);
+    };
 
     // This cycle per pump, for the control alert below: landed, refused by a person's choice, unknown, or failed.
     const outcomes = this.pumpIds.map((id) => controlOutcome(this.cycleOk[id] ?? null, this.cycleDetail[id] ?? "",
       pumps?.find((p) => p.id === id), state));
 
-    // "Heat-pump safety net is off": a pump without a countdown for > 30 min of cycles whose writes LANDED. The clock
-    // only runs across such cycles (a failed or skipped write, or no hub read, restarts it), so "A2W is still setting
-    // the heat pumps" is true when it fires; a Pi that drops off after one unarmed read is the control alert's business.
-    // Good = every pump's last read showed a countdown, or the pump is excused (a person stopped it or disabled writes).
-    // Anything in between is unknown: it neither opens nor counts towards the all-clear.
-    for (const id of this.pumpIds) {
-      if (this.leaseSeen[id] === "unarmed") this.unarmedSince[id] ??= now;
-      else this.unarmedSince[id] = null;
-    }
-    const off = this.pumpIds.filter((id) => this.unarmedSince[id] != null && now - (this.unarmedSince[id] as number) > SAFETY_NET_OFF_MS);
-    const allArmed = pumps != null && this.pumpIds.every((id, i) => this.leaseArmed[id] === true || outcomes[i] === "excused");
+    // "Heat-pump safety net is off": a pump without a countdown for > 30 min of writes that LANDED. A write that fails
+    // against a connected Pi says nothing about the countdown, so it leaves the clock running: one failed write every
+    // few cycles would otherwise keep both owner alerts silent for as long as the failsafe stayed off. A countdown seen,
+    // an excused, skipped or dry-run cycle, no hub read, or an unreachable Pi restarts the clock. It fires only on a
+    // cycle whose write landed, so "A2W is still setting the heat pumps" is true when it is sent; a run of failures with
+    // nothing landing, or a Pi that drops off after one unarmed read, is the control alert's or the Pi page's business.
+    // Good = every pump's read showed a countdown, or the pump is excused (a person stopped it or disabled writes), on a
+    // frame from a connected Pi: the hub keeps serving the last frame after the Pi drops. Anything in between is unknown:
+    // it neither opens nor counts towards the all-clear.
+    this.pumpIds.forEach((id, i) => {
+      const seen = this.leaseSeen[id];
+      if (seen === "unarmed") this.unarmedSince[id] ??= now;
+      else if (seen === "armed" || outcomes[i] !== "fail" || state?.pi_connected !== true) this.unarmedSince[id] = null;
+    });
+    const off = this.pumpIds.filter((id) => this.leaseSeen[id] === "unarmed" && now - (this.unarmedSince[id] as number) > SAFETY_NET_OFF_MS);
+    const allArmed = pumps != null && state?.pi_connected !== false
+      && this.pumpIds.every((id, i) => this.leaseArmed[id] === true || outcomes[i] === "excused");
     const net = this.safetyNet.step(off.length ? "bad" : allArmed ? "good" : "unknown", now);
     if (net === "open") {
-      await send(safetyNetOffMessage({
+      await openEpisode(this.safetyNet, safetyNetOffMessage({
         offPumps: off.map((id) => ({ name: name(id), forMs: now - (this.unarmedSince[id] as number) })),
         allPumps: this.pumpIds, pumps, tankF, floorF,
-      }), SAFETY_NET_KEY, false);
+      }), SAFETY_NET_KEY);
     } else if (net === "close") {
       await send(safetyNetBackMessage({ pumps, tankF, allPumps: this.pumpIds }), SAFETY_NET_KEY, true);
     }
@@ -504,11 +521,14 @@ export class PhaseB {
     const ctl = this.control.step(failing.length ? "bad" : allClear ? "good" : "unknown", now);
     if (ctl === "open") {
       const since = Math.min(...failing.map((id) => this.failingSince[id] ?? now));
-      const armed = failing.map((id) => this.leaseArmed[id]);
-      await send(controlFailingMessage({
+      // A frame with no countdown does not mean "off": the bridge also clears it once the revert to baseline has landed
+      // (poller.py check_lease), so only a landed write that left no countdown proves the safety net is missing.
+      const netOff = this.safetyNet.open || failing.some((id) => this.unarmedSince[id] != null);
+      const netOn = state?.pi_connected === true && failing.every((id) => this.leaseArmed[id] === true);
+      await openEpisode(this.control, controlFailingMessage({
         failing, allPumps: this.pumpIds, sinceMs: now - since, pumps, tankF, floorF,
-        safetyNet: this.safetyNet.open || armed.includes(false) ? "off" : armed.every((a) => a === true) ? "on" : "unknown",
-      }), CONTROL_KEY, false);
+        safetyNet: netOff ? "off" : netOn ? "on" : "unknown",
+      }), CONTROL_KEY);
     } else if (ctl === "close") {
       await send(controlBackMessage({ pumps, tankF, allPumps: this.pumpIds }), CONTROL_KEY, true);
     }

@@ -49,7 +49,7 @@ import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExcl
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
-import { route, tierSubject, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, piUnreachablePageAfterS, type Tier, type NotifyOpts } from "./alertpolicy";
+import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, piUnreachablePageAfterS, type Tier, type NotifyOpts } from "./alertpolicy";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
@@ -220,7 +220,7 @@ const SHAPED_CURVE_MODE = parseShapedCurveMode(process.env.SHAPED_CURVE);
 const SHAPED_CURVE = SHAPED_CURVE_MODE === "live";
 const SHAPED_CURVE_STAMP = SHAPED_CURVE_MODE !== "off";
 const phaseB = PHASE_B_ENABLED && hub
-  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfy, SHAPED_CURVE,
+  ? new PhaseB(store, hub, PHASE_B_PUMPS, PHASE_B_DRY_RUN, ntfyDelivered, SHAPED_CURVE,
       // Phase B writes through the hub (not writes.ts): gate it on the SAME lease the HBX writes honour — checked
       // FRESH against the DB row before every send, exactly like writes.ts does — and on the shutdown barrier
       // (codex passes 1–2 on #162: the dying container must not renew a 90-min pump lease, and a cached held=true
@@ -406,10 +406,10 @@ async function ntfy(title: string, body: string, priority: string, opts: NotifyO
 }
 
 /**
- * Push (+ email by priority). Resolves true when at least one configured channel ACKNOWLEDGED the alert (2xx) — or
- * when no channel is configured at all (rehearsal / local: the log line is the delivery) — and false when every
- * configured channel failed or refused. ntfy() is the fire-and-log form every alert uses; #177's pending-notice path
- * calls this one and resolves its evidence only on true (codex pass 9).
+ * Push (+ email by priority). Resolves true when someone can have heard the alert (alertpolicy.ts acknowledged: an owner
+ * channel answered 2xx, or the tier has no owner channel configured) and false otherwise; a keyed open is latched only
+ * on true. ntfy() is the fire-and-log form most alerts use; #177's pending-notice path and Phase B's owner pages call
+ * this one and act on the answer (codex pass 9).
  */
 // ── 6bb push (owner 2026-10-19) ─────────────────────────────────────────────────────────────────────────────
 // ntfy had no subscriber (the owner never installed it — 2026-08-23: "emails are plenty"), so no A2W push ever
@@ -484,7 +484,7 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   if (opts.key && resolved) {
     tier = (await latches.release(opts.key, opts.tier)) ?? "record";
     if (tier === "record" && opts.tier !== "record") suppressed = "nothing was sent for it";
-  } else if (opts.key && opts.tier !== "record" && !(await latches.claim(opts.key, opts.tier))) {
+  } else if (opts.key && opts.tier !== "record" && !(await latches.due(opts.key))) {
     tier = "record";
     suppressed = "already sent (latched)";
   }
@@ -534,12 +534,12 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   await store.logNotification({ source: "planner", tier: opts.tier, resolved, key: opts.key ?? null, title, body,
                                 pushed, emailed, suppressed }).catch((e) => console.error("notification log failed:", (e as Error).message));
 
-  // record tier has no owner channel to acknowledge: it is delivered by being logged. Otherwise true when a channel
-  // acknowledged, or when none of the wanted channels is configured (rehearsal / local: the log line is the delivery).
+  // record tier has no owner channel to acknowledge: it is delivered by being logged.
   if (tier === "record") return true;
-  const anyChannel = !!NTFY_TOPIC || (want.email && !!RESEND_API_KEY && !!RESEND_TO)
-    || (want.push && !!SIXBB_ALERT_URL && !!SIXBB_ALERT_KEY);
-  return delivered || !anyChannel;
+  const ownerConfigured = (want.email && !!RESEND_API_KEY && !!RESEND_TO) || (want.push && !!SIXBB_ALERT_URL && !!SIXBB_ALERT_KEY);
+  const heard = acknowledged({ ownerConfigured, ownerAcked: pushed || emailed, ntfyConfigured: !!NTFY_TOPIC, ntfyAcked: delivered });
+  if (heard && opts.key && !resolved) await latches.record(opts.key, tier);
+  return heard;
 }
 
 function toReading(dev: Record<string, any>): SlxReading {

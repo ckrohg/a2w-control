@@ -1,11 +1,13 @@
 /**
  * @purpose The owner's two failsafe emails (owneralerts.ts, owner 2026-10-29) on realistic 5-min Phase B sequences:
  * a restart's one "no countdown" read never emails; 31+ min without one emails once; re-armed sends one all-clear;
- * flapping never storms; the control-failing email needs ~35 min of failed writes. Run: npx tsx src/owneralerts.test.ts
+ * flapping never storms; the control-failing email needs ~35 min of failed writes; a page nobody heard is sent again and
+ * is never followed by an all-clear. Run: npx tsx src/owneralerts.test.ts
  */
 import assert from "node:assert/strict";
 import { PhaseB } from "./phaseb";
-import { SustainedEpisode, coldNow, controlOutcome, SAFETY_NET_KEY, CONTROL_KEY } from "./owneralerts";
+import { Latches, acknowledged, type LatchStore, type Tier } from "./alertpolicy";
+import { SustainedEpisode, coldNow, controlOutcome, pumpWords, SAFETY_NET_KEY, CONTROL_KEY } from "./owneralerts";
 
 const CYCLE = 5 * 60_000;
 let now = Date.UTC(2026, 9, 29, 12, 0);
@@ -20,12 +22,19 @@ function rig(opts: { latches?: Record<string, string>; dryRun?: boolean } = {}) 
   const fail: Record<string, string | null> = { pump1: null, pump2: null };
   const extra: Record<string, Record<string, unknown>> = { pump1: {}, pump2: {} };
   const hubSt = { piConnected: true, slxFresh: true };
+  const rows = new Map<string, { tier: string; notifiedAt: Date }>(
+    Object.entries(opts.latches ?? {}).map(([k, tier]) => [k, { tier, notifiedAt: new Date(now - 3_600_000) }]));
+  const latchStore: LatchStore = {
+    getNotifyLatch: async (k) => rows.get(k) ?? null,
+    upsertNotifyLatch: async (k, tier) => { rows.set(k, { tier, notifiedAt: new Date(now) }); },
+    deleteNotifyLatch: async (k) => { const r = rows.get(k); rows.delete(k); return r ? { tier: r.tier } : null; },
+  };
   const store = {
     getLatestSlx: async () => ({ ts: new Date(hubSt.slxFresh ? now : now - 3_600_000), targetF: 120, outdoorF: 40, tankF: 128 }),
     recentPlans: async () => [],
     insertPhaseBLog: async () => {},
     latestConfig: async () => null,
-    getNotifyLatch: async (k: string) => (opts.latches?.[k] ? { tier: opts.latches[k], notifiedAt: new Date(now - 3_600_000) } : null),
+    getNotifyLatch: latchStore.getNotifyLatch,
   } as any;
   const hub = {
     sendSetpoint: async (id: string) => (!hubSt.piConnected ? { ok: false, detail: "no Pi connected" }
@@ -39,11 +48,28 @@ function rig(opts: { latches?: Record<string, string>; dryRun?: boolean } = {}) 
     }),
   } as any;
   const notes: Note[] = [];
-  const pb = new PhaseB(store, hub, ["pump1", "pump2"], !!opts.dryRun,
-    async (title: string, body: string, _p: string, o: any) => { notes.push({ title, body, tier: o.tier, resolved: !!o.resolved, key: o.key, html: o.html }); });
+  /** the 6bb push and the email; ntfy.sh always answers 200 here, as it does for a topic nobody subscribes to */
+  const channels = { up: true, attempts: 0 };
+  const latches = new Latches(latchStore, () => {});
+  // the order of index.ts ntfyDelivered: which tier applies, the channels, then the latch for a page someone heard
+  const notify = async (title: string, body: string, _p: string, o: any): Promise<boolean> => {
+    let tier: Tier = o.tier;
+    if (o.key && o.resolved) tier = (await latches.release(o.key, o.tier)) ?? "record";
+    else if (o.key && o.tier !== "record" && !(await latches.due(o.key))) tier = "record";
+    const note = { title, body, tier, resolved: !!o.resolved, key: o.key, html: o.html };
+    if (tier === "record") { notes.push(note); return true; }
+    channels.attempts++;
+    if (!acknowledged({ ownerConfigured: true, ownerAcked: channels.up, ntfyConfigured: true, ntfyAcked: true })) return false;
+    notes.push(note);
+    if (o.key && !o.resolved) await latches.record(o.key, tier);
+    return true;
+  };
+  const fresh = () => new PhaseB(store, hub, ["pump1", "pump2"], !!opts.dryRun, notify);
+  let pb = fresh();
   const cycle = async (n = 1) => { for (let i = 0; i < n; i++) { now += CYCLE; await pb.runOnce(); } };
   const pages = () => notes.filter((n) => n.tier === "page");
-  return { pb, notes, pages, cycle, armed, fail, extra, hubSt, setWrites: (ok: boolean) => { writesOk = ok; } };
+  return { get pb() { return pb; }, redeploy: () => { pb = fresh(); }, notes, pages, cycle, armed, fail, extra, hubSt, channels, rows,
+    setWrites: (ok: boolean) => { writesOk = ok; } };
 }
 const setBoth = (a: Record<string, boolean>, v: boolean) => { a.pump1 = v; a.pump2 = v; };
 const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
@@ -167,11 +193,13 @@ const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
     assert.ok(r.pages()[1].resolved);
   }
   {
-    // the Pi lost its countdown (a bridge restart) and then writes stop landing: the pumps stay where they are
+    // the Pi lost its countdown (a bridge restart: a landed write showed none) and then writes stop landing: the pumps
+    // stay where they are
     const r = rig();
     await r.cycle();
-    r.setWrites(false);
     setBoth(r.armed, false);
+    await r.cycle();
+    r.setWrites(false);
     await r.cycle(7);
     assert.equal(r.pages().length, 1);
     assert.match(r.pages()[0].body, /safety net is off too/);
@@ -197,8 +225,8 @@ const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
     assert.equal(r.pages().length, 0, "and nothing on the way back");
   }
   {
-    // the same, but the Pi is connected and the writes fail for another reason: only the control email, and the
-    // safety-net clock never ran (it needs landed writes)
+    // the same, but the Pi is connected and the writes fail for another reason: only the control email. The safety-net
+    // email says A2W is still setting the pumps, so it waits for a write that lands
     const r = rig();
     await r.cycle(2);
     setBoth(r.armed, false);
@@ -283,6 +311,238 @@ const JARGON = /lease|phase b|writer|finding|baseline_setpoint/i;
     assert.deepEqual(r.pages().map((n) => [n.title, n.resolved]), [["Safety net is back on", true]]);
     assert.deepEqual(r.pb.ownerEpisodes(), { safety_net_off: false, control_failing: false });
   }
+
+  // ── post-merge review of #243, finding 1: a page nobody heard ─────────────────────────────────────────────────
+  {
+    // every channel down on the opening cycle: sent again each cycle until someone hears it, then one all-clear
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    r.channels.up = false;
+    await r.cycle(8);          // the page goes out at 35 min and is not heard
+    assert.equal(r.channels.attempts, 1);
+    assert.equal(r.pages().length, 0);
+    assert.deepEqual(r.pb.ownerEpisodes(), { safety_net_off: false, control_failing: false }, "an unheard page is not an open episode");
+    assert.equal(r.rows.has(SAFETY_NET_KEY), false, "and it is not latched");
+    await r.cycle(3);
+    assert.equal(r.channels.attempts, 4, "tried again every cycle");
+    r.channels.up = true;
+    await r.cycle();
+    assert.deepEqual(r.pages().map((n) => n.title), ["Heat-pump safety net is off"]);
+    assert.match(r.pages()[0].body, /off for 55 minutes/, "the page says how long it has really been");
+    await r.cycle(12);
+    assert.equal(r.pages().length, 1, "heard once, sent once");
+    setBoth(r.armed, true);
+    await r.cycle(7);
+    assert.deepEqual(r.pages().map((n) => n.title), ["Heat-pump safety net is off", "Safety net is back on"]);
+  }
+  {
+    // fixed before anyone could be told: no page is left to send and no all-clear is owed
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    r.channels.up = false;
+    await r.cycle(9);
+    setBoth(r.armed, true);
+    await r.cycle();
+    r.channels.up = true;
+    await r.cycle(24);
+    assert.equal(r.notes.filter((n) => /safety net/i.test(n.title)).length, 0, "no all-clear for a page never received");
+  }
+  {
+    // a redeploy after the failed open adopts nothing: the page is sent when the condition has held again, no orphan all-clear
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    r.channels.up = false;
+    await r.cycle(8);
+    r.redeploy();
+    r.channels.up = true;
+    setBoth(r.armed, true);
+    await r.cycle(24);
+    assert.equal(r.notes.filter((n) => /safety net/i.test(n.title)).length, 0, "nothing adopted, so nothing to close");
+  }
+  {
+    // the control email takes the same route
+    const r = rig();
+    await r.cycle(2);
+    r.setWrites(false);
+    r.channels.up = false;
+    await r.cycle(7);
+    assert.equal(r.channels.attempts, 1);
+    r.setWrites(true);
+    await r.cycle();
+    r.channels.up = true;
+    await r.cycle(12);
+    assert.equal(r.notes.filter((n) => n.key === CONTROL_KEY).length, 0, "recovered before it was heard: no all-clear either");
+
+    const s = rig();
+    await s.cycle(2);
+    s.setWrites(false);
+    s.channels.up = false;
+    await s.cycle(8);
+    assert.equal(s.channels.attempts, 2);
+    s.channels.up = true;
+    await s.cycle();
+    assert.deepEqual(s.pages().map((n) => n.title), ["A2W can't control the heat pumps"]);
+    s.setWrites(true);
+    await s.cycle(7);
+    assert.deepEqual(s.pages().map((n) => n.resolved), [false, true]);
+  }
+  {
+    // a sender with nothing to say (the fire-and-log form) still counts as sent; one that throws does not
+    let calls = 0;
+    const pb = new PhaseB({ getLatestSlx: async () => ({ ts: new Date(now), targetF: 120, outdoorF: 40, tankF: 128 }), recentPlans: async () => [],
+      insertPhaseBLog: async () => {}, latestConfig: async () => null, getNotifyLatch: async () => null } as any,
+      { sendSetpoint: async () => ({ ok: false, detail: "Modbus timeout" }),
+        getState: async () => ({ pi_connected: true, ts: now / 1000, pumps: [{ id: "pump1", online: true, setpoint_c: 55, remote_lease_until: now }] }) } as any,
+      ["pump1"], false, async (_t, _b, _p, o) => { if (o.tier === "page" && ++calls === 1) throw new Error("mail client blew up"); });
+    for (let i = 0; i < 7; i++) { now += CYCLE; await pb.runOnce(); }
+    assert.equal(pb.ownerEpisodes().control_failing, false, "a thrown send is an unheard page");
+    now += CYCLE; await pb.runOnce();
+    assert.equal(pb.ownerEpisodes().control_failing, true, "undefined is a sent one");
+    assert.equal(calls, 2);
+  }
+
+  // ── finding 2: one failed write every few cycles does not hide a missing countdown ────────────────────────────
+  {
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    for (let i = 0; i < 24; i++) { r.setWrites(i % 4 !== 3); await r.cycle(); }   // a read-back timeout every 4th cycle, for 2 h
+    assert.deepEqual(r.pages().map((n) => n.title), ["Heat-pump safety net is off"]);
+    assert.match(r.pages()[0].body, /still setting/);
+  }
+  {
+    // a cycle that shows the countdown does restart it, failed write or not
+    const r = rig();
+    await r.cycle(2);
+    for (let i = 0; i < 48; i++) { setBoth(r.armed, i % 5 === 4); r.setWrites(i % 5 !== 4); await r.cycle(); }
+    assert.equal(r.pages().length, 0, "never 30 min without seeing a countdown");
+  }
+  {
+    // an excused cycle restarts it too: a person's choice is not a missing failsafe
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle(5);          // 20 min unarmed
+    r.extra.pump1 = { write_enabled: false }; r.extra.pump2 = { write_enabled: false };
+    r.fail.pump1 = r.fail.pump2 = "writes are disabled (write_enabled: false)";
+    await r.cycle();
+    r.extra.pump1 = {}; r.extra.pump2 = {};
+    r.fail.pump1 = r.fail.pump2 = null;
+    await r.cycle(6);          // 25 min since the excused cycle
+    assert.equal(r.pages().length, 0, "the clock restarted at the excused cycle");
+    await r.cycle(2);
+    assert.equal(r.pages().length, 1);
+  }
+
+  {
+    // and so does a failed write on a cycle with no hub read: nothing was observed, so the run is not unbroken
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle(5);          // 20 min unarmed
+    const hub = (r.pb as any).hub;
+    const getState = hub.getState;
+    hub.getState = async () => { throw new Error("hub 502"); };
+    r.setWrites(false);
+    await r.cycle();
+    hub.getState = getState;
+    r.setWrites(true);
+    await r.cycle(6);          // 25 min since that cycle
+    assert.equal(r.pages().length, 0, "the clock restarted at the unobserved cycle");
+    await r.cycle(2);
+    assert.equal(r.pages().length, 1);
+  }
+
+  // ── finding 3: "the safety net is off too" only when it is ────────────────────────────────────────────────────
+  {
+    // the failsafe has worked: 3 failures, a 2 h dropout, the Pi reverts to 52 °C and clears the countdown, 4 more failures
+    const r = rig();
+    await r.cycle(2);
+    r.setWrites(false);
+    await r.cycle(3);
+    r.hubSt.piConnected = false;
+    await r.cycle(24);
+    r.hubSt.piConnected = true;
+    setBoth(r.armed, false);
+    r.extra.pump1 = { setpoint_c: 52 }; r.extra.pump2 = { setpoint_c: 52 };
+    await r.cycle(4);
+    assert.deepEqual(r.pages().map((n) => n.title), ["A2W can't control the heat pumps"]);
+    assert.doesNotMatch(r.pages()[0].body, /safety net is off too|will stay at their last setting/);
+    assert.match(r.pages()[0].body, /can't tell right now whether .* automatic recovery is running/);
+    assert.match(r.pages()[0].body, /safe warm 52 °C/);
+    assert.doesNotMatch(r.pages()[0].body, JARGON);
+  }
+  {
+    // no hub read on the 7th failure: a stale "armed" must not read as a running countdown
+    const r = rig();
+    await r.cycle(2);
+    r.setWrites(false);
+    await r.cycle(6);
+    const hub = (r.pb as any).hub;
+    const getState = hub.getState;
+    hub.getState = async () => { throw new Error("hub 502"); };
+    await r.cycle();
+    hub.getState = getState;
+    assert.equal(r.pages().length, 1);
+    assert.match(r.pages()[0].body, /can't tell right now/);
+  }
+
+  // ── finding 4: P17 anti-freeze is normal, never a fault ───────────────────────────────────────────────────────
+  {
+    const r = rig();
+    r.extra.pump1 = { active_faults: 1 }; r.extra.pump2 = { active_faults: 1 };  // the bridge counts info-level faults here
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle(8);
+    assert.equal(r.pages().length, 1);
+    assert.match(r.pages()[0].body, /Both heat pumps are running normally/);
+    assert.doesNotMatch(r.pages()[0].body, /fault/i);
+    assert.doesNotMatch(r.pages()[0].html ?? "", /fault/i);
+  }
+  assert.equal(pumpWords({ id: "p", online: true, setpoint_c: 50, state: "heating", active_faults: 1 }), "heating");
+  assert.equal(pumpWords({ id: "p", online: true, setpoint_c: 50, state: "idle", active_faults: 2 }), "on, resting");
+  assert.equal(pumpWords({ id: "p", online: true, setpoint_c: 50, state: "fault", active_faults: 1 }), "showing a fault", "the bridge's derived state");
+  assert.match(coldNow(125, 120, [{ id: "p1", name: "Heat Pump 1", online: true, setpoint_c: 50, state: "fault" }, { id: "p2", name: "Heat Pump 2", online: true, setpoint_c: 50, state: "idle", active_faults: 1 }]),
+    /Heat Pump 1 is showing a fault\.$/);
+
+  // ── finding 5: a frozen frame while the Pi is gone proves nothing ─────────────────────────────────────────────
+  {
+    const r = rig();
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle(8);
+    assert.equal(r.pages().length, 1);
+    setBoth(r.armed, true);
+    await r.cycle();           // the countdown is back …
+    r.hubSt.piConnected = false; // … and the Pi drops off; the hub keeps serving that frame
+    await r.cycle(12);         // an hour
+    assert.equal(r.pages().filter((n) => n.resolved).length, 0, "no all-clear from a frozen frame");
+    assert.equal(r.pb.ownerEpisodes().safety_net_off, true);
+    r.hubSt.piConnected = true;
+    await r.cycle(6);
+    assert.equal(r.pages().filter((n) => n.resolved).length, 0, "30 unbroken minutes from the Pi's return");
+    await r.cycle();
+    assert.equal(r.pages().filter((n) => n.resolved).length, 1);
+  }
+
+  // ── finding 6: switched off at the wall controller ────────────────────────────────────────────────────────────
+  {
+    const r = rig();
+    r.extra.pump2 = { state: "off" };
+    await r.cycle(2);
+    setBoth(r.armed, false);
+    await r.cycle(8);
+    assert.equal(r.pages().length, 1);
+    assert.match(r.pages()[0].body, /Heat Pump 2 is switched off\./);
+    assert.doesNotMatch(r.pages()[0].body, /running normally/);
+    assert.ok(/switched off/.test(r.pages()[0].html ?? ""), "and in the facts table");
+  }
+  assert.equal(pumpWords({ id: "p", online: true, setpoint_c: 50, state: "off" }), "switched off");
+  assert.match(coldNow(125, 120, [{ id: "p1", name: "Heat Pump 1", online: true, setpoint_c: 50, state: "off" }, { id: "p2", name: "Heat Pump 2", online: false, setpoint_c: null }]),
+    /Heat Pump 1 is switched off and Heat Pump 2 is not answering\./);
 
   // ── "is anything cold?" ───────────────────────────────────────────────────────────────────────────────────
   assert.match(coldNow(110, 120, []), /^The tank is 110 °F, below the 120 °F hot water needs/);
