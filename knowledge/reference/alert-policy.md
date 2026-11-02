@@ -100,6 +100,9 @@ engineer or a Claude session can act, it is record-tier; it does not email the o
 - **Outage feed silent (owner's decision, 2026-11-02):** 2 h with no answer from 6bb's feed (planner `housepages.ts`). One
   email per silence, sent again until a channel acknowledges it. The fix usually needs a Claude session, so the test above
   alone would make this record-tier. The owner chose an alert, because until the feed answers the planner can't see an outage.
+- **Element alarm blind (owner's decision, 2026-11-02):** an hour with no SPAN reading of the element's circuit (planner
+  `housepages.ts`, `spanwatch.ts` `blindness`). One email per blind spell, sent again until a channel acknowledges it. Same
+  exception as the outage feed: an alarm that can't read can't say so, and #257 proved it.
 - **Pumps and faults:**
   - a heat-pump breaker switched off outside A2W (#212: 6bb, the SPAN app or the panel), once it has stayed off
     3 min: switch it back on if that was not meant. Then quiet until it is back; the back-on note is record-only.

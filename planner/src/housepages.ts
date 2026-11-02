@@ -113,6 +113,7 @@ export class HousePages {
   private readonly freeze = new PageEdge("freeze-risk", this.queue);
   private readonly pi = new PageEdge("pi-unreachable", this.queue);
   private readonly feed = new PageEdge("outage-feed-silent", this.queue);
+  private readonly elementWatch = new PageEdge("element-alarm-blind", this.queue);
   private unservedStreak = 0;
   private unservedEpisodeOpen = false;
   private dhwShortfallStreak = 0;
@@ -229,6 +230,27 @@ export class HousePages {
       { tier, key: "outage-feed-silent",
         action: "Check that 6bb is running, and that OUTAGE_FEED_KEY there matches the key in the planner's OUTAGEWATCH_URL.",
         facts: [["Silent for", `${silent.hours.toFixed(1)} h`], ["Last failure", failure]] },
+    ), () => "attention");
+  }
+
+  /**
+   * The element's power alarm has had no reading from SPAN for an hour (spanwatch.ts blindness). An alarm that can't read
+   * can't say so, and #257 proved it: it ran blind with nothing but /health to show it. An email, not a page: the element's
+   * breaker is kept OPEN, so nothing is drawing. The element can't be seen until this clears.
+   */
+  elementAlarm(blind: { minutes: number; error: string | null } | null): void {
+    if (!blind) {
+      this.elementWatch.cleared((heard) => this.d.send("Element alarm reading again", "SPAN's reading of the backup element is back, so the alarm can see it again.", "default", { tier: "attention", resolved: true, key: "element-alarm-blind", heard }));
+      return;
+    }
+    const error = (blind.error ?? "no reading yet").slice(0, 200);
+    this.elementWatch.holding((tier) => this.d.send(
+      "Element alarm blind",
+      `The alarm that watches the backup element has had no reading from SPAN for ~${blind.minutes} min (${error}). If the element ran now, nothing would page.`,
+      "default",
+      { tier, key: "element-alarm-blind",
+        action: "Until this clears, nothing warns you if the element runs. If SPAN's own app is working, the fault is on the planner's side: ask a Claude session to look.",
+        facts: [["No reading for", `${blind.minutes} min`], ["Last error", error]] },
     ), () => "attention");
   }
 

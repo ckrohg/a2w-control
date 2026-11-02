@@ -2369,6 +2369,9 @@ async function loopBody(): Promise<void> {
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
     .catch((e) => { pumpDailyError = (e as Error).message; console.error("pump health daily failed:", pumpDailyError); });
 
+  // Out here for the same reason as the storm step below: a SensorLinx failure must not hide a blind alarm.
+  if (spanWatch) housePages.elementAlarm(spanWatch.blindness());
+
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
   try {
