@@ -6,10 +6,11 @@
  * hub state moves nothing; restore() closes instead of re-paging. #212: a pump a person switched off (the Pi's
  * per-pump deliberate_stop, in the hub frame shape the bridge sends: offline, Air-Water 2 OPEN) is not unserved or
  * faulted, closes what was open, and pages ONE reminder per stop when its stage is called 4 h into it; the "no heat"
- * helper. Run with: npx tsx planner/src/stagewatch.test.ts
+ * helper. #190: fault codes from the frame's list (never P17), else the mirror, for each active_faults shape. Run with:
+ * npx tsx planner/src/stagewatch.test.ts
  */
 import assert from "node:assert/strict";
-import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, STOPPED_REMIND_MS, type StagePump, type StageEvent } from "./stagewatch";
+import { StageWatch, annotateFaultCodes, liveCodes, parseStagePumpMap, partitionRestore, calledStagesAllStopped, DEFAULT_STAGE_PUMP_MAP, STAGE_START_GRACE_MS, STOPPED_REMIND_MS, type StagePump, type StageEvent } from "./stagewatch";
 import { episodeTier } from "./alertpolicy";
 
 const t0 = Date.parse("2026-10-16T04:30:00Z");
@@ -259,6 +260,33 @@ for (const bad of ["{", "[]", '{"0":"pump1"}', '{"1":""}', '{"one":"pump1"}', "{
   for (let m = 0; m <= 10; m += 5) ev.push(...w.step({ nowMs: min(m), stagesCalled: [false, true], pumps: [hp1("idle"), stray("idle")], lagTMin: 60 }));
   assert.deepEqual(ev.map((e) => e.type), ["stage_unserved"], "unserved as usual, no reminder");
   assert.equal(w.status()["2"].pump_state, "idle");
+}
+
+// ── #190: fault codes from either active_faults shape ──────────────────────────────────────────────────────────────
+{
+  const P17 = { code: "P17", message: "Stage 1 anti-freeze protection", severity: "info" };
+  const E21f = { code: "E21", message: "Display controller lost communication", severity: "warning" };
+  const nowS = 1_800_000_000;
+  const fresh = { codes: ["E05"], ts: nowS - 15 * 60 };
+  const fault = (active_faults: StagePump["active_faults"]) => hp1("fault", { active_faults });
+
+  assert.equal(liveCodes(fault(2)), null, "an integer count has no codes");
+  assert.deepEqual(liveCodes(fault([P17])), [], "P17 alone: a list, with no code worth naming");
+  assert.deepEqual(liveCodes(fault([P17, E21f])), ["E21"]);
+  assert.deepEqual(liveCodes(fault([E21f, E21f])), ["E21"], "deduplicated");
+
+  assert.deepEqual(annotateFaultCodes([fault(2)], { pump1: fresh }, nowS)[0].fault_codes, ["E05"], "integer: the mirror's codes");
+  assert.equal(annotateFaultCodes([fault(2)], { pump1: { ...fresh, ts: nowS - 15 * 60 - 1 } }, nowS)[0].fault_codes, undefined, "a stale snapshot annotates nothing");
+  assert.equal(annotateFaultCodes([fault(2)], {}, nowS)[0].fault_codes, undefined, "no snapshot annotates nothing");
+  assert.deepEqual(annotateFaultCodes([fault([P17])], { pump1: fresh }, nowS)[0].fault_codes, [], "[P17]: the frame wins, the mirror is not consulted");
+  assert.deepEqual(annotateFaultCodes([fault([P17, E21f])], { pump1: fresh }, nowS)[0].fault_codes, ["E21"]);
+
+  const idle = hp2("idle", { active_faults: [E21f] });
+  const mixed = annotateFaultCodes([hp1("fault", { active_faults: 1 }), hp2("fault", { active_faults: [P17, E21f] }), idle],
+    { pump1: fresh, pump2: { codes: ["E99"], ts: nowS } }, nowS);
+  assert.deepEqual(mixed[0].fault_codes, ["E05"], "mixed fleet: the old bridge's pump reads the mirror");
+  assert.deepEqual(mixed[1].fault_codes, ["E21"], "mixed fleet: the new bridge's pump reads its frame");
+  assert.equal(mixed[2], idle, "a pump not in fault passes through untouched");
 }
 
 console.log("stagewatch.test.ts: all assertions passed");

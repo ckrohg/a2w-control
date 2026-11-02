@@ -4,7 +4,7 @@
  * written under the soak's ceiling. Plain node:assert script under tsx like the other planner suites.
  */
 import assert from "node:assert/strict";
-import { AutoPilot, commandForBlock } from "./autopilot";
+import { AutoPilot, commandForBlock, planCommandForBlock, capForBlock, blockInForce } from "./autopilot";
 import { DEFAULT_OPTS } from "./shadow";
 import { curveOutputF } from "./curve";
 
@@ -170,4 +170,45 @@ function harness(block: Record<string, unknown>, commanded: number | null = 120,
     assert.deepEqual(flat.ap.commandForBlock(guard, 49), { targetF: 135, basis: "flat" });
   }
   console.log("autopilot.test.ts (#156 cap by the block's identity): all assertions passed");
+
+  // ── #232: planCommandForBlock — the WRITE the auto-pilot makes for a block, which restore() returns the plant to ──
+  {
+    const curve = { dot: 29, wwsd: 125, dbt: 120, mbt: 118 };
+    const guard = { tank_target_f: 135, reason: "winter guard: mimic HBX curve", shaped_curve: { ...curve, basis: {} } };
+    // shaped-curve mode, a curve hour → the curve's four endpoints (what setCurve writes), not the declared 135
+    assert.deepEqual(planCommandForBlock(guard, true, 135), { kind: "curve", curve, reason: guard.reason });
+    // flat-target mode → the declared target under the everyday cap, exactly as applyLatestPlan writes it
+    assert.deepEqual(planCommandForBlock(guard, false, 135), { kind: "flat", targetF: 135, capF: DEFAULT_OPTS.strictCapF, reason: guard.reason });
+    // excursions keep their flat write and the ceiling their IDENTITY authorises (a2w#156), in shaped mode too
+    const bank = { ...guard, tank_target_f: 128, bank: true, reason: "afternoon bank to 128°F (warmest hour, 52°F outdoor)" };
+    assert.deepEqual(planCommandForBlock(bank, true, 135), { kind: "flat", targetF: 128, capF: DEFAULT_OPTS.strictCapF, reason: bank.reason });
+    const soak = { ...guard, tank_target_f: 140, sani: true, reason: "daily sanitize to 140°F = 60°C (I8 pasteurization, warmest hour)" };
+    assert.deepEqual(planCommandForBlock(soak, true, 135), { kind: "flat", targetF: 140, capF: DEFAULT_OPTS.sanitizeCapF, reason: soak.reason });
+    const storm = { ...guard, tank_target_f: 135, storm: true, reason: "storm mode: banking heat (x)" };
+    assert.deepEqual(planCommandForBlock(storm, true, 138), { kind: "flat", targetF: 135, capF: 138, reason: storm.reason });
+    assert.equal(planCommandForBlock({ ...soak, storm: true }, true, 150).capF, 150, "a block with two identities may run to the higher ceiling");
+    assert.equal(capForBlock(soak, 135), DEFAULT_OPTS.sanitizeCapF); assert.equal(capForBlock(guard, 135), DEFAULT_OPTS.strictCapF); assert.equal(capForBlock(null, 135), DEFAULT_OPTS.strictCapF);
+    // a block without a curve in shaped mode is a flat write; no finite target → nothing (the writer then restores as-found)
+    assert.deepEqual(planCommandForBlock({ ...guard, shaped_curve: undefined }, true, 135), { kind: "flat", targetF: 135, capF: DEFAULT_OPTS.strictCapF, reason: guard.reason });
+    assert.equal(planCommandForBlock({ ...guard, tank_target_f: undefined }, true, 135), null);
+    assert.equal(planCommandForBlock(null, true, 135), null);
+    // the block in force: the newest block at or before now, the first block before the plan starts, nothing for no plan
+    const now = Date.now();
+    const plan = [{ ts: new Date(now - 7200_000).toISOString(), n: 1 }, { ts: new Date(now - 600_000).toISOString(), n: 2 }, { ts: new Date(now + 3600_000).toISOString(), n: 3 }];
+    assert.equal(blockInForce(plan, now)?.n, 2);
+    assert.equal(blockInForce(plan, now - 3 * 3600_000)?.n, 1, "before the first block the plan's first block stands in (applyLatestPlan's rule)");
+    assert.equal(blockInForce([], now), null);
+    // the INSTANCE: planCommand() is the block in force through its own shaped-curve mode and storm cap; null in dry run
+    // (the Off switch — the planner does not command the plan, so a restore must not either) and without a plan
+    const blocks = [{ ts: new Date(now - 7200_000).toISOString(), ...bank }, { ts: new Date(now - 600_000).toISOString(), ...guard }, { ts: new Date(now + 3600_000).toISOString(), ...soak }];
+    const multi = (shaped: boolean, dryRun = false, plans: unknown[] = [{ plan: blocks }]) => new AutoPilot({ recentPlans: async () => plans } as any, {} as any, dryRun, async () => {}, shaped, 138);
+    assert.deepEqual(await multi(true).planCommand(), { kind: "curve", curve, reason: guard.reason }, "the block in force is the guard hour, commanded as its curve");
+    assert.deepEqual(await multi(false).planCommand(), { kind: "flat", targetF: 135, capF: DEFAULT_OPTS.strictCapF, reason: guard.reason });
+    assert.equal(await multi(true, true).planCommand(), null, "dry run commands nothing");
+    assert.equal(await multi(true, false, []).planCommand(), null, "no recent plan");
+    assert.equal(await multi(true, false, [{ plan: [] }]).planCommand(), null, "an empty plan");
+    const stormy = new AutoPilot({ recentPlans: async () => [{ plan: [{ ts: new Date(now - 600_000).toISOString(), ...storm }] }] } as any, {} as any, false, async () => {}, true, 138);
+    assert.deepEqual(await stormy.planCommand(), { kind: "flat", targetF: 135, capF: 138, reason: storm.reason }, "the instance's own STORM_CAP_F");
+    console.log("autopilot.test.ts (#232 planCommandForBlock): all assertions passed");
+  }
 })().catch((e) => { console.error(e); process.exit(1); });

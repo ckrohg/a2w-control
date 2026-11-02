@@ -6,11 +6,13 @@
  * end to end: the winter-guard hour sends 52 °C in shaped mode and 60 °C in flat mode (byte-identical to before); an
  * excursion in force (the soak) is led exactly as before; a curve hour AHEAD of a bank is led at the next block's
  * outdoor (decision b); an excursion ahead is NOT led early (decision c); the exact curve output leads, not the
- * resolver's rounding; the stale-high report and the probe target still win the max.
+ * resolver's rounding; the stale-high report and the probe target still win the max; a pending boost (#231) is a
+ * term in the max too, bounded to 20 min.
  */
 import assert from "node:assert/strict";
 import { PhaseB, planLeadF, computeTracking } from "./phaseb";
 import { curveOutputF } from "./curve";
+import { PENDING_BOOST_MAX_MS } from "./writes";
 
 const fToC = (f: number) => ((f - 32) * 5) / 9;
 const sendsFor = (targetF: number) => computeTracking(targetF, ["p"])[0].value_c;
@@ -176,6 +178,43 @@ function harness(opts: { plan: any[]; targetF?: number; outdoorF?: number | null
     await broken.pb.runOnce();
     assert.deepEqual(broken.sends.map((x) => x.c), [52, 52], "119.7 report / 119.6 device curve → 52 °C");
     assert.equal(broken.pb.lastLead?.plan_basis, null);
+  }
+  // 12. #231: a pending boost is a term in the max like the probe — 135 °F leads 140 → 60 °C over the 120 °F curve
+  //     hour — surfaced as lead.boost_f; it expires (ignored and cleared), and a requested expiry past the 20-min bound
+  //     is clamped to it, so an abandoned boost cannot hold the setpoints up
+  {
+    const h = harness({ plan: [guard] });
+    assert.equal(h.pb.pendingBoostF, null);
+    h.pb.setPendingBoost(135, Date.now() + 60_000);
+    await h.pb.runOnce();
+    assert.deepEqual(h.sends.map((x) => x.c), [60, 60], "135 + 5 = 140 °F → 60 °C");
+    assert.equal(h.pb.lastLead?.boost_f, 135); assert.equal(h.pb.lastLead?.effective_f, 135);
+    assert.equal(h.pb.lastLead?.plan_f, 120, "the plan term is unchanged beside it");
+    // a boost below the other terms changes nothing
+    const low = harness({ plan: [guard] });
+    low.pb.setPendingBoost(110);
+    await low.pb.runOnce();
+    assert.deepEqual(low.sends.map((x) => x.c), [52, 52]); assert.equal(low.pb.lastLead?.boost_f, 110);
+    // expired → ignored and cleared: the next cycle leads the plan again
+    const exp = harness({ plan: [guard] });
+    exp.pb.setPendingBoost(135, Date.now() - 1);
+    await exp.pb.runOnce();
+    assert.deepEqual(exp.sends.map((x) => x.c), [52, 52], "an expired boost does not lead");
+    assert.equal(exp.pb.lastLead?.boost_f, null); assert.equal(exp.pb.pendingBoostF, null);
+    // the bound: a caller asking for an hour still gets at most PENDING_BOOST_MAX_MS
+    const far = harness({ plan: [guard] });
+    far.pb.setPendingBoost(135, Date.now() + 3_600_000);
+    const held = (far.pb as any).pendingBoost as { expiresAtMs: number };
+    assert.ok(held.expiresAtMs <= Date.now() + PENDING_BOOST_MAX_MS, "clamped to the 20-min bound");
+    held.expiresAtMs = Date.now() - 1; // 20 min pass with nobody clearing it
+    await far.pb.runOnce();
+    assert.deepEqual(far.sends.map((x) => x.c), [52, 52], "the abandoned boost released its lead");
+    // cleared explicitly (the boost landed / was cancelled) → gone from the next cycle
+    const clr = harness({ plan: [guard] });
+    clr.pb.setPendingBoost(135); clr.pb.setPendingBoost(null);
+    await clr.pb.runOnce();
+    assert.deepEqual(clr.sends.map((x) => x.c), [52, 52]); assert.equal(clr.pb.lastLead?.boost_f, null);
+    assert.equal(PENDING_BOOST_MAX_MS, 20 * 60_000);
   }
   assert.equal(Math.ceil(fToC(125)), 52);
   console.log("phaseb-lead.test.ts (plan lead = the auto-pilot's command): all assertions passed");

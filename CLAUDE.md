@@ -88,6 +88,13 @@ segfault. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 week
   likely to break something — it is that without a known-good bracket you cannot answer "did we
   cause this?" with anything better than a guess. On home-heating infrastructure that is the
   difference that matters.
+- **More than one agent merges here — both follow the gate (owner, 2026-10-30).** Two agents on two
+  Macs act on this repo as `ckrohg`. Every merge that deploys the planner or the hub goes through
+  `scripts/deploy-gate.sh merge <pr>`, whichever agent does it; none goes through `gh pr merge` or the
+  web UI directly. Right before merging, re-read `git log origin/main` since the PR's base and the open
+  PR list for overlapping work (two cold-room alerts landed 35 min apart on 2026-10-30: TempIQv2#2136 and
+  #2142; the second was removed in #2144), and re-check the PR's state: the other agent may already have
+  merged, closed or superseded it.
 
 **Key traps:** W610 transparent mode = RTU framing over TCP, not Modbus TCP. P17 anti-freeze is normal, never an alert-worthy error. Write guardrails (handoff §6.4) before any write path is exposed. SensorLinx's reported tank target (`temp1.target`, `slx_readings.tank_target_f`) is a snapshot that freezes while the HBX is idle — after a soak/bank lowering it reads the OLD target for 7–16 h while the device is on the new curve; the curve in force (`/health.curve.in_force`) is the operative target (`knowledge/reference/stale-slx-target-2026-10-19.md`).
 

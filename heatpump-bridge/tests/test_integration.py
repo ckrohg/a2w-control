@@ -385,6 +385,46 @@ async def test_prolonged_offline_emails_and_recovery_closes_by_email(rig, monkey
     assert {p["ch"] for p in recovery} == {"ntfy"}, "an attention all-clear is record-only"
 
 
+async def test_a_deliberately_stopped_pump_never_escalates_its_silence(rig, monkeypatch):
+    """#212: a pump whose breaker a person switched off answers no polls (measured 2026-10-19: Air-Water 2 OPEN ->
+    Modbus timeout). That silence is expected: no 'offline'/'prolonged outage' push or email while the stop lasts.
+    Once it ends, a pump that STAYS silent escalates on the usual schedule, counted from the end of the stop."""
+    pushes = _capture_pushes(monkeypatch)
+    pump, poller, store = rig
+    stop = {"circuit": "Air-Water 1", "since": 0.0, "announced": True}
+    poller.deliberate_stop = lambda: stop
+    poller.app_cfg.notifications.offline_alert_min = 0
+    poller.app_cfg.notifications.offline_email_min = 0
+    await poller.poll_once()
+    await pump.server.shutdown()
+    for _ in range(8):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert not poller.online
+    assert [p for p in pushes if "offline" in p["title"]] == []
+    poller.deliberate_stop = lambda: None            # switched back on... but the pump stays silent
+    for _ in range(3):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert "email" in [p["ch"] for p in pushes if "prolonged outage" in p["title"]]
+
+
+async def test_a_deliberate_stop_at_boot_is_not_a_never_responded_page(tmp_path, monkeypatch):
+    """A bridge that boots while a pump is switched off must not email 'has never responded' about it."""
+    pushes = _capture_pushes(monkeypatch)
+    cfg = AppConfig(pumps=[PumpConfig(id="pump1", name="HP1", host="127.0.0.1", port=free_port())],
+                    db_path=str(tmp_path / "b.db"))
+    store = Store(cfg.db_path)
+    await store.open()
+    poller = PumpPoller(cfg.pumps[0], cfg, store, SetpointGuard(cfg.guardrails))
+    poller.deliberate_stop = lambda: {"circuit": "Air-Water 1", "since": 0.0, "announced": False}
+    for _ in range(4):
+        await poller.poll_once()
+    await asyncio.sleep(0.01)
+    assert [p for p in pushes if p["ch"] == "email"] == []
+    await store.close()
+
+
 async def test_flapping_link_pages_link_degrading_once(rig, monkeypatch):
     """Repeated brief dropouts (each individually below the sustained gate) must page as a
     pattern: flap_alert_count offline edges inside flap_window_min -> one 'link degrading'
@@ -1108,6 +1148,64 @@ async def test_gateway_overrides_persist_and_respect_mac(tmp_path):
     apply_gateway_overrides(no_mac)
     assert no_mac.pumps[0].host == "10.0.0.99"
     assert no_mac.pumps[0].mac == "d8:b0:4c:12:34:56"
+
+
+async def test_gateway_overrides_compare_macs_like_the_identity_check(tmp_path):
+    """The override staleness guard must use the same MAC comparison as the poller's
+    identity check (discovery.normalize_mac: case, zero-padded octets, '-' separators).
+    Otherwise a config.yaml MAC written as 'D8-B0-4C-1-2-3' is the SAME unit to
+    _check_identity but a DIFFERENT unit to the override loader, and the write_enabled
+    toggle plus any gateway reassignment silently revert on the next restart."""
+    import json
+    from bridge.config import (AppConfig, apply_gateway_overrides, save_gateway_override,
+                               save_write_enabled)
+
+    state_file = tmp_path / "gateway-overrides.json"
+
+    def make_cfg(mac):
+        return AppConfig(
+            pumps=[PumpConfig(id="p1", name="P1", host="10.0.0.5", mac=mac,
+                              write_enabled=False)],
+            db_path=str(tmp_path / "bridge.db"))
+
+    # 1. state file holds the canonical form; config.yaml uses dashes and no zero-padding
+    state_file.write_text(json.dumps({"overrides": {"p1": {
+        "host": "10.0.0.99", "port": 8899, "mac": "d8:b0:4c:01:02:03",
+        "write_enabled": True}}, "added_pumps": []}))
+    fresh = make_cfg("D8-B0-4C-1-2-3")
+    apply_gateway_overrides(fresh)
+    assert fresh.pumps[0].host == "10.0.0.99"          # gateway reassignment applied
+    assert fresh.pumps[0].port == 8899
+    assert fresh.pumps[0].write_enabled is True        # toggle survived the restart
+
+    # 2. a genuinely different unit is still skipped — nothing applies, writes stay off
+    other = make_cfg("aa:aa:aa:aa:aa:aa")
+    apply_gateway_overrides(other)
+    assert other.pumps[0].host == "10.0.0.5"
+    assert other.pumps[0].write_enabled is False
+
+    # 3. a legacy state file written by the old code with the raw (un-normalised) config
+    #    MAC still matches a canonical config MAC after the change
+    state_file.write_text(json.dumps({"overrides": {"p1": {
+        "host": "10.0.0.77", "port": 8899, "mac": "D8-B0-4C-1-2-3",
+        "write_enabled": True}}, "added_pumps": []}))
+    legacy = make_cfg("d8:b0:4c:01:02:03")
+    apply_gateway_overrides(legacy)
+    assert legacy.pumps[0].host == "10.0.0.77"
+    assert legacy.pumps[0].write_enabled is True
+
+    # 4. new state written from an odd-format config MAC is canonical on disk, and the
+    #    write_enabled-only path normalises too
+    state_file.unlink()
+    cfg = make_cfg("D8-B0-4C-1-2-3")
+    save_gateway_override(cfg, "p1", "10.0.0.42", 8899)
+    assert json.loads(state_file.read_text())["overrides"]["p1"]["mac"] == "d8:b0:4c:01:02:03"
+    state_file.unlink()
+    save_write_enabled(make_cfg("D8-B0-4C-1-2-3"), "p1", True)
+    assert json.loads(state_file.read_text())["overrides"]["p1"]["mac"] == "d8:b0:4c:01:02:03"
+    canonical = make_cfg("d8:b0:4c:01:02:03")
+    apply_gateway_overrides(canonical)
+    assert canonical.pumps[0].write_enabled is True
 
 
 async def test_add_and_remove_pump_at_runtime(rig):

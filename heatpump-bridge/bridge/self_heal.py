@@ -12,6 +12,9 @@
 # needs the HBX stage call, which the Pi cannot see today — the HBX calls the pumps by dry contact,
 # and the switch-word bit the poller logs as "remote_contact" was never verified to be that
 # contact (a Phase 1 commissioning item). That trigger stays planner-side (#185) until it is.
+# Deliberate stops (#212): a pump whose circuit a PERSON switched off (deliberate_stop.py) is left alone — no cycle,
+# no verification, no pages about it — and still counts as DOWN for the other pump's guards, so the one pump left is
+# never power-cycled. "Every pump down" is not reported while one of them is down because someone switched it off.
 # Time: in-process holds use the monotonic clock; the attempt budget is persisted with wall time
 # + boot id + monotonic time, so a clock step can neither expire attempts early nor (within a
 # boot) shorten a hold. Persisted history that can't be read counts as a spent budget.
@@ -34,6 +37,12 @@ log = logging.getLogger(__name__)
 # Self-heal steps that mean the feature itself cannot work as configured (owner alert policy, alert-policy.md):
 # emailed. Every other step — shadow "would cycle", attempts, recoveries, escalations — is record-only.
 SELF_HEAL_ATTENTION: frozenset[str] = frozenset()  # owner 2026-10-21: a mis-configured self-heal is engineer-only (record)
+# The steps where a PERSON must act now are PAGES (6bb phone push + email), not record: the house may be without
+# heat-pump heat and nothing automatic will fix it. #219 sent every step to the record tier on the theory that the
+# pump's own stuck-fault page covers it, but these three are not a pump fault: both units down at once (often
+# offline/switched off, no fault code), self-heal giving up after its attempt budget, and a cycle self-heal could not
+# make ("switch it OFF and ON by hand"). The Oct 14-16 incident was exactly "nobody was told in time".
+SELF_HEAL_PAGE: frozenset[str] = frozenset({"both_down", "escalated", "cycle_refused"})
 
 TICK_S = 30.0
 FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything
@@ -68,8 +77,9 @@ def _draw_w(power_w) -> float | None:
 class SelfHealer:
     def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None, span_cfg=None,
                  state_dir: str | None = None, clock=time.time, mono=time.monotonic,
-                 boot_id: str | None = None):
+                 boot_id: str | None = None, stops=None):
         self.cfg = cfg                  # SelfHealConfig
+        self.stops = stops              # deliberate_stop.DeliberateStops | None (#212)
         self.pollers = pollers
         self.breakers = breakers        # span_control.BreakerController | None
         self.store = store
@@ -237,6 +247,17 @@ class SelfHealer:
         hits = [f for f in snap.get("active_faults", []) if str(f.get("code", "")).upper() in codes]
         return min(hits, key=lambda f: f.get("since") or 0) if hits else None
 
+    def _stopped(self, pid: str) -> str | None:
+        """#212: 'was switched off outside A2W at 3:12 PM (...)' while a person has this pump's circuit OFF."""
+        return self.stops.describe(pid) if self.stops is not None else None
+
+    def _others_down_only_by_choice(self, pid: str, *, span: dict | None) -> bool:
+        """True when every OTHER pump that is down is down because a person switched it off (#212). The guard still
+        refuses to cycle; only the 'both heat pumps down' note stands down — that is the owner's choice, not a fault
+        (the faulted pump's own sustained-fault page is the incident)."""
+        down = [o for o in self._expected_pumps() if o != pid and self._pump_down(o, span=span)]
+        return bool(down) and all(self._stopped(o) for o in down)
+
     def _expected_pumps(self) -> list[str]:
         return list(dict.fromkeys([*self.cfg.circuits, *self.pollers]))
 
@@ -288,6 +309,10 @@ class SelfHealer:
             if poller is None:
                 st["status"] = "pump not configured"
                 continue
+            stopped = self._stopped(pid)
+            if stopped:
+                await self._stand_down(pid, poller, st, stopped)
+                continue
             snap = poller.snapshot
             fresh = self._fresh(snap)
             if fresh and snap.get("running"):
@@ -314,6 +339,9 @@ class SelfHealer:
         """ONE definition of "this pump can't heat", shared by the cycle guard (_other_down) and
         the all-down watcher, so paging and re-arming can never disagree. Faulted counts only
         while the pump is not heating (an E21 that keeps heating is not down)."""
+        stopped = self._stopped(pid)
+        if stopped:
+            return stopped          # still DOWN for the guards: it cannot heat
         poller = self.pollers.get(pid)
         if poller is None:
             return "has no telemetry on this bridge"
@@ -346,6 +374,9 @@ class SelfHealer:
         if not all(downs.values()):
             self._all_down_since = None
             self._both_down_paged = False
+            return
+        if any(self._stopped(p) for p in downs):
+            self._all_down_since = None    # #212: a person switched one off — the owner's choice, not a fault
             return
         self._all_down_since = self._all_down_since or self._mono()
         if self._mono() - self._all_down_since < ALL_DOWN_PAGE_S or self._both_down_paged:
@@ -387,8 +418,11 @@ class SelfHealer:
             return
         if not fresh:
             st["status"] = f"{code} active but {name} is offline/stale — waiting"
-            other = self._other_down(pid, span=self._span())
-            if other and not self._both_down_paged:
+            span = self._span()
+            other = self._other_down(pid, span=span)
+            if other and self._others_down_only_by_choice(pid, span=span):
+                await self._peer_stopped(pid, name, code, other)
+            elif other and not self._both_down_paged:
                 # Nothing to cycle on stale data — but a pump offline with a last-known fault
                 # AND its peer down is the both-down case, and it pages.
                 self._both_down_paged = True
@@ -412,6 +446,10 @@ class SelfHealer:
         # goes down afterwards (each kind is de-duplicated on its own).
         span = self._span()
         other = self._other_down(pid, span=span)
+        if other and self._others_down_only_by_choice(pid, span=span):
+            st["status"] = f"{code} active but {other} — not cycling the only pump left"
+            await self._peer_stopped(pid, name, code, other)
+            return
         if other:
             st["status"] = f"{code} active but {other} — not cycling (paged)"
             if not self._both_down_paged:
@@ -591,6 +629,33 @@ class SelfHealer:
             return f"'{circ.get('name')}' draws {draw:.0f} W while the pump reports idle"
         return None
 
+    async def _stand_down(self, pid, poller, st, stopped: str) -> None:
+        """#212: a person has this pump's circuit OFF. Nothing to heal and nothing to verify: forget the episode (a
+        fault still there when it is switched back on starts a fresh grace), keep the attempt budget."""
+        if st["phase"] == "verifying" and st["verify"]:
+            code = st["verify"]["code"]
+            st["phase"], st["verify"] = "idle", None
+            self._record_outcome(st, "stopped_outside_a2w", f"verification ended: {poller.cfg.name} {stopped}")
+            await self._audit(pid, "stood_down", "info",
+                              f"{poller.cfg.name}: {code} verification ended — the pump {stopped}.", {"code": code})
+        st["paged"].clear()
+        st["fault_seen"] = None
+        st["aborts"], st["abort_until"], st["span_wait"] = 0, None, None
+        st["status"] = f"standing down: {stopped}"
+
+    async def _peer_stopped(self, pid, name, code, other: str) -> None:
+        """The target is faulted but the only other pump is OFF by a person's choice: never cycle the one pump left,
+        and say so once per episode (record — the faulted pump's own sustained-fault page is the incident)."""
+        st = self._pumps[pid]
+        if "peer_stopped" not in st["paged"]:
+            st["paged"].add("peer_stopped")
+            await self._step(pid, "peer_stopped", "warning",
+                             f"{name}: {code}, but {other} — A2W will not power-cycle the only heat pump left. "
+                             f"Switch the other pump back on, or power-cycle '{self.cfg.circuits[pid]}' by hand.",
+                             {"code": code, "other": other},
+                             title=f"A2W self-heal: not cycling {name} (the other pump is switched off)",
+                             priority="default")
+
     def _begin_verify(self, st: dict, code: str, *, shadow: bool) -> None:
         now = self._mono()
         st["phase"] = "verifying"
@@ -693,14 +758,15 @@ class SelfHealer:
     async def _step(self, pid, code, severity, message, detail, *, title: str,
                     priority: str = "high") -> None:
         """Audit one step (every step is in the events table and the dashboard) and route it through
-        the owner alert policy. Steps are RECORD: the incident the owner hears about is the pump fault
+        the owner alert policy. Steps are RECORD, except SELF_HEAL_PAGE (a person must act now: both pumps down,
+        self-heal gave up, a cycle it could not make), which PAGE. Otherwise the incident the owner hears about is the pump fault
         itself, which the poller pages once it has stuck for 30 min (poller.FAULT_PAGE_AFTER_S) and
         clears when it clears; a stuck-OFF circuit pages from span_control. Only a self-heal that
         cannot work as configured is worth an email (SELF_HEAL_ATTENTION)."""
         log.info("self-heal [%s] %s: %s", pid, code, message)
         await self._audit(pid, code, severity, message, detail)
         tags = "rotating_light" if priority == "urgent" else "wrench"
-        tier = "attention" if code in SELF_HEAL_ATTENTION else "record"
+        tier = "page" if code in SELF_HEAL_PAGE else "attention" if code in SELF_HEAL_ATTENTION else "record"
         t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
                                              priority=priority, tags=tags,
                                              action="Self-heal can't run as configured. Check the self_heal section of the "
