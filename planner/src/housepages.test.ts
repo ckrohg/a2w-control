@@ -15,26 +15,28 @@ const CYCLE = 5 * 60_000;
 type Note = { title: string; body: string; tier: Tier; resolved: boolean; key?: string; facts?: [string, string][] };
 
 function rig() {
+  /** the 6bb push and the email; ntfy.sh always answers 200 here, as it does for a topic nobody subscribes to */
+  const channels = { up: true, refuse: (_key?: string) => false, hung: null as Promise<void> | null, latchWriteFails: false, throws: false };
   const rows = new Map<string, { tier: string; notifiedAt: Date }>();
   const latchStore: LatchStore = {
     getNotifyLatch: async (k) => rows.get(k) ?? null,
-    upsertNotifyLatch: async (k, tier) => { rows.set(k, { tier, notifiedAt: new Date(now) }); },
+    upsertNotifyLatch: async (k, tier) => { if (channels.latchWriteFails) throw new Error("db blip"); rows.set(k, { tier, notifiedAt: new Date(now) }); },
     deleteNotifyLatch: async (k) => { const r = rows.get(k); rows.delete(k); return r ? { tier: r.tier } : null; },
   };
   const latches = new Latches(latchStore, () => {});
-  /** the 6bb push and the email; ntfy.sh always answers 200 here, as it does for a topic nobody subscribes to */
-  const channels = { up: true, refuse: (_key?: string) => false };
   const heard: Note[] = [];    // reached the owner
   const tried: Note[] = [];    // went to an owner channel, heard or not
   const logged: Note[] = [];   // record tier: nobody's phone
   // the order of index.ts ntfyDelivered: which tier applies, the channels, then the latch for a page someone heard
   const send = async (title: string, body: string, _p: string, o: any): Promise<boolean> => {
     let tier: Tier = o.tier;
-    if (o.key && o.resolved) tier = (await latches.release(o.key, o.tier, o.retrying)) ?? "record";
+    if (o.key && o.resolved) tier = (await latches.release(o.key, o.tier, o.heard)) ?? "record";
     else if (o.key && o.tier !== "record" && !(await latches.due(o.key))) tier = "record";
     const note: Note = { title, body, tier, resolved: !!o.resolved, key: o.key, facts: o.facts };
     if (tier === "record") { logged.push(note); return true; }
     tried.push(note);
+    await channels.hung;
+    if (channels.throws) throw new Error("send blew up");
     if (!acknowledged({ ownerConfigured: true, ownerAcked: channels.up && !channels.refuse(o.key), ntfyConfigured: true, ntfyAcked: true })) return false;
     heard.push(note);
     if (o.key && !o.resolved) await latches.record(o.key, tier);
@@ -52,7 +54,8 @@ function rig() {
     pi_connected: true, ts: now / 1000,
     pumps: [{ id: "pump1", name: "Heat Pump 1", online: true, state }, { id: "pump2", name: "Heat Pump 2", online: true, state: "idle" }],
   }) as unknown as HubState;
-  const cycles = async (n: number, f: () => Promise<void>) => { for (let i = 0; i < n; i++) { now += CYCLE; await f(); } };
+  // one poll, then everything it asked for has gone out; the "hung channel" block below is the case where it hasn't
+  const cycles = async (n: number, f: () => Promise<void>) => { for (let i = 0; i < n; i++) { now += CYCLE; await f(); await pages.settled(); } };
   return {
     get pages() { return pages; }, redeploy: () => { pages = fresh(); }, heard, tried, logged, channels, rows, episodes, slx, hub, cycles,
     // one poll, in pollOnce's order (unserved before DHW)
@@ -71,6 +74,9 @@ type Rig = ReturnType<typeof rig>;
 const titled = (notes: Note[], re: RegExp) => notes.filter((n) => re.test(n.title));
 const allClears = (r: Rig) => r.heard.filter((n) => n.resolved);
 const NO_HEAT_POLLS = 9, DHW_POLLS = 12, PI_PAGE_CYCLES = 25; // 2 h below 32 °F: the first read only starts the clock
+
+let finished = false;
+process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: stopped early, a test awaited a send that never finished"); process.exitCode = 1; } });
 
 (async () => {
   // ── "no heat" ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -377,6 +383,117 @@ const NO_HEAT_POLLS = 9, DHW_POLLS = 12, PI_PAGE_CYCLES = 25; // 2 h below 32 °
     assert.equal(allClears(r)[0].tier, "page");
   }
 
+  // ── a heard page whose latch write failed: the owner still gets the all-clear ─────────────────────────────────────
+  {
+    const r = rig();
+    r.channels.latchWriteFails = true;
+    await r.freezing();
+    assert.equal(r.heard.length, 1);
+    assert.equal(r.rows.has("freeze-risk"), false, "the DB blip: no latch");
+    r.channels.latchWriteFails = false;
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "the page was heard, so the all-clear is due without a latch");
+    assert.equal(allClears(r)[0].tier, "page");
+  }
+
+  // ── a thaw doesn't put a page nobody heard back to sleep ──────────────────────────────────────────────────────
+  {
+    const r = rig();
+    r.channels.up = false;
+    await r.piDown(PI_PAGE_CYCLES, 25);
+    assert.equal(r.tried.length, 1, "due at 2 h, it is 25 °F");
+    await r.piDown(2, 33);
+    assert.equal(r.tried.length, 3, "still sent every cycle above 32 °F");
+    r.channels.up = true;
+    await r.piDown(1, 33);
+    assert.equal(r.heard.length, 1);
+    await r.piBack();
+    // and the next outage starts over, at that outage's threshold
+    await r.piDown(PI_PAGE_CYCLES, 33);
+    assert.equal(titled(r.tried, /Pi unreachable/).length, 4, "above 32 °F a new outage waits for 12 h");
+  }
+
+  // ── a channel that hangs never holds the poll ─────────────────────────────────────────────────────────────────
+  const prompt = async (what: string, p: Promise<unknown>) => {
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} waited on a send`)), 500); });
+    await Promise.race([p, late]).finally(() => clearTimeout(timer));
+  };
+  const hang = (r: Rig) => { let release = () => {}; r.channels.hung = new Promise<void>((res) => { release = res; }); return () => { r.channels.hung = null; release(); }; };
+  {
+    const r = rig();
+    await r.noPumpRunning(NO_HEAT_POLLS - 1, 118);
+    await r.piDown(PI_PAGE_CYCLES - 1, 2);                                    // the next read makes the Pi page due
+    const free = hang(r);
+    const s = r.slx({ tankF: 100, outdoorF: 2 });
+    for (let i = 0; i < 16; i++) {
+      now += CYCLE;
+      await prompt("no heat", r.pages.unservedCall(s, r.hub(), true));
+      await prompt("tank cold", r.pages.dhwShortfall(s));
+      await prompt("freeze risk", r.pages.freezeRisk(s));
+      await prompt("Pi unreachable", r.pages.piLink(false, 2));
+    }
+    assert.equal(r.tried.length, 1, "one send on the wire, the rest wait in line");
+    free();
+    await r.pages.settled();
+    assert.equal(titled(r.heard, /NO pump/).length, 1, "one page, not one per cycle it waited");
+    assert.match(titled(r.heard, /NO pump/)[0].body, /~45 min/, "the send on the wire keeps its numbers");
+    assert.equal(titled(r.heard, /Freeze-risk/).length, 1);
+    assert.equal(titled(r.heard, /Pi unreachable/).length, 1);
+    assert.equal(titled(r.logged, /DHW/).length, 1, "behind \"no heat\" in line, so it saw that page heard: one incident, one page");
+    assert.equal(titled(r.heard, /DHW/).length, 0);
+    assert.equal(titled(r.logged, /NO pump|Freeze-risk/).length, 0, "nothing queued behind a heard page went out as a re-fire");
+  }
+  {
+    // the page still in line takes the newest cycle's numbers
+    const r = rig();
+    await r.tankCold(DHW_POLLS - 1);
+    const free = hang(r);
+    await prompt("tank cold", r.pages.dhwShortfall(r.slx({ tankF: 108 })));   // on the wire
+    for (const [outdoorF, tankF] of [[2, 100], [4, 101], [1, 99]]) await prompt("freeze risk", r.pages.freezeRisk(r.slx({ outdoorF, tankF })));
+    free();
+    await r.pages.settled();
+    assert.equal(titled(r.tried, /advisory/).length, 1, "three cycles in line, one send");
+    assert.match(titled(r.heard, /advisory/)[0].body, /Outdoor 1°F with the buffer only 99°F/);
+  }
+  {
+    // it clears while its page is on the wire: nothing else goes out until the next cycle, which owes the all-clear
+    const r = rig();
+    const free = hang(r);
+    await prompt("freeze risk", r.pages.freezeRisk(r.slx({ outdoorF: 2, tankF: 100 })));
+    await prompt("freeze risk", r.pages.freezeRisk(r.slx({ outdoorF: 20, tankF: 118 })));
+    free();
+    await r.pages.settled();
+    assert.equal(r.heard.length, 1);
+    assert.equal(allClears(r).length, 0);
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1);
+  }
+  {
+    // it comes back while the all-clear is on the wire: the next cycle pages again
+    const r = rig();
+    await r.freezing();
+    const free = hang(r);
+    await prompt("freeze risk", r.pages.freezeRisk(r.slx({ outdoorF: 20, tankF: 118 })));
+    await prompt("freeze risk", r.pages.freezeRisk(r.slx({ outdoorF: 2, tankF: 100 })));
+    free();
+    await r.pages.settled();
+    assert.equal(allClears(r).length, 1);
+    await r.freezing();
+    assert.equal(titled(r.heard, /advisory/).length, 2);
+  }
+
+  {
+    // a send that throws costs that attempt, not the queue, and never reaches the poll
+    const r = rig();
+    r.channels.throws = true;
+    await r.freezing();
+    await r.piDown();
+    r.channels.throws = false;
+    await r.freezing();
+    assert.equal(titled(r.heard, /advisory/).length, 1, "the next cycle's send still runs");
+  }
+
   // ── what #251 and the latch already gave: unchanged ───────────────────────────────────────────────────────────
   {
     // a redeploy's re-fire of a heard page is suppressed, reads as heard, and its all-clear still goes
@@ -402,5 +519,6 @@ const NO_HEAT_POLLS = 9, DHW_POLLS = 12, PI_PAGE_CYCLES = 25; // 2 h below 32 °
     assert.equal(r.heard.length, 1);
   }
 
+  finished = true;
   console.log("housepages.test.ts: all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });

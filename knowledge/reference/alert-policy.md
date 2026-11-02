@@ -52,8 +52,11 @@ These rules apply to every tier:
   - A condition that clears first owes no all-clear, because the owner never heard the alert.
   - A symptom is record-only only while its incident's page has been heard: if "no heat" failed on every channel, a cold
     tank still pages.
-  - An all-clear nobody heard goes out again every cycle the condition stays clear (`housepages.ts` only; Phase B's two
-    are sent once).
+  - An all-clear no channel acknowledged goes out again every cycle the condition stays clear (`housepages.ts` only;
+    Phase B's two are sent once). One the email acknowledged counts as heard even if the 6bb push failed, so the phone
+    can still show an alert that is over.
+  - `housepages.ts` sends run one at a time off the poll, so a channel that is timing out can't delay the writer lease
+    or Phase B through them.
 - **Restarts never re-alert.**
   - Planner: keyed alerts are latched in `notify_latches` once an owner channel (6bb push, email) has acknowledged
     them; a ntfy 200 does not count, because nobody subscribes to that topic. A redeploy's re-fire is suppressed, and a

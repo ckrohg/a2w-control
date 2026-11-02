@@ -476,12 +476,11 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   }
 
   // Which tier actually applies: a keyed open already sent (this restart's re-fire, or within RENOTIFY_MS) goes no
-  // further; a keyed all-clear is due only if its alert was sent, and at the tier it was sent at (`retrying`: the first
-  // attempt took the latch, and is the proof).
+  // further; a keyed all-clear is due only if its alert was sent (the latch, or the caller's `heard`), and at that tier.
   let tier: Tier = opts.tier;
   let suppressed: string | null = null;
   if (opts.key && resolved) {
-    tier = (await latches.release(opts.key, opts.tier, opts.retrying)) ?? "record";
+    tier = (await latches.release(opts.key, opts.tier, opts.heard)) ?? "record";
     if (tier === "record" && opts.tier !== "record") suppressed = "nothing was sent for it";
   } else if (opts.key && opts.tier !== "record" && !(await latches.due(opts.key))) {
     tier = "record";
@@ -800,7 +799,8 @@ async function checkI8(): Promise<void> {
 const STAGE_MAP = parseStagePumpMap(process.env.STAGE_PUMP_MAP);
 if (STAGE_MAP.error) console.warn(STAGE_MAP.error);
 const stageWatch = new StageWatch(STAGE_MAP.map);
-// "No heat", tank cold, freeze risk and Pi unreachable: a page nobody heard goes out again next cycle (housepages.ts)
+// "No heat", tank cold, freeze risk and Pi unreachable: a page nobody heard goes out again next cycle (housepages.ts).
+// Its sends run off the poll and are deliberately not in activeLoops: a slow one must not cost the lease release either.
 const housePages = new HousePages({ send: ntfyDelivered, store, stageMap: STAGE_MAP.map, dhwFloorF: DEFAULT_OPTS.dhwFloorF });
 let stageEpisodes24h: Record<string, number> | null = null;
 let lastLagTMin: number | null = null; // the HBX's lag-stage timer, from this poll's config (named in the page)
@@ -2445,6 +2445,7 @@ async function main(): Promise<void> {
     // "shadow failed" and carried on, so the rehearsal could not even observe the degraded behaviour it exists to test.
     const once = (label: string, fn: () => Promise<unknown>) => fn().then(() => {}, (e) => console.error(`${label} failed:`, (e as Error).message));
     await pollOnce();
+    await once("house pages", () => housePages.settled());
     await once("shadow", shadowOnce);
     await once("score", scoreOnce);
     await once("decay scan", () => decayScanOnce(store));

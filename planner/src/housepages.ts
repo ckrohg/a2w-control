@@ -5,9 +5,10 @@
  *
  * Every page is a PageEdge. It counts as sent only once a channel acknowledged it (index.ts ntfyDelivered): until then it
  * goes out again every cycle the condition still holds, with that cycle's numbers, and a condition that clears first owes
- * no all-clear. An all-clear nobody heard goes out again the same way, so the phone doesn't keep showing an alert that is
- * over. Same rule as Phase B's two pages (phaseb.ts ownerAlerts). Not AlertOutbox: its send path carries no key, action
- * or facts, so a re-sent page would lose its email layout and the 6bb replace-by-tag.
+ * no all-clear. An all-clear no channel acknowledged goes out again the same way. One the email acknowledged counts as
+ * heard even if the 6bb push failed, so the phone can still show an alert that is over. Same rule as Phase B's two pages
+ * (phaseb.ts ownerAlerts). Not AlertOutbox: its send path carries no key, action or facts, so a re-sent page would lose
+ * its email layout and the 6bb replace-by-tag.
  */
 import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import type { HubState } from "./hub";
@@ -21,35 +22,78 @@ export const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.r
 /** The delivery-aware sender (index.ts ntfyDelivered): false when nobody heard it. */
 export type SendPage = (title: string, body: string, priority: string, opts: NotifyOpts) => Promise<boolean>;
 
+type Job = () => Promise<unknown>;
+
+/**
+ * Sends run here, one at a time and in the order they were asked for, never inside the poll. With every channel timing
+ * out one send takes ~100 s, so four of them awaited in the tick would push the lease renew and Phase B back and make
+ * the overlap guard (index.ts loop) skip ticks. The poll says what it wants sent and moves on. The guard doesn't cover
+ * these; running one at a time does, and only a job here changes a PageEdge's state.
+ */
+class SendQueue {
+  private jobs: Job[] = [];
+  private draining: Promise<void> | null = null;
+
+  add(job: Job): void {
+    this.jobs.push(job);
+    this.draining ??= this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    for (let job = this.jobs.shift(); job; job = this.jobs.shift()) {
+      await job().catch((e) => console.error("[pages] send failed:", (e as Error).message));
+    }
+    this.draining = null;
+  }
+
+  /** Everything asked for so far has gone out. */
+  async settled(): Promise<void> { while (this.draining) await this.draining; }
+}
+
 /**
  * One page's delivery state. holding() runs on every cycle the condition holds, cleared() on every cycle it is clear; a
  * cycle that can't tell runs neither.
- *   heard     a channel acknowledged the page, and the condition has not cleared since
- *   clearing  the condition cleared, and no channel has acknowledged the all-clear yet
+ *   heard  the alert went out and the condition has not cleared since
+ *   owed   a page reached the owner and they have not heard it ended. Not the same thing: a record-tier open (a cold tank
+ *          during "no heat") is heard, so it isn't sent again, but nobody got it, so it owes nothing
  */
 export class PageEdge {
   heard = false;
-  private clearing = false;
-  constructor(private readonly key: string) {}
+  private owed = false;
+  /** What this page wants sent next. The newest wins: a send waiting in line takes this cycle's numbers, and no backlog builds. */
+  private wanted: Job | null = null;
+  constructor(private readonly key: string, private readonly queue: SendQueue) {}
 
-  /** The owner heard the page and has not heard that it ended. */
-  get owesAllClear(): boolean { return this.heard || this.clearing; }
+  get owesAllClear(): boolean { return this.owed; }
 
-  async holding(send: () => Promise<boolean>): Promise<void> {
-    if (this.heard) return;
-    // Back before its all-clear was heard: its latch went with that all-clear, so this is a page again, and it replaces
-    // the old alert by tag. Until someone hears it the all-clear stays owed: the phone still shows the first one.
-    this.heard = await send();
-    if (this.heard) this.clearing = false;
-    else console.error(`[pages] no channel acknowledged ${this.key}: sending it again next cycle`);
+  private want(job: Job | null): void {
+    const inLine = this.wanted != null;
+    this.wanted = job;
+    if (job && !inLine) this.queue.add(async () => { const next = this.wanted; this.wanted = null; await next?.(); });
   }
 
-  async cleared(send: (retrying: boolean) => Promise<boolean>): Promise<void> {
-    if (!this.owesAllClear) return;
-    const heard = await send(this.clearing);
-    this.heard = false;
-    this.clearing = !heard;
-    if (!heard) console.error(`[pages] no channel acknowledged the ${this.key} all-clear: sending it again next cycle`);
+  /** `tier` is asked when the send runs, after whatever went ahead of it. */
+  holding(send: (tier: Tier) => Promise<boolean>, tier: () => Tier = () => "page"): void {
+    this.want(this.heard ? null : async () => {
+      if (this.heard) return;
+      const at = tier();
+      // Back before its all-clear was heard, this is a page again and replaces the old alert by tag. The all-clear stays
+      // owed either way: if this page fails too, the phone still shows the first one.
+      this.heard = await send(at);
+      if (!this.heard) console.error(`[pages] no channel acknowledged ${this.key}: sending it again next cycle`);
+      else if (at === "page") this.owed = true;
+    });
+  }
+
+  /** `heard` tells ntfyDelivered the owner heard the page, so the all-clear is due whatever the latch says. */
+  cleared(send: (heard: boolean) => Promise<boolean>): void {
+    this.want(!this.heard && !this.owed ? null : async () => {
+      if (!this.heard && !this.owed) return;
+      const acked = await send(this.owed);
+      this.heard = false;
+      this.owed = this.owed && !acked;
+      if (!acked) console.error(`[pages] no channel acknowledged the ${this.key} all-clear: sending it again next cycle`);
+    });
   }
 }
 
@@ -63,15 +107,17 @@ const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor whil
 const PI_QUIET_ALERT_S = 600;
 
 export class HousePages {
-  private readonly noHeat = new PageEdge("no-heat");
-  private readonly dhw = new PageEdge("dhw-shortfall");
-  private readonly freeze = new PageEdge("freeze-risk");
-  private readonly pi = new PageEdge("pi-unreachable");
+  private readonly queue = new SendQueue();
+  private readonly noHeat = new PageEdge("no-heat", this.queue);
+  private readonly dhw = new PageEdge("dhw-shortfall", this.queue);
+  private readonly freeze = new PageEdge("freeze-risk", this.queue);
+  private readonly pi = new PageEdge("pi-unreachable", this.queue);
   private unservedStreak = 0;
   private unservedEpisodeOpen = false;
   private dhwShortfallStreak = 0;
   private piDisconnectedSince: number | null = null;
   private piQuietAlerted = false;
+  private piPageDue = false;
 
   constructor(private readonly d: {
     send: SendPage;
@@ -79,6 +125,9 @@ export class HousePages {
     stageMap: Record<string, string>;
     dhwFloorF: number;
   }) {}
+
+  /** Every send asked for so far has finished (the one-shot run, tests). The poll never waits for this. */
+  settled(): Promise<void> { return this.queue.settled(); }
 
   /** /health.unserved.all_idle. alerted: an episode is open; heard: its page reached someone. */
   allIdle(): { alerted: boolean; heard: boolean; streak: number } {
@@ -109,7 +158,7 @@ export class HousePages {
       this.unservedEpisodeOpen = true;
       await this.d.store.openUnservedEpisode(detail).catch(() => {});
     }
-    await this.noHeat.holding(() => this.d.send(
+    this.noHeat.holding(() => this.d.send(
       "⚠ Heat call active but NO pump is running",
       `${detail}. Causes: pump powered off, failure-to-start (the HP2 winter pattern), or a write-disabled/faulted unit. The tank is falling while HBX waits.`,
       "high",
@@ -128,7 +177,7 @@ export class HousePages {
       this.unservedEpisodeOpen = false;
       await this.d.store.closeUnservedEpisode().catch(() => {});
     }
-    await this.noHeat.cleared((retrying) => this.d.send("Unserved call cleared", body, "default", { tier: "page", resolved: true, key: "no-heat", retrying }));
+    this.noHeat.cleared((heard) => this.d.send("Unserved call cleared", body, "default", { tier: "page", resolved: true, key: "no-heat", heard }));
   }
 
   /** DHW-comfort shortfall (owner ask 2026-07-16, load-bearing now that autopilot holds a low buffer):
@@ -142,24 +191,23 @@ export class HousePages {
     if (tankF == null) return;
     if (tankF >= DHW_SHORTFALL_F) {
       this.dhwShortfallStreak = 0;
-      await this.dhw.cleared((retrying) => this.d.send("DHW shortfall cleared", `Buffer back to ${tankF.toFixed(0)}°F — hot water recovered.`, "default", { tier: "page", resolved: true, key: "dhw-shortfall", retrying }));
+      this.dhw.cleared((heard) => this.d.send("DHW shortfall cleared", `Buffer back to ${tankF.toFixed(0)}°F — hot water recovered.`, "default", { tier: "page", resolved: true, key: "dhw-shortfall", heard }));
       return;
     }
     this.dhwShortfallStreak++;
     if (this.dhwShortfallStreak < DHW_SHORTFALL_POLLS) return;
     // one incident, one page: a cold tank while the "no heat" page is open is that incident's symptom (Oct 11 and
     // Oct 15 2026, HP2 E21: both fired for the same outage). Only a page someone HEARD covers it: if "no heat" failed on
-    // every channel, this is another chance to reach them. Runs after unservedCall, so a cycle that gets "no heat"
-    // through sends this as its record.
-    const tier: Tier = this.noHeat.heard ? "record" : "page";
-    await this.dhw.holding(() => this.d.send(
+    // every channel, this is another chance to reach them. Asked when the send runs, behind unservedCall's in the queue,
+    // so a cycle that gets "no heat" through sends this as its record.
+    this.dhw.holding((tier) => this.d.send(
       "⚠ DHW comfort shortfall — buffer running cold",
       `Buffer ${tankF.toFixed(0)}°F, below the ${Math.round(this.d.dhwFloorF)}°F DHW-ready floor for ~${this.dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
       "high",
       { tier, key: "dhw-shortfall",
         action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
         facts: [["Tank", `${f0(tankF)} for ${this.dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(this.d.dhwFloorF)]] },
-    ));
+    ), () => (this.noHeat.heard ? "record" : "page"));
   }
 
   /** Freeze-risk advisory (owner ask 2026-07-16): deep cold AND a low buffer at the same time. The HBX
@@ -169,7 +217,7 @@ export class HousePages {
     const { outdoorF, tankF } = reading;
     if (outdoorF == null || tankF == null) return;
     if (outdoorF <= FREEZE_OUTDOOR_F && tankF < FREEZE_TANK_F) {
-      await this.freeze.holding(() => this.d.send(
+      this.freeze.holding(() => this.d.send(
         "⚠ Freeze-risk advisory",
         `Outdoor ${outdoorF.toFixed(0)}°F with the buffer only ${tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
         "urgent",
@@ -178,7 +226,7 @@ export class HousePages {
           facts: [["Outdoor", f0(outdoorF)], ["Tank", f0(tankF)]] },
       ));
     } else {
-      await this.freeze.cleared((retrying) => this.d.send("Freeze-risk cleared", `Outdoor ${outdoorF.toFixed(0)}°F / buffer ${tankF.toFixed(0)}°F — back in range.`, "default", { tier: "page", resolved: true, key: "freeze-risk", retrying }));
+      this.freeze.cleared((heard) => this.d.send("Freeze-risk cleared", `Outdoor ${outdoorF.toFixed(0)}°F / buffer ${tankF.toFixed(0)}°F — back in range.`, "default", { tier: "page", resolved: true, key: "freeze-risk", heard }));
     }
   }
 
@@ -190,13 +238,15 @@ export class HousePages {
       const downS = Math.round((Date.now() - this.piDisconnectedSince) / 1000);
       if (downS >= PI_QUIET_ALERT_S && !this.piQuietAlerted) {
         this.piQuietAlerted = true;
-        await this.d.send("Pi disconnected", `The bridge has been disconnected for ~${Math.round(downS / 60)} min.`, "high", { tier: "record" });
+        this.queue.add(() => this.d.send("Pi disconnected", `The bridge has been disconnected for ~${Math.round(downS / 60)} min.`, "high", { tier: "record" }));
       }
       // THE "Pi unreachable" incident (hub dead-man, SPAN-local stale and I8-blind are its record-only symptoms). The
       // pumps hold their lease-reverted setpoints and the HBX keeps running its curve without the Pi, so this is a
-      // page only after hours — sooner when it is freezing out (piUnreachablePageAfterS).
-      if (downS < piUnreachablePageAfterS(outdoorF)) return;
-      await this.pi.holding(() => this.d.send(
+      // page only after hours — sooner when it is freezing out (piUnreachablePageAfterS). Once due it stays due: a thaw
+      // must not put a page nobody heard back to sleep until the 12 h mark.
+      this.piPageDue ||= downS >= piUnreachablePageAfterS(outdoorF);
+      if (!this.piPageDue) return;
+      this.pi.holding(() => this.d.send(
         "Pi unreachable",
         `The heat-pump bridge (Pi) has not reported for ~${(downS / 3600).toFixed(1)} h` +
           (outdoorF != null ? ` with ${Math.round(outdoorF)}°F outside` : "") + `. The pumps hold their ` +
@@ -210,10 +260,10 @@ export class HousePages {
       return;
     }
     if (this.pi.owesAllClear) {
-      await this.pi.cleared((retrying) => this.d.send("Pi reconnected", "The bridge is pushing state again.", "default", { tier: "page", resolved: true, key: "pi-unreachable", retrying }));
+      this.pi.cleared((heard) => this.d.send("Pi reconnected", "The bridge is pushing state again.", "default", { tier: "page", resolved: true, key: "pi-unreachable", heard }));
     } else if (this.piQuietAlerted) {
-      await this.d.send("Pi reconnected", "The bridge is pushing state again.", "default", { tier: "record", resolved: true });
+      this.queue.add(() => this.d.send("Pi reconnected", "The bridge is pushing state again.", "default", { tier: "record", resolved: true }));
     }
-    this.piDisconnectedSince = null; this.piQuietAlerted = false;
+    this.piDisconnectedSince = null; this.piQuietAlerted = false; this.piPageDue = false;
   }
 }
