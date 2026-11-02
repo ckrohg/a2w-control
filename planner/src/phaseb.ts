@@ -275,6 +275,8 @@ export class PhaseB {
   }
   public lastRunAt: string | null = null;
   public lastResults: Record<string, string> = {};
+  /** #190: the Pi's remote_lease_until (UNIX seconds, null = no lease) at the last verify, per pump — GET /api/status */
+  public leaseUntilS: Record<string, number | null> = {};
 
   constructor(
     private readonly store: Store,
@@ -589,6 +591,7 @@ export class PhaseB {
       if (!p || p.remote_lease_until === undefined) continue;
       const armed = p.remote_lease_until !== null;
       this.leaseArmed[id] = armed;
+      this.leaseUntilS[id] = typeof p.remote_lease_until === "number" ? p.remote_lease_until : null;
       if (armed) this.leaseSeen[id] = "armed";
       const prev = this.lastResults[id] ?? "";
       if (!prev.startsWith("ok ")) continue; // the write itself failed; that message wins

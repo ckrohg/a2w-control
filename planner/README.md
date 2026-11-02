@@ -125,6 +125,7 @@ Thresholds come from 97 days of Pi data plus the Postgres restore (for the tank)
 | `idle_draw` | reports idle/off ≥ 10 min while the circuit's 9-min mean is > 1 kW (measured maximum 672 W) |
 | `defrost_overlong` | reports defrost continuously for > 20 min. Normal is 4–9 min. stagewatch suspends its clock in defrost, so pump1's 83-min stuck "defrost" on 2026-10-18 paged nothing |
 | `called_tank_flat` | a stage is called and its pump is engaged (heating or defrost) ≥ 90 % of 45 min, the tank's net rise plus standby loss is ≤ 2 °F **and** the unit's mean ΔT over it is < 1.5 °C, held for 30 min. A flat tank alone is house load: a healthy single pump at ≤ 45 °F routinely loses ground (measured, doc §5) |
+| `stage_never_called` | #172: the tank sits more than 3 °F under the **curve in force** (not SensorLinx's `tank_target_f`, which freezes while the HBX idles) at every HBX poll for 2 h, and stage 2 is never called. Not judged while either pump is deliberately switched off (#212) or when a curve change in the window lowered the target by > 3 °F (a setback); stale or gappy HBX data, or an unknown curve, is "unknown" |
 
 Data comes from the mirror's `readings` and `span_readings`. SPAN consumption is negative, so the checks use its
 magnitude. Gating follows stagewatch: no live Pi frame, or no measured Pi clock offset, means nothing moves. A stale
@@ -297,6 +298,7 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `POLL_SECONDS` | no | default `300` |
 | `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
 | `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `PLANNER_READ_TOKEN` | no | READ-ONLY bearer for the 6bb home app (#190) — opens `GET /api/status` and nothing else; see §Read-only status. Unset = that route is a plain 404, as before. |
 | `STAGE_PUMP_MAP` | no | JSON map of HBX stage relay → hub pump id, default `{"1":"pump1","2":"pump2"}`. The PHYSICAL wiring the per-stage unserved alarm (#185) checks against — verify it at the panel (§Per-stage unserved alarm). |
 | `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
 | `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
@@ -308,6 +310,36 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 | `FLOOR_CADENCE` | no | `0` disables the per-poll demand-floor re-check (#136). Default on: every poll the floor is recomputed and, if it exceeds the plan's current block by ≥ 3 °F (below the winter guard, never over a soak, band-clamped), the block is raised in place so Phase B leads it and the auto-pilot writes it on the same poll. Raises only. Escalation is per elapsed HOUR of unbroken calling (was per cycle), so the cadence change does not steepen it. `/health.demand_floor_cadence`. |
 | *(forecast cache)* | — | The hourly plan reads open-meteo; on failure (HTTP 429 after a deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed) so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`; the plan's `meta.forecast_source` records which. No cache → the hour fails as before. |
 | `PORT` | no | Railway injects it; default 8080 |
+
+## Read-only status for the 6bb app (#190, `readstatus.ts`)
+
+`GET /api/status` with `Authorization: Bearer $PLANNER_READ_TOKEN` (HEAD too) feeds the 6bb Heating card:
+
+```json
+{ "backup":   { "called": false, "spanBufferTankKwhLastHour": 0.02 },
+  "failsafe": { "armed": true, "leaseUntil": "2026-11-01T14:30:00.000Z" },
+  "thermal":  { "at": "…", "tank_f": 128, "tank_target_f": 130, "outdoor_f": 31, "setpoints_f": {}, "dhw_floor_f": 120, "dhw_ready": true, "coast_h": 9.1, "tank_ua": 0.04 },
+  "storm":    { "state": "idle", "trigger": null, "windowEnd": null, "enabled": false, "lastTriggerPollAt": "…" },
+  "outageSignal": "ok" }
+```
+
+- `backup.called` is the HBX's own backup-element call at the last poll; `spanBufferTankKwhLastHour` is the SPAN cloud
+  reading of the element circuit over the trailing 60 min (`null` while `SPAN_USERNAME` is unset).
+- `failsafe.armed`: `true` the Pi shows a live revert lease on every pump in `PHASE_B_PUMPS`, `false` any pump has none or
+  an expired one, or a write landed and the Pi showed none (FINDING-1), `null` Phase B off or no pump seen yet;
+  `leaseUntil` is the earliest expiry across the pumps, `null` if any has none.
+- `thermal` and `storm` are exactly `/health.thermal` and `/health.storm`. `outageSignal` is `unavailable` when the 6bb
+  outage feed has not answered recently, whether supply reads `unknown` or the grid is only assumed (generator.ts), else
+  `ok`.
+
+Reads cached state only — no DB, hub or SensorLinx call, no side effect, no secrets. Answers: `200`; `401` for no,
+empty or wrong bearer (including `PLANNER_API_TOKEN`); `405` for any other method. The read token opens no other route
+and `PLANNER_API_TOKEN` does not open this one. While `PLANNER_READ_TOKEN` is unset the route is the planner's usual
+empty `404`. If it equals another planner secret (`PLANNER_API_TOKEN`, `HUB_CLIENT_TOKEN`, `HUB_ARM_TOKEN`,
+`TEMPIQ_SURFACE_TOKEN`, `SIXBB_ALERT_KEY`, `RESEND_API_KEY`, `SENSORLINX_PASSWORD`, `SPAN_PASSWORD`, `DATABASE_URL`) the
+planner logs `ERROR: PLANNER_READ_TOKEN equals …` and keeps the route at 404 — it does **not** exit, because it controls
+the house. The token is trimmed at startup, before the clash check and matching. Generate it with
+`openssl rand -hex 32`. The hub's read-only side is `HUB_READONLY_TOKEN` (hub/README.md).
 
 ## Deploy to Railway
 

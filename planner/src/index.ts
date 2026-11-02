@@ -43,17 +43,17 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { StageWatch, annotateFaultCodes, liveCodes, parseStagePumpMap, partitionRestore, stopOf, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
-import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type GenAssessment, type ZoneTemp } from "./generator";
+import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
 import { HousePages, f0 } from "./housepages";
 import {
-  PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
-  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
+  PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
+  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut, type StoppedPump,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -61,6 +61,7 @@ import { pushTankUa } from "./tank-ua-push";
 import { pushTankReheat } from "./tank-reheat-push";
 import { RealizedSavings } from "./realized";
 import { observePeers, peerLiveMs, type PeerHeartbeat } from "./singlewriter";
+import { buildReadStatus, readGate, routeReadStatus } from "./readstatus";
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -106,6 +107,14 @@ const STANDBY_UA_BTU = Number(process.env.STANDBY_UA_BTU ?? "25");
 const REALIZED_LOOKBACK_DAYS = Number(process.env.REALIZED_LOOKBACK_DAYS ?? "45") || 45;
 
 const PLANNER_API_TOKEN = process.env.PLANNER_API_TOKEN;
+// #190: read-only bearer for the 6bb home app — GET /api/status only (readstatus.ts). Equal to another secret: the route
+// is disabled and logged, but the planner keeps running — it controls the house, a status route is not worth an exit.
+const READ_GATE = readGate(process.env.PLANNER_READ_TOKEN, {
+  PLANNER_API_TOKEN, HUB_CLIENT_TOKEN, HUB_ARM_TOKEN: process.env.HUB_ARM_TOKEN,
+  TEMPIQ_SURFACE_TOKEN: process.env.TEMPIQ_SURFACE_TOKEN, SIXBB_ALERT_KEY: process.env.SIXBB_ALERT_KEY,
+  RESEND_API_KEY, SENSORLINX_PASSWORD: PASSWORD, SPAN_PASSWORD: process.env.SPAN_PASSWORD, DATABASE_URL,
+});
+if (READ_GATE.error) console.error(`ERROR: ${READ_GATE.error}`);
 
 // Storm mode (§6.11, W0-5). Notify-first: triggers always page the owner, but the plan
 // is only shaped when STORM_MODE_ENABLED=1 (plan §11 Q6 is an open owner question).
@@ -211,6 +220,7 @@ let lastThermal: {
   outdoor_f: number | null;
   setpoints_f: Record<string, number | null>;
 } = { at: null, tank_f: null, tank_target_f: null, outdoor_f: null, setpoints_f: {} };
+let lastBackupCalled: boolean | null = null; // #190: the HBX's backup-element call at the last poll (GET /api/status)
 const PHASE_B_PUMPS = (process.env.PHASE_B_PUMPS ?? "pump1,pump2").split(",").map((s) => s.trim()).filter(Boolean);
 // #133 (b): SHAPED_CURVE=1 makes the auto-pilot command the plan's demand-shaped reset curve for
 // non-excursion hours and Phase B lead its output. Off = byte-identical to the pre-#133 planner: no
@@ -815,14 +825,11 @@ async function checkStages(reading: SlxReading, state: HubState | null, anyStage
   const live = !anyStageCall && !stageWatch.remindersOpen() ? [] : state && !piStateUnverifiable(state) ? state.pumps : null;
   let pumps: StagePump[] | null = live;
   if (live && live.some((p) => p.state === "fault")) {
-    // codes only ANNOTATE a live fault, and only from a snapshot ≤ 15 min old (the Pi attaches one every ~5 min)
     // an annotation only — bounded (store's bounded pool), and a failure or timeout simply means no codes
-    const codes = await store.pumpFaultCodes().catch(() => ({} as Record<string, { codes: string[]; ts: number }>));
-    const nowS = Date.now() / 1000;
-    pumps = live.map((p) => {
-      const c = codes[p.id];
-      return p.state === "fault" && c && Math.abs(nowS - c.ts) <= 15 * 60 ? { ...p, fault_codes: c.codes } : p;
-    });
+    const codes = live.every((p) => p.state !== "fault" || liveCodes(p))
+      ? {} as Record<string, { codes: string[]; ts: number }>
+      : await store.pumpFaultCodes().catch(() => ({} as Record<string, { codes: string[]; ts: number }>));
+    pumps = annotateFaultCodes(live, codes, Date.now() / 1000);
   }
   const events = stageWatch.step({ nowMs: Date.now(), stagesCalled: reading.stagesCalled, pumps, lagTMin: lastLagTMin });
   if (alertStateRestored && pumps != null && reading.stagesCalled != null) stageEvaluatedSinceRestore = true;
@@ -895,8 +902,9 @@ async function restoreAlertState(): Promise<void> {
     const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid) && !gateShadowAlerts.isClosing(o.id, o.uid));
     const gateKeep = gateOpen.filter((o) => o.kind === backupGateKind);
     const gateStale = gateOpen.filter((o) => o.kind !== backupGateKind);
-    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
-    if (stale.length || phStale.length || gateStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale].map((o) => o.id)); // a failure → the whole restore retries
+    const genStale = open.filter((o) => (o.kind === "generator" || o.kind === "generator_shadow") && o.kind !== genKind); // the other mode's, as the gate's
+    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !genStale.includes(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length || phStale.length || gateStale.length || genStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale, ...genStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
     (BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts).adopt(gateKeep);
     if (gateKeep.length) backupGate.restore({ closedByGate: true, atMs: Date.now() }); // dwell restarts now: conservative
@@ -906,7 +914,7 @@ async function restoreAlertState(): Promise<void> {
     stageWatch.restore(keep.filter(isStage)
       .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called" | "stopped_reminder", stage: o.key })));
     if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
-    for (const o of keep) if (o.kind === "generator_shadow") genOpen.add(o.key);
+    for (const o of keep) if (o.kind === genKind) genOpen.add(o.key);
     alertStateRestored = true;
   } catch (e) {
     console.error("alert state restore failed (retried next tick):", (e as Error).message);
@@ -1008,8 +1016,8 @@ async function checkPumpHealth(): Promise<void> {
   const readings = await store.pumpReadingsWindow(ids, from, nowPi + 60);
   const span = await store.spanWindow(ids.map((id) => PUMP_SPAN_CIRCUITS[id]), from, nowPi + 60);
   if (!readings || !span) { pumpHealthGate = "mirror tables absent (readings / span_readings)"; return; }
-  const tank = (await store.tankWindow(new Date((nowS - PH.LOOKBACK_S) * 1000)))
-    .map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
+  const hbx = await store.tankWindow(new Date((nowS - Math.max(PH.LOOKBACK_S, PH.TANK_LOOKBACK_S)) * 1000));
+  const tank = hbx.map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
   const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
   const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
   const verdicts: Verdict[] = [];
@@ -1017,6 +1025,18 @@ async function checkPumpHealth(): Promise<void> {
   for (const [stage, id] of Object.entries(STAGE_MAP.map)) {
     if (!PUMP_SPAN_CIRCUITS[id]) continue;
     verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
+  }
+  // #172 stage_never_called: stage 2 (the lag stage in the Oct incident) — planner clock, the HBX series and config
+  // versions as stored. Either mapped pump switched off by a person (#212) → not judged.
+  const stage2Pump = STAGE_MAP.map["2"];
+  if (stage2Pump) {
+    const curves = await store.curveVersionsSince(new Date((nowS - PH.STAGE_IDLE_WINDOW_S - PH.MAX_SLX_GAP_S) * 1000));
+    const stopped: StoppedPump[] = Object.values(STAGE_MAP.map).flatMap((id) => {
+      const p = state.pumps.find((x) => x.id === id);
+      const s = stopOf(p);
+      return s ? [{ pumpId: id, label: pumpNames[id] ?? id, since: s.since }] : [];
+    });
+    verdicts.push(evaluateStageNeverCalled("2", stage2Pump, hbx, curves, stopped, nowS));
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();
@@ -1112,16 +1132,17 @@ const BACKUP_CIRCUIT = "Buffer Tank";
 const HUB_ARM_TOKEN = process.env.HUB_ARM_TOKEN ?? "";
 const backupGate = new BackupGate(BACKUP_GATE_CFG.mode, BACKUP_GATE_CFG.reopen, BACKUP_GATE_CFG.t);
 const backupGateKind = BACKUP_GATE_CFG.mode === "live" ? "backup_gate" : "backup_gate_shadow";
+const genKind = genEpisodeKind(BACKUP_GATE_CFG.mode);
 let backupGateBlind: string | null = "not evaluated yet";
 let backupGateError: string | null = null;
 let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback: Record<string, unknown> | null } = { relay: null, element_w: null, pi_fallback: null };
 let backupGateEpisodes7d: number | null = null;
 /**
  * #241 generator-aware outage mode (generator.ts), SHADOW with the gate: on the generator (or when the supply is unknown)
- * the gate may close the element breaker only if the live house load leaves room for 16.5 kW under GEN_CAP_KW and the
- * house is getting cold (TempIQ). "Would have" notices are alert_episodes kind generator_shadow (attention: one email per
- * episode): key "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is
- * ON while on the generator without headroom. The one-pump staging hint is /health + log only.
+ * the gate never closes the element breaker (owner, 2026-11-02); the house-load budget under GEN_CAP_KW and TempIQ
+ * comfort are still reported. Notices are alert_episodes of kind genKind (attention: one email per episode): key
+ * "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is ON while on the
+ * generator without headroom or with the load unknown. The one-pump staging hint is /health + log only.
  */
 const GEN_CFG = parseGenConfig(process.env);
 for (const e of GEN_CFG.errors) console.warn(e);
@@ -1131,7 +1152,7 @@ const COMFORT_EXCLUDE = parseComfortExclude(process.env);
 let genAssessment: GenAssessment | null = null;
 let genEvaluatedSinceRestore = false;
 let genOnePumpLogged = false;
-const genOpen = new Set<string>(); // generator_shadow episode keys open now
+const genOpen = new Set<string>(); // genKind episode keys open now
 // shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
 // every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
 // The would-open is a log line + /health + the dashboard: no second email.
@@ -1231,15 +1252,11 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
 async function checkGenerator(g: GenAssessment, blind: string | null): Promise<void> {
   if (!backupGate.generatorLockoutEpisode) await genEpisode("lockout", false);
   if (!blind) {
-    const why = `${g.supply_why}. House ${g.house_w ?? "?"} W + element ${g.element_w} W + margin ${g.margin_w} W = ` +
-      `${g.projected_w ?? "?"} W against the ${g.cap_w} W cap.`;
-    await genEpisode("shed", g.shed, "Backup element (shadow): breaker is ON on the generator without headroom",
-      `SHADOW — nothing was switched. The Buffer Tank breaker is ON, so the HBX can fire the 16.5 kW element at any moment, ` +
-      `but ${why} A2W does NOT switch it off — nothing re-opens the breaker on the generator (an owner decision before ` +
-      "going live). If you can, switch it off at the SPAN panel or in the 6bb app, or shed another big load (EV charger).");
+    const shed = shedNotice(BACKUP_GATE_CFG.mode, g);
+    await genEpisode("shed", g.shed, shed.title, shed.body);
     if (g.one_pump !== genOnePumpLogged) {
       genOnePumpLogged = g.one_pump;
-      if (g.one_pump) console.warn(`[generator] both pumps running near the cap — would hold to one pump. ${why}`);
+      if (g.one_pump) console.warn(`[generator] both pumps running near the cap — would hold to one pump. ${budgetLine(g)}`);
     }
   }
   genEvaluatedSinceRestore = true;
@@ -1249,10 +1266,10 @@ async function genEpisode(key: "lockout" | "shed", on: boolean, title = "", body
   if (on && !genOpen.has(key)) {
     console.warn(`[generator] ${title}: ${body}`);
     genOpen.add(key);
-    await alerts.open("generator_shadow", key, null, title, body);
+    await alerts.open(genKind, key, null, title, body);
   } else if (!on && genOpen.has(key)) {
     genOpen.delete(key);
-    await alerts.close("generator_shadow", key);
+    await alerts.close(genKind, key);
   }
 }
 
@@ -1560,9 +1577,17 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
 
 /** 5-min tick: OutageWatch (unreachable → null = NO signal) then one machine step. */
 async function stormTick(): Promise<void> {
-  const outage = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
-  outageFeed.note(outage ? outage.hasActiveOutage : null, Date.now()); // #241: grid or generator
-  await stormEvaluate(outage ? outage.hasActiveOutage : null);
+  const answer = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
+  const active = answer.hasActiveOutage ?? null;
+  const before = outageFeed.memory();
+  outageFeed.note(active, Date.now(), answer.failure); // #241: grid or generator
+  const after = outageFeed.memory();
+  // A changed memory only, so a normal day writes nothing. A failed save heals on the next change.
+  if (after.active !== before.active || after.lastActiveMs !== before.lastActiveMs) {
+    await store.saveOutageFeedMemory(after).catch((e) => console.error("outage feed memory save failed:", (e as Error).message));
+  }
+  housePages.outageFeed(outageFeed.silence(Date.now()));
+  await stormEvaluate(active);
 }
 
 /**
@@ -2168,6 +2193,7 @@ async function pollOnce(): Promise<void> {
     tank_target_f: reading.tankTargetF,
     outdoor_f: reading.outdoorF,
   };
+  lastBackupCalled = reading.backupCalled;
   // Foreign-write (single-writer-invariant) baseline — captured at poll time, BEFORE this
   // cycle's own guarded writes (expireBoosts / phase-b / autopilot). The planner's writer
   // self-records each write it makes (writes.ts patch → insertConfigVersion, `_source`-tagged),
@@ -2343,13 +2369,16 @@ async function loopBody(): Promise<void> {
     : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
     : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore
-    : kind === "generator_shadow" ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
+    : kind === genKind ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
   await gateShadowAlerts.retry((kind) => kind === "backup_gate_shadow").catch((e) => console.error("backup-gate shadow re-send failed:", (e as Error).message));
   // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)
   await shadowAlerts.retry(() => false).catch((e) => console.error("shadow episode flush failed:", (e as Error).message));
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
     .catch((e) => { pumpDailyError = (e as Error).message; console.error("pump health daily failed:", pumpDailyError); });
+
+  // Out here for the same reason as the storm step below: a SensorLinx failure must not hide a blind alarm.
+  if (spanWatch) housePages.elementAlarm(spanWatch.blindness());
 
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
@@ -2370,6 +2399,10 @@ async function main(): Promise<void> {
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
   await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
   await sweepStormOrphans(); // #183 — retried every tick until it succeeds
+  // Without it a deploy during an outage reads a silent feed as "grid, assumed" (no memory = grid). An unreadable row
+  // leaves exactly that, which is what every start did before this table existed.
+  const feedMemory = await store.getOutageFeedMemory().catch((e) => { console.error("outage feed memory read failed:", (e as Error).message); return null; });
+  if (feedMemory) outageFeed.restore(feedMemory);
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the
@@ -2469,6 +2502,34 @@ async function main(): Promise<void> {
     const a = Buffer.from(got), b = Buffer.from(PLANNER_API_TOKEN);
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   };
+  // /health.thermal and /health.storm — also served to the 6bb app by GET /api/status (#190)
+  const thermalStatus = () => {
+    // winterDpState is loosely typed; coerce and fall back rather than trust it.
+    const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
+    const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
+    const t = lastThermal.tank_f;
+    const floor = DEFAULT_OPTS.dhwFloorF;
+    const coast =
+      t != null && t > floor && ua > 0
+        ? Math.round((Math.log((t - 65) / (floor - 65)) / ua) * 10) / 10
+        : t != null && t <= floor
+          ? 0
+          : null;
+    return {
+      ...lastThermal,
+      dhw_floor_f: floor,
+      dhw_ready: t != null ? t >= floor : null,
+      coast_h: coast,
+      tank_ua: ua,
+    };
+  };
+  const stormStatus = () => ({
+    state: stormState.kind,
+    trigger: stormState.kind === "idle" ? null : stormState.trigger,
+    windowEnd: stormState.kind === "idle" ? null : stormState.windowEnd,
+    enabled: STORM_MODE_ENABLED,
+    lastTriggerPollAt: lastStormPollAt,
+  });
   const json = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
@@ -2616,33 +2677,8 @@ async function main(): Promise<void> {
             // the DHW floor: C_eff/UA = 1/tank_ua hours per e-fold above the 65 °F ambient the UA
             // is defined against (winterdp.ts). Draws are NOT modelled -- one shower is ~9 °F --
             // so treat it as a ceiling, not a promise.
-            thermal: (() => {
-              // winterDpState is loosely typed; coerce and fall back rather than trust it.
-              const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
-              const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
-              const t = lastThermal.tank_f;
-              const floor = DEFAULT_OPTS.dhwFloorF;
-              const coast =
-                t != null && t > floor && ua > 0
-                  ? Math.round((Math.log((t - 65) / (floor - 65)) / ua) * 10) / 10
-                  : t != null && t <= floor
-                    ? 0
-                    : null;
-              return {
-                ...lastThermal,
-                dhw_floor_f: floor,
-                dhw_ready: t != null ? t >= floor : null,
-                coast_h: coast,
-                tank_ua: ua,
-              };
-            })(),
-            storm: {
-              state: stormState.kind,
-              trigger: stormState.kind === "idle" ? null : stormState.trigger,
-              windowEnd: stormState.kind === "idle" ? null : stormState.windowEnd,
-              enabled: STORM_MODE_ENABLED,
-              lastTriggerPollAt: lastStormPollAt,
-            },
+            thermal: thermalStatus(),
+            storm: stormStatus(),
             // I8 thermal hygiene — runtime ground truth for go-live verification. auto_sanitize=true
             // means checkI8 owns the soak (shadow boost stood down); effective_interval_h reflects the
             // current season; last_satisfied=true confirms the coil's potable slug was pasteurized.
@@ -2744,6 +2780,18 @@ async function main(): Promise<void> {
             at: new Date().toISOString(),
           });
         }
+        // #190: the 6bb Heating card. PLANNER_READ_TOKEN only, here only; 404 for everyone while it is unset or refused.
+        // Reads cached state — no DB, hub or SensorLinx call, no side effect.
+        const readStatus = routeReadStatus(READ_GATE, req.method, req.url, req.headers.authorization, () => buildReadStatus({
+          backupCalled: lastBackupCalled,
+          backupKwhLastHour: spanWatch?.lastHourKwh ?? null,
+          phaseB: phaseB ? { pumpIds: PHASE_B_PUMPS, lastResults: phaseB.lastResults, leaseUntilS: phaseB.leaseUntilS } : null,
+          thermal: thermalStatus(),
+          storm: stormStatus(),
+          outageSupply: outageFeed.supply(Date.now()),
+          nowMs: Date.now(),
+        }));
+        if (readStatus) return json(res, readStatus.status, readStatus.body);
 
         if (req.url === "/api/drill" && req.method === "POST") {
           // Winter-readiness alert drill (owner-triggered, authed): fires the REAL alert
@@ -2787,7 +2835,7 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.restore("dashboard", { endsBoost: true, to })); // the owner cancelled any boost
           }
           if (req.url === "/api/hbx/boost") {
-            // #231: 202 { arming: true, setpoints_needed_f } when I1 setpoints are the boost's only obstacle
+            // #231: 202 { arming: true, reason, setpoints_needed_f } when I1 setpoints or the rate limit are the only obstacle
             const out = await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard", undefined, { armIfLow: true });
             return json(res, out.arming === true ? 202 : 200, out);
           }

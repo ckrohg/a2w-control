@@ -27,6 +27,7 @@ export const CHECK_LABELS: Record<string, string> = {
   idle_draw: "idle, drawing power",
   defrost_overlong: "stuck in defrost",
   called_tank_flat: "called, tank flat",
+  stage_never_called: "Tank low, stage 2 never called",
 };
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
