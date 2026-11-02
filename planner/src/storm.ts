@@ -275,21 +275,30 @@ export function deriveSyntheticTriggers(allHours: StormForecastHour[], nowMs?: n
   return triggers;
 }
 
-export async function fetchOutageStatus(baseUrl: string): Promise<{ hasActiveOutage: boolean } | null> {
+/** Why the outage feed gave no answer, in words for the owner's email. No URL: OUTAGEWATCH_URL carries the feed key. */
+export function feedFailure(status: number): string {
+  if (status === 401 || status === 403) return `it refused the planner's key (HTTP ${status})`;
+  if (status === 503) return "HTTP 503: 6bb is down, or is not tracking outages yet";
+  return `HTTP ${status}`;
+}
+
+export type OutageAnswer = { hasActiveOutage: boolean; failure?: undefined } | { hasActiveOutage?: undefined; failure: string };
+
+export async function fetchOutageStatus(baseUrl: string): Promise<OutageAnswer> {
   try {
     const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/status`, {
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { failure: feedFailure(res.status) };
     const body = (await res.json()) as any;
     // OutageWatch returns an ARRAY of monitor statuses (verified live 2026-07-14);
     // accept both shapes and report an outage if any monitor has one.
     const monitors = Array.isArray(body) ? body : [body];
     const flags = monitors.map((m) => m?.hasActiveOutage).filter((v) => typeof v === "boolean");
-    if (!flags.length) return null;
+    if (!flags.length) return { failure: "it answered without an outage flag" };
     return { hasActiveOutage: flags.some(Boolean) };
   } catch {
-    return null;
+    return { failure: "unreachable or unreadable" };
   }
 }
 

@@ -11,6 +11,7 @@
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { ZoneCallSample } from "./demand";
+import type { FeedMemory } from "./generator";
 import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT_F } from "./stale-target";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
@@ -454,6 +455,13 @@ export class Store {
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
+      -- What the outage feed last said (generator.ts FeedMemory): a planner restart must not forget an outage in progress.
+      CREATE TABLE IF NOT EXISTS outage_feed_memory (
+        id             integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        active         boolean,
+        last_active_at timestamptz,
+        updated_at     timestamptz NOT NULL DEFAULT now()
+      );
       CREATE TABLE IF NOT EXISTS tempiq_window_posts (
         write_id    integer PRIMARY KEY,
         external_id text NOT NULL,
@@ -631,6 +639,23 @@ export class Store {
     if (!r.rowCount) return null;
     const x = r.rows[0];
     return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run, autoSanitize: x.auto_sanitize, identificationMode: x.identification_mode ?? "off" };
+  }
+
+  /** generator.ts FeedMemory. null before the feed has ever changed. */
+  async getOutageFeedMemory(): Promise<FeedMemory | null> {
+    const r = await this.pool.query(`SELECT active, last_active_at FROM outage_feed_memory WHERE id = 1`);
+    if (!r.rowCount) return null;
+    const x = r.rows[0];
+    return { active: x.active, lastActiveMs: x.last_active_at ? new Date(x.last_active_at).getTime() : null };
+  }
+
+  async saveOutageFeedMemory(m: FeedMemory): Promise<void> {
+    const at = m.lastActiveMs == null ? null : new Date(m.lastActiveMs);
+    await this.pool.query(
+      `INSERT INTO outage_feed_memory (id, active, last_active_at) VALUES (1, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET active = $1, last_active_at = $2, updated_at = now()`,
+      [m.active, at],
+    );
   }
 
   /** identify.ts: the runtime identification mode (off | shadow | armed), independent of the autonomy switch. */

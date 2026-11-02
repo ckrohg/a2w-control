@@ -1570,9 +1570,17 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
 
 /** 5-min tick: OutageWatch (unreachable → null = NO signal) then one machine step. */
 async function stormTick(): Promise<void> {
-  const outage = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
-  outageFeed.note(outage ? outage.hasActiveOutage : null, Date.now()); // #241: grid or generator
-  await stormEvaluate(outage ? outage.hasActiveOutage : null);
+  const answer = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
+  const active = answer.hasActiveOutage ?? null;
+  const before = outageFeed.memory();
+  outageFeed.note(active, Date.now(), answer.failure); // #241: grid or generator
+  const after = outageFeed.memory();
+  // A changed memory only, so a normal day writes nothing. A failed save heals on the next change.
+  if (after.active !== before.active || after.lastActiveMs !== before.lastActiveMs) {
+    await store.saveOutageFeedMemory(after).catch((e) => console.error("outage feed memory save failed:", (e as Error).message));
+  }
+  housePages.outageFeed(outageFeed.silence(Date.now()));
+  await stormEvaluate(active);
 }
 
 /**
@@ -2380,6 +2388,10 @@ async function main(): Promise<void> {
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
   await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
   await sweepStormOrphans(); // #183 — retried every tick until it succeeds
+  // Without it a deploy during an outage reads a silent feed as "grid, assumed" (no memory = grid). An unreadable row
+  // leaves exactly that, which is what every start did before this table existed.
+  const feedMemory = await store.getOutageFeedMemory().catch((e) => { console.error("outage feed memory read failed:", (e as Error).message); return null; });
+  if (feedMemory) outageFeed.restore(feedMemory);
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the

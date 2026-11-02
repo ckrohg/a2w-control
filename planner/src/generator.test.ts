@@ -104,6 +104,82 @@ const PUMP_W = 5_100;  // measured p50 heating draw
   assert.equal(n2.supply(t + 40 * M).supply, "unknown", "the outage it reported keeps a silent feed unknown past the grace");
 }
 
+// ── 2c. the feed's memory outlives a restart (#252 review): every deploy restarts the planner ──────────
+{
+  const t = Date.parse("2026-12-20T12:00:00Z");
+  const H = 3600_000, M = 60_000;
+  // the scenario: outage reported, the feed dies, a deploy lands, and the new instance has never heard from it
+  const old = new OutageFeed(t);
+  old.note(true, t);
+  const restarted = new OutageFeed(t + 25 * M);
+  assert.equal(restarted.supply(t + 55 * M + 30 * M).supply, "grid", "without the memory, the deploy forgets the outage");
+  const kept = new OutageFeed(t + 25 * M);
+  kept.restore(old.memory());
+  assert.equal(kept.supply(t + 30 * M).supply, "unknown", "inside the grace");
+  const later = kept.supply(t + 25 * M + 30 * M);
+  assert.equal(later.supply, "unknown", "past the grace, the remembered outage keeps it unknown");
+  assert.equal(later.assumed, false);
+  assert.match(later.why, /its last answer was an active outage/);
+  assert.equal(kept.supply(t + 72 * H).supply, "unknown", "same answer as a planner that never restarted");
+  // an outage that ended before the restart: recent keeps it unknown, then the 6 h rule applies
+  const ended = new OutageFeed(t);
+  ended.note(true, t);
+  ended.note(false, t + 5 * M);
+  const kept2 = new OutageFeed(t + 10 * M);
+  kept2.restore(ended.memory());
+  assert.equal(kept2.supply(t + 45 * M).supply, "unknown", "outage 45 min ago, feed silent");
+  assert.equal(kept2.supply(t + 6 * H).supply, "grid", "6 h since the outage: the grid is assumed");
+  assert.equal(kept2.supply(t + 6 * H).assumed, true);
+  // a first answer after the restart wins, and the retransfer tail still counts from the remembered outage
+  const tail = new OutageFeed(t + 10 * M);
+  tail.restore(ended.memory());
+  tail.note(false, t + 15 * M);
+  assert.equal(tail.supply(t + 16 * M).supply, "generator", "just restored before the deploy: still the retransfer tail");
+  tail.note(false, t + 30 * M);
+  assert.equal(tail.supply(t + 31 * M).supply, "grid", "the tail ends 30 min after the remembered outage");
+  // the memory is not an answer: a calm one still gets the startup grace, so a deploy never reads as "grid, assumed"
+  const calm = new OutageFeed(t);
+  calm.restore({ active: false, lastActiveMs: t - 30 * H });
+  assert.equal(calm.supply(t + 10 * M).supply, "unknown", "inside the grace after a restore");
+  assert.equal(calm.supply(t + 30 * M).assumed, true, "the grace ends as it always did");
+  // an answer that beat the restore is not overwritten by older memory
+  const raced = new OutageFeed(t);
+  raced.note(false, t + M);
+  raced.restore({ active: true, lastActiveMs: null });
+  assert.equal(raced.supply(t + 2 * M).supply, "grid");
+  assert.deepEqual(new OutageFeed(t).memory(), { active: null, lastActiveMs: null });
+}
+
+// ── 2d. a silent feed tells the owner (#252 review) ──────────
+{
+  const t = Date.parse("2026-12-20T12:00:00Z");
+  const H = 3600_000, M = 60_000;
+  const f = new OutageFeed(t);
+  assert.equal(f.silence(t + 119 * M), null, "under 2 h since the planner started");
+  assert.equal(f.silence(t + 2 * H)?.hours, 2, "never answered counts from the start");
+  f.note(false, t + 3 * H);
+  assert.equal(f.silence(t + 3 * H + M), null, "it answered");
+  f.note(null, t + 3 * H + 5 * M, "it refused the planner's key (HTTP 401)");
+  assert.equal(f.status(t + 3 * H + 5 * M).last_failure, "it refused the planner's key (HTTP 401)", "/health names the failure");
+  assert.equal(f.silence(t + 5 * H - M), null);
+  const s = f.silence(t + 5 * H)!;
+  assert.equal(s.failure, "it refused the planner's key (HTTP 401)");
+  assert.match(s.why, /assuming the grid/);
+  f.note(false, t + 6 * H);
+  assert.equal(f.status(t + 6 * H).last_failure, null, "an answer clears the failure");
+  assert.equal(f.silence(t + 6 * H), null);
+  // silent after an outage: the element is locked out on a guess, which the owner needs to hear about too
+  const a = new OutageFeed(t);
+  a.note(true, t);
+  assert.match(a.silence(t + 3 * H)!.why, /its last answer was an active outage/);
+  // the owner can see the grid was a guess
+  const base = { nowMs: t, houseW: 3_000, relay: "CLOSED", pumpsEngaged: 1 } as const;
+  const guessed = assess({ ...base, supply: { supply: "grid", why: "x", assumed: true }, comfort: { at_risk: null, why: "" } });
+  assert.match(guessed.element_why, /assumed on the grid \(the outage feed is silent\)/);
+  const known = assess({ ...base, supply: { supply: "grid", why: "x", assumed: false }, comfort: { at_risk: null, why: "" } });
+  assert.equal(known.element_why, "on the grid: no generator limit");
+}
+
 // ── 3. comfort: every OCCUPIED zone counts, the coldest decides; a zone with no / a stale temperature is unknown ──────
 const Z = (id: string, roomF: number | null, setpointF: number | null, name = id, extra: Partial<ZoneTemp> = {}): ZoneTemp =>
   ({ id, name, roomF, setpointF, ...extra });

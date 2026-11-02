@@ -13,7 +13,8 @@
  *     seen < SILENT_OUTAGE_RECENT_MS ago, or the planner started < FEED_STARTUP_GRACE_MS ago with no answer yet.
  *     Otherwise it is the grid, flagged `assumed` (owner 2026-11-01: a dead feed must not block the element on normal
  *     grid power all season). The feed is email-based: it cannot see the first minutes of an outage, nor one that
- *     starts while it is silent (the doc covers what that leaves open).
+ *     starts while it is silent (the doc covers what that leaves open). What it last said survives a restart
+ *     (FeedMemory), because every deploy restarts the planner, and a feed silent for FEED_SILENT_ALERT_MS emails the owner.
  *   - BUDGET: house load (every SPAN circuit but the element's, from a fresh Pi panel read) + the element's 16.5 kW +
  *     MARGIN must stay ≤ CAP. Unknown load = does not fit.
  *   - COMFORT from TempIQ (the planner's demand feed): every OCCUPIED zone (comfortRisk), the coldest driving it. At
@@ -44,6 +45,8 @@ export const GEN = {
   /** no answer yet since the planner started: "unknown" this long (the first poll normally answers within minutes;
    *  every deploy restarts the planner), then the grid is assumed */
   FEED_STARTUP_GRACE_MS: 30 * 60_000,
+  /** silent this long and the owner hears about it: past any 6bb deploy, and the supply is a guess until it answers */
+  FEED_SILENT_ALERT_MS: 2 * 3600_000,
   /** a panel read older than this (Pi clock, relative to the frame) is not a live load */
   HOUSE_FRESH_S: 120,
   FLOOR_F: 60,
@@ -69,20 +72,47 @@ export function parseGenConfig(env: Record<string, string | undefined>): { cfg: 
 
 export type Supply = "grid" | "generator" | "unknown";
 
+/** The part of the feed's state that outlives a restart (store: outage_feed_memory). */
+export interface FeedMemory { active: boolean | null; lastActiveMs: number | null }
+
 /** What the outage feed has said: index.ts notes every storm-tick answer (null = unreachable / unreadable). */
 export class OutageFeed {
   private answerMs: number | null = null;
   private active: boolean | null = null;
   private lastActiveMs: number | null = null;
+  private failure: string | null = null;
 
   /** startMs = when the planner started (the FEED_STARTUP_GRACE_MS clock) */
   constructor(private readonly startMs: number = Date.now()) {}
 
-  note(active: boolean | null, nowMs: number): void {
+  /** `failure` says why there was no answer (storm.ts feedFailure), for the owner's email and /health */
+  note(active: boolean | null, nowMs: number, failure: string | null = null): void {
+    this.failure = active == null ? failure : null;
     if (active == null) return; // no answer: the last one ages out by FEED_FRESH_MS
     this.answerMs = nowMs;
     this.active = active;
     if (active) this.lastActiveMs = nowMs;
+  }
+
+  memory(): FeedMemory { return { active: this.active, lastActiveMs: this.lastActiveMs }; }
+
+  /**
+   * What the feed said before this start. The answer time stays null: "has it answered since we started" is what the
+   * startup grace needs, and the memory then does the rest (an active outage or a recent one keeps a silent feed
+   * unknown, and a first "no outage" still gets the retransfer tail). An answer that beat the restore wins.
+   */
+  restore(m: FeedMemory): void {
+    if (this.answerMs != null) return;
+    this.active = m.active;
+    this.lastActiveMs = m.lastActiveMs;
+  }
+
+  /** Silent for FEED_SILENT_ALERT_MS (a restart restarts this clock), else null. Whatever the supply reads: a dead feed
+   *  after an outage locks the element out on a guess, and a dead feed with no outage hides the next one. */
+  silence(nowMs: number): { hours: number; why: string; failure: string | null } | null {
+    const silentMs = nowMs - (this.answerMs ?? this.startMs);
+    if (silentMs < GEN.FEED_SILENT_ALERT_MS) return null;
+    return { hours: silentMs / 3600_000, why: this.supply(nowMs).why, failure: this.failure };
   }
 
   /** `assumed` = the grid answer comes from the feed's silence, not from the feed */
@@ -112,6 +142,7 @@ export class OutageFeed {
       last_answer_at: this.answerMs == null ? null : new Date(this.answerMs).toISOString(),
       outage_active: this.active,
       last_outage_seen_at: this.lastActiveMs == null ? null : new Date(this.lastActiveMs).toISOString(),
+      last_failure: this.failure,
     };
   }
 }
@@ -211,7 +242,7 @@ export function comfortRisk(zones: ZoneTemp[] | null, callingIds: string[] | nul
 
 export interface GenInput {
   nowMs: number;
-  supply: { supply: Supply; why: string };
+  supply: { supply: Supply; why: string; assumed?: boolean };
   /** whole-house draw from a fresh panel read, EXCLUDING the element's circuit; null = unknown */
   houseW: number | null;
   relay: "OPEN" | "CLOSED" | null;
@@ -249,7 +280,7 @@ export function assess(i: GenInput, cfg: GenConfig = DEFAULT_GEN_CONFIG): GenAss
   const projected = i.houseW == null ? null : i.houseW + GEN.ELEMENT_W + cfg.marginW;
   const fits = projected == null ? null : projected <= cfg.capW;
   let allowed = true;
-  let why = "on the grid: no generator limit";
+  let why = i.supply.assumed ? "assumed on the grid (the outage feed is silent): no generator limit" : "on the grid: no generator limit";
   if (applies) {
     const on = i.supply.supply === "generator" ? "on the generator" : "possibly on the generator (supply unknown)";
     if (fits == null) { allowed = false; why = `${on} and the live house load is unknown — the element stays locked out`; }

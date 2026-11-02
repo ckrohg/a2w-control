@@ -178,6 +178,10 @@ domain and is not built.
     this needs a gate episode to reach its close while the house is on the generator. The Pi fallback has no outage
     input and always applies its budget check, so it is unaffected.
   - drift-check [5] asserts the feed daily (#242); `assumed: true` in /health shows when the grid is a guess.
+  - **Silence reaches the owner (#252 review):** a feed silent for 2 h sends one email (`outage-feed-silent`, attention)
+    naming the failure, whichever way the supply reads. A planner restart restarts that 2 h clock.
+  - **A restart keeps the outage (#252 review):** the feed's last answer and last outage live in `outage_feed_memory`, so
+    a deploy mid-outage does not read a silent feed as the grid.
 - **The feed's latency at outage start has never been measured** (see Detection).
 
 ## Residual risks (owner should know)
