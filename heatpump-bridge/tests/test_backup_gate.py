@@ -400,7 +400,9 @@ def test_house_load_falls_back_to_the_panels_site_power():
                 "d": {"name": "EV Charger", "instantPowerW": None}}
     assert house_load(circuits, 28_700.0) == {"w": 12_300.0, "partial_w": 5100.0, "unread": ["EV Charger"], "source": "site"}, \
         "site power counts the element too: it comes back out, the budget adds it at full rating"
-    assert house_load(circuits, 100.0)["w"] == 5100.0, "never below what the readable circuits add up to"
+    assert house_load(circuits, 100.0 + 16400.0) == {"w": None, "partial_w": 5100.0, "unread": ["EV Charger"], "source": None}, \
+        "site power below the readable circuits contradicts them (wrong unit, retained): unknown, not a number that fits"
+    assert house_load(circuits, 5100.0 + 16400.0)["w"] == 5100.0, "exactly the readable sum is consistent: an idle circuit"
     circuits["b"]["instantPowerW"] = None
     assert house_load(circuits, 20_000.0)["w"] == 20_000.0, "element unread: it stays in, the safe side"
     circuits["d"]["instantPowerW"] = -7200.0
@@ -542,8 +544,8 @@ async def test_fallback_close_rechecks_the_budget_on_the_fresh_read(rig):
     assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
 
 
-async def test_fallback_close_is_not_held_for_a_load_the_fresh_read_cannot_see(rig):
-    """A safety close: only a fresh over-budget verdict refuses it, never a missing number."""
+async def test_fallback_close_applies_the_ticks_rule_to_a_load_the_fresh_read_cannot_see(rig):
+    """Unknown load = no close, at the tick and at the close alike: which of the two saw the read must not decide."""
     add_ev(rig, -2.0)
     fb = rig.fallback(live=True)
     rig.p1.fault(); rig.p2.fault()
@@ -553,8 +555,42 @@ async def test_fallback_close_is_not_held_for_a_load_the_fresh_read_cannot_see(r
     if rig.panel.ebus is not None:
         rig.panel.ebus.site_power = ""
     await rig.step(fb, span=False)
+    await settle()
+    assert rig.panel.writes == [] and await fb_events(rig.store) == ["generator_budget"]
+    assert "no power reading for EV Charger" in fb.status()["budget"]["why"]
+    rig.panel.set("EV Charger", instantPowerW=-2.0)        # the reading is back: the next tick closes
+    await rig.step(fb)
     assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
-    assert (await fb_events(rig.store))[0] == "closed"
+
+
+async def test_fallback_a_new_hold_after_a_fit_pages_again(rig):
+    """The owner sheds the load on the first page, the tick fits, the close is held: silence would read as fixed."""
+    add_ev(rig, -7200.0)
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+
+    async def fits_then_held():
+        rig.panel.set("EV Charger", instantPowerW=-2.0)
+        await rig.prime()                                  # the tick's cached read fits…
+        rig.panel.set("EV Charger", instantPowerW=-7200.0)
+        await rig.step(fb, seconds=30.0, span=False)       # …the fresh one at the close does not
+        await settle()
+
+    def pages():
+        return [a for a in rig.alerts if a[0] == "push"]
+    for _ in range(36):
+        await rig.step(fb)
+    await settle()
+    assert len(pages()) == 1
+    await fits_then_held()
+    assert len(pages()) == 2 and rig.panel.writes == []
+    await fits_then_held()                                 # flapping across the cap does not page every minute
+    assert len(pages()) == 2
+    for _ in range(6):
+        await rig.step(fb)
+    await fits_then_held()                                 # past RETRY_S a new hold pages again
+    await settle()
+    assert len(pages()) == 3
 
 
 async def test_fallback_live_with_no_breaker_control_pages_the_manual_close(rig):

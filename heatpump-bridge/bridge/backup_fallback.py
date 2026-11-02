@@ -16,7 +16,9 @@
 # Unknown load = no close. A refused episode is re-checked every tick (the load may drop) and noted once. With a circuit
 # unread, v2's panel-level site power stands in; with neither, the refusal names the circuit, because the fix is at the
 # panel, not the Pi's network. The tick judges a read up to SPAN_FRESH_S old, so the close re-runs the budget on the
-# controller's fresh read (precheck): a fresh over-budget verdict holds it, a fresh unknown does not.
+# controller's fresh read (precheck), by the same rule: a fresh "does not fit" or a fresh unknown holds it for the next
+# tick. A hold noted before a fit is noted again after one (the owner may think the shed load fixed it), at most once per
+# RETRY_S, because a load flapping across the cap must not page every minute.
 # Default SHADOW: audit + record "would close" once per cooldown (never a phone push) and switch nothing until
 # backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
@@ -61,7 +63,8 @@ class BackupFallback:
         self._next_ok: float | None = None        # monotonic: no decision before this (cooldown / retry)
         self._decided = False                     # one decision per all-down episode
         self._refusal_paged = False
-        self._budget_noted = False                # one budget-refusal note per all-down episode
+        self._budget_noted = False                # this hold has been noted (cleared by a fit)
+        self._budget_note_at: float | None = None # monotonic: the last budget note of this episode
         self.budget: dict | None = None           # the last generator-budget check (status)
         self.down: dict[str, str | None] = {}      # pump -> why it is DOWN (None: not down)
         self.pumps: dict[str, dict] = {}            # pump -> {state: down|off|unknown|up, why}
@@ -185,19 +188,17 @@ class BackupFallback:
 
     def _budget_precheck(self, circ: dict) -> str | None:
         """The close's last look: the budget again, on the read the controller took an instant ago (it refreshed the
-        snapshot this reads, so no I/O). Only a fresh "does not fit" refuses: a load this read cannot see leaves the
-        tick's verdict standing, because a safety close is never held for want of a number."""
-        fresh = self.budget_check()
-        if fresh["house_w"] is None:
-            return None
-        self.budget = fresh
-        return None if fresh["fits"] else fresh["why"]
+        snapshot this reads, so no I/O). Same rule as the tick, unknown included: had this read come one tick sooner, the
+        tick would have held the close on it, and an element on a load nobody can see is what trips the generator."""
+        self.budget = self.budget_check()
+        return None if self.budget["fits"] else self.budget["why"]
 
     async def _note_budget(self, held_min: float, relay) -> None:
-        """The element stays off for the generator budget: noted once per all-down episode."""
-        if self._budget_noted:
+        """The element stays off for the generator budget: noted once per hold, at most once per RETRY_S."""
+        now = self._mono()
+        if self._budget_noted or (self._budget_note_at is not None and now - self._budget_note_at < RETRY_S):
             return
-        self._budget_noted = True
+        self._budget_noted, self._budget_note_at = True, now
         await self._decide(
             "generator_budget", "high" if self.cfg.live else "info",
             f"{'' if self.cfg.live else 'SHADOW — nothing was switched. '}Every heat pump has been down "
@@ -228,6 +229,7 @@ class BackupFallback:
             self._decided = False
             self._refusal_paged = False
             self._budget_noted = False
+            self._budget_note_at = None
             self.budget = None
             return
         now = self._mono()
@@ -245,6 +247,7 @@ class BackupFallback:
             if not self.budget["fits"]:
                 await self._note_budget(held_min, relay)
                 return
+            self._budget_noted = False           # it fits: a hold after this is a new one
         self._decided = True
         self._next_ok = now + self.cfg.cooldown_h * 3600
         why = self._why_down()
@@ -283,7 +286,7 @@ class BackupFallback:
         except Exception as exc:  # noqa: BLE001 — a refusal (BreakerRefused) or any error: retried, never latched
             # refused before anything was switched: retry in RETRY_S, page the first refusal of the episode
             self._decided = False
-            if not self.budget["fits"]:      # the fresh read does not fit: a budget hold, re-checked next tick
+            if not self.budget["fits"]:      # the fresh read says no: a budget hold, re-checked next tick
                 self._next_ok = None
                 await self._note_budget(held_min, relay)
                 return

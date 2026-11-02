@@ -166,8 +166,8 @@ class BreakerController:
         `precheck(circ)` (optional, sync) runs on the FRESH panel read immediately before an OPEN
         or a CLOSE is dispatched — no await in between — and refuses the action by returning a
         reason. The self-heal uses it to re-validate pump state at the last possible moment; on a
-        close it stands between a circuit and its write, so it must never touch I/O, and may refuse
-        only on what the read just showed (backup_fallback's generator budget)."""
+        close it stands between a circuit and its write, so it must never touch I/O, and only a
+        caller with its own rule for the circuit passes one (backup_fallback's generator budget)."""
         name = circuit.strip() if isinstance(circuit, str) else ""
         label = name or repr(circuit)
         try:

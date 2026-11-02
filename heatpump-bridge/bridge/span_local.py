@@ -486,8 +486,9 @@ def house_load(circuits: dict, site_w: float | None = None) -> dict:
     this panel; abs also counts any producing circuit as load, the safe side) EXCEPT the backup element's own, which the
     generator budget adds at its full rating. Loads not on a SPAN circuit (none known) are what generator_margin_w is for.
     A circuit with no reading is never 0 W: summing the rest would read a 7 kW EV charger whose value is missing as nothing.
-    With any unread, `w` comes from `site_w`, the panel's own site power (v2), less the element's draw; never below what
-    the readable circuits add up to. No site power either: `w` is None (= unknown, the element stays locked out).
+    With any unread, `w` comes from `site_w`, the panel's own site power (v2), less the element's draw. No site power, or
+    one below what the readable circuits already add up to (it contradicts them, so it cannot be trusted to include the
+    rest): `w` is None (= unknown, the element stays locked out).
     → {w, partial_w: the sum of the circuits that have a reading, unread: their names, source: circuits | site | None}."""
     from .config import BACKUP_ELEMENT_CIRCUIT
     total, element = 0.0, 0.0
@@ -506,8 +507,8 @@ def house_load(circuits: dict, site_w: float | None = None) -> dict:
         else:
             unread.append(name or str(c.get("id")))
     w, source = (round(total, 1), "circuits") if seen and not unread else (None, None)
-    if unread and site_w is not None:
-        w, source = round(max(abs(site_w) - element, total), 1), "site"
+    if unread and site_w is not None and abs(site_w) - element >= total:
+        w, source = round(abs(site_w) - element, 1), "site"
     return {"w": w, "partial_w": round(total, 1), "unread": sorted(unread), "source": source}
 
 
