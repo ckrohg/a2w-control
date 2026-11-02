@@ -26,6 +26,8 @@ export type NotifyOpts = {
   resolved?: boolean;
   /** latch key (notify_latches): suppresses a redeploy's re-fire and replaces the 6bb push on resolve */
   key?: string;
+  /** an all-clear sent again because no channel acknowledged it (housepages.ts): its first attempt took the latch, so it is due at `tier` */
+  retrying?: boolean;
   /** email only (alertemail.ts): what the owner should do — boxed at the top. Required in spirit for page/attention. */
   action?: string;
   /** email only: a short label/value table under the action */
@@ -104,12 +106,14 @@ export class Latches {
 
   /**
    * Release on resolve. Returns the tier the alert was SENT at, or null when nothing was sent for it (so no all-clear
-   * is due). A DB failure returns the caller's tier: an extra all-clear beats a page left hanging.
+   * is due). A DB failure returns the caller's tier: an extra all-clear beats a page left hanging. A retrying all-clear
+   * finds no row, because its first attempt released it: the caller's tier again, since that attempt is the proof.
+   * The latch goes before the send on purpose: a caller that does not retry must not leave one to swallow the next page.
    */
-  async release(key: string, fallback: Tier): Promise<Tier | null> {
+  async release(key: string, fallback: Tier, retrying = false): Promise<Tier | null> {
     try {
       const row = await this.store.deleteNotifyLatch(key);
-      return row ? (row.tier as Tier) : null;
+      return row ? (row.tier as Tier) : retrying ? fallback : null;
     } catch (e) {
       this.log(`notify latch release failed for ${key}: ${(e as Error).message}`);
       return fallback;

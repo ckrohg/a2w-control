@@ -43,13 +43,14 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, type StagePump } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
-import { renderAlertEmail } from "./alertemail";
-import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, piUnreachablePageAfterS, type Tier, type NotifyOpts } from "./alertpolicy";
+import { renderAlertEmail, f0 } from "./alertemail";
+import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
+import { HousePages } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
@@ -398,9 +399,6 @@ function describeFetchError(err: unknown): string {
  *
  * So the tier leads, in the one place with room for it. Only a page gets the siren; if everything shouts, nothing does.
  */
-/** °F for an email fact ("?" when unknown). */
-const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.round(v)} °F`);
-
 async function ntfy(title: string, body: string, priority: string, opts: NotifyOpts): Promise<void> {
   await ntfyDelivered(title, body, priority, opts);
 }
@@ -408,8 +406,8 @@ async function ntfy(title: string, body: string, priority: string, opts: NotifyO
 /**
  * Push (+ email by priority). Resolves true when someone can have heard the alert (alertpolicy.ts acknowledged: an owner
  * channel answered 2xx, or the tier has no owner channel configured) and false otherwise; a keyed open is latched only
- * on true. ntfy() is the fire-and-log form most alerts use; #177's pending-notice path and Phase B's owner pages call
- * this one and act on the answer (codex pass 9).
+ * on true. ntfy() is the fire-and-log form most alerts use; #177's pending-notice path, Phase B's owner pages and the
+ * house pages (housepages.ts) call this one and act on the answer (codex pass 9).
  */
 // ── 6bb push (owner 2026-10-19) ─────────────────────────────────────────────────────────────────────────────
 // ntfy had no subscriber (the owner never installed it — 2026-08-23: "emails are plenty"), so no A2W push ever
@@ -478,11 +476,12 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   }
 
   // Which tier actually applies: a keyed open already sent (this restart's re-fire, or within RENOTIFY_MS) goes no
-  // further; a keyed all-clear is due only if its alert was sent, and at the tier it was sent at.
+  // further; a keyed all-clear is due only if its alert was sent, and at the tier it was sent at (`retrying`: the first
+  // attempt took the latch, and is the proof).
   let tier: Tier = opts.tier;
   let suppressed: string | null = null;
   if (opts.key && resolved) {
-    tier = (await latches.release(opts.key, opts.tier)) ?? "record";
+    tier = (await latches.release(opts.key, opts.tier, opts.retrying)) ?? "record";
     if (tier === "record" && opts.tier !== "record") suppressed = "nothing was sent for it";
   } else if (opts.key && opts.tier !== "record" && !(await latches.due(opts.key))) {
     tier = "record";
@@ -796,21 +795,13 @@ async function checkI8(): Promise<void> {
   }
 }
 
-/**
- * Called-but-not-running (owner ask 2026-07-15; §8.1's capacity-outage rule made live):
- * an HBX stage call is up but NO pump's compressors are running. Requires the condition
- * to persist ≥2 consecutive polls (~10 min) — anti-short-cycle restarts and normal
- * call-to-start ramps are innocent. This is the alarm HP2's silent winter failure never
- * had, and the exact state the A-4 power-cycle produced. Episodes persist for the
- * incident log; edge-triggered ntfy both ways.
- */
-let unservedStreak = 0;
-let unservedAlerted = false;
 // #185: the per-stage alarm (stagewatch.ts). STAGE_PUMP_MAP is the PHYSICAL stage-relay → heat-pump wiring
 // (README §Per-stage unserved alarm says how to verify it at the panel); default {"1":"pump1","2":"pump2"}.
 const STAGE_MAP = parseStagePumpMap(process.env.STAGE_PUMP_MAP);
 if (STAGE_MAP.error) console.warn(STAGE_MAP.error);
 const stageWatch = new StageWatch(STAGE_MAP.map);
+// "No heat", tank cold, freeze risk and Pi unreachable: a page nobody heard goes out again next cycle (housepages.ts)
+const housePages = new HousePages({ send: ntfyDelivered, store, stageMap: STAGE_MAP.map, dhwFloorF: DEFAULT_OPTS.dhwFloorF });
 let stageEpisodes24h: Record<string, number> | null = null;
 let lastLagTMin: number | null = null; // the HBX's lag-stage timer, from this poll's config (named in the page)
 
@@ -1265,59 +1256,14 @@ async function genEpisode(key: "lockout" | "shed", on: boolean, title = "", body
   }
 }
 
-// Owner alert policy: 29 of 36 unserved calls in Sept–Oct cleared within 15 min (start-up, defrost). The buffer tank
-// carries the house for hours, so only a call left unserved this long is a page.
-const UNSERVED_PAGE_POLLS = 9; // ~45 min at the 5-min poll
 async function checkUnservedCall(reading: SlxReading): Promise<void> {
   if (!hub) return;
   const anyStageCall = reading.stagesCalled?.some(Boolean) === true;
-  // one hub read serves both alarms; the stage watch runs first and never changes the all-idle logic below
+  // one hub read serves both alarms; the stage watch runs first and never changes the all-idle logic
   let st: HubState | null = null;
   if (anyStageCall || stageWatch.remindersOpen()) { try { st = await hub.getState(); } catch { st = null; } }
   await checkStages(reading, st, anyStageCall).catch((e) => console.error("stage check failed:", (e as Error).message));
-  if (!anyStageCall) {
-    unservedStreak = 0;
-    if (unservedAlerted) {
-      unservedAlerted = false;
-      await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "The heat call ended or a pump is running again.", "default", { tier: "page", resolved: true, key: "no-heat" });
-    }
-    return;
-  }
-  if (!st) return; // hub unreachable — can't judge; don't false-alarm
-  const running = st.pumps.some((p) => p.online && p.state === "heating");
-  if (running) {
-    unservedStreak = 0;
-    if (unservedAlerted) {
-      unservedAlerted = false;
-      await store.closeUnservedEpisode().catch(() => {});
-      await ntfy("Unserved call cleared", "A pump is running against the call again.", "default", { tier: "page", resolved: true, key: "no-heat" });
-    }
-    return;
-  }
-  if (!piStateUnverifiable(st) && calledStagesAllStopped(reading.stagesCalled, STAGE_MAP.map, st.pumps)) {
-    // #212: every called stage's pump was switched off by a person (6bb / SPAN app / the panel). No heat is the owner's
-    // choice, not a failure: the stage watch's one stopped_reminder covers a forgotten switch-off. The streak restarts.
-    unservedStreak = 0;
-    return;
-  }
-  unservedStreak++;
-  if (unservedStreak >= UNSERVED_PAGE_POLLS && !unservedAlerted) {
-    unservedAlerted = true;
-    const detail = `HBX stage call active ~${unservedStreak * 5} min with no pump running (tank ${reading.tankF ?? "?"}°F / target ${reading.tankTargetF ?? "?"}°F)`;
-    await store.openUnservedEpisode(detail).catch(() => {});
-    await ntfy(
-      "⚠ Heat call active but NO pump is running",
-      `${detail}. Causes: pump powered off, failure-to-start (the HP2 winter pattern), or a write-disabled/faulted unit. The tank is falling while HBX waits.`,
-      "high",
-      // THE "no heat" incident: the per-stage unserved/fault-called episodes are its record-only symptoms
-      { tier: "page", key: "no-heat",
-        action: "Check both heat pumps: is each one powered on, and is either showing a fault code? Power-cycling a faulted pump's breaker at the SPAN panel often clears it.",
-        facts: [["No heat for", `${unservedStreak * 5} min`], ["Tank", `${f0(reading.tankF)} (target ${f0(reading.tankTargetF)})`],
-                ["Outdoor", f0(reading.outdoorF)],
-                ["Pumps", st.pumps.map((p) => `${p.name ?? p.id}: ${p.online ? p.state ?? "?" : "offline"}`).join(" · ")]] },
-    );
-  }
+  await housePages.unservedCall(reading, st, anyStageCall);
 }
 
 /** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
@@ -1339,81 +1285,15 @@ async function checkBackupCalled(called: boolean | null): Promise<void> {
   }
 }
 
-/** DHW-comfort shortfall (owner ask 2026-07-16, load-bearing now that autopilot holds a low buffer):
- *  the buffer sits BELOW the DHW-ready floor for a SUSTAINED period — the HPs can't hold hot-water temp
- *  (a big draw, a genuine capacity shortfall, or a stuck-low autopilot target). This is the gap I8 does
- *  NOT cover: I8 verifies a daily HOT soak; this catches the opposite — the tank running too COLD to
- *  shower. Detection + high-priority page only (the HBX's own bkLag escalates to the element on a real
- *  drawn-down call, breaker permitting; auto-raising the target here would fight autopilot's rate-limit).
- *  Edge-triggered both ways. */
-const DHW_SHORTFALL_F = 113;   // below the 45 °C unattended floor → clearly cold for delivery (normal cycle bottoms ~117°F)
-const DHW_SHORTFALL_POLLS = 12; // ~60 min sustained at the 5-min poll — a draw dip recovers well inside that (alert-policy.md)
-let dhwShortfallStreak = 0;
-let dhwShortfallAlerted = false;
-async function checkDHWShortfall(reading: SlxReading): Promise<void> {
-  if (reading.tankF == null) return;
-  if (reading.tankF >= DHW_SHORTFALL_F) {
-    dhwShortfallStreak = 0;
-    if (dhwShortfallAlerted) {
-      dhwShortfallAlerted = false;
-      await ntfy("DHW shortfall cleared", `Buffer back to ${reading.tankF.toFixed(0)}°F — hot water recovered.`, "default", { tier: "page", resolved: true, key: "dhw-shortfall" });
-    }
-    return;
-  }
-  dhwShortfallStreak++;
-  if (dhwShortfallStreak >= DHW_SHORTFALL_POLLS && !dhwShortfallAlerted) {
-    dhwShortfallAlerted = true;
-    // one incident, one page: a cold tank while the "no heat" page is open is that incident's symptom (Oct 11 and
-    // Oct 15 2026, HP2 E21: both fired for the same outage)
-    const tier: Tier = unservedAlerted ? "record" : "page";
-    await ntfy(
-      "⚠ DHW comfort shortfall — buffer running cold",
-      `Buffer ${reading.tankF.toFixed(0)}°F, below the ${Math.round(DEFAULT_OPTS.dhwFloorF)}°F DHW-ready floor for ~${dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
-      "high",
-      { tier, key: "dhw-shortfall",
-        action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
-        facts: [["Tank", `${f0(reading.tankF)} for ${dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(DEFAULT_OPTS.dhwFloorF)]] },
-    );
-  }
-}
-
-/** Freeze-risk advisory (owner ask 2026-07-16): deep cold AND a low buffer at the same time. The HBX
- *  P17 anti-freeze is the hard device-side backstop; this is planner visibility so the owner knows to
- *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only); edge-triggered. */
-const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
-const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
-let freezeRiskAlerted = false;
 // #122 Wave 2. #116 established that NOTHING watched the writer lease: a planner that is up,
 // healthy and silently not commanding setpoints read as fine everywhere. Same for a Pi that has
 // gone quiet -- the 2026-09-16 incident was a 73-minute WiFi drop on a calm day, and the only
-// reason anyone noticed was that a human happened to be looking. Both are edge-triggered so a
-// long outage pages once, not every poll.
+// reason anyone noticed was that a human happened to be looking. A long outage pages once a
+// channel has heard it, not every poll.
 let leaseLostSince: number | null = null;
 let leaseAlerted = false;
 let lastPiConnected: boolean | null = null; // cached from checkI1's existing hub read
-let piDisconnectedSince: number | null = null;
-let piQuietAlerted = false;
-let piQuietPaged = false;
 const LEASE_LOST_ALERT_S = 900;  // past the ~11-15 min handover a redeploy legitimately causes
-const PI_QUIET_ALERT_S = 600;
-async function checkFreezeRisk(reading: SlxReading): Promise<void> {
-  if (reading.outdoorF == null || reading.tankF == null) return;
-  const risk = reading.outdoorF <= FREEZE_OUTDOOR_F && reading.tankF < FREEZE_TANK_F;
-  if (risk && !freezeRiskAlerted) {
-    freezeRiskAlerted = true;
-    await ntfy(
-      "⚠ Freeze-risk advisory",
-      `Outdoor ${reading.outdoorF.toFixed(0)}°F with the buffer only ${reading.tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,
-      "urgent",
-      { tier: "page", key: "freeze-risk", // house-threatening, intervene now
-        action: "Make sure both heat pumps are running and the backup element breaker is ON at the SPAN panel.",
-        facts: [["Outdoor", f0(reading.outdoorF)], ["Tank", f0(reading.tankF)]] },
-    );
-  } else if (!risk && freezeRiskAlerted) {
-    freezeRiskAlerted = false;
-    await ntfy("Freeze-risk cleared", `Outdoor ${reading.outdoorF.toFixed(0)}°F / buffer ${reading.tankF.toFixed(0)}°F — back in range.`, "default", { tier: "page", resolved: true, key: "freeze-risk" });
-  }
-}
 
 // Non-blocking single-writer guard (#36): heartbeat this instance every poll and page if a
 // SECOND planner instance is ever live against the shared DB (only one may write the HBX). It
@@ -2268,40 +2148,7 @@ async function checkLeaseAndPi(): Promise<void> {
     // in-memory copy of the Pi's last push (hub/src/index.ts:275), so it never reaches the Pi
     // either -- but a second redundant read per poll is still waste, and on a bridge with an open
     // comm-degradation bug (#76) the right default is to add no round-trips at all.
-    const connected = lastPiConnected;
-    if (connected === null) return;      // no reading yet this process; say nothing
-    if (!connected) {
-      piDisconnectedSince ??= Date.now();
-      const downS = Math.round((Date.now() - piDisconnectedSince) / 1000);
-      if (downS >= PI_QUIET_ALERT_S && !piQuietAlerted) {
-        piQuietAlerted = true;
-        await ntfy("Pi disconnected", `The bridge has been disconnected for ~${Math.round(downS / 60)} min.`, "high", { tier: "record" });
-      }
-      // THE "Pi unreachable" incident (hub dead-man, SPAN-local stale and I8-blind are its record-only symptoms). The
-      // pumps hold their lease-reverted setpoints and the HBX keeps running its curve without the Pi, so this is a
-      // page only after hours — sooner when it is freezing out (piUnreachablePageAfterS).
-      const pageAfterS = piUnreachablePageAfterS(lastOutdoorF);
-      if (downS >= pageAfterS && !piQuietPaged) {
-        piQuietPaged = true;
-        await ntfy(
-          "Pi unreachable",
-          `The heat-pump bridge (Pi) has not reported for ~${(downS / 3600).toFixed(1)} h` +
-            (lastOutdoorF != null ? ` with ${Math.round(lastOutdoorF)}°F outside` : "") + `. The pumps hold their ` +
-            `lease-reverted setpoints and the HBX keeps heating on its own curve, but A2W cannot see or optimize the plant. ` +
-            `Check the Pi's power and the house internet/WiFi (the Pi is 6bb-a2w-control at 192.168.184.197).`,
-          "high",
-          { tier: "page", key: "pi-unreachable",
-            action: "Check the Pi (6bb-a2w-control) has power, and that the house internet and WiFi are up. Unplugging and replugging the Pi is safe.",
-            facts: [["Silent for", `${(downS / 3600).toFixed(1)} h`], ["Outdoor", f0(lastOutdoorF)]] },
-        );
-      }
-    } else {
-      if (piQuietAlerted) {
-        await ntfy("Pi reconnected", "The bridge is pushing state again.", "default",
-                   piQuietPaged ? { tier: "page", resolved: true, key: "pi-unreachable" } : { tier: "record", resolved: true });
-      }
-      piDisconnectedSince = null; piQuietAlerted = false; piQuietPaged = false;
-    }
+    await housePages.piLink(lastPiConnected, lastOutdoorF);
   } catch { /* hub unreachable is already covered by the poll-failure path */ }
 }
 
@@ -2368,8 +2215,8 @@ async function pollOnce(): Promise<void> {
   await checkBackupGate(reading)
     .catch((e) => { backupGateError = `gate: ${(e as Error).message}`; console.error("backup gate failed:", backupGateError); });
 
-  await checkDHWShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
-  await checkFreezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
+  await housePages.dhwShortfall(reading).catch((e) => console.error("dhw-shortfall check failed:", (e as Error).message));
+  await housePages.freezeRisk(reading).catch((e) => console.error("freeze-risk check failed:", (e as Error).message));
   await checkSingleWriter().catch((e) => console.error("single-writer check failed:", (e as Error).message));
   if (WRITER_LEASE_ENABLED && !shuttingDown) {
     // Renew/claim the lease BEFORE this cycle's writes so the writer holds a fresh lease. (Not while shutting
@@ -2641,7 +2488,7 @@ async function main(): Promise<void> {
             // #185: the all-idle alarm beside the per-stage watch (stage → mapped pump, called-not-heating minutes,
             // open episodes) and episodes opened in 24 h. STAGE_PUMP_MAP is the physical wiring (README).
             unserved: {
-              all_idle: { alerted: unservedAlerted, streak: unservedStreak },
+              all_idle: housePages.allIdle(),
               stage_pump_map: STAGE_MAP.map, stage_pump_map_error: STAGE_MAP.error,
               stages: stageWatch.status(), episodes_24h: stageEpisodes24h, lag_t_min: lastLagTMin,
             },
