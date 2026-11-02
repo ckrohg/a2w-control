@@ -5,7 +5,9 @@
 #     while the owner's arm intent is ARMED; power_cycle stays refused; allow_open stays refused in config;
 #   - backup_fallback.py (every pump down for hold_min → close, no cloud): SHADOW by default (audit + page "would close",
 #     nothing switched), live closes and never opens, one pump up = nothing, a Modbus-stale pump the panel shows running
-#     is not down, already-ON is a no-op, a refusal retries, cooldown, and its status rides the hub state frame.
+#     is not down, already-ON is a no-op, a refusal retries, cooldown, and its status rides the hub state frame;
+#   - the planner gate's close through the hub: budget-checked on the controller's fresh read only with the planner's
+#     flag on the gate's own close, so a close on the grid and a dashboard close are never held (#241).
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +19,9 @@ from pydantic import ValidationError
 
 from bridge import backup_fallback as bf_mod
 from bridge import span_control
-from bridge.backup_fallback import BackupFallback
-from bridge.config import BackupFallbackConfig, BreakerCircuit, SpanConfig
+from bridge.backup_fallback import BackupFallback, generator_budget
+from bridge.config import BackupFallbackConfig, BreakerCircuit, HubConfig, SpanConfig
+from bridge.hub_client import HubClient
 from bridge.span_control import BreakerController, BreakerRefused
 from bridge.span_local import SpanLocalPoller, house_load, write_arm_intent
 from bridge.store import Store
@@ -613,6 +616,132 @@ async def test_fallback_shadow_with_no_breaker_control_stays_record_only(rig):
     await settle()
     assert await fb_events(rig.store) == ["would_close"]
     assert not any(a[0] in ("email", "push") for a in rig.alerts)
+
+
+# --- the planner gate's close through the hub: the budget binds only when the planner says it applies ------------------
+GENERATOR = {"source": "backup-gate", "generator_budget": True}
+
+
+class HubLink:
+    """The hub's end of the socket: what the bridge acked."""
+
+    def __init__(self):
+        self.acks: list[dict] = []
+
+    async def send(self, raw: str) -> None:
+        self.acks.append(json.loads(raw))
+
+
+async def hub_breaker(ctl, op="close", *, budget=None, circuit="Buffer Tank", **fields) -> dict:
+    hc = HubClient(HubConfig(), {}, budget)
+    hc.span = ctl
+    link = HubLink()
+    await hc._handle_breaker(link, {"command_id": "c1", "circuit": circuit, "op": op, **fields})
+    return link.acks[-1]
+
+
+def winter_load(rig):
+    """The gate's normal winter close: 1.2 kW base + 5.1 kW pump + 16.5 + 2.4 = 25.2 kW against the 24 kW cap."""
+    rig.panel.set("Air-Water 1", instantPowerW=-5100.0)
+    rig.panel.set("Kitchen", instantPowerW=-1192.0)
+
+
+async def test_gate_close_without_the_flag_is_not_budget_checked(rig):
+    """The planner says the grid. The Pi can't tell, so refusing here is the defect #252 fixed."""
+    winter_load(rig)
+    ack = await hub_breaker(rig.ctl, source="backup-gate")
+    assert ack["ok"] is True and rig.panel.writes == [("Buffer Tank", "CLOSED")]
+    assert rig.ctl.snapshot()["house_w"] == 6300.0, "over the budget, and it closed: nothing judged it"
+
+
+async def test_gate_close_on_the_generator_is_held_on_a_fresh_over_budget_read(rig):
+    await rig.prime()                                      # the read the planner judged: it fits
+    assert rig.ctl.snapshot()["house_w"] == 66.0
+    winter_load(rig)                                       # the load the close would land on
+    ack = await hub_breaker(rig.ctl, **GENERATOR)
+    assert rig.panel.writes == [] and rig.panel.relay("Buffer Tank") == "OPEN"
+    why = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 24.0 kW generator cap"
+    assert ack["ok"] is False and ack["detail"] == why, "the planner's notice quotes this, with no 'refused: precheck:'"
+    assert ack["result"]["budget_held"] is True and ack["result"]["refused"] is True
+    ev = [e for e in await rig.store.get_events("span", 1) if e["type"] == "span_breaker"]
+    assert [e["code"] for e in ev] == ["refused"] and "hub:backup-gate" in ev[0]["message"], "audited"
+    await settle()
+    assert not any(a[0] in ("push", "email") for a in rig.alerts), "the planner's episode carries the notice"
+    # the load drops: the same command closes
+    rig.panel.set("Air-Water 1", instantPowerW=-8.0)
+    assert (await hub_breaker(rig.ctl, **GENERATOR))["ok"] is True
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_gate_close_on_the_generator_is_held_on_a_fresh_unknown_read(rig):
+    """Unknown load = no close: an element on a load nobody can see is what trips the generator."""
+    await rig.prime()
+    add_ev(rig, None)
+    if rig.panel.ebus is not None:
+        rig.panel.ebus.site_power = ""                     # no panel-level reading to stand in
+    ack = await hub_breaker(rig.ctl, **GENERATOR)
+    assert rig.panel.writes == [] and ack["ok"] is False and ack["result"]["budget_held"] is True
+    assert ack["detail"] == ("the live house load is unknown: the panel gives no power reading for EV Charger "
+                             "(the other circuits add up to 0.1 kW)")
+
+
+async def test_gate_close_on_the_generator_closes_when_the_fresh_read_fits(rig):
+    ack = await hub_breaker(rig.ctl, **GENERATOR)
+    assert ack["ok"] is True and "budget_held" not in ack["result"]
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_gate_close_uses_the_pis_own_budget_numbers(rig):
+    winter_load(rig)
+    ack = await hub_breaker(rig.ctl, budget=BackupFallbackConfig(generator_cap_w=30000.0), **GENERATOR)
+    assert ack["ok"] is True and rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+@pytest.mark.parametrize("source", [None, "armed-dashboard"])
+async def test_dashboard_close_is_never_budget_checked(rig, source):
+    """A human override: a flag on one changes nothing, and only the gate's source label arms the check."""
+    winter_load(rig)
+    ack = await hub_breaker(rig.ctl, source=source, generator_budget=True)
+    assert ack["ok"] is True and rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
+async def test_the_budget_binds_only_a_close(rig):
+    """An open sheds the element: holding one on the generator budget would keep the load the budget is about."""
+    _, ctl = rig.controller(backup_reopen=True)
+    rig.panel.set("Buffer Tank", relayState="CLOSED", instantPowerW=0.0)
+    winter_load(rig)
+    ack = await hub_breaker(ctl, "open", **GENERATOR)
+    assert ack["ok"] is True and rig.panel.writes == [("Buffer Tank", "OPEN")]
+    await ctl.stop()
+
+
+async def test_another_guards_refusal_of_the_gates_close_is_not_a_budget_hold(rig):
+    """Only the budget's own "no" reads as the generator rule; every other guard stays an ordinary refusal."""
+    winter_load(rig)
+    rig.panel.set("Buffer Tank", isUserControllable=False)
+    ack = await hub_breaker(rig.ctl, **GENERATOR)
+    assert ack["ok"] is False and ack["result"]["refused"] is True and "budget_held" not in ack["result"]
+    assert ack["detail"].startswith("refused: ") and "isUserControllable" in ack["detail"]
+
+
+async def test_the_gates_budget_check_is_the_fallbacks(rig):
+    """One rule: the hub path and the fallback read the same snapshot and must say the same thing."""
+    winter_load(rig)
+    fb = rig.fallback()
+    await rig.prime()
+    assert generator_budget(rig.ctl.snapshot(), fb.cfg) == fb.budget_check()
+    assert fb.budget_check()["fits"] is False
+
+
+def test_generator_budget_needs_no_fallback_and_no_read():
+    cfg = SimpleNamespace(element_w=16500.0, generator_margin_w=2400.0, generator_cap_w=24000.0)
+    assert generator_budget({"house_w": 5100.0}, cfg)["fits"] is True, "exactly at the cap fits"
+    assert generator_budget({"house_w": 5101.0}, cfg)["fits"] is False
+    unknown = {"fits": False, "house_w": None, "projected_w": None,
+               "why": "the live house load is unknown (no fresh panel read)"}
+    assert generator_budget(None, cfg) == unknown
+    assert generator_budget({"house_w": None}, cfg) == unknown
+    assert generator_budget({"house_w": True}, cfg) == unknown, "a bool is not a power"
 
 
 def test_generator_budget_config_bounds():

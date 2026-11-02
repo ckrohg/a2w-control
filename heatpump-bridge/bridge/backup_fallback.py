@@ -43,6 +43,28 @@ EVENT_PUMP_ID = "span"
 EVENT_TYPE = "backup_fallback"
 
 
+def generator_budget(snap: dict | None, cfg) -> dict:
+    """#241: would the element fit on a ~24 kW generator right now? {fits, house_w, projected_w, why}. `snap` is a
+    BreakerController.snapshot() (None: no fresh one), `cfg` carries the numbers (BackupFallbackConfig). No I/O and no
+    BackupFallback: it runs between a fresh panel read and the write, for this fallback and for the planner gate's close
+    (hub_client), and an unknown load never fits."""
+    house = snap.get("house_w") if snap else None
+    detail = (snap.get("house") if snap else None) or {}
+    unread = ", ".join(detail.get("unread") or [])
+    if not isinstance(house, (int, float)) or isinstance(house, bool):
+        return {"fits": False, "house_w": None, "projected_w": None, "why": (
+            f"the live house load is unknown: the panel gives no power reading for {unread} (the other circuits add "
+            f"up to {detail.get('partial_w', 0) / 1000:.1f} kW)" if unread
+            else "the live house load is unknown (no fresh panel read)")}
+    projected = house + cfg.element_w + cfg.generator_margin_w
+    fits = projected <= cfg.generator_cap_w
+    return {"fits": fits, "house_w": round(house), "projected_w": round(projected),
+            "why": (f"house {house / 1000:.1f} kW + element {cfg.element_w / 1000:.1f} kW + margin "
+                    f"{cfg.generator_margin_w / 1000:.1f} kW = {projected / 1000:.1f} kW "
+                    f"{'fits under' if fits else 'exceeds'} the {cfg.generator_cap_w / 1000:.1f} kW generator cap"
+                    + (f" (panel site power: no reading for {unread})" if unread else ""))}
+
+
 class BackupFallback:
     def __init__(self, cfg, pollers: dict, breakers, store, *, notify_cfg=None, circuits: dict | None = None,
                  clock=time.time, mono=time.monotonic, stops=None):
@@ -168,23 +190,7 @@ class BackupFallback:
         return "down", f"is offline and its circuit draws {draw:.0f} W (not running)"
 
     def budget_check(self) -> dict:
-        """#241: would the element fit on a ~24 kW generator right now? {fits, house_w, projected_w, why}."""
-        snap = self._span()
-        house = snap.get("house_w") if snap else None
-        detail = (snap.get("house") if snap else None) or {}
-        unread = ", ".join(detail.get("unread") or [])
-        if not isinstance(house, (int, float)) or isinstance(house, bool):
-            return {"fits": False, "house_w": None, "projected_w": None, "why": (
-                f"the live house load is unknown: the panel gives no power reading for {unread} (the other circuits add "
-                f"up to {detail.get('partial_w', 0) / 1000:.1f} kW)" if unread
-                else "the live house load is unknown (no fresh panel read)")}
-        projected = house + self.cfg.element_w + self.cfg.generator_margin_w
-        fits = projected <= self.cfg.generator_cap_w
-        return {"fits": fits, "house_w": round(house), "projected_w": round(projected),
-                "why": (f"house {house / 1000:.1f} kW + element {self.cfg.element_w / 1000:.1f} kW + margin "
-                        f"{self.cfg.generator_margin_w / 1000:.1f} kW = {projected / 1000:.1f} kW "
-                        f"{'fits under' if fits else 'exceeds'} the {self.cfg.generator_cap_w / 1000:.1f} kW generator cap"
-                        + (f" (panel site power: no reading for {unread})" if unread else ""))}
+        return generator_budget(self._span(), self.cfg)
 
     def _budget_precheck(self, circ: dict) -> str | None:
         """The close's last look: the budget again, on the read the controller took an instant ago (it refreshed the

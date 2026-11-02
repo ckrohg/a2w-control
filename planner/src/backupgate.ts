@@ -16,7 +16,7 @@
  * AND every pump is healthy, continuously for OPEN_HOLD — only a breaker the GATE closed, never sooner than MIN_DWELL
  * after its last action. Thresholds are MEASURED: knowledge/reference/backup-gate-thresholds.md. On the generator (#241,
  * generator.ts) a close the rules want is refused unless the house load leaves room for the element and the house is
- * getting cold: knowledge/reference/generator-outage-mode.md.
+ * getting cold, and live the Pi re-checks the budget on its fresh panel read: knowledge/reference/generator-outage-mode.md.
  *
  * Clocks follow stagewatch.ts: time is credited only between two consecutive qualifying observations ≤ MAX_STEP apart;
  * a non-qualifying observation resets the clock; a BLIND observation (hub/Pi state unverifiable, SensorLinx field
@@ -166,7 +166,7 @@ export class BackupGate {
   private byGate = false;
   private lastActionMs: number | null = null;
   private overrideUntilMs: number | null = null;
-  private pending: { kind: "close" | "open"; rule: GateRule; atMs: number } | null = null;
+  private pending: { kind: "close" | "open"; rule: GateRule; atMs: number; ctx: string } | null = null;
   private retryAtMs: number | null = null;
   /** live: a refused command (a bridge guard said no) is not retried until its condition ends */
   private standDown: "close" | "open" | null = null;
@@ -324,14 +324,7 @@ export class BackupGate {
         this.genLockout = i.generator.why;
         if (!this.genLockoutNoted) {
           this.genLockoutNoted = true;
-          out.push(this.ev(now, {
-            kind: "generator_lockout", rule, priority: "default",
-            title: this.mode === "live" ? "Backup element: generator rule holds the breaker OFF"
-              : "Backup element gate (shadow): would close, but the generator rule says no",
-            body: `${this.mode === "live" ? "" : "SHADOW — nothing was switched. "}Rule ${rule} wants the 16.5 kW element ` +
-              `available, but ${i.generator.why}. The element stays locked out while that holds; the gate re-checks every ` +
-              `poll. ${ctx}`,
-          }));
+          out.push(this.lockoutEvent(now, rule, i.generator.why, ctx));
         }
         return out;
       }
@@ -363,6 +356,16 @@ export class BackupGate {
     return out;
   }
 
+  private lockoutEvent(now: number, rule: GateRule, why: string, ctx: string): GateEvent {
+    return this.ev(now, {
+      kind: "generator_lockout", rule, priority: "default",
+      title: this.mode === "live" ? "Backup element: generator rule holds the breaker OFF"
+        : "Backup element gate (shadow): would close, but the generator rule says no",
+      body: `${this.mode === "live" ? "" : "SHADOW — nothing was switched. "}Rule ${rule} wants the 16.5 kW element ` +
+        `available, but ${why}. The element stays locked out while that holds; the gate re-checks every poll. ${ctx}`,
+    });
+  }
+
   private context(i: GateInput, c: GateConditions): string {
     const ps = (i.pumps ?? []).map((p) => `${label(p)} ${p.online ? p.state ?? "?" : "offline"}${p.stageEpisode ? " (stage episode open)" : ""}`).join(", ");
     return `Tank ${c.tank_f ?? "?"} °F / target ${c.target_f ?? "?"} °F, rise ${c.rise_f ?? "?"} °F over 20 min, ` +
@@ -387,7 +390,7 @@ export class BackupGate {
             `${shadow ? "Live (with re-open enabled), A2W would switch" : "A2W switched (relay read-back verified)"} the Buffer Tank breaker back OFF. ${ctx}`,
         };
     if (shadow) this.transition(now, kind);
-    else this.pending = { kind, rule, atMs: now };
+    else this.pending = { kind, rule, atMs: now, ctx };
     return this.ev(now, e);
   }
 
@@ -396,12 +399,23 @@ export class BackupGate {
    * (nothing was switched; retrying cannot help): the gate stands down until the condition ends. Otherwise (no Pi,
    * timeout) it retries after RETRY_MS and, should the command land late, the relay read confirms it. Returns whether
    * to page the failure — once per episode.
+   * heldWhy = the Pi held a close on the generator budget, on its fresh panel read. That is the generator rule at work
+   * and retrying CAN help (the load may drop), so it reads as the gate's own lockout: no failure page, no stand-down,
+   * the next poll re-checks, and `lockout` carries the one notice of the episode.
    */
-  applied(ok: boolean, nowMs: number, refused = false): { page: boolean } {
+  applied(ok: boolean, nowMs: number, refused = false, heldWhy: string | null = null): { page: boolean; lockout?: GateEvent | null } {
     const p = this.pending;
     if (!p) return { page: false };
     this.pending = null;
     if (ok) { this.transition(nowMs, p.kind); this.retryAtMs = null; this.unconfirmed = null; return { page: false }; }
+    if (heldWhy != null) {
+      this.unconfirmed = null;
+      this.genLockout = `the Pi's fresh panel read says no: ${heldWhy}`;
+      const e = this.lockoutEvent(nowMs, p.rule, this.genLockout, p.ctx); // also replaces act()'s "A2W closed" last_event
+      const first = !this.genLockoutNoted;
+      this.genLockoutNoted = true;
+      return { page: false, lockout: first ? e : null };
+    }
     if (refused) { this.standDown = p.kind; this.unconfirmed = null; }
     else { this.retryAtMs = nowMs + BG.RETRY_MS; this.unconfirmed = { kind: p.kind, atMs: nowMs }; }
     const page = !this.failPaged;

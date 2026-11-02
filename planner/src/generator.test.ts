@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { BackupGate, type GateEvent, type GatePump } from "./backupgate";
 import { StageWatch, DEFAULT_STAGE_PUMP_MAP } from "./stagewatch";
-import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type Comfort, type ZoneTemp } from "./generator";
+import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, piBudgetCheck, shedNotice, type Comfort, type ZoneTemp } from "./generator";
 import { episodeTier } from "./alertpolicy";
 
 const BASE_W = 1_211;  // SPAN power-flows/site, 2026-10-29
@@ -239,6 +239,16 @@ const UNK = { supply: "unknown" as const, why: "the outage feed has not answered
   assert.equal(houseLoadW(1000, { ts: 800, house_w: 1211 }), null, "a panel read 200 s older than the frame is stale");
   assert.equal(houseLoadW(1000, { ts: 990 }), null, "an older bridge without house_w: unknown");
   assert.equal(houseLoadW(null, { ts: 990, house_w: 5 }), null);
+  // the Pi re-checks the budget at the close only when it applies here: on the grid the gate's normal winter close is
+  // 25.2 kW against the 24 kW cap, and it must go through (#252); an open adds no load
+  const winter = BASE_W + PUMP_W;
+  assert.equal(piBudgetCheck("close", a(winter, warm, GRID)), false, "grid: unchecked, the load does not matter");
+  assert.equal(piBudgetCheck("close", a(null, warm, GRID)), false);
+  assert.equal(piBudgetCheck("close", a(winter, cold, { ...GRID, assumed: true } as typeof GRID)), false,
+    "a grid assumed from a silent feed is the grid to the gate: the known gap of the owner's 2026-11-01 rule");
+  assert.equal(piBudgetCheck("close", a(BASE_W, cold, GENR)), true, "generator: checked on the Pi's fresh read");
+  assert.equal(piBudgetCheck("close", a(BASE_W, cold, UNK)), true, "unknown supply is the generator rule");
+  assert.equal(piBudgetCheck("open", a(BASE_W, cold, GENR)), false);
 }
 
 // ── 5. REPLAY the Oct 15–16 incident with an outage laid over it ─────────────────────────────────────────────────────

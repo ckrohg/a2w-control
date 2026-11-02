@@ -24,6 +24,9 @@ export interface BreakerCommand {
   /** audit label the bridge records ("hub:<source>"): the dashboard by default, "backup-gate" for the planner's live
    *  backup-element gate. A label, not a permission — every caller needs the client bearer AND the arm token. */
   source: string;
+  /** the planner's supply check says the generator budget applies (#241): the bridge re-checks it on its fresh panel
+   *  read right before the backup gate's close. Relayed as sent; the bridge ignores it on any other command. */
+  generator_budget: boolean;
 }
 
 export const DEFAULT_BREAKER_SOURCE = "armed-dashboard";
@@ -56,7 +59,13 @@ export function validateBreakerBody(body: unknown): Validated {
     }
     source = b.source;
   }
-  return { ok: true, cmd: { circuit: b.circuit.trim(), op: b.action as BreakerAction, off_s: offS, source } };
+  if (b.generator_budget !== undefined && b.generator_budget !== null && typeof b.generator_budget !== "boolean") {
+    return { ok: false, detail: "generator_budget must be a boolean when provided" };
+  }
+  return {
+    ok: true,
+    cmd: { circuit: b.circuit.trim(), op: b.action as BreakerAction, off_s: offS, source, generator_budget: b.generator_budget === true },
+  };
 }
 
 /** How long to wait for the Pi's ack: a power cycle holds off_s before it can answer. */

@@ -300,6 +300,12 @@ export function shedNotice(mode: string, g: GenAssessment): { title: string; bod
   };
 }
 
+/** Should the Pi re-check the budget on its fresh panel read before this gate command? Only a close, and only when the
+ *  budget applies here: the Pi can't tell the grid from the generator, and on the grid the gate's normal winter close
+ *  (every pump running) is over the budget. The planner's own check above judged a read up to HOUSE_FRESH_S old. */
+export const piBudgetCheck = (kind: "close" | "open", g: Pick<GenAssessment, "budget_applies">): boolean =>
+  kind === "close" && g.budget_applies;
+
 /** The live house load from the Pi's SPAN snapshot: `house_w` (bridge ≥ #241), only when that panel read was fresh
  *  when the frame was pushed (both clocks are the Pi's, so no skew). */
 export function houseLoadW(frameTs: number | null, span: { ts?: number | null; house_w?: unknown } | null | undefined): number | null {

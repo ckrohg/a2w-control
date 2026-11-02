@@ -510,7 +510,7 @@ app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) =
 });
 
 /**
- * POST /api/breaker — body {circuit, action: "power_cycle"|"close"|"open", off_s?, source?} (owner decision
+ * POST /api/breaker — body {circuit, action: "power_cycle"|"close"|"open", off_s?, source?, generator_budget?} (owner decision
  * 2026-10-18: remote SPAN breaker control through the panel's LOCAL API, because the SPAN app's
  * cloud path cannot switch circuits here). Gated exactly like /api/write-enable: the client
  * bearer AND X-Arm-Token (HUB_ARM_TOKEN), which the dashboard releases only after a fresh
@@ -577,6 +577,7 @@ app.post("/api/breaker", requireClientAuth, (req: Request, res: Response) => {
       op: cmd.op,
       off_s: cmd.off_s,
       source: cmd.source,
+      generator_budget: cmd.generator_budget,
     }));
   } catch (err) {
     if (pending.delete(commandId)) {

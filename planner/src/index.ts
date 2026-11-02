@@ -45,7 +45,7 @@ import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
-import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
+import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, piBudgetCheck, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
@@ -1198,11 +1198,13 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
       // answer. A refusal (a bridge guard said no) stands the gate down for the episode; no Pi / no answer retries after
       // BG.RETRY_MS, and a late landing is confirmed from the relay. Either way the failure pages ONCE per episode.
       const fresh = !shuttingDown && (!WRITER_LEASE_ENABLED || await store.holdsWriterLease(INSTANCE_ID, INSTANCE_FRESH_MS));
+      // #241: a close the Pi's fresh read holds on the generator budget is the generator rule, not a failed command
       const r = !HUB_ARM_TOKEN ? { ok: false, refused: true, detail: "HUB_ARM_TOKEN is not set on the planner" }
         : !fresh ? { ok: false, refused: false, detail: "lost the writer lease" }
-        : await hub.sendBreaker(BACKUP_CIRCUIT, e.kind, HUB_ARM_TOKEN, "backup-gate");
-      const { page } = backupGate.applied(r.ok, Date.now(), r.refused);
-      backupGateError = r.ok ? null : `${e.kind} ${r.refused ? "refused" : "failed"}: ${r.detail}`;
+        : await hub.sendBreaker(BACKUP_CIRCUIT, e.kind, HUB_ARM_TOKEN, "backup-gate", piBudgetCheck(e.kind, genAssessment));
+      const { page, lockout } = backupGate.applied(r.ok, Date.now(), r.refused, r.budgetHeld ? r.detail : null);
+      if (lockout) await genEpisode("lockout", true, lockout.title, lockout.body);
+      backupGateError = r.ok || r.budgetHeld ? null : `${e.kind} ${r.refused ? "refused" : "failed"}: ${r.detail}`;
       if (!r.ok) {
         if (page) {
           await ntfyDelivered(`A2W could not ${e.kind} the backup element breaker`,

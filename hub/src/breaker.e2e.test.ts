@@ -163,6 +163,10 @@ async function test(name: string, fn: () => Promise<void>) {
       capabilities: ["breaker"], span,
       reply: (cmd) => {
         if (cmd.circuit === "Silent") return null;                         // never acks
+        if (cmd.circuit === "Over Budget") {
+          return { ok: false, detail: "25.2 kW exceeds the 24.0 kW generator cap",
+                   result: { ok: false, refused: true, budget_held: true, status: 409 } };
+        }
         if (cmd.circuit === "Buffer Tank") {
           return { ok: false, detail: "refused: close-only", result: { ok: false, refused: true } };
         }
@@ -196,6 +200,29 @@ async function test(name: string, fn: () => Promise<void>) {
       assert.equal(r.status, 200);
       assert.equal(pi.commands.at(-1)!.source, "backup-gate");
       assert.equal((await hub.post({ circuit: "Air-Water 2", action: "close", source: "Not OK" }, AUTH)).status, 400);
+    });
+
+    await test("generator_budget reaches the Pi as sent; a dashboard close carries false; junk → 400", async () => {
+      const gate = { circuit: "Air-Water 2", action: "close", source: "backup-gate" };
+      assert.equal((await hub.post({ ...gate, generator_budget: true }, AUTH)).status, 200);
+      assert.equal(pi.commands.at(-1)!.generator_budget, true);
+      assert.equal((await hub.post(gate, AUTH)).status, 200);
+      assert.equal(pi.commands.at(-1)!.generator_budget, false);
+      assert.equal((await hub.post({ circuit: "Air-Water 2", action: "close" }, AUTH)).status, 200);
+      assert.equal(pi.commands.at(-1)!.generator_budget, false);
+      const sent = pi.commands.length;
+      assert.equal((await hub.post({ ...gate, generator_budget: "yes" }, AUTH)).status, 400);
+      assert.equal(pi.commands.length, sent, "nothing reached the Pi");
+    });
+
+    await test("a generator-budget hold → 502 with budget_held relayed, so the planner can tell it from a failure", async () => {
+      const r = await hub.post({ circuit: "Over Budget", action: "close", source: "backup-gate", generator_budget: true }, AUTH);
+      assert.equal(r.status, 502);
+      const out = (await r.json()) as { ok: boolean; detail: string; result: { refused: boolean; budget_held: boolean } };
+      assert.equal(out.ok, false);
+      assert.match(out.detail, /24\.0 kW generator cap/);
+      assert.equal(out.result.refused, true);
+      assert.equal(out.result.budget_held, true);
     });
 
     await test("bridge refusal → 502 with its detail and result", async () => {

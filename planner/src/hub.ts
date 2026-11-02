@@ -106,22 +106,25 @@ export class HubClient {
   }
 
   /** LIVE backup gate only: one breaker action through the hub → Pi BreakerController. ok = the Pi VERIFIED the relay
-   *  read-back. Never throws; a refusal / timeout is a normal outcome the caller retries later. */
-  async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string): Promise<{ ok: boolean; refused: boolean; detail: string }> {
+   *  read-back. Never throws; a refusal / timeout is a normal outcome the caller retries later. generatorBudget = the Pi
+   *  re-checks the generator budget on its fresh panel read right before this close (the Pi can't tell the grid from the
+   *  generator, so only the caller can say it applies). budgetHeld = that check said no: nothing was switched, and it is
+   *  the generator rule at work, not a failed command. */
+  async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string, generatorBudget = false): Promise<{ ok: boolean; refused: boolean; detail: string; budgetHeld?: true }> {
     try {
       const res = await fetch(`${this.baseUrl}/api/breaker`, {
         method: "POST",
         headers: { Authorization: `Bearer ${this.token}`, "X-Arm-Token": armToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ circuit, action, source }),
+        body: JSON.stringify({ circuit, action, source, ...(generatorBudget ? { generator_budget: true } : {}) }),
         signal: AbortSignal.timeout(60_000),
       });
-      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string; result?: { refused?: boolean } | null };
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; detail?: string; result?: { refused?: boolean; budget_held?: boolean } | null };
       const ok = res.ok && body.ok === true;
       // refused = definitely nothing switched and a retry cannot help: a bridge guard (result.refused), or the hub
       // rejecting the request itself (auth, validation, a bridge without breaker control). 502 without `refused` is
       // "switched but not verified"; 503 / 504 are no Pi / no answer — those retry.
       const refused = !ok && (body.result?.refused === true || [400, 401, 403, 404, 422, 501].includes(res.status));
-      return { ok, refused, detail: body.detail || `HTTP ${res.status}` };
+      return { ok, refused, detail: body.detail || `HTTP ${res.status}`, ...(!ok && body.result?.budget_held === true ? { budgetHeld: true as const } : {}) };
     } catch (e) {
       return { ok: false, refused: false, detail: (e as Error).message };
     }

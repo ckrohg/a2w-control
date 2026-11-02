@@ -9,6 +9,11 @@
 # is a NORMAL outcome, not an error. One more relayed action, `breaker` (owner decision
 # 2026-10-18), switches an allowlisted SPAN circuit through span_control.BreakerController's
 # guards; it runs in its own task so a 60 s power cycle never stalls setpoint commands.
+# GENERATOR BUDGET (#241): the Pi can't tell the grid from the generator, so a breaker command is
+# budget-checked only when the planner says the budget applies (`generator_budget`) and it is the
+# planner gate's own close: the check then runs on the controller's fresh panel read, right before
+# the write. Without the flag a close on the grid goes through (every pump running, the gate's
+# normal winter close, is over the budget). A dashboard close is a human override: never checked.
 from __future__ import annotations
 
 import asyncio
@@ -21,7 +26,7 @@ import time
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from .config import HubConfig
+from .config import BackupFallbackConfig, HubConfig
 from .guardrails import GuardrailError
 from .poller import PumpPoller
 
@@ -29,12 +34,14 @@ log = logging.getLogger(__name__)
 
 _BACKOFF_MIN_S = 1.0
 _BACKOFF_MAX_S = 30.0
+_GATE_SOURCE = "backup-gate"   # the planner's backup gate (planner/src/index.ts), the one caller the budget binds
 
 
 class HubClient:
-    def __init__(self, cfg: HubConfig, pollers: dict[str, PumpPoller]):
+    def __init__(self, cfg: HubConfig, pollers: dict[str, PumpPoller], budget: BackupFallbackConfig | None = None):
         self.cfg = cfg
         self.pollers = pollers
+        self.budget = budget or BackupFallbackConfig()   # the generator budget's numbers, shared with the fallback
         self.span = None   # span_control.BreakerController when SPAN local is configured
         self.backup_fallback = None   # backup_fallback.BackupFallback — its status rides frame["span"]
         self.stops = None             # deliberate_stop.DeliberateStops — per pump "deliberate_stop" (#212)
@@ -216,8 +223,11 @@ class HubClient:
                         "(the action itself completed — see the bridge events)")
 
     async def _handle_breaker(self, ws, msg: dict) -> None:
-        """Dashboard breaker action → BreakerController (allowlist, controllable, global lock,
-        never two heat pumps off, read-back). Acked with the read-back result either way."""
+        """Dashboard or planner-gate breaker action → BreakerController (allowlist, controllable,
+        global lock, never two heat pumps off, read-back). Acked with the read-back result either
+        way. A close the generator budget holds is acked `budget_held`, so the planner can tell the
+        generator rule at work from a failed command (see the header)."""
+        from .backup_fallback import generator_budget
         from .span_control import BreakerRefused
 
         command_id = msg.get("command_id")
@@ -226,13 +236,26 @@ class HubClient:
                             "SPAN local control is not configured on this bridge", None)
             return
         source = "hub:" + str(msg.get("source") or "armed-dashboard")
+        held: list[str] = []
+
+        def budget_precheck(_circ: dict) -> str | None:
+            # Sync and no I/O: the controller refreshed this snapshot an instant ago, for this close
+            budget = generator_budget(self.span.snapshot(), self.budget)
+            if budget["fits"]:
+                return None
+            held.append(budget["why"])
+            return budget["why"]
+
+        checked = (msg.get("generator_budget") and msg.get("op") == "close"
+                   and msg.get("source") == _GATE_SOURCE)
         try:
             result = await self.span.execute(msg.get("circuit"), msg.get("op"),
-                                             off_s=msg.get("off_s"), source=source)
+                                             off_s=msg.get("off_s"), source=source,
+                                             precheck=budget_precheck if checked else None)
         except BreakerRefused as exc:
-            await self._ack(ws, command_id, False, f"refused: {exc}", None,
+            await self._ack(ws, command_id, False, held[0] if held else f"refused: {exc}", None,
                             result={"ok": False, "refused": True, "detail": str(exc),
-                                    "status": exc.status_code})
+                                    "status": exc.status_code, **({"budget_held": True} if held else {})})
             return
         except Exception as exc:  # noqa: BLE001 — a failure must still produce an ack
             log.exception("hub: breaker command failed")

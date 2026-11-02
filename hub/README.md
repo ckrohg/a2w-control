@@ -38,7 +38,11 @@ action in flight) when the bridge sends it; `null` from a bridge that predates b
 (`off_s` only for `power_cycle`; default and floor 60, max 600). The bridge enforces every safety
 rule (allowlist, per-circuit OFF opt-in, isUserControllable, one action at a time, never two heat
 pumps off, CLOSE in a `finally`, read-back) and answers with the panel read-back; the hub waits
-`off_s` + `BREAKER_ACK_GRACE_MS` (30 s) for it. `200 {ok,detail,result}` verified · `502` refused
+`off_s` + `BREAKER_ACK_GRACE_MS` (30 s) for it. The planner's backup gate also sends
+`"source":"backup-gate"`, and `"generator_budget":true` on a close while its supply check says the
+budget applies: the bridge then re-checks the generator budget on its fresh panel read, and a
+`502` whose `result.budget_held` is true means that rule held the close (nothing was switched). A
+dashboard close is never checked. `200 {ok,detail,result}` verified · `502` refused
 or not verified (`result` says which) · `501` the connected bridge does not advertise the
 `breaker` capability (older release, or SPAN local not configured) · `503` no Pi / arming off ·
 `504` no answer in time (the action may still complete — read the live state).

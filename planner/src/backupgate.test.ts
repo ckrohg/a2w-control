@@ -283,6 +283,68 @@ function run(g: BackupGate, from: number, to: number, f: (m: number) => Partial<
   assert.equal(g2.breakerState, "closed"); assert.equal(g2.closedByGate, true, "so it may re-open it later");
 }
 
+// ── 9c. LIVE: the Pi's fresh read holds a close on the generator budget. That is the generator rule at work, not a failed
+//        command: no failure page, no stand-down, re-checked next poll, one notice per episode ───────────────────────────
+{
+  const low = () => ({ tankF: 97, tankTargetF: 120, relay: "OPEN" as const });
+  const WHY = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 24.0 kW generator cap";
+  const g = new BackupGate("live", true);
+  assert.equal(run(g, 0, 45, low).length, 1);
+  const held = g.applied(false, at(45), true, WHY);
+  assert.equal(held.page, false, "never the 'could not close' page");
+  assert.equal(held.lockout?.kind, "generator_lockout");
+  assert.equal(held.lockout?.rule, "floor");
+  assert.match(held.lockout!.title, /generator rule holds the breaker OFF/);
+  assert.match(held.lockout!.body, /the Pi's fresh panel read says no: house 6\.3 kW .* 25\.2 kW exceeds/);
+  assert.match(held.lockout!.body, /Tank 97 °F \/ target 120 °F/, "the close's own context");
+  assert.equal(g.pendingAction, null); assert.equal(g.breakerState, "open"); assert.equal(g.generatorLockoutEpisode, true);
+  const s = g.status(at(45)) as Record<string, any>;
+  assert.equal(s.stand_down, null, "not a stand-down: the load may drop");
+  assert.equal(s.retry_at, null); assert.equal(s.unconfirmed, null, "a definite answer: nothing was switched");
+  assert.match(s.generator_lockout, /fresh panel read says no/);
+  assert.equal(s.last_event.kind, "generator_lockout", "/health must not keep saying 'A2W closed'");
+  // the next poll asks again, not after RETRY_MS; the second hold is silent but /health still says so
+  assert.deepEqual(run(g, 50, 50, low).map((x) => x.e.kind), ["close"]);
+  assert.deepEqual(g.applied(false, at(50), true, WHY), { page: false, lockout: null }, "one notice per episode");
+  assert.equal((g.status(at(50)) as Record<string, any>).last_event.kind, "generator_lockout");
+  assert.match((g.status(at(50)) as Record<string, any>).generator_lockout, /fresh panel read says no/);
+  // the load drops: the close lands and the lockout episode ends with it
+  assert.deepEqual(run(g, 55, 55, low).map((x) => x.e.kind), ["close"]);
+  g.applied(true, at(55));
+  assert.equal(g.breakerState, "closed"); assert.equal(g.generatorLockoutEpisode, false);
+
+  // the planner's own lockout and the Pi's hold are one episode: no second notice
+  const g2 = new BackupGate("live", true);
+  const refuse = { allowed: false, why: "on the generator: house over budget" };
+  assert.deepEqual(run(g2, 0, 45, () => ({ ...low(), generator: refuse })).map((x) => x.e.kind), ["generator_lockout"]);
+  assert.deepEqual(run(g2, 50, 50, () => ({ ...low(), generator: { allowed: true, why: "fits" } })).map((x) => x.e.kind), ["close"]);
+  assert.deepEqual(g2.applied(false, at(50), true, WHY), { page: false, lockout: null });
+
+  // a hold spends neither the episode's failure page nor its retry: a real refusal after it still pages and stands down
+  const g3 = new BackupGate("live", true);
+  run(g3, 0, 45, low);
+  g3.applied(false, at(45), true, WHY);
+  run(g3, 50, 50, low);
+  assert.deepEqual(g3.applied(false, at(50), true), { page: true }, "no heldWhy: an ordinary guard refusal");
+  assert.equal((g3.status(at(50)) as Record<string, unknown>).stand_down, "close");
+  // ... and a command the hub lost after a hold still retries on RETRY_MS, unconfirmed
+  const g4 = new BackupGate("live", true);
+  run(g4, 0, 45, low);
+  g4.applied(false, at(45), true, WHY);
+  run(g4, 50, 50, low);
+  assert.deepEqual(g4.applied(false, at(50)), { page: true });
+  assert.equal(run(g4, 55, 60, low).length, 0, "a failed command is still not retried for 15 min");
+  // a hold is a definite answer: an earlier lost close did not land, so a relay someone else closes later is theirs
+  const g5 = new BackupGate("live", true);
+  run(g5, 0, 45, low);
+  g5.applied(false, at(45));
+  assert.equal(run(g5, 50, 60, low).length, 1);
+  g5.applied(false, at(60), true, WHY);
+  assert.equal((g5.status(at(60)) as Record<string, unknown>).unconfirmed, null);
+  assert.deepEqual(run(g5, 65, 65, () => ({ ...low(), relay: "CLOSED" as const })).map((x) => x.e.kind), []);
+  assert.equal(g5.closedByGate, false, "the gate never claims a close the Pi said it held");
+}
+
 // ── 10. status() is what /health serves ───────────────────────────────────────────────────────────────────────────────
 {
   const g = new BackupGate();

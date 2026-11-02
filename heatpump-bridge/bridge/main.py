@@ -62,7 +62,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         scheduler.start()
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
-        hub_client = HubClient(cfg.hub, pollers)
+        hub_client = HubClient(cfg.hub, pollers, cfg.backup_fallback)
 
         async def span_notify(title, message, priority="default", *, tier, resolved=False, action=None):
             from . import notify

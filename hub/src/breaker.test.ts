@@ -12,7 +12,20 @@ const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ok   ${n
 
 t("valid power_cycle defaults off_s to the 60 s floor and trims the circuit", () => {
   assert.deepEqual(validateBreakerBody({ circuit: " Air-Water 2 ", action: "power_cycle" }),
-    { ok: true, cmd: { circuit: "Air-Water 2", op: "power_cycle", off_s: 60, source: "armed-dashboard" } });
+    { ok: true, cmd: { circuit: "Air-Water 2", op: "power_cycle", off_s: 60, source: "armed-dashboard", generator_budget: false } });
+});
+
+t("generator_budget: off unless the planner says so, relayed as sent, junk is refused", () => {
+  const close = { circuit: "Buffer Tank", action: "close", source: "backup-gate" };
+  const v = validateBreakerBody({ ...close, generator_budget: true });
+  assert.ok(v.ok && v.cmd.generator_budget === true);
+  for (const off of [{}, { generator_budget: false }, { generator_budget: null }]) {
+    const w = validateBreakerBody({ ...close, ...off });
+    assert.ok(w.ok && w.cmd.generator_budget === false);
+  }
+  for (const generator_budget of ["true", 1, 0, {}]) {
+    assert.equal(validateBreakerBody({ ...close, generator_budget }).ok, false, `generator_budget ${String(generator_budget)}`);
+  }
 });
 
 t("source: an audit label — defaults to the dashboard, the backup gate names itself, junk is refused", () => {
@@ -41,7 +54,7 @@ t("unknown action / missing or empty circuit is refused", () => {
 });
 
 t("ack deadline: power_cycle waits off_s + grace; close/open only the grace", () => {
-  const pc = { circuit: "Air-Water 2", op: "power_cycle" as const, off_s: 60, source: "armed-dashboard" };
+  const pc = { circuit: "Air-Water 2", op: "power_cycle" as const, off_s: 60, source: "armed-dashboard", generator_budget: false };
   assert.equal(breakerAckTimeoutMs(pc, 30_000), 90_000);
   assert.equal(breakerAckTimeoutMs({ ...pc, off_s: 180 }, 30_000), 210_000);
   assert.equal(breakerAckTimeoutMs({ ...pc, op: "close" }, 30_000), 30_000);

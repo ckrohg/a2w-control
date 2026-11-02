@@ -134,11 +134,21 @@ treated as the generator only while an outage is plausible; otherwise the grid i
   live, it is a page.
 - **At the close:** the 30 s tick can judge a panel read up to 120 s old, so the close re-runs the budget on the
   controller's fresh read, by the same rule: over budget or unknown holds it for the next tick.
-- **The Pi's budget binds only its own fallback close.** A close from the dashboard or a person has no budget check, on
-  purpose. Neither does the planner gate's close: the Pi can't tell the grid from the generator, and on the grid the
-  gate's normal winter close (every pump running) would fail the budget. The planner applies its own generator rule, on a
-  read up to 120 s old.
-- **Knobs:** `backup_fallback.generator_cap_w` (24000), `generator_margin_w` (2400), `element_w` (16500).
+- **The planner gate's close uses the same check, only when the planner says the budget applies.** The planner's rule
+  judges a panel read up to 120 s old, so it sends `generator_budget` with its close when its supply check says generator
+  or unknown (`budget_applies`), and the Pi re-runs this budget on the controller's fresh read, right before the write.
+  - **No flag, no check.** The Pi can't tell the grid from the generator, and on the grid the gate's normal winter close
+    (every pump running, 25.2 kW) fails the budget. So wherever the planner believes the grid, this check does not run
+    either: the email-lag window (Residual risk 1), and an outage that starts while the feed is silent (Pre-live gaps).
+  - **Over budget or unknown holds it,** the same rule as the fallback's close.
+  - **A hold is the generator rule at work, not a failed command** (`result.budget_held`). It reads as the gate's own
+    lockout: the one `lockout` notice of the episode, `generator_lockout` in /health, no "could not close" page, no
+    stand-down, and the next poll asks again, because the load may drop.
+  - **A close from the dashboard or a person is never checked,** on purpose: a human override. The local API route
+    (`bridge/api.py`) has no check either. Only the gate's own close (`source: backup-gate`) can ask for one.
+- **Knobs:** `backup_fallback.generator_cap_w` (24000), `generator_margin_w` (2400), `element_w` (16500). They bind the
+  gate's close too: the planner's `GEN_CAP_KW` / `GEN_MARGIN_KW` judge whether to send it, then the Pi's numbers judge it,
+  so the stricter of the two wins. Change them together.
 - **House load source:** the bridge now computes `house_w` from each `/circuits` read and puts it in the hub frame
   (`span.house_w`). Until the bridge release carrying this lands, the planner sees no house load. On the generator or
   with an unknown supply it then locks the element out. On the grid nothing changes.
@@ -210,5 +220,7 @@ domain and is not built.
 - **Install the ATS aux contact** into a Pi GPIO. That would replace the email feed as the supply input.
 - **Do a transfer test:** throw the utility main for 15 min while the Pi logs SPAN v2 voltage/site power and the pumps'
   AC voltage every 5 s. That measures what the panel actually sees on the generator.
+- **Put the bridge release carrying the close check on the Pi first.** An older bridge ignores `generator_budget`, so the
+  gate's close would run on the planner's read alone, up to 120 s old, with nothing to say so.
 - **Go live:** `BACKUP_GATE=live` (planner) and `backup_fallback.live` (Pi) already carry the generator rule. A `shed`
   that actually opens the breaker would also need `BACKUP_GATE_REOPEN=1` and `span.backup_reopen`.
