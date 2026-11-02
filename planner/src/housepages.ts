@@ -112,6 +112,7 @@ export class HousePages {
   private readonly dhw = new PageEdge("dhw-shortfall", this.queue);
   private readonly freeze = new PageEdge("freeze-risk", this.queue);
   private readonly pi = new PageEdge("pi-unreachable", this.queue);
+  private readonly feed = new PageEdge("outage-feed-silent", this.queue);
   private unservedStreak = 0;
   private unservedEpisodeOpen = false;
   private dhwShortfallStreak = 0;
@@ -208,6 +209,27 @@ export class HousePages {
         action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
         facts: [["Tank", `${f0(tankF)} for ${this.dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(this.d.dhwFloorF)]] },
     ), () => (this.noHeat.heard ? "record" : "page"));
+  }
+
+  /**
+   * The outage feed has been silent for hours (generator.ts silence), so the supply is a guess until it answers. An email,
+   * not a page: nothing is wrong with the house, but a dead feed is otherwise visible only in /health. Goes out once per
+   * silence, like the pages, and its all-clear is record-only (alertpolicy.ts route).
+   */
+  outageFeed(silent: { hours: number; why: string; failure: string | null } | null): void {
+    if (!silent) {
+      this.feed.cleared((heard) => this.d.send("Outage feed answering again", "The planner can tell the grid from the generator again.", "default", { tier: "attention", resolved: true, key: "outage-feed-silent", heard }));
+      return;
+    }
+    const failure = silent.failure ?? "no answer yet";
+    this.feed.holding((tier) => this.d.send(
+      "Outage feed silent",
+      `The planner has not heard from 6bb's outage feed for ~${silent.hours.toFixed(1)} h (${failure}). Until it answers, the planner cannot see a grid outage: ${silent.why}.`,
+      "default",
+      { tier, key: "outage-feed-silent",
+        action: "Check that 6bb is running, and that OUTAGE_FEED_KEY there matches the key in the planner's OUTAGEWATCH_URL.",
+        facts: [["Silent for", `${silent.hours.toFixed(1)} h`], ["Last failure", failure]] },
+    ), () => "attention");
   }
 
   /** Freeze-risk advisory (owner ask 2026-07-16): deep cold AND a low buffer at the same time. The HBX
