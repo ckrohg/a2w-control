@@ -11,6 +11,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .discovery import normalize_mac   # stdlib + pymodbus only: no import cycle
 from .registers import COOLING_REGISTER_RANGE, HARD_MAX_SETPOINT_C, HARD_MIN_SETPOINT_C
 
 
@@ -244,6 +245,15 @@ class SpanConfig(BaseModel):
     ip_fallback: str | None = None     # last-known LAN IP, tried if the hostname won't resolve
     passphrase: str | None = None      # On-premise home-owner passphrase (enables auto-re-register)
     circuits: list[str] = ["Buffer Tank", "Air-Water 1", "Air-Water 2"]  # circuit NAMES to log
+    # #199: which local API to speak. v1 = REST only (the default: this release changes no behaviour). auto = v2 (MQTT
+    # on the panel) first, v1 as the fallback while the panel still serves it (removed 2026-12-31). v2 = v2 only.
+    # Rollout (owner 2026-10-29): ship on v1 → set v2_soak: true for a few days → with the owner's OK, transport: auto.
+    # See knowledge/reference/span-v2-local-api.md.
+    transport: Literal["v1", "auto", "v2"] = "v1"
+    # Read-only v2 soak, for transport: v1 only. After every v1 read the bridge also reads the v2 tree and compares relay
+    # state + controllable per circuit (/api/health.span.soak). It never writes over v2, and a v2 failure never touches
+    # the v1 read.
+    v2_soak: bool = False
     poll_interval_s: float = 25.0
     down_alert_after_s: float = 4 * 3600.0  # alert once if logging has been down this long
     # Backup-element ARM control (see knowledge/reference/span-backup-arm-spec.md). A2W may CLOSE-ONLY
@@ -348,6 +358,19 @@ class BackupFallbackConfig(BaseModel):
     hold_min: float = Field(default=30.0, ge=10, le=240)       # measured: both-stale with SPAN up never > 3.5 min
     running_power_w: float = Field(default=500.0, gt=0)        # SPAN draw that means "the compressor runs"
     cooldown_h: float = Field(default=6.0, ge=1, le=48)        # one decision (page / close) per this
+    # #241 generator budget. In an outage a whole-house transfer switch puts the house on the generator, a Kohler 20RESA
+    # on propane (20 kW / 83 A at 240 V; owner 2026-11-02, the earlier 24 kW / 100 A was wrong), and neither the panel
+    # nor the Pi can tell (knowledge/reference/generator-outage-mode.md), so the Pi ALWAYS assumes it might be: it
+    # closes only when the live house load (every circuit but the element's, fresh panel read) + the element + the
+    # margin stays under the cap. Unknown load = no close.
+    # Owner rule 2026-11-02: the element NEVER closes automatically on the generator. The Pi cannot enforce that by
+    # itself (no generator signal reaches it). With 20 kW - 16.5 kW - 2.4 kW it closes only when the rest of the house
+    # draws at most 1.1 kW: it can still close on the generator at a very low load, and on the grid it will usually
+    # refuse. So backup_fallback.live must stay false until the Pi has a real generator signal (transfer-switch aux
+    # contact to a Pi input; see the doc's pre-live gaps).
+    generator_cap_w: float = Field(default=20000.0, ge=15000, le=40000)
+    generator_margin_w: float = Field(default=2400.0, ge=0, le=8000)
+    element_w: float = Field(default=16500.0, ge=10000, le=20000)
 
 
 class AppConfig(BaseModel):
@@ -425,8 +448,9 @@ def save_gateway_override(cfg: AppConfig, pump_id: str, host: str, port: int) ->
     data = _read_state(cfg)
     pump = next((p for p in cfg.pumps if p.id == pump_id), None)
     prior = data["overrides"].get(pump_id, {})
+    # canonical MAC on disk (same form the poller's identity check uses)
     data["overrides"][pump_id] = {"host": host, "port": port,
-                                  "mac": pump.mac if pump else None}
+                                  "mac": normalize_mac(pump.mac) if pump and pump.mac else None}
     if "write_enabled" in prior:  # a gateway reassignment must not clobber the toggle
         data["overrides"][pump_id]["write_enabled"] = prior["write_enabled"]
     if pump and pump.added:  # keep the added-pump record current too
@@ -444,7 +468,7 @@ def save_write_enabled(cfg: AppConfig, pump_id: str, enabled: bool) -> None:
     entry = data["overrides"].setdefault(pump_id, {})
     entry["write_enabled"] = enabled
     if pump and pump.mac and not entry.get("mac"):
-        entry["mac"] = pump.mac  # same staleness guard as gateway overrides
+        entry["mac"] = normalize_mac(pump.mac)  # same staleness guard as gateway overrides
     if pump and pump.added:
         pump.write_enabled = enabled
         save_added_pump(cfg, pump, _data=data)
@@ -475,7 +499,11 @@ def apply_gateway_overrides(cfg: AppConfig) -> None:
         entry = data["overrides"].get(pump.id)
         if not entry:
             continue
-        if pump.mac and entry.get("mac") and pump.mac.lower() != entry["mac"].lower():
+        # Same comparison as the poller's identity check (normalize_mac: case, zero-pad,
+        # '-' separators). A formatting difference between config.yaml and the state file
+        # must never silently revert write_enabled or a gateway reassignment on restart.
+        if pump.mac and entry.get("mac") and \
+                normalize_mac(pump.mac) != normalize_mac(entry["mac"]):
             continue  # config points at a different physical unit now — override stale
         if "host" in entry:  # entry may be write_enabled-only (no gateway override yet)
             pump.host = entry["host"]

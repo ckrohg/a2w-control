@@ -5,6 +5,18 @@
  * same second factor the dashboard releases after a password re-entry; the Pi applies every breaker guard itself).
  */
 
+/** One active fault in plain English (bridge faults.py FaultDef). severity "info" (P17 anti-freeze) is normal, never alerted. */
+export interface HubFault { code: string; message: string; severity: string }
+export type HubActiveFaults = number | HubFault[] | null;
+
+/** The fault list when the bridge sent one (well-formed entries only), else null — an old bridge's count has no codes. */
+export function faultList(v: unknown): HubFault[] | null {
+  if (!Array.isArray(v)) return null;
+  return v.filter((f): f is Record<string, unknown> => !!f && typeof f === "object" && typeof (f as { code?: unknown }).code === "string")
+    .map((f) => ({ code: String(f.code), message: typeof f.message === "string" ? f.message : "",
+                   severity: typeof f.severity === "string" ? f.severity : "" }));
+}
+
 export interface HubPump {
   id: string;
   name: string;
@@ -22,8 +34,14 @@ export interface HubPump {
   // armed (the Pi records a lease only when baseline_setpoint_c is set — poller.py:600).
   remote_lease_until?: number | null;
   write_enabled?: boolean;
-  /** COUNT of the pump's active faults (bridge hub_client.py state frame); the codes are in the mirror's pump_snapshots */
-  active_faults?: number | null;
+  /** #190: the fault LIST from bridges of that release, the bare COUNT from older ones — both are live while the Pi lags
+   *  a release tag, so read it only through faultList above. Owner wording ignores it: pumpWords reads `state` */
+  active_faults?: HubActiveFaults;
+  /**
+   * #212 (bridge deliberate_stop.py): set while a PERSON has this pump's breaker off (6bb, the SPAN app, the panel) and
+   * A2W did not switch it — a deliberate stop, not a fault. since = Pi wall seconds. Absent on older bridges.
+   */
+  deliberate_stop?: { circuit?: string; since: number; announced?: boolean } | null;
 }
 
 /** One allowlisted breaker in the Pi's SPAN snapshot (bridge span_control.BreakerController.snapshot). */

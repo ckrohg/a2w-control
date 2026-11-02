@@ -34,6 +34,7 @@ from pathlib import Path
 from . import notify
 from .config import BACKUP_ELEMENT_CIRCUIT, HEAT_PUMP_CIRCUITS
 from .span_local import OpenAborted, OpenPermit, read_arm_intent
+from .span_v2 import canon_id
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ READBACK_GAP_S = 1.0
 CYCLE_FILE = "span-breaker-cycle.json"
 RECORD_RETRY_S = 30.0                    # re-read an unreadable (I/O error) cycle record this often
 OPENS_FILE = "span-breaker-opens.json"   # bare OPENs: when, so the min-off survives a restart
+DISPATCH_MAX_AGE_S = 3.0                 # an element OPEN's fresh read: a v2 tree older than this is not fresh
 
 
 def read_boot_id() -> str | None:
@@ -99,6 +101,7 @@ class BreakerController:
         self._record_task: asyncio.Task | None = None
         self._pending_close: dict[str, asyncio.Task] = {}   # circuit name -> background re-close
         self._opened_at: dict[str, float] = {}              # circuit name -> mono time A2W opened it
+        self._switched: dict[str, float] = {}               # circuit name -> mono time A2W last wrote its relay
         self._open_untimed: set[str] = set()                # bare OPEN dispatched, landing time unknown
         self._bg: set[asyncio.Task] = set()
         self._boot_id = read_boot_id()
@@ -123,12 +126,37 @@ class BreakerController:
             "ts": getattr(self.cache, "latest_circuits_ts", None),
             "mono": getattr(self.cache, "latest_circuits_mono", None),
             "circuits": circuits,
+            # #241: every circuit but the element's, from the same read (span_local.house_load); the planner's
+            # generator rule reads house_w from the hub frame
+            "house_w": getattr(self.cache, "latest_house_w", None),
+            "house": getattr(self.cache, "latest_house", None),
             "busy": dict(self._busy) if self._busy else None,
             "pending_close": sorted(self._pending_close),
             "last": self.last,
             "min_off_s": self.cfg.min_off_s,
             "max_off_s": self.cfg.max_off_s,
+            # #199: which local API answered (v2 MQTT / v1 REST) — drift-check + the dashboard read it from the hub
+            "transport": (self.client.transport_status() if hasattr(self.client, "transport_status") else None),
         }
+
+    def own_switching(self, name: str, within_s: float) -> str | None:
+        """Why a relay state on `name` may be A2W's OWN doing right now (None: A2W has not switched it). #212 uses it
+        to tell a circuit a PERSON switched off (6bb, the SPAN app, the panel — the panel reports USER for all of
+        them) from one A2W is cycling: A2W leaves a heat-pump circuit OPEN only inside its own action, a re-close it
+        keeps retrying, or an interrupted cycle it has not finished, plus `within_s` after its last relay write.
+        _opened_at is deliberately not consulted: a heat-pump circuit is never bare-OPENed (config forbids it), so an
+        OPEN that outlives A2W's own action (after a restart, or more than `within_s` after its last write) reads as
+        a person's choice. Acceptable: someone did choose it, and the planner's reminder still covers a forgotten one."""
+        if self._busy is not None and self._busy.get("circuit") == name:
+            return f"A2W is running {self._busy.get('action')} on it"
+        if name in self._pending_close:
+            return "A2W is retrying its switch-back-ON"
+        if self._record_blocked:
+            return "an interrupted A2W power cycle is not resolved yet"
+        t = self._switched.get(name)
+        if t is not None and self._mono() - t < within_s:
+            return f"A2W switched it {self._mono() - t:.0f} s ago"
+        return None
 
     async def execute(self, circuit, action, *, off_s=None, source: str = "ui",
                       precheck=None) -> dict:
@@ -137,8 +165,10 @@ class BreakerController:
         a controller-owned task behind a shield, so a caller that goes away (a closed browser
         tab, a dropped hub link) can never abandon a circuit half-way through a cycle.
         `precheck(circ)` (optional, sync) runs on the FRESH panel read immediately before an OPEN
-        is dispatched — no await in between — and refuses the action by returning a reason. The
-        self-heal uses it to re-validate pump state at the last possible moment."""
+        or a CLOSE is dispatched — no await in between — and refuses the action by returning a
+        reason. The self-heal uses it to re-validate pump state at the last possible moment; on a
+        close it stands between a circuit and its write, so it must never touch I/O, and only a
+        caller with its own rule for the circuit passes one (backup_fallback's generator budget)."""
         name = circuit.strip() if isinstance(circuit, str) else ""
         label = name or repr(circuit)
         try:
@@ -356,6 +386,9 @@ class BreakerController:
                     raise BreakerRefused(
                         f"'{', '.join(off)}' is not confirmed ON — never two heat pumps off at once", 409)
             if action == "close":
+                why = precheck(circ) if precheck is not None else None
+                if why:
+                    raise BreakerRefused(f"precheck: {why}", 409)
                 return await self._do_close(spec, circ, source)
             if circ["relay_state"] != "CLOSED":
                 raise BreakerRefused(
@@ -380,6 +413,9 @@ class BreakerController:
                         fresh = self.client._fetch_locked()
                     except Exception as exc:  # noqa: BLE001 — no fresh read, no OPEN
                         return f"could not re-read the panel before the OPEN ({exc})"
+                    age = self.client.read_age_s() if hasattr(self.client, "read_age_s") else None
+                    if age is not None and age > DISPATCH_MAX_AGE_S:
+                        return f"the panel's last message is {age:.0f} s old — not switching it off on a frozen read"
                     return self._backup_open_refusal(spec.name, fresh) or (_g() if _g else None)
             if action == "open":
                 return await self._do_open(spec, circ, source, guard)
@@ -428,6 +464,7 @@ class BreakerController:
             self._open_untimed.discard(name)
             raise BreakerRefused("could not persist the switch-off time (disk?) — refusing to "
                                  "switch anything off", 503)
+        self._switched[name] = self._mono()
         _, exc, cancelled = await self._finish(   # wait for the worker even if cancelled
             self.client.set_relay(cid, "OPEN",
                                   open_permit=OpenPermit(cid, name, f"open ({source})", guard)))
@@ -505,6 +542,7 @@ class BreakerController:
         dispatched = True
         try:
             self._opened_at[name] = self._mono()
+            self._switched[name] = self._mono()
             # Shielded: a cancellation must not stop us waiting for the worker thread, or the
             # OPEN could land after we have started (and shortened) the hold.
             _, exc, c1 = await self._finish(self.client.set_relay(
@@ -517,6 +555,7 @@ class BreakerController:
                 open_err = str(exc)          # may have landed anyway: hold regardless
             open_mono = self._mono()
             self._opened_at[name] = open_mono
+            self._switched[name] = open_mono
             # Timed from when the OPEN call RETURNED: a late-landing OPEN still gets its full hold.
             self._write_cycle_file({"name": name, "circuit_id": cid, "opened_at": self._clock(),
                                     "opened_mono": open_mono, "boot_id": self._boot_id,
@@ -616,7 +655,8 @@ class BreakerController:
             try:
                 circuits = await self._read_panel()
                 c = find_circuit(circuits, name)
-                state = c["relay_state"] if c and c["circuit_id"] == cid else state
+                # canon_id: a cycle record written under v1 names the circuit as v1 spells it (#199)
+                state = c["relay_state"] if c and canon_id(c["circuit_id"]) == canon_id(cid) else state
             except Exception as exc:  # noqa: BLE001 — includes an ambiguous name: no state
                 log.warning("span breaker read-back failed (%s): %s", name, exc)
             if state == want:
@@ -628,6 +668,7 @@ class BreakerController:
 
     async def _close_once(self, cid: str, name: str) -> tuple[str | None, str | None]:
         err = None
+        self._switched[name] = self._mono()
         try:
             await self.client.set_relay(cid, "CLOSED")
         except Exception as exc:  # noqa: BLE001 — may have landed; the read-back decides

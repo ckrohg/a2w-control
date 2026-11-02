@@ -4,7 +4,7 @@
  * Run with: npx tsx planner/src/alertpolicy.test.ts
  */
 import assert from "node:assert/strict";
-import { route, tierSubject, Latches, PageBudget, episodeTier, piUnreachablePageAfterS, RENOTIFY_MS, type LatchStore, type Tier } from "./alertpolicy";
+import { route, tierSubject, acknowledged, Latches, PageBudget, episodeTier, piUnreachablePageAfterS, RENOTIFY_MS, type LatchStore, type Tier } from "./alertpolicy";
 
 (async () => {
   // tier → channels
@@ -31,17 +31,30 @@ import { route, tierSubject, Latches, PageBudget, episodeTier, piUnreachablePage
   };
   const quiet = () => {};
   let latches = new Latches(store, quiet);
-  assert.equal(await latches.claim("freeze", "page", now), true, "first open sends");
+  assert.equal(await latches.due("freeze", now), true, "first open sends");
+  assert.equal(rows.has("freeze"), false, "asking writes nothing: only a page someone heard is latched");
+  assert.equal(await latches.due("freeze", now + 60_000), true, "not heard, so the next try still sends");
+  assert.equal(await latches.release("freeze", "page"), null, "and a page nobody heard is owed no all-clear");
+  await latches.record("freeze", "page");
   latches = new Latches(store, quiet); // a redeploy: in-memory edges lost, the DB row is not
-  assert.equal(await latches.claim("freeze", "page", now + 60_000), false, "the restart's re-fire is suppressed");
-  assert.equal(await latches.claim("freeze", "page", now + RENOTIFY_MS + 1), true, "still true a day later: one reminder");
+  assert.equal(await latches.due("freeze", now + 60_000), false, "the restart's re-fire is suppressed");
+  assert.equal(await latches.due("freeze", now + RENOTIFY_MS + 1), true, "still true a day later: one reminder");
+  // that reminder fails on every channel: the first page was still heard, so its latch and its all-clear stand
   assert.equal(await latches.release("freeze", "page"), "page", "release reports the tier it was sent at");
   assert.equal(await latches.release("freeze", "page"), null, "nothing open: no all-clear due");
 
   down = true;
-  assert.equal(await latches.claim("x", "attention", now), true, "DB down fails open");
+  assert.equal(await latches.due("x", now), true, "DB down fails open");
+  await latches.record("x", "page"); // logged, not thrown: the page has already been heard
   assert.equal(await latches.release("x", "page" as Tier), "page", "DB down: all-clear still sent at the caller's tier");
   down = false;
+
+  // who heard it: a ntfy 200 proves nothing while nobody subscribes to the topic
+  assert.equal(acknowledged({ ownerConfigured: true, ownerAcked: false, ntfyConfigured: true, ntfyAcked: true }), false, "ntfy alone is nobody");
+  assert.equal(acknowledged({ ownerConfigured: true, ownerAcked: true, ntfyConfigured: true, ntfyAcked: false }), true);
+  assert.equal(acknowledged({ ownerConfigured: false, ownerAcked: false, ntfyConfigured: true, ntfyAcked: true }), true, "no owner channel: ntfy is all there is");
+  assert.equal(acknowledged({ ownerConfigured: false, ownerAcked: false, ntfyConfigured: true, ntfyAcked: false }), false);
+  assert.equal(acknowledged({ ownerConfigured: false, ownerAcked: false, ntfyConfigured: false, ntfyAcked: false }), true, "rehearsal: the log line is the delivery");
 
   // page budget
   const b = new PageBudget();

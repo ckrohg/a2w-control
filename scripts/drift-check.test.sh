@@ -45,4 +45,18 @@ ck "mixed: the unknown one is STALE"   1 "$(grep -c 'pump2: unrecognised phase_b
 OUT="$(run_2a '{"pump1":"ok 61°C — ⚠ NO LEASE ARMED"}')"
 ck "no lease is still DRIFT"           1 "$(grep -c 'DRIFT.*armed NO lease' <<<"$OUT")"
 
+# ---- 3. [11]'s readers (#164) on the REAL files, so a PR that drops a watch pattern from either config fails CI here
+# rather than surfacing as a redeploy storm (or a missed deploy) after it lands.
+for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+  svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"
+  ck "${svc}: declared set has both spellings" 6 "$(wc -w <<<"$want" | tr -d ' ')"
+  ck "${svc}: .railway/railway.ts = declared"  "$want" "$(iac_watch .railway/railway.ts "$svc")"
+  [ -f "$dir/railway.toml" ] && ck "${dir}/railway.toml = declared" "$want" "$(toml_watch "$dir/railway.toml")"
+done
+# a dropped pattern must read as a difference, not as a match
+sed 's|\["planner/\*\*", |[|' .railway/railway.ts > "$TMP/dropped.ts"
+ck "a dropped planner/** reads as 5 patterns" "package-lock.json package.json railway.toml src/** tsconfig.json" \
+   "$(iac_watch "$TMP/dropped.ts" a2w-planner)"
+ck "an unknown service reads as empty" "" "$(iac_watch .railway/railway.ts a2w-nonexistent)"
+
 [ "$fails" = 0 ] && echo "drift-check.test: all passed" || { echo "drift-check.test: FAILURES"; exit 1; }

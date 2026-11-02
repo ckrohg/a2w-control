@@ -12,6 +12,10 @@
  * draw). Config-gated: dormant unless SPAN_USERNAME is set. STANDALONE — A2W's own SPAN login; the
  * pattern is copied from TempIQ (span-cloud.ts), no runtime coupling. The same poll records the pump
  * circuits' day-cumulative value into span_energy for the realized-savings ledger (#207).
+ * #124: `value` is normalized by the `unit` SPAN reports beside it (Wh or kWh, any case). A missing or unknown unit, or a
+ * non-numeric value, is never guessed: the alarm path reports itself blind (lastError, failStreak) and logs it once.
+ * An alarm that cannot read is silent by nature, so blindness() is the separate check that tells the owner (#257 ran
+ * blind for 25 minutes with nothing but /health to show it).
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
 import type { Notify } from "./alertpolicy";
@@ -23,6 +27,24 @@ const API_BASE = "https://app-api.prod.span-csp.com";
 
 /** The alarm's window: energy the element drew in the last this-many ms is what is compared to alarmKwh. */
 export const BACKUP_WINDOW_MS = 60 * 60_000;
+/** lastError's prefix while the backup circuit's energy cannot be read (#124) — /health.span.cloud.last_error */
+export const BACKUP_BLIND = "backup-element alarm blind: ";
+/** No reading this long and the owner hears about it: a whole alarm window gone, and past SPAN's brief cloud errors. */
+export const BLIND_ALERT_MS = BACKUP_WINDOW_MS;
+
+/** #124: SPAN's energy aggregate in kWh, by the unit it reports — or why it cannot be read (nothing is guessed). */
+export function energyKwh(m: { value?: unknown; unit?: unknown } | null | undefined): { kwh: number } | { error: string } {
+  const raw = m?.value;
+  const v = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+  if (!Number.isFinite(v)) return { error: `energy value ${JSON.stringify(raw ?? null)} is not a number` };
+  const unit = typeof m?.unit === "string" ? m.unit.trim() : "";
+  // SPAN's GraphQL spells it KILO_WATT_HOUR (live log, 2026-11-02), so the punctuation and the long form both count
+  switch (unit.toLowerCase().replace(/[^a-z]/g, "")) {
+    case "kwh": case "kilowatthour": return { kwh: v };
+    case "wh": case "watthour": return { kwh: v / 1000 };
+    default: return { error: unit ? `energy unit "${unit}" is not Wh or kWh` : "energy unit missing" };
+  }
+}
 
 const BUILDINGS_Q = `query { data: currentUser { buildings { name buildingId accepted } } }`;
 // `currentHour` is a historical alias: with duration: DAY / calendarWindows: true the value is the circuit's
@@ -48,6 +70,8 @@ export class SpanWatch {
   private tokenExpMs = 0;
   private buildingId: string | null = null;
   private loggedOk = false;
+  /** #124: the unreadable-energy reasons already logged (each once; cleared when the reading is readable again) */
+  private loggedBlind = new Set<string>();
   /** edge state: a page is open until the trailing hour is back under alarmKwh (/health.span.cloud.backup_alarmed) */
   public alarmed = false;
   /** kWh the backup circuit drew in the trailing BACKUP_WINDOW_MS — what the alarm compares to alarmKwh */
@@ -61,6 +85,7 @@ export class SpanWatch {
   // The day counter at the previous poll, and the per-poll increments still inside the window.
   private prevDayKwh: number | null = null;
   private increments: { t: number; kwh: number }[] = [];
+  private startedAtMs: number | null = null;
 
   constructor(
     private readonly username: string,
@@ -73,6 +98,17 @@ export class SpanWatch {
     private readonly pumpMatch?: string,    // case-insensitive substring for the pump circuits (Air-Water)
   ) {
     if (fixedBuildingId) this.buildingId = fixedBuildingId;
+  }
+
+  /**
+   * No reading of the element's circuit for BLIND_ALERT_MS, else null. Timed from the last good reading, not failStreak,
+   * so a hung poll counts too, and a restart restarts the clock. The first call starts it if no poll has yet.
+   */
+  blindness(): { minutes: number; error: string | null } | null {
+    const nowMs = this.now().getTime();
+    this.startedAtMs ??= nowMs;
+    const blindMs = nowMs - (this.lastOkAt ? Date.parse(this.lastOkAt) : this.startedAtMs);
+    return blindMs < BLIND_ALERT_MS ? null : { minutes: Math.round(blindMs / 60_000), error: this.lastError };
   }
 
   /** The clock — overridable so spanwatch.test.ts can walk a scripted sequence through hour and day boundaries. */
@@ -150,24 +186,33 @@ export class SpanWatch {
     return this.increments.reduce((s, x) => s + x.kwh, 0);
   }
 
+  /** #124: warn about an unreadable energy reading the first time it is seen, not every poll. */
+  private logBlindOnce(msg: string): void {
+    if (this.loggedBlind.has(msg)) return;
+    this.loggedBlind.add(msg);
+    console.warn(`[spanwatch] ${msg}`);
+  }
+
   /** Poll once. Alarms when the backup circuit drew more than alarmKwh in the trailing 60 minutes. */
   async tick(): Promise<void> {
+    this.startedAtMs ??= this.now().getTime();
     try {
       const buildingId = await this.findBuilding();
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });
       const now = this.now();
       const panels: any[] = d?.data?.building?.multiPanels ?? [];
-      let hit: { name: string; kwh: number; unit: string } | null = null;
+      let hit: { name: string; e: ReturnType<typeof energyKwh>; raw: string } | null = null;
       let pumpKwh = 0; // sum of the pump (Air-Water) circuits' day-to-date energy (see below)
       for (const p of panels) for (const s of p.spaces ?? []) {
         const name = (s.name ?? "").toLowerCase();
         if (name.includes(this.circuitMatch.toLowerCase())) {
-          const v = Number(s.currentHour?.value);
-          hit = { name: s.name ?? this.circuitMatch, kwh: Number.isFinite(v) ? v : 0, unit: s.currentHour?.unit ?? "?" };
+          hit = { name: s.name ?? this.circuitMatch, e: energyKwh(s.currentHour), raw: `${s.currentHour?.value ?? "?"} ${s.currentHour?.unit ?? "?"}` };
         }
         if (this.pumpMatch && name.includes(this.pumpMatch.toLowerCase())) {
-          const v = Number(s.currentHour?.value);
-          if (Number.isFinite(v)) pumpKwh += v;
+          // an unreadable pump circuit is left out, as a non-numeric value always was — never added under a guessed unit
+          const e = energyKwh(s.currentHour);
+          if ("kwh" in e) pumpKwh += e.kwh;
+          else this.logBlindOnce(`pump circuit "${s.name}": ${e.error} — left out of span_energy`);
         }
       }
       // Record the pumps' metered energy. HOUR_ENERGY_Q asks for duration: DAY / calendarWindows: true,
@@ -186,30 +231,40 @@ export class SpanWatch {
         console.warn(`[spanwatch] ${this.lastError}`);
         return;
       }
+      if ("error" in hit.e) {
+        // #124: blind, like a failed read — no page, no clear, no baseline moved; the next readable poll differences
+        // against the last readable one
+        this.lastError = `${BACKUP_BLIND}circuit "${hit.name}": ${hit.e.error}`; // no live value in it: logged once per reason
+        this.failStreak++;
+        this.logBlindOnce(this.lastError);
+        return;
+      }
+      const dayKwh = hit.e.kwh;
+      for (const k of this.loggedBlind) if (k.startsWith(BACKUP_BLIND)) this.loggedBlind.delete(k); // a recurrence logs again
       this.lastError = null;
-      const hourKwh = this.accrue(hit.kwh, now.getTime());
-      this.lastDayKwh = hit.kwh;
+      const hourKwh = this.accrue(dayKwh, now.getTime());
+      this.lastDayKwh = dayKwh;
       this.lastHourKwh = hourKwh;
       this.lastOkAt = now.toISOString();
       this.failStreak = 0;
       if (!this.loggedOk) {
         this.loggedOk = true;
-        console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${hit.kwh} ${hit.unit} so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
+        console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${dayKwh} kWh (SPAN: ${hit.raw}) so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
       }
       if (hourKwh > this.alarmKwh && !this.alarmed) {
         this.alarmed = true;
         await this.notify(
           "16.5 kW backup element DREW POWER",
-          `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today, ≈$${(hit.kwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
+          `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
           "high",
           // costs money, never endangers the house (the element IS the heat): worth a look, at most daily
           { tier: "attention", key: "backup-element-power",
             action: "If it isn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
-            facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${hit.kwh.toFixed(2)} kWh ≈ $${(hit.kwh * 0.3).toFixed(2)}`]] },
+            facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
         );
       } else if (hourKwh <= this.alarmKwh && this.alarmed) {
         this.alarmed = false;
-        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${hit.kwh.toFixed(2)} kWh so far today).`, "default",
+        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today).`, "default",
           { tier: "attention", resolved: true, key: "backup-element-power" });
       }
     } catch (e) {

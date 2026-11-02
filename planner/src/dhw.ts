@@ -95,6 +95,7 @@ export interface WindowSag {
   windowEnd: number;     // local hour, exclusive
   n: number;             // draws observed inside the window
   sagP75F: number;       // 75th-percentile fall from the pre-draw level to the trough (°F)
+  sagP90F: number;       // 90th percentile — what the pre-boost is sized from since 2026-10-30 (owner: no lukewarm showers)
   sagMedianF: number;
   preDrawMedianF: number;
   troughMedianF: number;
@@ -148,6 +149,7 @@ export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: 
     return {
       windowStart, windowEnd, n: g.sags.length,
       sagP75F: Math.round(q(g.sags, 0.75) * 10) / 10,
+      sagP90F: Math.round(q(g.sags, 0.9) * 10) / 10,
       sagMedianF: Math.round(q(g.sags, 0.5) * 10) / 10,
       preDrawMedianF: Math.round(q(g.pre, 0.5) * 10) / 10,
       troughMedianF: Math.round(q(g.trough, 0.5) * 10) / 10,
@@ -163,6 +165,39 @@ export function measureWindowSags(rows: { ts: Date; tankF: number }[], windows: 
  * before midnight. The shower peaks are what the sag is measured over and what the boost precedes.
  */
 export const PEAK_THRESHOLD = 0.5;
+
+/**
+ * Owner-declared shower windows (env DHW_SHOWER_WINDOWS, owner 2026-10-30): "HH:MM-HH:MM,HH:MM-HH:MM", local time.
+ * Why: the learned peaks are hours where ≥ 50 % of days had a draw, so a regular-but-not-daily 07:00 shower falls
+ * outside the [8,10] morning peak and gets no pre-boost (measured Oct 1–29: deep draws, sag ≥ 8 °F, cluster 07–11).
+ * Hour granularity, because plan blocks are hourly: the start rounds DOWN (06:30 → 6, so the boost is in force by the
+ * 06:00 block) and the end rounds UP. An entry that does not parse, or is empty or inverted, is skipped with a warning.
+ */
+export function parseShowerWindows(raw: string | undefined): [number, number][] {
+  if (!raw || !raw.trim()) return [];
+  const out: [number, number][] = [];
+  for (const part of raw.split(",").map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.exec(part);
+    const toMin = (h: string, mm: string) => Number(h) * 60 + Number(mm);
+    if (!m || Number(m[2]) > 59 || Number(m[4]) > 59) { console.warn(`DHW_SHOWER_WINDOWS: "${part}" is not HH:MM-HH:MM — skipped`); continue; }
+    const a = toMin(m[1], m[2]), b = toMin(m[3], m[4]);
+    if (a >= b || b > 24 * 60) { console.warn(`DHW_SHOWER_WINDOWS: "${part}" is empty, inverted or past 24:00 — skipped`); continue; }
+    out.push([Math.floor(a / 60), Math.ceil(b / 60)]);
+  }
+  return out;
+}
+
+/** Union of hour ranges: ranges that overlap or abut become one ([8,10] + [6,10] → [6,10]; [6,8] + [8,9] → [6,9]). */
+export function mergeWindows(...lists: [number, number][][]): [number, number][] {
+  const all = lists.flat().map(([a, b]) => [a, b] as [number, number]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  const out: [number, number][] = [];
+  for (const w of all) {
+    const last = out[out.length - 1];
+    if (last && w[0] <= last[1]) last[1] = Math.max(last[1], w[1]);
+    else out.push([w[0], w[1]]);
+  }
+  return out;
+}
 export function peakWindows(hourScores: number[], threshold = PEAK_THRESHOLD): [number, number][] {
   const out: [number, number][] = [];
   let start: number | null = null;

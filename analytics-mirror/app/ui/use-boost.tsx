@@ -3,7 +3,8 @@
 // Home "Heat now" card. confirm modal (exact request + preflight warnings) → POST /api/planner/boost
 // → poll /api/planner/target (writer status) and /api/hub/state (which pumps are heating). Every
 // message the UI shows comes from lib/boost-state.ts boostView(): success text exists ONLY after the
-// writer status shows the boost; a planner rejection is shown verbatim as a rejection.
+// writer status shows the boost; a planner rejection is shown verbatim as a rejection. A 202 (#231) is the
+// `arming` phase: the planner is warming the heat pumps first; it becomes `accepted` once the boost row appears.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useModals } from "./modal";
 import {
@@ -89,9 +90,14 @@ export function useBoost() {
     if (phase.phase === "accepted" && !phase.seen && ["commanded", "in_force", "superseded", "unverified"].includes(view.key)) {
       setPhase({ ...phase, seen: true, writeAt: st?.last_write_at ?? null });
     }
+    // #231: the armed boost has landed — from here it is an ordinary accepted boost, timed from its own row
+    if (phase.phase === "arming" && st?.active_boost && st.active_boost.target_f === phase.req.target_f
+        && ["commanded", "in_force", "superseded", "unverified"].includes(view.key)) {
+      setPhase({ phase: "accepted", req: phase.req, atMs: Date.now(), restoreAt: st.active_boost.restore_at, seen: true, writeAt: st.last_write_at ?? null });
+    }
   }, [phase, view.key, st]);
 
-  const waiting = ["verifying", "commanded", "sending", "expired_unrestored", "stale", "unverified"].includes(view.key);
+  const waiting = ["verifying", "commanded", "sending", "arming", "expired_unrestored", "stale", "unverified"].includes(view.key);
   useEffect(() => {
     loadStatus();
     loadHub();
@@ -117,8 +123,13 @@ export function useBoost() {
         body: JSON.stringify(req),
         signal: AbortSignal.timeout(30_000),
       });
-      const out: { error?: string; detail?: string; boost_restore_at?: string } = await res.json().catch(() => ({}));
+      const out: { error?: string; detail?: string; boost_restore_at?: string; arming?: boolean; setpoints_needed_f?: number; expires_at?: string; reason?: string } = await res.json().catch(() => ({}));
       if (!res.ok) setPhase({ phase: "rejected", req, status: res.status, error: out.error || out.detail || "" });
+      // #231: 202 — the planner raises the pump setpoints first and writes the boost once they cover it
+      else if (out.arming === true) setPhase({ phase: "arming", req, atMs: Date.now(),
+        setpointsNeededF: typeof out.setpoints_needed_f === "number" ? out.setpoints_needed_f : null,
+        expiresAt: typeof out.expires_at === "string" ? out.expires_at : null,
+        reason: out.reason === "rate_limit" || out.reason === "setpoints" ? out.reason : null });
       else setPhase({ phase: "accepted", req, atMs: Date.now(), restoreAt: typeof out.boost_restore_at === "string" ? out.boost_restore_at : null });
     } catch {
       setPhase({ phase: "rejected", req, status: 0, error: "network error — the request may not have reached the planner; check the writer status before retrying" });
