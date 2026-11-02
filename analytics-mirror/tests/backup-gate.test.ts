@@ -4,7 +4,7 @@
 // shadow never reads as the real breaker; the real relay line is separate; blind → "not judged"; a planner without the
 // block → unavailable; the Pi fallback passes through; junk is tolerated. Run: npx tsx tests/backup-gate.test.ts
 import assert from "node:assert/strict";
-import { backupGateView, gateChip, generatorLine, relayLine } from "../lib/backup-gate";
+import { backupGateView, gateChip, generatorLine, relayLine, shedLine } from "../lib/backup-gate";
 
 let n = 0;
 const t = (name: string, fn: () => void) => { fn(); n++; console.log(`  ✓ ${name}`); };
@@ -78,6 +78,10 @@ t("#241 generator: grid says so; on the generator the budget and the lockout sho
   assert.deepEqual(gateChip(v), { cls: "warn", text: "held OFF (generator)" });
   const unk = backupGateView({ ...sample, generator: gen({ supply: "unknown", house_w: null, projected_w: null }) });
   assert.match(generatorLine(unk.generator!), /^Supply unknown \(treated as generator\): house \? kW/);
+  assert.equal(shedLine(v.generator!), "", "no shed advisory, no sentence");
+  assert.match(shedLine(backupGateView({ ...sample, generator: gen({ shed: true }) }).generator!), /^The breaker is ON without headroom — /);
+  assert.match(shedLine(backupGateView({ ...sample, generator: gen({ shed: true, house_w: null, projected_w: null }) }).generator!),
+    /^The breaker is ON and the house load is unknown — /, "a load nobody can see is not \"no headroom\"");
   assert.equal(backupGateView({ ...sample, generator: { supply: "moon" } }).generator, null, "junk supply → no line");
   assert.equal(backupGateView(sample).generator, null, "an older planner without the block → no line");
 });

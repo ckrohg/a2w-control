@@ -105,10 +105,13 @@ treated as the generator only while an outage is plausible; otherwise the grid i
   rules (a pump failed and the tank is not recovering, or every pump runs and the tank stays under 100 °F) still decide
   whether it wants the element at all. The generator rule only refuses.
 - **Advisories (/health, dashboard, log; never acted on):**
-  - `shed`: the breaker is ON while on the generator without headroom, so the HBX could fire the element at any moment.
+  - `shed`: the breaker is ON while on the generator without headroom, or with the house load unknown, so the HBX could
+    fire the element at any moment. An unknown load counts here for the same reason it locks the element out.
   - `one_pump`: both pumps run with the house within the margin of the cap.
 - **Knobs:** `GEN_CAP_KW` (default 24) and `GEN_MARGIN_KW` (default 2.4) on the planner.
-- **Notices:** alert episode `generator_shadow`, tier attention, so **one email per episode**:
+- **Notices:** alert episode `generator_shadow` (`generator` once `BACKUP_GATE=live`), tier attention, so **one email
+  per episode**. An episode left open under the other kind is closed at restart, and the watch re-opens it if it still
+  holds:
   - `lockout`: the gate wanted the element and the generator rule refused;
   - `shed`: as above.
 

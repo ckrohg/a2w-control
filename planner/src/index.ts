@@ -45,7 +45,7 @@ import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, parseStagePumpMap, partitionRestore, calledStagesAllStopped, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
-import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type GenAssessment, type ZoneTemp } from "./generator";
+import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
@@ -904,8 +904,9 @@ async function restoreAlertState(): Promise<void> {
     const gateOpen = open.filter((o) => isGate(o) && !alerts.isClosing(o.id, o.uid) && !gateShadowAlerts.isClosing(o.id, o.uid));
     const gateKeep = gateOpen.filter((o) => o.kind === backupGateKind);
     const gateStale = gateOpen.filter((o) => o.kind !== backupGateKind);
-    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
-    if (stale.length || phStale.length || gateStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale].map((o) => o.id)); // a failure → the whole restore retries
+    const genStale = open.filter((o) => (o.kind === "generator" || o.kind === "generator_shadow") && o.kind !== genKind); // the other mode's, as the gate's
+    const { keep, stale } = partitionRestore(open.filter((o) => !parseEpisodeKind(o.kind) && !isGate(o) && !genStale.includes(o) && !alerts.isClosing(o.id, o.uid)), STAGE_MAP.map);
+    if (stale.length || phStale.length || gateStale.length || genStale.length) await store.closeAlertEpisodeIds([...stale, ...phStale, ...gateStale, ...genStale].map((o) => o.id)); // a failure → the whole restore retries
     alerts.adopt(keep);
     (BACKUP_GATE_CFG.mode === "live" ? alerts : gateShadowAlerts).adopt(gateKeep);
     if (gateKeep.length) backupGate.restore({ closedByGate: true, atMs: Date.now() }); // dwell restarts now: conservative
@@ -915,7 +916,7 @@ async function restoreAlertState(): Promise<void> {
     stageWatch.restore(keep.filter(isStage)
       .map((o) => ({ type: o.kind as "stage_unserved" | "fault_called" | "stopped_reminder", stage: o.key })));
     if (keep.some((o) => o.kind === "span_local_stale")) spanLocalAlarm.restore(true);
-    for (const o of keep) if (o.kind === "generator_shadow") genOpen.add(o.key);
+    for (const o of keep) if (o.kind === genKind) genOpen.add(o.key);
     alertStateRestored = true;
   } catch (e) {
     console.error("alert state restore failed (retried next tick):", (e as Error).message);
@@ -1121,6 +1122,7 @@ const BACKUP_CIRCUIT = "Buffer Tank";
 const HUB_ARM_TOKEN = process.env.HUB_ARM_TOKEN ?? "";
 const backupGate = new BackupGate(BACKUP_GATE_CFG.mode, BACKUP_GATE_CFG.reopen, BACKUP_GATE_CFG.t);
 const backupGateKind = BACKUP_GATE_CFG.mode === "live" ? "backup_gate" : "backup_gate_shadow";
+const genKind = genEpisodeKind(BACKUP_GATE_CFG.mode);
 let backupGateBlind: string | null = "not evaluated yet";
 let backupGateError: string | null = null;
 let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback: Record<string, unknown> | null } = { relay: null, element_w: null, pi_fallback: null };
@@ -1128,9 +1130,9 @@ let backupGateEpisodes7d: number | null = null;
 /**
  * #241 generator-aware outage mode (generator.ts), SHADOW with the gate: on the generator (or when the supply is unknown)
  * the gate may close the element breaker only if the live house load leaves room for 16.5 kW under GEN_CAP_KW and the
- * house is getting cold (TempIQ). "Would have" notices are alert_episodes kind generator_shadow (attention: one email per
- * episode): key "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is
- * ON while on the generator without headroom. The one-pump staging hint is /health + log only.
+ * house is getting cold (TempIQ). Notices are alert_episodes of kind genKind (attention: one email per episode): key
+ * "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is ON while on the
+ * generator without headroom or with the load unknown. The one-pump staging hint is /health + log only.
  */
 const GEN_CFG = parseGenConfig(process.env);
 for (const e of GEN_CFG.errors) console.warn(e);
@@ -1140,7 +1142,7 @@ const COMFORT_EXCLUDE = parseComfortExclude(process.env);
 let genAssessment: GenAssessment | null = null;
 let genEvaluatedSinceRestore = false;
 let genOnePumpLogged = false;
-const genOpen = new Set<string>(); // generator_shadow episode keys open now
+const genOpen = new Set<string>(); // genKind episode keys open now
 // shadow episodes page through their OWN outbox: default priority (never a 6bb phone push — #211 pushes high/urgent and
 // every `resolved`), email forced on, so a would-close is one email per episode, re-sent only until a channel hears it.
 // The would-open is a log line + /health + the dashboard: no second email.
@@ -1240,15 +1242,11 @@ async function checkBackupGate(reading: SlxReading): Promise<void> {
 async function checkGenerator(g: GenAssessment, blind: string | null): Promise<void> {
   if (!backupGate.generatorLockoutEpisode) await genEpisode("lockout", false);
   if (!blind) {
-    const why = `${g.supply_why}. House ${g.house_w ?? "?"} W + element ${g.element_w} W + margin ${g.margin_w} W = ` +
-      `${g.projected_w ?? "?"} W against the ${g.cap_w} W cap.`;
-    await genEpisode("shed", g.shed, "Backup element (shadow): breaker is ON on the generator without headroom",
-      `SHADOW — nothing was switched. The Buffer Tank breaker is ON, so the HBX can fire the 16.5 kW element at any moment, ` +
-      `but ${why} A2W does NOT switch it off — nothing re-opens the breaker on the generator (an owner decision before ` +
-      "going live). If you can, switch it off at the SPAN panel or in the 6bb app, or shed another big load (EV charger).");
+    const shed = shedNotice(BACKUP_GATE_CFG.mode, g);
+    await genEpisode("shed", g.shed, shed.title, shed.body);
     if (g.one_pump !== genOnePumpLogged) {
       genOnePumpLogged = g.one_pump;
-      if (g.one_pump) console.warn(`[generator] both pumps running near the cap — would hold to one pump. ${why}`);
+      if (g.one_pump) console.warn(`[generator] both pumps running near the cap — would hold to one pump. ${budgetLine(g)}`);
     }
   }
   genEvaluatedSinceRestore = true;
@@ -1258,10 +1256,10 @@ async function genEpisode(key: "lockout" | "shed", on: boolean, title = "", body
   if (on && !genOpen.has(key)) {
     console.warn(`[generator] ${title}: ${body}`);
     genOpen.add(key);
-    await alerts.open("generator_shadow", key, null, title, body);
+    await alerts.open(genKind, key, null, title, body);
   } else if (!on && genOpen.has(key)) {
     genOpen.delete(key);
-    await alerts.close("generator_shadow", key);
+    await alerts.close(genKind, key);
   }
 }
 
@@ -2496,7 +2494,7 @@ async function loopBody(): Promise<void> {
     : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
     : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore
-    : kind === "generator_shadow" ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
+    : kind === genKind ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
   await gateShadowAlerts.retry((kind) => kind === "backup_gate_shadow").catch((e) => console.error("backup-gate shadow re-send failed:", (e as Error).message));
   // shadow: flush closes / notified-marks owed; it never "re-sends" a DB row (live rows are the paging outbox's)

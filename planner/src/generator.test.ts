@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { BackupGate, type GateEvent, type GatePump } from "./backupgate";
 import { StageWatch, DEFAULT_STAGE_PUMP_MAP } from "./stagewatch";
-import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type Comfort, type ZoneTemp } from "./generator";
+import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type Comfort, type ZoneTemp } from "./generator";
 import { episodeTier } from "./alertpolicy";
 
 const BASE_W = 1_211;  // SPAN power-flows/site, 2026-10-29
@@ -120,7 +120,7 @@ const Z = (id: string, roomF: number | null, setpointF: number | null, name = id
   assert.equal(setBack.at_risk, true, "nobody calling, but an occupied room is within 2 °F of the floor");
   assert.match(setBack.why, /Mom's room is 59.4 °F — within 2 °F of the 60 °F floor/);
   assert.equal(comfortRisk([mom, Z("mom2", 66, 68, "Den", { mode: "off" })], null, { nowMs: T }).at_risk, false, "a thermostat in OFF is not occupied");
-  assert.equal(comfortRisk([mom, Z("dhw", null, null, "Hot Water", { deliveryType: "dhw" })], null, { nowMs: T }).at_risk, false, "DHW is not a room");
+  assert.equal(comfortRisk([mom, Z("dhw", null, 120, "Hot Water", { deliveryType: "dhw" })], null, { nowMs: T }).at_risk, false, "DHW is not a room");
   assert.equal(comfortRisk([mom, base], null, { nowMs: T }).at_risk, false, "an OFF Nest (no setpoint) is not occupied");
   assert.equal(comfortRisk([mom, Z("tack", 59, 62.6, "Barn - Tack")], null, { nowMs: T }).at_risk, false, "the barn is excluded by default");
   assert.equal(comfortRisk([mom, Z("tack", 59, 62.6, "Barn - Tack")], null, { nowMs: T, exclude: [] }).at_risk, true, "… unless the owner says otherwise");
@@ -196,8 +196,44 @@ const UNK = { supply: "unknown" as const, why: "the outage feed has not answered
   assert.equal(a(BASE_W + PUMP_W, cold, GENR, "CLOSED").shed, true, "breaker ON on the generator without headroom");
   assert.equal(a(BASE_W, cold, GENR, "CLOSED").shed, false);
   assert.equal(a(BASE_W + PUMP_W, cold, GRID, "CLOSED").shed, false, "never on the grid");
+  assert.equal(a(null, cold, GENR, "CLOSED").shed, true, "the load nobody can see is what the lockout refuses on: the shed warns on it too");
+  assert.equal(a(null, cold, UNK, "CLOSED").shed, true);
+  assert.equal(a(null, cold, GRID, "CLOSED").shed, false, "unknown load on the grid: nothing to shed for");
+  assert.equal(a(null, cold, GENR, "OPEN").shed, false, "the breaker is OFF: the HBX cannot fire it");
+  assert.equal(a(null, cold, GENR, null).shed, false, "no relay reading: not a claim that it is ON");
   assert.equal(a(BASE_W + 2 * PUMP_W, cold, GENR, "OPEN", 2).one_pump, false, "both pumps + base = 11.4 kW: room to spare");
   assert.equal(a(BASE_W + 2 * PUMP_W + 7_200 + 4_000, cold, GENR, "OPEN", 2).one_pump, true, "both pumps + EV + more: near the cap");
+  // the shed notice follows the gate's mode, and says the load is unknown rather than "no headroom"
+  const over = a(BASE_W + PUMP_W, cold, GENR, "CLOSED");
+  const sh = shedNotice("shadow", over), lv = shedNotice("live", over), unk = shedNotice("shadow", a(null, cold, GENR, "CLOSED"));
+  assert.equal(sh.title, "Backup element (shadow): breaker is ON on the generator without headroom");
+  assert.match(sh.body, /^SHADOW — nothing was switched\. /);
+  assert.match(sh.body, /an owner decision before going live/);
+  assert.equal(lv.title, "Backup element: breaker is ON on the generator without headroom");
+  assert.doesNotMatch(lv.title + lv.body, /shadow|going live/i, "promoted to live, the notice must not assert shadow");
+  assert.match(lv.body, /House 6311 W \+ element 16500 W \+ margin 2400 W = 25211 W against the 24000 W cap/);
+  assert.equal(unk.title, "Backup element (shadow): breaker is ON on the generator with the house load unknown");
+  assert.match(unk.body, /The live house load is unknown, so nothing shows the 16500 W element fits under the 24000 W cap/);
+  assert.doesNotMatch(unk.title + unk.body, /headroom|\?/);
+  assert.equal(genEpisodeKind("shadow"), "generator_shadow");
+  assert.equal(genEpisodeKind("off"), "generator_shadow");
+  assert.equal(genEpisodeKind("live"), "generator");
+  assert.equal(episodeTier("generator"), "attention", "live keeps the one email per episode (the default tier is record)");
+  // a room a thermostat holds sits in one 0.5 °C bucket for hours: not stale, so a warm steady house is not "unknown"
+  // comfort, and on the generator with headroom it does not get the element (the last-resort test in the calm case)
+  const T = Date.parse("2026-12-20T12:00:00Z");
+  const steady = [Z("lr", 68, 68, "Living Room"), Z("bed", 69.8, 68, "Bedroom")];
+  const ages = new ZoneAges();
+  ages.observe(steady, T);
+  const after7h = comfortRisk(steady, null, { nowMs: T + 7 * 3600_000, ages });
+  assert.equal(after7h.at_risk, false, after7h.why);
+  assert.deepEqual(after7h.unknown, []);
+  assert.equal(a(BASE_W, after7h).element_allowed, false);
+  // ... but a reading BELOW its setpoint that stops moving is still stale, and so is one with no setpoint to compare
+  const slipping = [Z("lr", 67.5, 68, "Living Room"), Z("loft", 67, null, "Loft")];
+  ages.observe(slipping, T);
+  assert.deepEqual(comfortRisk(slipping, ["loft"], { nowMs: T + 7 * 3600_000, ages }).unknown,
+    ["Living Room stale at 67.5 °F", "Loft stale at 67 °F"]);
   // the Pi's house_w, fresh only
   assert.equal(houseLoadW(1000, { ts: 950, house_w: 1211 }), 1211);
   assert.equal(houseLoadW(1000, { ts: 800, house_w: 1211 }), null, "a panel read 200 s older than the frame is stale");
