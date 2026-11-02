@@ -15,8 +15,8 @@
 # Transport (#199): SPAN removes v1 REST on 2026-12-31. span.transport picks v1 (the default until the
 # owner flips it), auto (v2 MQTT first via span_v2.py, v1 fallback) or v2; v1 + v2_soak shadows v2
 # read-only. Every consumer sees the v1 /circuits shape, and transport_status() says which answered.
-# In auto nothing waits on v2 while v1 can answer, a CLOSE above all: only the first read of a process gives the session
-# time to come up, outside the client lock; every later (re)start runs in the background (#239 review).
+# In auto nothing waits on v2 while v1 can answer, a CLOSE above all: only reads during a process's first bring-up give
+# the session time to come up, outside the client lock; every later (re)start runs in the background (#239 review).
 from __future__ import annotations
 
 import asyncio
@@ -93,7 +93,7 @@ class SpanClient:
         self._soak_stats = {"since": time.time(), "compared": 0, "agree": 0, "disagree": 0, "unavailable": 0,
                             "last_disagreement": None, "last_error": None, "last_ts": None}
         self._soak_last_diff: tuple = ()
-        self._first_read = True              # auto: this process has not given v2 its one wait yet
+        self._first_bring_up = True          # auto: this process has not finished giving v2 its one wait
         self._v1_ids: dict[str, str] = {}    # canonical id -> the id v1 spells it with
         self._answered: dict[str, dict] = {"read": {}, "write": {}}   # which transport answered, when
         self._errors: dict[str, str | None] = {"v1": None, "v2": None}
@@ -311,12 +311,13 @@ class SpanClient:
             return self._circuits_sync(self._token)
 
     def _fetch_locked(self) -> dict:
-        if self._first_read and self.transport == "auto":
-            # Outside the client lock, so a restart's CLOSE never queues behind it. A bridge's first read must not land
-            # on v1 (or, once v1 is gone, fail and page "link down since startup") because the session is 0.2 s away.
-            self._first_read = False
+        if self._first_bring_up and self.transport == "auto":
+            # Outside the client lock, so a restart's CLOSE never queues behind it. Every read until this finishes waits
+            # too: right after a bridge restart nothing should land on v1, or, once v1 is gone, fail (a page, "link down
+            # since startup"; a 503 on a breaker click) because the session is 0.2 s away.
             with contextlib.suppress(ConnectionError, V2AuthError, OSError):   # the read below reports it
                 self.v2.fetch()
+            self._first_bring_up = False
         with self._lock:
             return self._fetch_sync()
 

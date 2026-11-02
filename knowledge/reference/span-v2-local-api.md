@@ -53,10 +53,10 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
   before an outage are never served as current. An OPEN of the backup element also refuses a tree whose last message
   is more than 3 s old.
 - **Nothing waits on v2 while v1 can answer.** In `auto` a CLOSE never waits for the session: if v2 is not usable
-  right now it starts on a background thread and the CLOSE goes to v1 at once. Reads behave the same, except the first
-  read of a process, which waits outside the client lock so a bridge restart doesn't land on v1 or, once v1 is gone,
-  page "link down since startup". An OPEN still waits (it is not a safety write), and so does everything under
-  `transport: v2`, which has nowhere else to go.
+  right now it starts on a background thread and the CLOSE goes to v1 at once. Reads behave the same, except during a
+  process's first bring-up: they wait, outside the client lock, so a bridge restart doesn't land on v1 or, once v1 is
+  gone, page "link down since startup" or refuse a breaker click. An OPEN still waits (it is not a safety write), and so
+  does everything under `transport: v2`, which has nowhere else to go.
 - **Registration backs off.** A broker that refuses what the panel just issued used to mean a new panel client every
   10 minutes. Re-registering now waits 10 min, then 20, 40 … capped at 6 h. The state is persisted in
   `span-v2-register.json`, so a restart doesn't reset it. After 3 registrations in a row without a session,

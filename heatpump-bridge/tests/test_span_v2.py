@@ -339,7 +339,7 @@ def test_the_wrong_ca_fails_tls_falls_back_and_heals(make, tmp_path, monkeypatch
     st = c.transport_status()
     assert st["read"] == "v1" and not st["v2"]["connected"]
     # a session that never comes up is restarted with a freshly fetched CA (a re-issued panel CA heals itself)
-    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.0)
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 1.0)   # not 0: every read would restart it before TLS finishes
     c.v2._next_start = 0.0
     # restart: drops the stale CA, fetches the panel's, connects
     assert wait_for(lambda: reads(c) and c.transport_status()["read"] == "v2", 5)
@@ -596,7 +596,7 @@ def slow_starts(monkeypatch, seconds=1.5):
 def test_a_running_session_heals_a_reissued_ca(make, tmp_path, monkeypatch):
     """Finding 1: it connected once, then a firmware update re-issues the broker cert. Every reconnect fails TLS, so
     only a restart with a fresh CA heals it. With v1 removed this is the whole panel going unreadable."""
-    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.3)
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.5)
     sd = tmp_path / "reissued"
     sd.mkdir()
     panel, c = make(v1=False, state_dir=sd)
@@ -653,6 +653,37 @@ def test_a_read_bringing_v2_up_never_holds_a_close(make, monkeypatch):
     assert time.monotonic() - t < 1.0
     reader.join(8)
     assert c.transport_status()["read"] == "v2"       # the first read did get its wait
+
+
+def release_tree_soon(panel, seconds=0.4):
+    def release():
+        panel.ebus.hold_retained = False
+        panel.ebus.resend_retained()
+    threading.Timer(seconds, release).start()
+
+
+def test_the_first_read_waits_for_a_session_a_close_already_started(make):
+    """A bridge restart mid power cycle: the recovery CLOSE is the client's first act, and its background start must
+    not cost the read-back behind it the wait. With v1 gone that read is the only way to see the session come up."""
+    panel, c = make(v1=False)
+    panel.ebus.hold_retained = True
+    with pytest.raises(ConnectionError):
+        c._set_relay_sync("c-k", "CLOSED")
+    assert wait_for(lambda: c.v2._connected)
+    release_tree_soon(panel)
+    assert "Kitchen" in {x["name"] for x in c._fetch_locked().values()}
+
+
+def test_every_read_during_the_first_bring_up_waits_for_it(make):
+    """A breaker click just after a bridge restart must not be refused 503 because the poll loop's read got there first."""
+    panel, c = make(v1=False)
+    panel.ebus.hold_retained = True
+    first = threading.Thread(target=reads, args=(c,))
+    first.start()
+    assert wait_for(lambda: c.v2._connected)
+    release_tree_soon(panel)
+    assert reads(c)
+    first.join(5)
 
 
 def test_a_restart_never_slows_a_read_while_v1_can_answer(make, monkeypatch):

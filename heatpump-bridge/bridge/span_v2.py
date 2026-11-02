@@ -168,6 +168,7 @@ class SpanV2:
         self._subscribed_at = 0.0
         self._down_since: float | None = None  # monotonic: no broker session since then (None: connected)
         self._starts = 0                     # sessions started (alternates host / ip_fallback)
+        self._started_at = 0.0               # monotonic: when the current session started
         self._next_start = 0.0               # after a failed start, wait before trying again
         self._tree_complete = False          # this connection's retained tree has fully arrived (latched)
         self._reg = {"last": 0.0, "strikes": 0}   # registrations since the last good session (persisted)
@@ -348,6 +349,7 @@ class SpanV2:
         hosts = [h.rsplit(":", 1)[0] if h.count(":") == 1 else h for h in (self.host, self.ip_fallback) if h]
         host = hosts[self._starts % len(hosts)]
         self._starts += 1
+        self._started_at = time.monotonic()
         self.broker = f"{host}:{port}"
         with self._cv:
             self._connected = self._subscribed = self._auth_failed = False
@@ -481,7 +483,7 @@ class SpanV2:
         return None
 
     def _ensure_session(self, wait: bool = True) -> None:
-        """Start (or after an auth refusal, re-register and restart) the session; on a fresh start wait for the
+        """Start (or after an auth refusal, re-register and restart) the session; while it is fresh, wait for the
         retained tree. Raises ConnectionError / V2AuthError when v2 cannot be started right now."""
         with self._session_lock:        # inline (a read, an OPEN) or on _kick's thread: never two paho clients
             self._bring_up(wait)
@@ -523,15 +525,17 @@ class SpanV2:
                 # a dead panel must not cost every poll a timeout; a registration backoff sets its own time
                 self._next_start = time.monotonic() + (self.register_backoff_s() or 60.0)
                 raise ConnectionError(f"v2: {e}") if not isinstance(e, V2AuthError) else e
-            if not wait:
-                return
-            deadline = time.monotonic() + CONNECT_WAIT_S
-            with self._cv:
-                while self._usable_reason() is not None and not self._auth_failed:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        break
-                    self._cv.wait(min(left, 0.25))
+        if not wait:
+            return
+        # Whoever started it: a recovery CLOSE's background start must not cost the read behind it this wait. A session
+        # that started longer ago than this has had its chance (paho is reconnecting it, or it is due a restart).
+        deadline = self._started_at + CONNECT_WAIT_S
+        with self._cv:
+            while self._usable_reason() is not None and not self._auth_failed:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cv.wait(min(left, 0.25))
 
     def fetch(self, wait: bool = True) -> dict:
         """The tree in the v1 /circuits shape. wait=False (the soak, and `auto` after its first read) never blocks at
