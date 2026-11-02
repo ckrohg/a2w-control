@@ -2195,6 +2195,10 @@ const autopilot = AUTOPILOT_ENABLED ? new AutoPilot(store, writer, AUTOPILOT_DRY
 // the block in force — resolved inside the writer's restore slot — and to the as-found curve only when no plan is
 // being commanded (no auto-pilot here, or it is in shadow).
 if (autopilot) writer.setPlanCommand(() => autopilot.planCommand());
+// #231: a dashboard boost above the setpoints is armed — Phase B leads them up to it (≤ 20 min) and the poll loop
+// writes it once they cover it. Only while Phase B is actually sending: in dry-run nothing would raise them, so such a
+// boost is refused 409 as before.
+if (phaseB) writer.setBoostLead({ canLead: () => !phaseB.isDryRun, set: (t, exp) => phaseB.setPendingBoost(t, exp) });
 
 // Identification driver (identify.ts — a2w's half of gtm#1616, the "switchback driver" of #137): runs
 // RANDOMISED supply-water probes drawn from TempIQ's identification plan so U4 can MEASURE each
@@ -2405,6 +2409,9 @@ async function pollOnce(): Promise<void> {
   // (so the pump setpoints lead the raised target on this same poll) and the auto-pilot (which writes it).
   await floorReCheckOnce().catch((e) => console.error("floor re-check failed:", (e as Error).message));
   if (phaseB) await phaseB.runOnce().catch((e) => console.error("phase-b failed:", (e as Error).message));
+  // #231: an armed dashboard boost is written once the hub shows the setpoints covering it (usually the poll after
+  // the Phase B cycle that raised them — the Pi's state frame lags the send), or dropped past its 20-min bound.
+  await writer.retryPendingBoost().catch((e) => console.error("pending boost retry failed:", (e as Error).message));
   // The driver runs BETWEEN Phase B (which may be leading a probe target) and the auto-pilot (which
   // it holds for the window): a window opened here is respected by the auto-pilot in the same poll.
   if (identification) await identification.tick();
@@ -2736,7 +2743,10 @@ async function main(): Promise<void> {
             phase_b: phaseB
               // lead: the terms of the last cycle's max() — the plan term is the auto-pilot's COMMAND for the block in force
               // (plan_basis curve / flat), beside the declared tank_target_f it led before (phaseb.ts planLeadF).
-              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults, fail_streak: phaseB.streaks(), lead: phaseB.lastLead,
+              // #231: boost_f is read LIVE (the pending boost now, not as of the last cycle), so it shows the armed
+              // target from the 202 on and null as soon as the boost lands or its 20-min bound releases it.
+              ? { mode: PHASE_B_DRY_RUN ? "dry-run" : "active", pumps: PHASE_B_PUMPS, lastRunAt: phaseB.lastRunAt, lastResults: phaseB.lastResults, fail_streak: phaseB.streaks(),
+                  lead: phaseB.lastLead ? { ...phaseB.lastLead, boost_f: phaseB.pendingBoostF } : null,
                   // the two episodes the owner is emailed about (owneralerts.ts): true while one is open
                   owner_alerts: phaseB.ownerEpisodes() }
               : "disabled",
@@ -2929,7 +2939,9 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.restore("dashboard", { endsBoost: true, to })); // the owner cancelled any boost
           }
           if (req.url === "/api/hbx/boost") {
-            return json(res, 200, await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard"));
+            // #231: 202 { arming: true, setpoints_needed_f } when I1 setpoints are the boost's only obstacle
+            const out = await writer.boost(Number(body.target_f), Number(body.minutes), "dashboard", undefined, { armIfLow: true });
+            return json(res, out.arming === true ? 202 : 200, out);
           }
           return json(res, 200, await writer.setTarget(Number(body.target_f), "dashboard", undefined, { endsBoost: true }));
         }

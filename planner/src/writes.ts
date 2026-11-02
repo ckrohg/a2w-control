@@ -16,6 +16,9 @@
  * config version (so the drift detector doesn't re-alert our own write) → audit row for EVERY
  * attempt, accepted or rejected → ntfy on success. Adoption then shows up in the 5-min poll loop
  * as temp1.target moves onto the new band; status() reports commanded-vs-operative.
+ * A dashboard boost the pump setpoints do not yet cover (#231) is ARMED rather than refused when I1 is its only
+ * obstacle: Phase B leads the setpoints up to it for at most 20 min, and the poll loop writes it — every guard
+ * re-run — once the hub shows them covering it.
  */
 
 import { SensorLinxClient } from "./sensorlinx";
@@ -124,6 +127,27 @@ export type PlanCommand =
 export type RestoreTo = "plan" | "as-found";
 export type RestoreOpts = WriteOpts & { to?: RestoreTo };
 export const BOOST_YIELD = "yielded to an active boost";
+
+/**
+ * #231: the longest a dashboard boost may wait ARMED — Phase B leading the pump setpoints up to it — before the
+ * request is dropped and its lead released. Phase B enforces the same bound on its own term (setPendingBoost), so an
+ * abandoned request cannot hold the setpoints up even if the writer never retries.
+ */
+export const PENDING_BOOST_MAX_MS = 20 * 60 * 1000;
+/**
+ * #231: how the writer asks Phase B to lead a pending boost — wired by index.ts. canLead() is false while Phase B
+ * cannot raise the setpoints (dry-run); a boost above the lead is then refused 409 exactly as before.
+ */
+export interface BoostLead {
+  canLead(): boolean;
+  set(targetF: number | null, expiresAtMs?: number): void;
+}
+/** A boost waiting for the setpoints to cover it (boost() with armIfLow → 202). In memory: a restart forgets it. */
+export type PendingBoost = { targetF: number; minutes: number; source: string; capF: number; requiredF: number; requestedAt: Date; expiresAt: Date };
+/** Thrown inside setTargetSerial when the ONLY refusal would be I1 setpoints below target + margin (armable). */
+class I1ShortOnly {
+  constructor(public readonly requiredF: number, public readonly offenders: string[]) {}
+}
 export function isBoostYield(e: unknown): e is BoostYieldError { return e instanceof BoostYieldError; }
 
 export class WriteError extends Error {
@@ -246,6 +270,7 @@ export class HbxWriter {
   private lastDeviceWriteAt = new Date(0);
   /** Retire the open boost row for a landed human write; on failure arm the retry. true = retired. */
   private async retireCancelledBoost(source: string, action: string, landedAt: Date): Promise<boolean> {
+    this.clearPendingBoost(`replaced by ${source} ${action}`); // the owner's write replaces an armed boost as well
     try { await this.store.retireOpenBoosts(landedAt); return true; }
     catch (e) {
       // a second failed cancel widens the window to its own landing time (rows before the earlier one are inside it)
@@ -260,6 +285,11 @@ export class HbxWriter {
   private planCurve: Pick<ShapedCurve, "dot" | "dbt" | "mbt" | "wwsd"> | null = null;
   /** #232: resolves the plan's command for the block in force (AutoPilot.planCommand); null until index.ts wires it. */
   private planCommand: (() => Promise<PlanCommand | null>) | null = null;
+  /** #231: Phase B's pending-boost lead; null = no arming (every boost short of the setpoints is refused 409). */
+  private boostLead: BoostLead | null = null;
+  private pendingBoost: PendingBoost | null = null;
+  /** #231: how the last pending boost ended, for status() — the dashboard explains a boost that never started. */
+  private pendingBoostEnded: { target_f: number; outcome: "landed" | "expired" | "refused" | "replaced"; detail: string; at: string } | null = null;
 
   constructor(
     private readonly slx: SensorLinxClient,
@@ -296,6 +326,7 @@ export class HbxWriter {
     const operative = latest?.targetF ?? null;
     const adoptionPending = commanded != null && operative != null && Math.abs(commanded - operative) > 3;
     const boost = await this.store.activeBoost();
+    const pending = this.pendingBoost && Date.now() < this.pendingBoost.expiresAt.getTime() ? this.pendingBoost : null;
     return {
       tank_f: latest?.tankF ?? null,
       target_f: operative,
@@ -323,6 +354,10 @@ export class HbxWriter {
       last_write_at: this.lastWriteAt ? new Date(this.lastWriteAt).toISOString() : null,
       i1_margin_f: DEFAULT_OPTS.i1MarginF,
       active_boost: boost ? { target_f: boost.targetF, restore_at: boost.restoreAt.toISOString() } : null,
+      // #231: a boost waiting for Phase B to raise the pump setpoints (202 arming), and how the last one ended
+      pending_boost: pending ? { target_f: pending.targetF, minutes: pending.minutes, setpoints_needed_f: pending.requiredF,
+        requested_at: pending.requestedAt.toISOString(), expires_at: pending.expiresAt.toISOString() } : null,
+      pending_boost_ended: this.pendingBoostEnded,
       boost_cancel_pending: this.retirePending,
       auto_sanitize_enabled: this.autoSanitizeEnabled,
     };
@@ -351,6 +386,36 @@ export class HbxWriter {
     this.planCommand = resolve;
   }
 
+  /** #231: wire Phase B's pending-boost lead (index.ts, when Phase B is constructed). null = boosts never arm. */
+  setBoostLead(lead: BoostLead | null): void {
+    this.boostLead = lead;
+  }
+
+  /** #231: drop the pending boost (if any) and release its Phase B lead. */
+  private clearPendingBoost(detail: string, outcome: "landed" | "expired" | "refused" | "replaced" = "replaced"): void {
+    const p = this.pendingBoost;
+    if (!p) return;
+    this.pendingBoost = null;
+    this.boostLead?.set(null);
+    this.pendingBoostEnded = { target_f: p.targetF, outcome, detail, at: new Date().toISOString() };
+    console.log(`[boost] pending ${p.targetF}°F boost ${outcome}: ${detail}`);
+  }
+
+  /**
+   * #231: would every guard AFTER the I1 cross-check pass right now — the rate limit, the write barrier, the
+   * single-writer lease? Only then is a boost short of the setpoints armed; otherwise it is refused 409 exactly as
+   * before (I1 is the first refusal it would meet). The guards still run for real when the armed boost is written.
+   */
+  private async armable(): Promise<boolean> {
+    if (!this.boostLead?.canLead() || writeBarrier) return false;
+    if (Date.now() - this.lastWriteAt < WRITE_MIN_INTERVAL_MS) return false;
+    if (this.writerLease) {
+      try { if (!(await this.store.holdsWriterLease(this.writerLease.instanceId, this.writerLease.staleMs))) return false; }
+      catch { return false; }
+    }
+    return true;
+  }
+
   /**
    * #167: the I1 cross-check may only read hub state that IS the live pumps. A disconnected Pi, a hub that has had no
    * frame since it started, or a frame older than PI_STATE_FRESH_MS is refused with 503 — the same status and the
@@ -376,7 +441,7 @@ export class HbxWriter {
    * row still says set_target: the device got a near-flat target curve, which is what the TempIQ window poster must
    * see (a set_target both closes the boost's window and opens the excursion's).
    */
-  private async setTargetSerial(targetF: number, source: string, capF: number, asRestore = false): Promise<Record<string, unknown>> {
+  private async setTargetSerial(targetF: number, source: string, capF: number, asRestore = false, armIfShort = false): Promise<Record<string, unknown>> {
     const epoch = this.deviceWrites; // what the guards below are evaluated against — re-checked before the PATCH
     const reject = async (status: number, detail: string, stable?: string): Promise<never> => {
       await this.store.insertHbxWrite({ source, action: "set_target", requested: { target_f: targetF }, result: "rejected", detail });
@@ -415,10 +480,13 @@ export class HbxWriter {
           .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
           .map((p) => `${p.id} at ${cToF(p.setpoint_c as number).toFixed(1)}°F < ${required}°F`);
         if (offenders.length) {
+          // #231: a dashboard boost whose ONLY obstacle is the setpoints is armed (boost() records it, Phase B leads
+          // it), not refused. Nothing is written and no rejection is audited here — boost() audits the arming.
+          if (armIfShort && !asRestore && (await this.armable())) throw new I1ShortOnly(required, offenders);
           await reject(409, `I1 conflict: ${offenders.join("; ")} — raise pump setpoint(s) first or pick a lower target`);
         }
       } catch (e) {
-        if (e instanceof WriteError) throw e;
+        if (e instanceof WriteError || e instanceof I1ShortOnly) throw e;
         await reject(503, `hub unreachable — cannot verify I1: ${(e as Error).message}`);
       }
     }
@@ -538,35 +606,106 @@ export class HbxWriter {
    * restart mid-boost cannot strand the override (the Phase C write-safety primitive,
    * built early in human-triggered form). All setTarget guardrails apply to the boost;
    * the restore is exempt from the rate limit (returning the plant is never blocked).
+   *
+   * #231 `armIfLow` (the dashboard route): when the I1 cross-check would refuse ONLY because the pump setpoints sit
+   * below target + margin — every other guard (envelope / cap, fresh reading, Pi live, hub reachable, rate limit,
+   * write barrier, lease) passing — the boost is ARMED instead of refused: recorded as pending, published to Phase B
+   * as a lead term, and answered `{ arming: true, setpoints_needed_f }` (202). retryPendingBoost() writes it once the
+   * hub shows the setpoints covering it, through this same path with every guard re-run. Any other refusal is thrown
+   * exactly as before and nothing is recorded. A boost the setpoints already cover writes at once, unchanged.
    */
-  async boost(targetF: number, minutes: number, source: string, capF: number = DEFAULT_OPTS.strictCapF): Promise<Record<string, unknown>> {
+  async boost(targetF: number, minutes: number, source: string, capF: number = DEFAULT_OPTS.strictCapF, opts: { armIfLow?: boolean } = {}): Promise<Record<string, unknown>> {
     if (!Number.isFinite(minutes) || minutes < 15 || minutes > 120) {
       await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "rejected", detail: "minutes must be 15–120" });
       throw new WriteError(422, "minutes must be 15–120");
     }
     // The write AND its hbx_boosts row inside one serial slot: the auto-pilot's boost hold reads that row.
     return this.serial(async () => {
-      await this.retryPendingRetire();
-      const before = this.deviceWrites;
-      const result = await this.setTargetSerial(targetF, source, capF); // envelope (capF) + I1 + rate limit
-      // The boost's PATCH is device write before+1 (the in-lock epoch check guarantees none landed ahead of it). Any
-      // later one is a restore that overtook this slot while it was stuck after the PATCH (ntfy, audit): the owner
-      // replaced the boost, so recording it now would hold the auto-pilot on the restored curve (codex pass 10).
-      const overtaken = () => this.deviceWrites !== before + 1;
-      if (overtaken()) {
-        console.warn(`[boost] ${targetF}°F boost was overtaken by a restore before its row was recorded — not recorded`);
-        return { ...result, boost_restore_at: null, boost_superseded: true };
+      // a new boost request replaces one still arming, whatever becomes of it
+      this.clearPendingBoost(`replaced by a new ${targetF}°F boost request from ${source}`);
+      try {
+        return await this.boostSerial(targetF, minutes, source, capF, opts.armIfLow === true);
+      } catch (e) {
+        if (!(e instanceof I1ShortOnly)) throw e;
+        return this.armBoost(Math.round(targetF), minutes, source, capF, e);
       }
-      const restoreAt = new Date(Date.now() + minutes * 60_000);
-      const id = await this.store.insertBoost(targetF, restoreAt);
-      this.retirePendingBefore = null; // insertBoost retired every older open row, the stale one included
-      if (overtaken()) {
-        // the restore landed while the insert was in flight — its own retire may have run before the row existed
-        await this.store.retireBoost(id);
-        console.warn(`[boost] ${targetF}°F boost row #${id} retired — a restore overtook it while it was being recorded`);
-        return { ...result, boost_restore_at: null, boost_superseded: true };
+    });
+  }
+
+  /** The boost's write and its hbx_boosts row — runs inside a serial slot (boost(), retryPendingBoost()). */
+  private async boostSerial(targetF: number, minutes: number, source: string, capF: number, armIfShort: boolean): Promise<Record<string, unknown>> {
+    await this.retryPendingRetire();
+    const before = this.deviceWrites;
+    const result = await this.setTargetSerial(targetF, source, capF, false, armIfShort); // envelope (capF) + I1 + rate limit
+    // The boost's PATCH is device write before+1 (the in-lock epoch check guarantees none landed ahead of it). Any
+    // later one is a restore that overtook this slot while it was stuck after the PATCH (ntfy, audit): the owner
+    // replaced the boost, so recording it now would hold the auto-pilot on the restored curve (codex pass 10).
+    const overtaken = () => this.deviceWrites !== before + 1;
+    if (overtaken()) {
+      console.warn(`[boost] ${targetF}°F boost was overtaken by a restore before its row was recorded — not recorded`);
+      return { ...result, boost_restore_at: null, boost_superseded: true };
+    }
+    const restoreAt = new Date(Date.now() + minutes * 60_000);
+    const id = await this.store.insertBoost(targetF, restoreAt);
+    this.retirePendingBefore = null; // insertBoost retired every older open row, the stale one included
+    if (overtaken()) {
+      // the restore landed while the insert was in flight — its own retire may have run before the row existed
+      await this.store.retireBoost(id);
+      console.warn(`[boost] ${targetF}°F boost row #${id} retired — a restore overtook it while it was being recorded`);
+      return { ...result, boost_restore_at: null, boost_superseded: true };
+    }
+    return { ...result, boost_restore_at: restoreAt.toISOString() };
+  }
+
+  /** #231: record an armable boost as pending and hand Phase B its lead term. Audited as action boost / result arming. */
+  private async armBoost(targetF: number, minutes: number, source: string, capF: number, short: I1ShortOnly): Promise<Record<string, unknown>> {
+    const now = Date.now();
+    const expiresAt = new Date(now + PENDING_BOOST_MAX_MS);
+    this.pendingBoost = { targetF, minutes, source, capF, requiredF: short.requiredF, requestedAt: new Date(now), expiresAt };
+    this.pendingBoostEnded = null;
+    this.boostLead!.set(targetF, expiresAt.getTime());
+    const detail = `arming: ${short.offenders.join("; ")} — Phase B raises the setpoints to ≥ ${short.requiredF}°F first; the boost is written once they cover it (gives up at ${expiresAt.toISOString()})`;
+    console.log(`[boost] ${targetF}°F for ${minutes} min ${detail}`);
+    await this.store.insertHbxWrite({ source, action: "boost", requested: { target_f: targetF, minutes }, result: "arming", detail }).catch((e) =>
+      console.error(`[boost] arming audit row failed: ${(e as Error).message}`));
+    return { arming: true, target_f: targetF, minutes, setpoints_needed_f: short.requiredF, expires_at: expiresAt.toISOString(), detail };
+  }
+
+  /**
+   * #231: called every poll after Phase B. A pending boost past PENDING_BOOST_MAX_MS is dropped (its lead released);
+   * otherwise, once the hub shows every online pump ≥ target + margin from a live Pi, the boost is written through
+   * boostSerial in its own serial slot — every guard re-run, the hbx_boosts row recorded as for any boost — and the
+   * pending term cleared. Setpoints not there yet, or a transient refusal (rate limit, an I1 race), leave it pending
+   * for the next poll; any other refusal drops it.
+   */
+  async retryPendingBoost(): Promise<void> {
+    const p = this.pendingBoost;
+    if (!p) return;
+    if (Date.now() >= p.expiresAt.getTime()) {
+      this.clearPendingBoost(`the pump setpoints did not reach ${p.requiredF}°F within ${PENDING_BOOST_MAX_MS / 60_000} min — not started`, "expired");
+      await this.store.insertHbxWrite({ source: p.source, action: "boost", requested: { target_f: p.targetF, minutes: p.minutes }, result: "expired",
+        detail: `armed boost not started: the setpoints did not reach ${p.requiredF}°F within ${PENDING_BOOST_MAX_MS / 60_000} min` }).catch(() => {});
+      return;
+    }
+    if (this.hub) {
+      let covered = false;
+      try {
+        const state = await this.hub.getState();
+        const online = piStateUnverifiable(state) ? [] : state.pumps.filter((x) => x.online);
+        covered = online.length > 0 && online.every((x) => x.setpoint_c != null && cToF(x.setpoint_c) >= p.requiredF);
+      } catch { covered = false; }
+      if (!covered) return;
+    }
+    await this.serial(async () => {
+      if (this.pendingBoost !== p) return; // replaced or cancelled while this slot was queued
+      try {
+        const r = await this.boostSerial(p.targetF, p.minutes, p.source, p.capF, false);
+        this.clearPendingBoost(`written — restores at ${String(r.boost_restore_at ?? "n/a")}`, "landed");
+      } catch (e) {
+        const transient = e instanceof WriteError && (e.status === 429 || (e.status === 409 && /^I1 conflict/.test(e.message)));
+        if (transient) { console.log(`[boost] pending ${p.targetF}°F boost not written yet: ${(e as Error).message}`); return; }
+        this.clearPendingBoost(`refused: ${(e as Error).message}`, "refused");
       }
-      return { ...result, boost_restore_at: restoreAt.toISOString() };
     });
   }
 
