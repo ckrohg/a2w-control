@@ -119,6 +119,7 @@ class FakeEbus:
         self.silent = False                     # the panel stops publishing (stale tree) but the session lives
         self.hold_retained = False              # a new SUBSCRIBE gets its SUBACK but no retained tree (yet)
         self.refuse_all = False                 # every CONNECT is refused "not authorised", whatever the creds
+        self.withheld: set[str] = set()         # topic prefixes retained but not delivered (see release_withheld)
         self._published: dict[str, bytes] = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -278,7 +279,7 @@ class FakeEbus:
         with self._lock:
             retained = list(self.retained.items())
         for topic, payload in retained:
-            if any(topic_matches(flt, topic) for flt in filters):
+            if any(topic_matches(flt, topic) for flt in filters) and not self._held(topic):
                 self._send(s, _packet(0x31, _str(topic.encode()) + payload))
 
     def resend_retained(self) -> None:
@@ -288,6 +289,18 @@ class FakeEbus:
         for s in sessions:
             self._send_retained(s, s["subs"])
 
+    def _held(self, topic: str) -> bool:
+        return any(topic.startswith(w) for w in self.withheld)
+
+    def release_withheld(self) -> None:
+        self.withheld = set()
+        self.resend_retained()
+
+    def reissue_ca(self, tmp: str) -> None:
+        """A firmware update re-issues the broker certificate: new CA, new sessions must use it (live ones are dropped)."""
+        self.ca_pem, self._srv_ctx = make_tls(tmp)
+        self.drop_sessions()
+
     def _route(self, topic: str, payload: bytes, *, retain: bool) -> None:
         with self._lock:
             if retain:
@@ -295,7 +308,7 @@ class FakeEbus:
                     self.retained[topic] = payload
                 else:
                     self.retained.pop(topic, None)
-            sessions = list(self.sessions)
+            sessions = [] if self._held(topic) else list(self.sessions)
         pkt = _packet(0x30, _str(topic.encode()) + payload)
         for s in sessions:
             if any(topic_matches(flt, topic) for flt in s["subs"]):
