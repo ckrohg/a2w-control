@@ -25,5 +25,7 @@ export async function POST(req: Request) {
 }
 
 export async function GET() {
+  // Same in-handler re-check as POST (CVE-2025-29927: middleware can be skipped).
+  if (!isAuthed()) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   return NextResponse.json((await getSpanArmState()) ?? {});
 }
