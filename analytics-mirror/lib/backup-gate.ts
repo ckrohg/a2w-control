@@ -125,6 +125,13 @@ function generatorView(gen: Record<string, unknown> | null, lockout: string | nu
   };
 }
 
+/** The `shed` advisory in words: a load nobody can see is a different warning from one that does not fit. */
+export function shedLine(g: GeneratorView): string {
+  if (!g.shed) return "";
+  return `The breaker is ON ${g.houseW == null ? "and the house load is unknown" : "without headroom"} — ` +
+    "A2W does not switch it off; shed a load or switch it off by hand.";
+}
+
 /** The generator line: where the power comes from, the budget, and what it means for the element. */
 export function generatorLine(g: GeneratorView): string {
   const kw = (w: number | null) => (w == null ? "?" : (w / 1000).toFixed(1));

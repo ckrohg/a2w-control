@@ -3,7 +3,7 @@
 // Buffer Tank breaker beside it. Server component; reads the planner's /health.backup_gate. In SHADOW the gate's state
 // is virtual (nothing is switched), and the card says so in words, so it is never mistaken for the panel.
 import { fetchPlannerBackupGate } from "@/lib/planner-health";
-import { backupGateView, gateChip, generatorLine, relayLine } from "@/lib/backup-gate";
+import { backupGateView, gateChip, generatorLine, relayLine, shedLine } from "@/lib/backup-gate";
 import { fmtDateTime } from "@/lib/tz";
 
 const f1 = (v: number | null) => (v == null ? "—" : v.toFixed(1));
@@ -47,7 +47,7 @@ export async function BackupGateCard() {
         <div className="meta" style={v.generator.supply !== "grid" ? { color: "var(--warm)" } : undefined}>
           ⚡ {generatorLine(v.generator)}
           {v.generator.lockout ? ` Would close now, but: ${v.generator.lockout}.` : ""}
-          {v.generator.shed ? " The breaker is ON without headroom — A2W does not switch it off; shed a load or switch it off by hand." : ""}
+          {v.generator.shed ? ` ${shedLine(v.generator)}` : ""}
           {v.generator.onePump ? " Both pumps run near the cap: would hold to one pump." : ""}
         </div>
       ) : null}

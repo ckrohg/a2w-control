@@ -21,8 +21,8 @@
  *     temperature makes it unknown, and unknown comfort counts AS at risk (the budget still binds): the gate only gets
  *     here because the heat pumps already cannot hold the tank, and a TempIQ outage must not leave her cold.
  * Two advisories ride along (log, /health, dashboard; never acted on): `shed` — the element breaker is ON while on the
- * generator without headroom (the HBX could fire it any moment); `one_pump` — both pumps run and the house is near the
- * cap.
+ * generator without headroom, or with a load nobody can see (the HBX could fire it any moment); `one_pump` — both pumps
+ * run and the house is near the cap.
  */
 
 export const GEN = {
@@ -148,6 +148,7 @@ export function parseComfortExclude(env: Record<string, string | undefined>): st
  * TempIQ's zone payload carries no per-zone reading time, so staleness is inferred: a room temperature that has not
  * changed for STALE_MS is treated as stale (a sensor or integration that stopped reporting keeps serving its last
  * value — "Barn - Tack" above). A real occupied room moves by a step in hours, and certainly once the heat is failing.
+ * comfortRisk asks only about a room below its setpoint: one a thermostat holds does not move, and that means nothing.
  */
 export class ZoneAges {
   static readonly STALE_MS = 6 * 3600_000;
@@ -185,7 +186,10 @@ export function comfortRisk(zones: ZoneTemp[] | null, callingIds: string[] | nul
     && ((callingIds?.includes(z.id) ?? false) || (z.setpointF != null && !/^off$/i.test(z.mode ?? ""))));
   if (!occupied.length) return { at_risk: null, coldest: null, why: "no occupied zone reported" };
   const now = opts.nowMs ?? Date.now();
-  const unknown = occupied.filter((z) => z.roomF == null || (opts.ages?.stale(z.id, now) ?? false));
+  // TempIQ reports 0.5 °C steps, so a room a thermostat holds sits in one bucket for hours: an unchanged value says
+  // nothing at or above the setpoint, and treating it as unknown would hand a warm, steady house the element
+  const held = (z: ZoneTemp) => z.roomF != null && z.setpointF != null && z.roomF >= z.setpointF;
+  const unknown = occupied.filter((z) => z.roomF == null || (!held(z) && (opts.ages?.stale(z.id, now) ?? false)));
   const known = occupied.filter((z): z is ZoneTemp & { roomF: number } => !unknown.includes(z) && z.roomF != null);
   const r1 = (v: number) => Math.round(v * 10) / 10;
   const unk = unknown.map((z) => `${z.name} ${z.roomF == null ? "no temperature" : `stale at ${r1(z.roomF)} °F`}`);
@@ -232,7 +236,7 @@ export interface GenAssessment {
   /** the gate may close the element breaker (its own rules still decide whether it wants to) */
   element_allowed: boolean;
   element_why: string;
-  /** advisory: the breaker is ON on the generator without headroom for the element */
+  /** advisory: the breaker is ON on the generator without headroom for the element, or with the load unknown */
   shed: boolean;
   /** advisory: both pumps run on the generator with the house within the margin of the cap */
   one_pump: boolean;
@@ -266,8 +270,33 @@ export function assess(i: GenInput, cfg: GenConfig = DEFAULT_GEN_CONFIG): GenAss
     cap_w: cfg.capW, margin_w: cfg.marginW, element_w: GEN.ELEMENT_W,
     house_w: i.houseW == null ? null : Math.round(i.houseW), projected_w: projected == null ? null : Math.round(projected),
     budget_fits: fits, comfort: i.comfort, element_allowed: allowed, element_why: why,
-    shed: applies && i.relay === "CLOSED" && fits === false,
+    shed: applies && i.relay === "CLOSED" && fits !== true,
     one_pump: applies && (i.pumpsEngaged ?? 0) >= 2 && i.houseW != null && i.houseW + cfg.marginW > cfg.capW,
+  };
+}
+
+/** The budget in one line, for the shed notice and the one-pump log. */
+export function budgetLine(g: GenAssessment): string {
+  return `${g.supply_why}. House ${g.house_w ?? "?"} W + element ${g.element_w} W + margin ${g.margin_w} W = ` +
+    `${g.projected_w ?? "?"} W against the ${g.cap_w} W cap.`;
+}
+
+/** The alert-episode kind for generator notices, by the gate's mode (as index.ts's backupGateKind). */
+export const genEpisodeKind = (mode: string): "generator" | "generator_shadow" =>
+  mode === "live" ? "generator" : "generator_shadow";
+
+/** The `shed` notice. Live it must not claim SHADOW; with the load unknown it must not claim there is no headroom. */
+export function shedNotice(mode: string, g: GenAssessment): { title: string; body: string } {
+  const live = mode === "live";
+  const unknown = g.house_w == null;
+  const reason = unknown
+    ? `${g.supply_why}. The live house load is unknown, so nothing shows the ${g.element_w} W element fits under the ${g.cap_w} W cap.`
+    : budgetLine(g);
+  return {
+    title: `Backup element${live ? "" : " (shadow)"}: breaker is ON on the generator ${unknown ? "with the house load unknown" : "without headroom"}`,
+    body: `${live ? "" : "SHADOW — nothing was switched. "}The Buffer Tank breaker is ON, so the HBX can fire the 16.5 kW element at any moment, ` +
+      `but ${reason} A2W does NOT switch it off — nothing re-opens the breaker on the generator${live ? "" : " (an owner decision before going live)"}. ` +
+      "If you can, switch it off at the SPAN panel or in the 6bb app, or shed another big load (EV charger).",
   };
 }
 
