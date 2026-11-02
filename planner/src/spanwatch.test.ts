@@ -22,7 +22,7 @@ class FakeSpan extends SpanWatch {
   nowMs: number;
   reading = { backup: 0, pumps: 0 };
   /** #124: the unit SPAN reports — `value` is published in it (kWh × 1000 for Wh); anything else is sent as-is */
-  unit: string | undefined = "kWh";
+  unit: string | undefined = "KILO_WATT_HOUR"; // what SPAN really sends
   readonly pages: { title: string; body: string; priority?: string; tier?: string; resolved?: boolean }[] = [];
   readonly upserts: { hour: string; kwh: number }[] = [];
   constructor(startIso: string) {
@@ -37,7 +37,7 @@ class FakeSpan extends SpanWatch {
   }
   protected override now(): Date { return new Date(this.nowMs); }
   protected override async gql(_query: string, _variables: Record<string, unknown>): Promise<any> {
-    const m = (kwh: number) => ({ value: this.unit?.toLowerCase() === "wh" ? kwh * 1000 : kwh, unit: this.unit });
+    const m = (kwh: number) => ({ value: /^(wh|watt_hour)$/i.test(this.unit ?? "") ? kwh * 1000 : kwh, unit: this.unit });
     return { data: { building: { buildingId: "bld-1", multiPanels: [{ panelId: "p1", spaces: [
       { spaceId: "s1", name: "Buffer Tank", state: "CLOSED", currentHour: m(this.reading.backup) },
       { spaceId: "s2", name: "Air-Water 1", state: "CLOSED", currentHour: m(this.reading.pumps / 2) },
@@ -170,6 +170,8 @@ const r3 = (x: number) => Math.round(x * 1000) / 1000;
   assert.deepEqual(energyKwh({ value: 2750, unit: "Wh" }), { kwh: 2.75 });
   assert.deepEqual(energyKwh({ value: 2750, unit: "WH" }), { kwh: 2.75 });
   assert.deepEqual(energyKwh({ value: 2.75, unit: "kWh" }), { kwh: 2.75 });
+  assert.deepEqual(energyKwh({ value: 2.75, unit: "KILO_WATT_HOUR" }), { kwh: 2.75 }, "the live spelling");
+  assert.deepEqual(energyKwh({ value: 2750, unit: "WATT_HOUR" }), { kwh: 2.75 });
   assert.deepEqual(energyKwh({ value: "2.75", unit: " KWH " }), { kwh: 2.75 });
   assert.ok("error" in energyKwh({ value: 2.75, unit: "MWh" }));
   assert.ok("error" in energyKwh({ value: 2.75 }), "a missing unit is not kWh");
