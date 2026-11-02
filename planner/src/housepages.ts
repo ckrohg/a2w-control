@@ -9,12 +9,14 @@
  * over. Same rule as Phase B's two pages (phaseb.ts ownerAlerts). Not AlertOutbox: its send path carries no key, action
  * or facts, so a re-sent page would lose its email layout and the 6bb replace-by-tag.
  */
-import { f0 } from "./alertemail";
 import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import type { HubState } from "./hub";
 import { calledStagesAllStopped } from "./stagewatch";
 import type { SlxReading, Store } from "./store";
 import { piStateUnverifiable } from "./writes";
+
+/** °F for an email fact ("?" when unknown). */
+export const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.round(v)} °F`);
 
 /** The delivery-aware sender (index.ts ntfyDelivered): false when nobody heard it. */
 export type SendPage = (title: string, body: string, priority: string, opts: NotifyOpts) => Promise<boolean>;

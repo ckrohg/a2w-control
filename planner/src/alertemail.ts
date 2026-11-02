@@ -62,9 +62,6 @@ export interface AlertEmail {
   at?: Date;
 }
 
-/** °F for an email fact ("?" when unknown). */
-export const f0 = (v: number | null | undefined) => (v == null ? "?" : `${Math.round(v)} °F`);
-
 /** Strip the emoji/✓/⚠ prefixes and the "A2W:" label the ntfy titles carry. */
 export const cleanTitle = (t: string) =>
   t.trim().replace(/^[\u26A0\u2705\u2713\u{1F6A8}\uFE0F\s]+/u, "").replace(/^\s*A2W\s*[:—-]\s*/i, "").trim() || t.trim();

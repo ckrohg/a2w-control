@@ -48,9 +48,9 @@ import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { OutageFeed, ZoneAges, assess, comfortRisk, houseLoadW, parseComfortExclude, parseGenConfig, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
-import { renderAlertEmail, f0 } from "./alertemail";
+import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
-import { HousePages } from "./housepages";
+import { HousePages, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
