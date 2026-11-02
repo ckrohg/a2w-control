@@ -16,7 +16,9 @@
 # owner flips it), auto (v2 MQTT first via span_v2.py, v1 fallback) or v2; v1 + v2_soak shadows v2
 # read-only. Every consumer sees the v1 /circuits shape, and transport_status() says which answered.
 # In auto nothing waits on v2 while v1 can answer, a CLOSE above all: only reads during a process's first bring-up give
-# the session time to come up, outside the client lock; every later (re)start runs in the background (#239 review).
+# the session time to come up, outside the client lock; every later (re)start runs in the background. When v1 cannot
+# answer (removed, on cooldown, unreachable) a read or a CLOSE does wait for v2: a safety write is never refused when it
+# could wait (#239 review).
 from __future__ import annotations
 
 import asyncio
@@ -200,13 +202,9 @@ class SpanClient:
         v2_err = None
         if self.v2 is not None:
             try:
-                circuits = self.v2.fetch(wait=self.transport == "v2")
+                return self._v2_read(wait=self.transport == "v2")
             except (ConnectionError, V2AuthError, OSError) as e:
                 v2_err = self._errors["v2"] = str(e)
-            else:
-                self._errors["v2"] = None
-                self._note("read", "v2")
-                return {canon_id(k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
             if self.transport == "v2":
                 raise ConnectionError(v2_err)
         try:
@@ -214,12 +212,22 @@ class SpanClient:
         except Exception as e:  # noqa: BLE001 — report both transports' failures
             if v2_err is None:
                 raise
+            try:                        # v1 cannot answer: v2 gets the wait it was spared
+                return self._v2_read(wait=True)
+            except (ConnectionError, V2AuthError, OSError) as e2:
+                v2_err = self._errors["v2"] = str(e2)
             raise ConnectionError(f"v1: {e} | {v2_err}") from e
         self._note("read", "v1")
         out = {canon_id(c.get("id") or k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
         if self._soak is not None:
             self._soak_compare(out)
         return out
+
+    def _v2_read(self, wait: bool) -> dict:
+        circuits = self.v2.fetch(wait=wait)
+        self._errors["v2"] = None
+        self._note("read", "v2")
+        return {canon_id(k): {**c, "id": canon_id(c.get("id") or k)} for k, c in circuits.items()}
 
     def _soak_compare(self, v1: dict) -> None:
         """Read-only v2 soak: compare the v2 tree with the v1 read just made. Never raises, never writes, never waits
@@ -276,6 +284,10 @@ class SpanClient:
                 if st["auth_alarm"]:
                     return st
         return None
+
+    def v2_ca_replaced_at(self) -> float | None:
+        """When the panel's CA last differed from the one pinned on disk (active session or soak), else None."""
+        return max((v2.ca_replaced_at for v2 in (self.v2, self._soak) if v2 is not None and v2.ca_replaced_at), default=None)
 
     def transport_status(self) -> dict:
         """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
@@ -342,12 +354,14 @@ class SpanClient:
         elif want != "CLOSED":
             raise ValueError(f"set_relay: unknown relay state {want!r}")
         v2_err = None
+        v2_unsent = False
         if self.v2 is not None:
             try:   # an OPEN's permit recheck (expiry + guard) runs at v2's dispatch boundary; OpenAborted propagates
                 state = self.v2.set_relay(circuit_id, want, wait=want == "OPEN" or self.transport == "v2",
                                           before_send=open_permit.recheck if want == "OPEN" else None)
             except V2NotSent as e:      # never reached the panel: v1 may try (OPEN rechecks again)
                 v2_err = self._errors["v2"] = str(e)
+                v2_unsent = True
             except (ConnectionError, OSError) as e:
                 v2_err = self._errors["v2"] = str(e)
                 if want == "OPEN":      # may have landed: NEVER send a second OPEN on another transport
@@ -370,8 +384,18 @@ class SpanClient:
         try:
             state = self._v1_set_relay_sync(self._v1_ids.get(canon_id(circuit_id), circuit_id), want,
                                             open_permit=open_permit)
-        except ConnectionError as e:
-            raise ConnectionError(f"{e}{' | ' + v2_err if v2_err else ''}") from e
+        except (ConnectionError, SpanAuthError) as e:
+            if want != "CLOSED" or not v2_unsent:
+                raise ConnectionError(f"{e}{' | ' + v2_err if v2_err else ''}") from e
+            log.warning("span: CLOSED over v1 failed (%s) — waiting for v2", e)
+            try:                        # v1 cannot take it: a safety write is never refused when it could wait
+                state = self.v2.set_relay(circuit_id, want)
+            except (ConnectionError, OSError) as e2:
+                raise ConnectionError(f"{e} | {e2}") from e
+            self._note("write", "v2")
+            if state != want:
+                raise ConnectionError(f"v2: sent {want}, the panel still shows {state or 'nothing'}") from e
+            return state
         self._note("write", "v1")
         return state
 
@@ -551,6 +575,7 @@ class SpanLocalPoller:
         self._last_ok = 0.0
         self._down_alerted = False
         self._v2_alarmed = False
+        self._v2_ca_noted: float | None = None
         self._last_arm_action = 0.0
         # Latest arm/relay snapshot for the exporter + /api/span/arm (in-memory; cheap).
         self.latest_arm: dict = {}
@@ -600,6 +625,26 @@ class SpanLocalPoller:
                 except Exception as e:  # noqa: BLE001
                     log.warning("span v2 alarm record failed: %s", e)
 
+    async def _check_v2_ca(self) -> None:
+        """#239 review: the panel's CA changed under the pinned one. v2 accepts it, or a re-issued cert would never heal.
+        The fetch is plain HTTP on the LAN, so each change is recorded once (record tier: an events row + the log channel,
+        not a page): a firmware update explains it, and if there was none the record is how anyone would know."""
+        at = self.client.v2_ca_replaced_at()
+        if at is None or at == self._v2_ca_noted:
+            return
+        self._v2_ca_noted = at
+        msg = ("SPAN v2: the panel's broker CA changed and A2W now trusts the new one. A firmware update does this. If the "
+               "panel did not update, something else answered for it on the LAN.")
+        log.warning("%s", msg)
+        if self.store is not None:
+            try:
+                await self.store.add_event("span", "span_v2", code="v2_ca_changed", severity="warning", message=msg,
+                                           detail={"at": at})
+            except Exception as e:  # noqa: BLE001 — a record must never break the poller
+                log.warning("span v2 CA record failed: %s", e)
+        if self.notify:
+            await self.notify("SPAN v2 CA changed", msg, tier="record")
+
     async def poll_once(self) -> list[dict]:
         circuits = await self.client.fetch_circuits()
         rows = extract_powers(circuits, self.cfg.circuits)
@@ -609,6 +654,7 @@ class SpanLocalPoller:
             await self.store.add_span_sample(ts, r["circuit_id"], r["name"], r["power_w"])
         await self._evaluate_arm(circuits, ts)
         await self._check_v2_auth()
+        await self._check_v2_ca()
         self._last_ok = ts
         if self._down_alerted:
             self._down_alerted = False
@@ -692,6 +738,7 @@ class SpanLocalPoller:
                 await self._maybe_alert_down(str(e))
                 try:
                     await self._check_v2_auth()
+                    await self._check_v2_ca()
                 except Exception as e2:  # noqa: BLE001
                     log.warning("span v2 alarm check failed: %s", e2)
             await asyncio.sleep(self.cfg.poll_interval_s)

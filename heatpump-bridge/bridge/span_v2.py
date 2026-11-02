@@ -13,8 +13,10 @@
 #     fully arrived since its latest (re)connect, or a circuit not "ready", reads as unknown (fetch raises, or
 #     relayState/instantPowerW are None), never as OPEN or 0 W. The tree is rebuilt from scratch on every reconnect.
 #     A child the panel lists is never skipped: until it has a description and a state the tree is not complete.
-#   - A session down for NEVER_UP_S, new or long-running, is restarted on the other address with a fresh CA, so a
-#     firmware update that re-issues the broker cert heals without a bridge restart once v1 is gone.
+#   - A session down for NEVER_UP_S, new or long-running, asks the panel for its CA and, if it answers, restarts on the
+#     other address with that CA, so a firmware update that re-issues the broker cert heals without a bridge restart
+#     once v1 is gone. A panel that does not answer is an outage: paho keeps reconnecting and the pinned CA stays. A CA
+#     that differs from the pinned one is accepted and flagged (ca_replaced_at), because the fetch is plain HTTP.
 #   - A CLOSE that v1 can still take never waits for v2 to come up (set_relay(wait=False)).
 #   - Registration backs off exponentially (REGISTER_BACKOFF_MAX_S) and deletes this bridge's own stale
 #     a2w-bridge-v2-* clients, so a broker that keeps refusing cannot fill the panel's client list.
@@ -180,6 +182,7 @@ class SpanV2:
         self._ca: str | None = None
         self.last_error: str | None = None
         self.broker: str | None = None       # host:port of the live session (for /health)
+        self.ca_replaced_at: float | None = None   # wall clock: the panel's CA last differed from the pinned one
 
     # --- persistence -------------------------------------------------------------
     def _path(self, name: str) -> Path | None:
@@ -315,16 +318,26 @@ class SpanV2:
             self._creds = self._register()
         return self._creds
 
+    def _fetch_ca(self) -> str:
+        status, raw = self._http("/api/v2/certificate/ca")
+        pem = raw.decode("ascii", "replace")
+        if status != 200 or "BEGIN CERTIFICATE" not in pem:
+            raise ConnectionError(f"v2 panel CA unavailable (HTTP {status})")
+        return pem
+
+    def _pin_ca(self, pem: str) -> None:
+        pinned = self._ca or self._read(CA_FILE)
+        if pinned and pinned.strip() != pem.strip():
+            log.warning("span v2: the panel's CA differs from the pinned one — trusting the new one")
+            self.ca_replaced_at = time.time()
+        self._ca = pem
+        self._write(CA_FILE, pem, 0o644)
+
     def _ensure_ca(self) -> str:
         if self._ca is None:
             self._ca = self._read(CA_FILE)
         if not self._ca:
-            status, raw = self._http("/api/v2/certificate/ca")
-            pem = raw.decode("ascii", "replace")
-            if status != 200 or "BEGIN CERTIFICATE" not in pem:
-                raise ConnectionError(f"v2 panel CA unavailable (HTTP {status})")
-            self._ca = pem
-            self._write(CA_FILE, pem, 0o644)
+            self._pin_ca(self._fetch_ca())
         return self._ca
 
     # --- MQTT session -----------------------------------------------------------------
@@ -504,15 +517,21 @@ class SpanV2:
                 p.unlink(missing_ok=True)
         elif (self._client is not None and self._down_since is not None
               and time.monotonic() - self._down_since > NEVER_UP_S):
-            # Never came up, or lost and paho cannot get it back: rotate to the other address, and re-fetch the CA (a
-            # firmware update may have re-issued it; a stale cached CA would otherwise fail TLS forever).
+            # Never came up, or lost and paho cannot get it back. Ask the panel first: no answer is an outage (a panel
+            # reboot, the Pi's Wi-Fi), and paho's reconnect plus the pinned CA are what recover from one; ask again in
+            # NEVER_UP_S. An answer means the session itself is the problem: rotate to the other address on the CA the
+            # panel gave (a firmware update may have re-issued it; a stale one would fail TLS forever).
+            try:
+                pem = self._fetch_ca()
+            except ConnectionError as e:
+                log.info("span v2: no session on %s for %.0f s and the panel does not answer (%s) — waiting", self.broker,
+                         NEVER_UP_S, e)
+                self._down_since = time.monotonic()
+                return
             log.warning("span v2: no session on %s for %.0f s (%s) — restarting", self.broker, NEVER_UP_S,
                         self.last_error)
             self._stop()
-            self._ca = None
-            p = self._path(CA_FILE)
-            if p:
-                p.unlink(missing_ok=True)
+            self._pin_ca(pem)
         if self._client is None:
             if time.monotonic() < self._next_start:
                 if not wait:            # _kick's thread: the read reports last_error as it stands
@@ -625,4 +644,5 @@ class SpanV2:
                     "broker": self.broker, "last_message_age_s": age,
                     "serial": (self._creds or {}).get("serial"), "error": self.last_error,
                     "register_strikes": strikes, "register_backoff_s": round(self.register_backoff_s()),
+                    "ca_replaced_at": self.ca_replaced_at,
                     "auth_alarm": strikes >= AUTH_ALARM_STRIKES}

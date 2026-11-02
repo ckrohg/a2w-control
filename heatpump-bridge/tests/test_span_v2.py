@@ -667,16 +667,16 @@ def test_the_first_read_waits_for_a_session_a_close_already_started(make):
     not cost the read-back behind it the wait. With v1 gone that read is the only way to see the session come up."""
     panel, c = make(v1=False)
     panel.ebus.hold_retained = True
-    with pytest.raises(ConnectionError):
-        c._set_relay_sync("c-k", "CLOSED")
+    c.v2._kick()
     assert wait_for(lambda: c.v2._connected)
     release_tree_soon(panel)
     assert "Kitchen" in {x["name"] for x in c._fetch_locked().values()}
 
 
 def test_every_read_during_the_first_bring_up_waits_for_it(make):
-    """A breaker click just after a bridge restart must not be refused 503 because the poll loop's read got there first."""
-    panel, c = make(v1=False)
+    """A breaker click just after a bridge restart must not get a v1 answer, or a 503 once v1 is gone, because the poll
+    loop's read got there first."""
+    panel, c = make()
     panel.ebus.hold_retained = True
     first = threading.Thread(target=reads, args=(c,))
     first.start()
@@ -684,6 +684,84 @@ def test_every_read_during_the_first_bring_up_waits_for_it(make):
     release_tree_soon(panel)
     assert reads(c)
     first.join(5)
+    assert c.transport_status()["read"] == "v2" and panel.v1_requests == []
+
+
+def test_a_close_waits_for_v2_when_v1_cannot_take_it(make):
+    """Never wait while v1 can take it, always when it cannot: a recovery CLOSE on a panel with v1 removed lands on its
+    first attempt instead of 5-8 s later, and a safety write is not refused when it could wait."""
+    panel, c = make(v1=False)
+    panel.set("Kitchen", relayState="OPEN")
+    panel.ebus.hold_retained = True
+    release_tree_soon(panel)
+    assert c._set_relay_sync("c-k", "CLOSED") == "CLOSED"
+    assert c.transport_status()["write"] == "v2" and panel.relay("Kitchen") == "CLOSED"
+
+
+def test_a_later_read_waits_for_v2_when_v1_cannot_answer(make):
+    panel, c = make(v1=False)
+    c._first_bring_up = False                          # past startup: a read that fails here is a 503 on a breaker click
+    panel.ebus.hold_retained = True
+    release_tree_soon(panel)
+    assert "Kitchen" in {x["name"] for x in c._fetch_locked().values()}
+    assert c.transport_status()["read"] == "v2"
+
+
+def test_a_panel_that_does_not_answer_keeps_the_pinned_ca_and_pahos_reconnect(make, tmp_path, monkeypatch):
+    """A panel reboot or the Pi's Wi-Fi dropping for over a minute is an outage, not a re-issued CA: no answer means
+    nothing to restart on, and tearing the session down would throw away paho's own reconnect."""
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.3)
+    sd = tmp_path / "outage"
+    sd.mkdir()
+    panel, c = make(v1=False, state_dir=sd)
+    c._fetch_locked()
+    client, starts, pinned = c.v2._client, c.v2._starts, (sd / span_v2.CA_FILE).read_text()
+    panel.down = True
+    assert wait_for(lambda: not c.v2._connected)
+    time.sleep(0.5)
+    assert not reads(c)
+    assert wait_for(lambda: not c.v2._bg_lock.locked())
+    assert c.v2._client is client and c.v2._starts == starts
+    assert (sd / span_v2.CA_FILE).read_text() == pinned
+    panel.down = False                                 # the panel answers again: back on the CA it was pinned to
+    assert wait_for(lambda: reads(c), 12)
+    assert (sd / span_v2.CA_FILE).read_text() == pinned and c.v2.ca_replaced_at is None
+    assert len(panel.v2_registrations) == 1
+
+
+async def test_a_changed_ca_is_accepted_and_recorded_once(tmp_path, monkeypatch):
+    """The CA fetch is plain HTTP: healing needs the new one, and the record is how anyone would ever notice."""
+    monkeypatch.setattr(span_v2, "NEVER_UP_S", 0.5)
+    panel = FakeSpan(v1=False, v2=True)
+    addr = panel.start()
+    store = Store(str(tmp_path / "b.db"))
+    await store.open()
+    sent = []
+
+    async def notify(title, message, priority="default", *, tier, resolved=False, action=None):
+        sent.append((tier, title))
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", transport="auto"), store, notify=notify,
+                             token_path=str(tmp_path / "span-local-token"))
+    try:
+        await poller.poll_once()
+        assert poller.status()["v2"]["ca_replaced_at"] is None and sent == []
+        new_ca = tmp_path / "newca"
+        new_ca.mkdir()
+        panel.ebus.reissue_ca(str(new_ca))
+        for _ in range(80):
+            try:
+                await poller.poll_once()
+                break
+            except ConnectionError:
+                await asyncio.sleep(0.1)
+        await poller.poll_once()
+        assert poller.status()["read"] == "v2" and poller.status()["v2"]["ca_replaced_at"]
+        assert sent == [("record", "SPAN v2 CA changed")]
+        assert [e["code"] for e in await store.get_events("span", 1) if e["type"] == "span_v2"] == ["v2_ca_changed"]
+    finally:
+        await poller.stop()
+        await store.close()
+        panel.stop()
 
 
 def test_a_restart_never_slows_a_read_while_v1_can_answer(make, monkeypatch):
