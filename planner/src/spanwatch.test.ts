@@ -6,10 +6,12 @@
  * without the element; the local-midnight counter reset neither pages nor clears on its own; a restart's first
  * sample is only a baseline; and the pump path still stores the RAW day-cumulative value. The GraphQL layer and
  * the clock are scripted by overriding SpanWatch.gql / SpanWatch.now — no Cognito, no network.
+ * #124: the value is normalized by SPAN's unit (Wh / kWh, any case) and a 16.5 kW run pages in both; an unknown or
+ * missing unit is never guessed — the alarm path is blind (no page, no clear), logged once.
  * Run with: npx tsx planner/src/spanwatch.test.ts
  */
 import assert from "node:assert/strict";
-import { BACKUP_WINDOW_MS, SpanWatch } from "./spanwatch";
+import { BACKUP_BLIND, BACKUP_WINDOW_MS, SpanWatch, energyKwh } from "./spanwatch";
 import type { Store } from "./store";
 
 const ALARM_KWH = 0.3;
@@ -19,6 +21,8 @@ const ELEMENT_KWH_PER_MIN = 16.5 / 60; // 0.275 — one minute of the resistive 
 class FakeSpan extends SpanWatch {
   nowMs: number;
   reading = { backup: 0, pumps: 0 };
+  /** #124: the unit SPAN reports — `value` is published in it (kWh × 1000 for Wh); anything else is sent as-is */
+  unit: string | undefined = "kWh";
   readonly pages: { title: string; body: string; priority?: string; tier?: string; resolved?: boolean }[] = [];
   readonly upserts: { hour: string; kwh: number }[] = [];
   constructor(startIso: string) {
@@ -33,10 +37,11 @@ class FakeSpan extends SpanWatch {
   }
   protected override now(): Date { return new Date(this.nowMs); }
   protected override async gql(_query: string, _variables: Record<string, unknown>): Promise<any> {
+    const m = (kwh: number) => ({ value: this.unit?.toLowerCase() === "wh" ? kwh * 1000 : kwh, unit: this.unit });
     return { data: { building: { buildingId: "bld-1", multiPanels: [{ panelId: "p1", spaces: [
-      { spaceId: "s1", name: "Buffer Tank", state: "CLOSED", currentHour: { value: this.reading.backup, unit: "kWh" } },
-      { spaceId: "s2", name: "Air-Water 1", state: "CLOSED", currentHour: { value: this.reading.pumps / 2, unit: "kWh" } },
-      { spaceId: "s3", name: "Air-Water 2", state: "CLOSED", currentHour: { value: this.reading.pumps / 2, unit: "kWh" } },
+      { spaceId: "s1", name: "Buffer Tank", state: "CLOSED", currentHour: m(this.reading.backup) },
+      { spaceId: "s2", name: "Air-Water 1", state: "CLOSED", currentHour: m(this.reading.pumps / 2) },
+      { spaceId: "s3", name: "Air-Water 2", state: "CLOSED", currentHour: m(this.reading.pumps / 2) },
     ] }] } } };
   }
   /** advance the clock `minutes`, publish the day-cumulative readings, poll once */
@@ -158,6 +163,85 @@ const r3 = (x: number) => Math.round(x * 1000) / 1000;
     "2026-10-19T23:30:00.000Z", "2026-10-19T23:31:00.000Z", "2026-10-20T00:00:00.000Z", "2026-10-20T00:01:00.000Z",
   ], "stamped with the poll's clock; the store truncates to the hour and keeps the max");
   assert.equal(w.pages.length, 0, "pump energy never touches the alarm");
+}
+// ── 7. #124 units: SPAN's value is normalized by the unit it reports. A 16.5 kW element run trips in Wh and in kWh ─────
+{
+  // the pure conversion, case-insensitive
+  assert.deepEqual(energyKwh({ value: 2750, unit: "Wh" }), { kwh: 2.75 });
+  assert.deepEqual(energyKwh({ value: 2750, unit: "WH" }), { kwh: 2.75 });
+  assert.deepEqual(energyKwh({ value: 2.75, unit: "kWh" }), { kwh: 2.75 });
+  assert.deepEqual(energyKwh({ value: "2.75", unit: " KWH " }), { kwh: 2.75 });
+  assert.ok("error" in energyKwh({ value: 2.75, unit: "MWh" }));
+  assert.ok("error" in energyKwh({ value: 2.75 }), "a missing unit is not kWh");
+  assert.ok("error" in energyKwh({ value: null, unit: "kWh" }), "a missing value is not 0");
+
+  for (const unit of ["Wh", "wh", "kWh", "kwh"]) {
+    const w = new FakeSpan("2026-10-19T23:30:00Z");
+    w.unit = unit;
+    await w.poll(0, 0.05, 4.0);
+    await w.poll(1, 0.05, 4.0);
+    for (let m = 1; m <= 2; m++) await w.poll(1, r3(0.05 + m * ELEMENT_KWH_PER_MIN), 4.0); // the element runs 2 min
+    assert.equal(w.pages.length, 1, `${unit}: the element run pages`);
+    assert.equal(w.pages[0].title, "16.5 kW backup element DREW POWER");
+    assert.match(w.pages[0].body, /drew 0\.55 kWh in the last 60 min \(0\.60 kWh so far today/, `${unit}: reported in kWh`);
+    assert.equal(r3(w.lastDayKwh!), 0.6, `${unit}: the day total is in kWh`);
+    assert.equal(w.lastError, null);
+    assert.deepEqual(w.upserts.map((u) => r3(u.kwh)), [4, 4, 4, 4], `${unit}: the pump path is in kWh too`);
+  }
+  // Wh read as kWh would have paged on standby: 4 Wh/min is 0.004 kWh/min — the slow climb of case 1 never pages
+  {
+    const w = new FakeSpan("2026-10-19T23:30:00Z");
+    w.unit = "Wh";
+    let total = 0;
+    await w.poll(0, total);
+    for (let m = 1; m <= 90; m++) { total = r3(total + 0.004); await w.poll(1, total); }
+    assert.equal(w.pages.length, 0, "Wh standby is not a kWh element run");
+  }
+}
+// ── 8. #124 unknown or missing unit: no guess — the alarm path is blind (lastError, failStreak), logged once ───────────
+{
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...a: unknown[]) => { warned.push(a.join(" ")); };
+  try {
+    const w = new FakeSpan("2026-10-19T23:30:00Z");
+    await w.poll(0, 0.05);
+    await w.poll(1, 0.05);
+    w.unit = "MWh"; // a unit we do not know: the element run below must NOT page off a guessed scale
+    for (let m = 1; m <= 5; m++) await w.poll(1, r3(0.05 + m * ELEMENT_KWH_PER_MIN));
+    assert.equal(w.pages.length, 0, "an unknown unit never pages");
+    assert.equal(w.alarmed, false);
+    assert.equal(w.failStreak, 5, "every blind poll counts, like a failed read");
+    assert.ok(w.lastError?.startsWith(BACKUP_BLIND), w.lastError ?? "");
+    assert.match(w.lastError!, /circuit "Buffer Tank": energy unit "MWh" is not Wh or kWh/);
+    assert.equal(w.lastDayKwh, 0.05, "the last READABLE day total stays");
+    const backupWarns = warned.filter((x) => x.includes(BACKUP_BLIND));
+    assert.equal(backupWarns.length, 1, `logged once, not every poll: ${backupWarns.join(" | ")}`);
+    assert.equal(warned.filter((x) => x.includes('pump circuit "Air-Water 1"')).length, 1, "the pump circuits are logged once each too");
+
+    w.unit = undefined; // missing: a different reason, logged once
+    await w.poll(1, 2.0);
+    await w.poll(1, 2.0);
+    assert.match(w.lastError!, /energy unit missing/);
+    assert.equal(warned.filter((x) => x.includes(BACKUP_BLIND)).length, 2);
+    assert.equal(w.pages.length, 0);
+
+    // readable again: differenced against the last readable poll — the energy drawn while blind is not lost
+    w.unit = "kWh";
+    await w.poll(1, 2.0);
+    assert.equal(w.lastError, null);
+    assert.equal(w.failStreak, 0);
+    assert.equal(w.pages.length, 1, "the run that happened while blind pages once the reading is readable");
+    assert.equal(r2(w.lastHourKwh!), 1.95);
+
+    // blind while alarmed: no clear either
+    w.unit = "";
+    for (let m = 0; m < 90; m++) await w.poll(1, 2.0);
+    assert.equal(w.alarmed, true, "a blind spell never clears the page");
+    assert.equal(w.pages.length, 1);
+  } finally {
+    console.warn = warn;
+  }
 }
 
 console.log("spanwatch.test.ts: all assertions passed");
