@@ -100,8 +100,11 @@ npm run typecheck
 
 1. **New service from the `/hub` subdirectory.** In the Railway project, add a
    service pointing at this repo and set the **root directory** to `hub`
-   (Settings → Root Directory = `hub`). `railway.toml` here builds with
-   `npm install && npm run build` and starts with `npm start`.
+   (Settings → Root Directory = `hub`). The build (`npm install && npm run build`),
+   start (`npm start`), restart policy and watch patterns are **service settings**,
+   declared in `.railway/railway.ts` at the repo root and written to the service with
+   `railway config apply` — which redeploys both services, so read that file's header
+   first. There is no `railway.toml` any more (#164).
 2. **Set the two tokens** as service variables:
    - `HUB_PI_TOKEN` = a long random secret (share with the Pi)
    - `HUB_CLIENT_TOKEN` = a different long random secret (share with the optimizer + dashboard)
