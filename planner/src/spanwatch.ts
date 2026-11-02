@@ -34,9 +34,10 @@ export function energyKwh(m: { value?: unknown; unit?: unknown } | null | undefi
   const v = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
   if (!Number.isFinite(v)) return { error: `energy value ${JSON.stringify(raw ?? null)} is not a number` };
   const unit = typeof m?.unit === "string" ? m.unit.trim() : "";
-  switch (unit.toLowerCase()) {
-    case "kwh": return { kwh: v };
-    case "wh": return { kwh: v / 1000 };
+  // SPAN's GraphQL spells it KILO_WATT_HOUR (live log, 2026-11-02), so the punctuation and the long form both count
+  switch (unit.toLowerCase().replace(/[^a-z]/g, "")) {
+    case "kwh": case "kilowatthour": return { kwh: v };
+    case "wh": case "watthour": return { kwh: v / 1000 };
     default: return { error: unit ? `energy unit "${unit}" is not Wh or kWh` : "energy unit missing" };
   }
 }
