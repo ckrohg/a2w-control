@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import ssl
 import threading
@@ -748,13 +749,13 @@ async def test_a_changed_ca_is_accepted_and_recorded_once(tmp_path, monkeypatch)
         new_ca = tmp_path / "newca"
         new_ca.mkdir()
         panel.ebus.reissue_ca(str(new_ca))
-        for _ in range(80):
-            try:
+        for _ in range(100):                               # a poll can still land on the old tree before the drop shows
+            with contextlib.suppress(ConnectionError):
                 await poller.poll_once()
+            if poller.status()["v2"]["ca_replaced_at"] and poller.status()["v2"]["connected"]:
                 break
-            except ConnectionError:
-                await asyncio.sleep(0.1)
-        await poller.poll_once()
+            await asyncio.sleep(0.1)
+        await poller.poll_once()                           # healed: a read lands, and the record does not repeat
         assert poller.status()["read"] == "v2" and poller.status()["v2"]["ca_replaced_at"]
         assert sent == [("record", "SPAN v2 CA changed")]
         assert [e["code"] for e in await store.get_events("span", 1) if e["type"] == "span_v2"] == ["v2_ca_changed"]
