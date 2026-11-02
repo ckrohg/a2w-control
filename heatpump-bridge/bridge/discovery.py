@@ -15,6 +15,8 @@ import subprocess
 from pymodbus import FramerType
 from pymodbus.client import AsyncModbusTcpClient
 
+from .registers import TEMP_SCALE, to_signed
+
 log = logging.getLogger(__name__)
 
 USR_DISCOVERY_PORT = 48899
@@ -63,6 +65,18 @@ def local_subnet_hosts() -> list[str]:
     return [f"{base}.{i}" for i in range(1, 255)]
 
 
+def parse_usr_reply(data: bytes) -> str | None:
+    """One USR broadcast reply -> its MAC as 'aa:bb:cc:dd:ee:ff', or None if malformed.
+    Replies look like b"192.168.1.61,D8B04CXXXXXX,USR-W610" (this is the BASE MAC)."""
+    try:
+        parts = data.decode(errors="ignore").split(",")
+    except Exception:
+        return None
+    if len(parts) >= 2 and re.fullmatch(r"[0-9A-Fa-f]{12}", parts[1]):
+        return ":".join(parts[1][i:i + 2] for i in range(0, 12, 2)).lower()
+    return None
+
+
 async def usr_udp_discover(timeout_s: float = 1.5) -> dict[str, str]:
     """USR vendor broadcast discovery -> {ip: mac}. Harmless no-op if nothing answers."""
     found: dict[str, str] = {}
@@ -71,14 +85,9 @@ async def usr_udp_discover(timeout_s: float = 1.5) -> dict[str, str]:
 
         class Proto(asyncio.DatagramProtocol):
             def datagram_received(self, data, addr):
-                # replies look like b"192.168.1.61,D8B04CXXXXXX,USR-W610"
-                try:
-                    parts = data.decode(errors="ignore").split(",")
-                    if len(parts) >= 2 and re.fullmatch(r"[0-9A-Fa-f]{12}", parts[1]):
-                        mac = ":".join(parts[1][i:i + 2] for i in range(0, 12, 2)).lower()
-                        found[addr[0]] = mac
-                except Exception:
-                    pass
+                mac = parse_usr_reply(data)
+                if mac:
+                    found[addr[0]] = mac
 
         transport, _ = await loop.create_datagram_endpoint(
             Proto, local_addr=("0.0.0.0", 0), allow_broadcast=True)
@@ -125,13 +134,28 @@ async def probe_heatpump(host: str, port: int, device_id: int = 1,
         rr = await client.read_holding_registers(2050, count=3, device_id=device_id)
         if rr.isError():
             return None
-        def sign(v): return v - 0x10000 if v > 0x7FFF else v
-        return {"inlet_c": sign(rr.registers[0]), "outlet_c": sign(rr.registers[1]),
-                "ambient_c": sign(rr.registers[2])}
+        return {"inlet_c": to_signed(rr.registers[0]) * TEMP_SCALE,
+                "outlet_c": to_signed(rr.registers[1]) * TEMP_SCALE,
+                "ambient_c": to_signed(rr.registers[2]) * TEMP_SCALE}
     except Exception:
         return None
     finally:
         client.close()
+
+
+def merge_candidates(udp_found: dict[str, str],
+                     open_ports: list[tuple[str, int]]) -> dict[str, dict]:
+    """Merge the two sweeps -> {ip: {ip, port, mac, source}}. A broadcast hit keeps its
+    MAC and "usr-broadcast" source (port defaults to 8899, overridden by any open port the
+    scan found on that ip); a scan-only hit is "port-scan" with mac None. When one ip has
+    several open ports the last one wins."""
+    candidates: dict[str, dict] = {}
+    for ip, mac in udp_found.items():
+        candidates[ip] = {"ip": ip, "port": 8899, "mac": mac, "source": "usr-broadcast"}
+    for ip, port in open_ports:
+        entry = candidates.setdefault(ip, {"ip": ip, "mac": None, "source": "port-scan"})
+        entry["port"] = port
+    return candidates
 
 
 async def discover(extra_ports: set[int] | None = None, probe: bool = True,
@@ -148,14 +172,7 @@ async def discover(extra_ports: set[int] | None = None, probe: bool = True,
     # skipped pairs are open by definition — the bridge holds a live connection to them
     open_ports += list(skip_probe or ())
 
-    candidates: dict[str, dict] = {}
-    for ip, mac in udp_found.items():
-        candidates[ip] = {"ip": ip, "port": 8899, "mac": mac, "source": "usr-broadcast"}
-    for ip, port in open_ports:
-        entry = candidates.setdefault(ip, {"ip": ip, "mac": None, "source": "port-scan"})
-        entry["port"] = port
-        entry.setdefault("source", "port-scan")
-
+    candidates = merge_candidates(udp_found, open_ports)
     for entry in candidates.values():
         # Canonicalize identity on the ARP MAC — the WiFi station-interface MAC, which
         # is exactly what the poller adopts (set_gateway) and verifies every poll
