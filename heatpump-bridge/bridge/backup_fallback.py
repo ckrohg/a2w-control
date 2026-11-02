@@ -19,6 +19,11 @@
 # controller's fresh read (precheck), by the same rule: a fresh "does not fit" or a fresh unknown holds it for the next
 # tick. A hold noted before a fit is noted again after one (the owner may think the shed load fixed it), at most once per
 # RETRY_S, because a load flapping across the cap must not page every minute.
+# OWNER RULE 2026-11-02 — NOT ENFORCED HERE: the element never closes automatically on the generator (a 20 kW Kohler
+# 20RESA). This budget is not that rule. With the 20 kW cap and 2.4 kW margin it fits only when the rest of the house
+# draws ≤ 1.1 kW, so on the generator it can still close at a very low load, and on the grid it will usually refuse.
+# The Pi has no generator signal; backup_fallback.live must not be set until it has one (transfer-switch aux contact to
+# a Pi input — knowledge/reference/generator-outage-mode.md, pre-live gaps).
 # Default SHADOW: audit + record "would close" once per cooldown (never a phone push) and switch nothing until
 # backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
@@ -44,7 +49,7 @@ EVENT_TYPE = "backup_fallback"
 
 
 def generator_budget(snap: dict | None, cfg) -> dict:
-    """#241: would the element fit on a ~24 kW generator right now? {fits, house_w, projected_w, why}. `snap` is a
+    """#241: would the element fit on the 20 kW generator right now? {fits, house_w, projected_w, why}. `snap` is a
     BreakerController.snapshot() (None: no fresh one), `cfg` carries the numbers (BackupFallbackConfig). No I/O and no
     BackupFallback: it runs between a fresh panel read and the write, for this fallback and for the planner gate's close
     (hub_client), and an unknown load never fits."""

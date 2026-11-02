@@ -14,6 +14,8 @@
 # planner gate's own close: the check then runs on the controller's fresh panel read, right before
 # the write. Without the flag a close on the grid goes through (every pump running, the gate's
 # normal winter close, is over the budget). A dashboard close is a human override: never checked.
+# Since the owner's 2026-11-02 rule the gate sends no close when the budget applies, so no flagged
+# close arrives today: this is a backstop, should that rule change.
 from __future__ import annotations
 
 import asyncio

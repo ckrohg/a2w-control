@@ -95,7 +95,7 @@ const label = (p: StagePump | undefined, id: string) => p?.name?.trim() || id;
 const hhmm = (sinceS: number) => new Date(sinceS * 1000).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
 // a pump that answers Modbus has power, so it cannot be switched off — whatever the frame's deliberate_stop says (defence in
 // depth: the Pi already drops the stop when the pump answers)
-const stopOf = (p: StagePump | undefined) =>
+export const stopOf = (p: StagePump | undefined) =>
   (p?.deliberate_stop && Number.isFinite(p.deliberate_stop.since) && p.online !== true ? p.deliberate_stop : null);
 // The bridge's LIVE derived `fault` state is the only fault signal: it already excludes info-level protections (P17
 // anti-freeze is NORMAL — poller.py _derive_state), while the hub's raw active_faults COUNT includes them (codex pass

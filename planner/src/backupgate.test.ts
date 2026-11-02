@@ -8,13 +8,18 @@
  *   - Jul 22 – Aug 7 (lagT 60, HP2 faulted for weeks, HP1 joining as lag stage with the HBX backup call ~60 min in): NOTHING
  *     — the remaining pump always recovered the tank inside the 90-min hold;
  *   - Aug 12–13 (20.1 h stage-2 call, HP2 fault, HP1 never called): one would-close, one would-open;
- * plus the floor rule, blind spells, dwell, restore, and the live command / override / re-open-disabled paths.
+ * plus the floor rule, blind spells, dwell, restore, the live command / override / re-open-disabled paths, and the
+ * generator rule (#241, owner 2026-11-02: never a close on the generator or an unknown supply).
  * Run with: npx tsx planner/src/backupgate.test.ts
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { BackupGate, BG, DEFAULT_THRESHOLDS, parseGateConfig, type GateEvent, type GateInput, type GatePump } from "./backupgate";
 import { StageWatch, DEFAULT_STAGE_PUMP_MAP } from "./stagewatch";
+import { GEN, OutageFeed, assess, type Comfort } from "./generator";
+
+/** the most house load the 20 kW generator budget leaves room for the element beside: 20 − 16.5 − 2.4 = 1.1 kW */
+const BASE_FITS_W = GEN.CAP_W - GEN.ELEMENT_W - GEN.MARGIN_W;
 
 type FxRow = [number, number | null, number | null, string | null, string[] | null];
 const fx = (name: string): FxRow[] => JSON.parse(readFileSync(new URL(`../fixtures/${name}`, import.meta.url), "utf8")).rows;
@@ -283,11 +288,47 @@ function run(g: BackupGate, from: number, to: number, f: (m: number) => Partial<
   assert.equal(g2.breakerState, "closed"); assert.equal(g2.closedByGate, true, "so it may re-open it later");
 }
 
-// ── 9c. LIVE: the Pi's fresh read holds a close on the generator budget. That is the generator rule at work, not a failed
-//        command: no failure page, no stand-down, re-checked next poll, one notice per episode ───────────────────────────
+// ── 9c. #241 generator (owner 2026-11-02): the gate never closes on the generator or an unknown supply, whatever the
+//        budget and comfort say; the grid and an assumed grid close as before ─────────────────────────────────────────
+{
+  const cold: Comfort = { at_risk: true, coldest: null, why: "Mom's room is 61 °F — within 2 °F of the 60 °F floor" };
+  const warm: Comfort = { at_risk: false, coldest: null, why: "the coldest occupied zone is 68 °F" };
+  const unknown: Comfort = { at_risk: null, coldest: null, why: "TempIQ zone temperatures unavailable" };
+  const supplies = {
+    generator: { supply: "generator" as const, why: "National Grid reports an outage (6bb feed)" },
+    unknown: { supply: "unknown" as const, why: "the outage feed has not answered; its last answer was an active outage" },
+    grid: { supply: "grid" as const, why: "no outage reported (6bb feed)" },
+    assumed: new OutageFeed(0).supply(GEN.FEED_STARTUP_GRACE_MS),
+  };
+  assert.equal(supplies.assumed.supply, "grid"); assert.equal(supplies.assumed.assumed, true);
+  const low = () => ({ tankF: 97, tankTargetF: 120 }); // the floor rule wants the element at m=45 (§6)
+  for (const [name, supply] of Object.entries(supplies)) {
+    for (const houseW of [0, 1_000, BASE_FITS_W, 1_211, 6_311, null]) {
+      for (const comfort of [cold, warm, unknown]) {
+        for (const mode of ["shadow", "live"] as const) {
+          const g = assess({ nowMs: 0, supply, houseW, relay: "OPEN", pumpsEngaged: 2, comfort });
+          const gate = new BackupGate(mode, true);
+          const ev = run(gate, 0, 120, () => ({ ...low(), relay: "OPEN" as const, generator: { allowed: g.element_allowed, why: g.element_why } }));
+          const label = `${name}, house ${houseW} W, comfort ${comfort.at_risk}, ${mode}`;
+          if (name === "generator" || name === "unknown") {
+            assert.deepEqual(ev.map((x) => x.e.kind), ["generator_lockout"], label);
+            assert.match(ev[0].e.body, /the element is never used there \(owner, 2026-11-02\)/, label);
+            assert.equal(gate.breakerState, "open"); assert.equal(gate.pendingAction, null, `${label}: no command`);
+          } else {
+            assert.deepEqual(ev.map((x) => x.e.kind), ["close"], label);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── 9d. LIVE, the backstop: 9c means no close carries the flag today, but should one, the Pi's fresh read can hold it on
+//        the generator budget. That is the generator rule at work, not a failed command: no failure page, no stand-down,
+//        re-checked next poll, one notice per episode ─────────────────────────────────────────────────────────────────
 {
   const low = () => ({ tankF: 97, tankTargetF: 120, relay: "OPEN" as const });
-  const WHY = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 24.0 kW generator cap";
+  const WHY = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 20.0 kW generator cap";
   const g = new BackupGate("live", true);
   assert.equal(run(g, 0, 45, low).length, 1);
   const held = g.applied(false, at(45), true, WHY);

@@ -14,9 +14,9 @@
  *       available), and the tank is below FLOOR_F and not rising, continuously for FLOOR_HOLD ("totally cannot keep up").
  * and re-opens it (the `recovered` rule) once tank ≥ target − OPEN_MARGIN_F (or the HBX is satisfied: no stage called)
  * AND every pump is healthy, continuously for OPEN_HOLD — only a breaker the GATE closed, never sooner than MIN_DWELL
- * after its last action. Thresholds are MEASURED: knowledge/reference/backup-gate-thresholds.md. On the generator (#241,
- * generator.ts) a close the rules want is refused unless the house load leaves room for the element and the house is
- * getting cold, and live the Pi re-checks the budget on its fresh panel read: knowledge/reference/generator-outage-mode.md.
+ * after its last action. Thresholds are MEASURED: knowledge/reference/backup-gate-thresholds.md. On the generator or an
+ * unknown supply (#241, generator.ts) every close the rules want is refused: owner rule 2026-11-02, the element never
+ * closes automatically on the generator (knowledge/reference/generator-outage-mode.md).
  *
  * Clocks follow stagewatch.ts: time is credited only between two consecutive qualifying observations ≤ MAX_STEP apart;
  * a non-qualifying observation resets the clock; a BLIND observation (hub/Pi state unverifiable, SensorLinx field
@@ -109,8 +109,8 @@ export interface GateInput {
   pumps: GatePump[] | null;
   /** the REAL Buffer Tank relay from the Pi's SPAN snapshot, null when unknown */
   relay?: "OPEN" | "CLOSED" | null;
-  /** #241 generator.ts: allowed = false refuses a close the rules want (on the generator without headroom, or the house
-   *  not getting cold). Absent = no generator restriction. */
+  /** #241 generator.ts: allowed = false refuses a close the rules want (on the generator or an unknown supply, always).
+   *  Absent = no generator restriction. */
   generator?: { allowed: boolean; why: string } | null;
 }
 

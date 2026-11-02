@@ -125,6 +125,7 @@ Thresholds come from 97 days of Pi data plus the Postgres restore (for the tank)
 | `idle_draw` | reports idle/off ≥ 10 min while the circuit's 9-min mean is > 1 kW (measured maximum 672 W) |
 | `defrost_overlong` | reports defrost continuously for > 20 min. Normal is 4–9 min. stagewatch suspends its clock in defrost, so pump1's 83-min stuck "defrost" on 2026-10-18 paged nothing |
 | `called_tank_flat` | a stage is called and its pump is engaged (heating or defrost) ≥ 90 % of 45 min, the tank's net rise plus standby loss is ≤ 2 °F **and** the unit's mean ΔT over it is < 1.5 °C, held for 30 min. A flat tank alone is house load: a healthy single pump at ≤ 45 °F routinely loses ground (measured, doc §5) |
+| `stage_never_called` | #172: the tank sits more than 3 °F under the **curve in force** (not SensorLinx's `tank_target_f`, which freezes while the HBX idles) at every HBX poll for 2 h, and stage 2 is never called. Not judged while either pump is deliberately switched off (#212) or when a curve change in the window lowered the target by > 3 °F (a setback); stale or gappy HBX data, or an unknown curve, is "unknown" |
 
 Data comes from the mirror's `readings` and `span_readings`. SPAN consumption is negative, so the checks use its
 magnitude. Gating follows stagewatch: no live Pi frame, or no measured Pi clock offset, means nothing moves. A stale

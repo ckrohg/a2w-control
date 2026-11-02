@@ -43,7 +43,7 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, stopOf, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, piBudgetCheck, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
@@ -52,8 +52,8 @@ import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
 import { HousePages, f0 } from "./housepages";
 import {
-  PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
-  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
+  PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
+  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut, type StoppedPump,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -1009,8 +1009,8 @@ async function checkPumpHealth(): Promise<void> {
   const readings = await store.pumpReadingsWindow(ids, from, nowPi + 60);
   const span = await store.spanWindow(ids.map((id) => PUMP_SPAN_CIRCUITS[id]), from, nowPi + 60);
   if (!readings || !span) { pumpHealthGate = "mirror tables absent (readings / span_readings)"; return; }
-  const tank = (await store.tankWindow(new Date((nowS - PH.LOOKBACK_S) * 1000)))
-    .map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
+  const hbx = await store.tankWindow(new Date((nowS - Math.max(PH.LOOKBACK_S, PH.TANK_LOOKBACK_S)) * 1000));
+  const tank = hbx.map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
   const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
   const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
   const verdicts: Verdict[] = [];
@@ -1018,6 +1018,18 @@ async function checkPumpHealth(): Promise<void> {
   for (const [stage, id] of Object.entries(STAGE_MAP.map)) {
     if (!PUMP_SPAN_CIRCUITS[id]) continue;
     verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
+  }
+  // #172 stage_never_called: stage 2 (the lag stage in the Oct incident) — planner clock, the HBX series and config
+  // versions as stored. Either mapped pump switched off by a person (#212) → not judged.
+  const stage2Pump = STAGE_MAP.map["2"];
+  if (stage2Pump) {
+    const curves = await store.curveVersionsSince(new Date((nowS - PH.STAGE_IDLE_WINDOW_S - PH.MAX_SLX_GAP_S) * 1000));
+    const stopped: StoppedPump[] = Object.values(STAGE_MAP.map).flatMap((id) => {
+      const p = state.pumps.find((x) => x.id === id);
+      const s = stopOf(p);
+      return s ? [{ pumpId: id, label: pumpNames[id] ?? id, since: s.since }] : [];
+    });
+    verdicts.push(evaluateStageNeverCalled("2", stage2Pump, hbx, curves, stopped, nowS));
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();
@@ -1120,8 +1132,8 @@ let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback
 let backupGateEpisodes7d: number | null = null;
 /**
  * #241 generator-aware outage mode (generator.ts), SHADOW with the gate: on the generator (or when the supply is unknown)
- * the gate may close the element breaker only if the live house load leaves room for 16.5 kW under GEN_CAP_KW and the
- * house is getting cold (TempIQ). Notices are alert_episodes of kind genKind (attention: one email per episode): key
+ * the gate never closes the element breaker (owner, 2026-11-02); the house-load budget under GEN_CAP_KW and TempIQ
+ * comfort are still reported. Notices are alert_episodes of kind genKind (attention: one email per episode): key
  * "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is ON while on the
  * generator without headroom or with the load unknown. The one-pump staging hint is /health + log only.
  */
@@ -1560,9 +1572,17 @@ async function stormEvaluate(outageActive: boolean | null): Promise<void> {
 
 /** 5-min tick: OutageWatch (unreachable → null = NO signal) then one machine step. */
 async function stormTick(): Promise<void> {
-  const outage = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
-  outageFeed.note(outage ? outage.hasActiveOutage : null, Date.now()); // #241: grid or generator
-  await stormEvaluate(outage ? outage.hasActiveOutage : null);
+  const answer = await fetchOutageStatus(OUTAGEWATCH_URL); // never throws
+  const active = answer.hasActiveOutage ?? null;
+  const before = outageFeed.memory();
+  outageFeed.note(active, Date.now(), answer.failure); // #241: grid or generator
+  const after = outageFeed.memory();
+  // A changed memory only, so a normal day writes nothing. A failed save heals on the next change.
+  if (after.active !== before.active || after.lastActiveMs !== before.lastActiveMs) {
+    await store.saveOutageFeedMemory(after).catch((e) => console.error("outage feed memory save failed:", (e as Error).message));
+  }
+  housePages.outageFeed(outageFeed.silence(Date.now()));
+  await stormEvaluate(active);
 }
 
 /**
@@ -2351,6 +2371,9 @@ async function loopBody(): Promise<void> {
   await checkPumpHealthDaily().then(() => { pumpDailyError = null; })
     .catch((e) => { pumpDailyError = (e as Error).message; console.error("pump health daily failed:", pumpDailyError); });
 
+  // Out here for the same reason as the storm step below: a SensorLinx failure must not hide a blind alarm.
+  if (spanWatch) housePages.elementAlarm(spanWatch.blindness());
+
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
   try {
@@ -2370,6 +2393,10 @@ async function main(): Promise<void> {
   await pendingUnconfirmed.ensureLoaded();                                    // #177: so does an unsettled observation
   await restoreAlertState(); // #185 / #187 — retried every tick until it succeeds
   await sweepStormOrphans(); // #183 — retried every tick until it succeeds
+  // Without it a deploy during an outage reads a silent feed as "grid, assumed" (no memory = grid). An unreadable row
+  // leaves exactly that, which is what every start did before this table existed.
+  const feedMemory = await store.getOutageFeedMemory().catch((e) => { console.error("outage feed memory read failed:", (e as Error).message); return null; });
+  if (feedMemory) outageFeed.restore(feedMemory);
 
   // W2-A: seed the runtime autonomy row from env on FIRST boot only (ON CONFLICT DO NOTHING),
   // preserving the EXACT current per-controller state so deploying this changes nothing until the

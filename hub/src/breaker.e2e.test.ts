@@ -164,7 +164,7 @@ async function test(name: string, fn: () => Promise<void>) {
       reply: (cmd) => {
         if (cmd.circuit === "Silent") return null;                         // never acks
         if (cmd.circuit === "Over Budget") {
-          return { ok: false, detail: "25.2 kW exceeds the 24.0 kW generator cap",
+          return { ok: false, detail: "25.2 kW exceeds the 20.0 kW generator cap",
                    result: { ok: false, refused: true, budget_held: true, status: 409 } };
         }
         if (cmd.circuit === "Buffer Tank") {
@@ -220,7 +220,7 @@ async function test(name: string, fn: () => Promise<void>) {
       assert.equal(r.status, 502);
       const out = (await r.json()) as { ok: boolean; detail: string; result: { refused: boolean; budget_held: boolean } };
       assert.equal(out.ok, false);
-      assert.match(out.detail, /24\.0 kW generator cap/);
+      assert.match(out.detail, /20\.0 kW generator cap/);
       assert.equal(out.result.refused, true);
       assert.equal(out.result.budget_held, true);
     });

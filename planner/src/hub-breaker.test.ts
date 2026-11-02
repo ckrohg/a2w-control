@@ -2,12 +2,13 @@
  * @purpose Assertions for the generator-budget half of HubClient.sendBreaker (hub.ts), against a recording fetch stub: the
  * flag is sent only when the caller asks (no flag on the grid, or the Pi would refuse the gate's normal winter close), and
  * a `budget_held` answer comes back as budgetHeld, so index.ts can tell the generator rule from a failed command. The
- * last block walks the path index.ts walks (it starts a server on import, so it can't be imported here).
+ * last blocks walk the path index.ts walks (it starts a server on import, so it can't be imported here): since the
+ * owner's 2026-11-02 rule that path never sends the flag, so the hold is a backstop.
  * Run with: npx tsx planner/src/hub-breaker.test.ts
  */
 import assert from "node:assert/strict";
 import { BackupGate } from "./backupgate";
-import { assess, piBudgetCheck } from "./generator";
+import { assess, piBudgetCheck, type GenAssessment, type Supply } from "./generator";
 import { HubClient } from "./hub";
 
 const realFetch = globalThis.fetch;
@@ -36,7 +37,7 @@ function stub(status: number, body: unknown): { sent: unknown[] } {
   assert.deepEqual(rec.sent, [{ circuit: "Buffer Tank", action: "close", source: "backup-gate", generator_budget: true }]);
 
   // a budget hold: the bridge's refusal, marked. It stays `refused` for anything that doesn't read the mark.
-  const why = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 24.0 kW generator cap";
+  const why = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 20.0 kW generator cap";
   stub(502, { ok: false, detail: why, result: { ok: false, refused: true, budget_held: true, status: 409 } });
   assert.deepEqual(await send(true), { ok: false, refused: true, detail: why, budgetHeld: true });
 
@@ -50,36 +51,41 @@ function stub(status: number, body: unknown): { sent: unknown[] } {
   globalThis.fetch = (async () => { throw new Error("socket hang up"); }) as typeof fetch;
   assert.deepEqual(await send(true), { ok: false, refused: false, detail: "socket hang up" });
 
-  // the whole path as index.ts walks it: the planner's supply decides the flag, the Pi's answer lands in the gate
+  // the path as index.ts walks it: one assessment tells the gate whether it may close and sets the flag, so the gate
+  // sends nothing on the generator (owner, 2026-11-02) and no flag on the grid
   const NOW = Date.UTC(2026, 11, 1, 12);
-  const gate = new BackupGate("live", true);
   const pumps = [{ id: "pump1", online: true, state: "heating" }, { id: "pump2", online: true, state: "heating" }];
-  const close = () => {
+  const comfort = { at_risk: true, coldest: null, why: "cold" };
+  const on = (supply: Supply, houseW: number) => assess({ nowMs: NOW, supply, houseW, relay: "OPEN", pumpsEngaged: 2, comfort });
+  const firstEvent = (gate: BackupGate, g: GenAssessment) => {
     for (let m = 0; m <= 45; m += 5) {
-      const events = gate.step({ nowMs: NOW + m * 60_000, tankF: 97, tankTargetF: 120, stagesCalled: [true, true], pumps, relay: "OPEN" });
+      const events = gate.step({ nowMs: NOW + m * 60_000, tankF: 97, tankTargetF: 120, stagesCalled: [true, true], pumps, relay: "OPEN",
+                                 generator: { allowed: g.element_allowed, why: g.element_why } });
       if (events.length) return events[0];
     }
     throw new Error("the floor rule never fired");
   };
-  const e = close();
-  assert.equal(e.kind, "close");
-  const kind = e.kind as "close";
-  const supply = { supply: "generator" as const, why: "National Grid reports an outage (6bb feed)" };
-  const comfort = { at_risk: true, coldest: null, why: "cold" };
-  rec = stub(502, { ok: false, detail: why, result: { ok: false, refused: true, budget_held: true, status: 409 } });
-  const r = await hub.sendBreaker("Buffer Tank", kind, "arm", "backup-gate",
-    piBudgetCheck(kind, assess({ nowMs: NOW, supply, houseW: 1_200, relay: "OPEN", pumpsEngaged: 2, comfort })));
-  assert.equal((rec.sent[0] as { generator_budget?: boolean }).generator_budget, true);
+  const generator = on({ supply: "generator", why: "National Grid reports an outage (6bb feed)" }, 1_000);
+  const held = new BackupGate("live", true);
+  assert.equal(firstEvent(held, generator).kind, "generator_lockout", "a load that fits changes nothing");
+  assert.equal(held.pendingAction, null, "no command, so no flag");
+  const grid = on({ supply: "grid", why: "no outage" }, 6_300);
+  assert.equal(firstEvent(new BackupGate("live", true), grid).kind, "close");
+  rec = stub(200, ok);
+  await hub.sendBreaker("Buffer Tank", "close", "arm", "backup-gate", piBudgetCheck("close", grid));
+  assert.equal("generator_budget" in (rec.sent[0] as object), false, "on the grid the Pi is not asked");
+
+  // the backstop: should a flagged close ever go out, the Pi's hold lands in the gate as the generator rule
+  const gate = new BackupGate("live", true);
+  assert.equal(firstEvent(gate, grid).kind, "close");
+  stub(502, { ok: false, detail: why, result: { ok: false, refused: true, budget_held: true, status: 409 } });
+  const r = await send(true);
   const { page, lockout } = gate.applied(r.ok, NOW, r.refused, r.budgetHeld ? r.detail : null);
   assert.equal(page, false, "no 'could not close' page");
   assert.equal(lockout?.kind, "generator_lockout");
   const s = gate.status(NOW) as Record<string, unknown>;
   assert.equal(s.stand_down, null);
-  assert.match(String(s.generator_lockout), /25\.2 kW exceeds the 24\.0 kW generator cap/);
-  rec = stub(200, ok);
-  await hub.sendBreaker("Buffer Tank", kind, "arm", "backup-gate",
-    piBudgetCheck(kind, assess({ nowMs: NOW, supply: { supply: "grid", why: "no outage" }, houseW: 6_300, relay: "OPEN", pumpsEngaged: 2, comfort })));
-  assert.equal("generator_budget" in (rec.sent[0] as object), false, "on the grid the Pi is not asked");
+  assert.match(String(s.generator_lockout), /25\.2 kW exceeds the 20\.0 kW generator cap/);
 
   globalThis.fetch = realFetch;
   console.log("hub-breaker.test.ts: all assertions passed");

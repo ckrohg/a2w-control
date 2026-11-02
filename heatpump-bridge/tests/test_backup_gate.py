@@ -375,7 +375,7 @@ async def test_fallback_status_rides_the_hub_state_frame(rig):
     json.dumps(frame)   # serialisable
 
 
-# --- #241 generator budget: the Pi always assumes it may be on the ~24 kW generator ----------------------------------
+# --- #241 generator budget: the Pi always assumes it may be on the 20 kW generator -----------------------------------
 def test_house_load_sums_every_circuit_but_the_element():
     circuits = {"a": {"name": "Air-Water 1", "instantPowerW": -5100.0}, "b": {"name": "Buffer Tank", "instantPowerW": -16400.0},
                 "c": {"name": "Kitchen", "instantPowerW": -50.0}, "d": {"name": "EV Charger", "instantPowerW": -7200.0}}
@@ -426,6 +426,23 @@ async def test_fallback_budget_fits_a_normal_house(rig):
     assert events[0]["detail"]["budget"]["fits"] is True
 
 
+async def test_fallback_on_the_20kw_cap_closes_only_at_a_very_low_house_load(rig):
+    """Pins what the 20 kW budget does (owner rule 2026-11-02 is NOT enforced here: the Pi has no generator signal).
+    20 − 16.5 − 2.4 leaves 1.1 kW for the rest of the house: above it the Pi refuses (grid or not); at or below it the
+    Pi would close, generator or not. Why backup_fallback.live stays off until a real generator signal reaches the Pi."""
+    rig.panel.set("Kitchen", instantPowerW=-1_150.0)        # 8 + 8 + 1150 = 1.17 kW: 20.07 kW with the element
+    fb = rig.fallback(live=True)
+    rig.p1.fault(); rig.p2.fault()
+    for _ in range(31):
+        await rig.step(fb)
+    await settle()
+    assert rig.panel.writes == [] and await fb_events(rig.store) == ["generator_budget"]
+    assert fb.status()["budget"]["fits"] is False
+    rig.panel.set("Kitchen", instantPowerW=-1_000.0)        # 1.02 kW: 19.92 kW fits
+    await rig.step(fb)
+    assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
+
+
 async def test_fallback_generator_budget_holds_the_element_off_until_the_load_drops(rig):
     rig.panel.circuits["EV Charger"] = {"id": "c-ev", "relayState": "CLOSED", "isUserControllable": True,
                                         "instantPowerW": -7200.0}
@@ -434,11 +451,11 @@ async def test_fallback_generator_budget_holds_the_element_off_until_the_load_dr
     for _ in range(90):
         await rig.step(fb)
     await settle()
-    assert rig.panel.writes == [], "7.3 kW of house + 16.5 + 2.4 = 26.2 kW > 24: never closed, even live"
+    assert rig.panel.writes == [], "7.3 kW of house + 16.5 + 2.4 = 26.2 kW > 20: never closed, even live"
     assert await fb_events(rig.store) == ["generator_budget"], "noted once per episode"
     pages = [a for a in rig.alerts if a[0] == "push"]
     assert len(pages) == 1 and "generator budget" in pages[0][1], "live: both pumps down with the element held off pages"
-    assert "26.2 kW exceeds the 24.0 kW generator cap" in fb.status()["last"]["message"]
+    assert "26.2 kW exceeds the 20.0 kW generator cap" in fb.status()["last"]["message"]
     # the EV stops: the next tick closes
     rig.panel.set("EV Charger", instantPowerW=-2.0)
     await rig.step(fb)
@@ -497,8 +514,8 @@ async def test_fallback_uses_the_panels_site_power_when_a_circuit_has_no_reading
         await rig.step(fb)
     assert rig.panel.writes == []
     assert rig.ctl.snapshot()["house"]["source"] == "site" and rig.ctl.snapshot()["house_w"] == 9000.0
-    assert "27.9 kW exceeds the 24.0 kW generator cap (panel site power: no reading for EV Charger)" in fb.status()["budget"]["why"]
-    rig.panel.ebus.site_power = 1_500.0                    # the load drops: the circuit is still unread, the budget is not
+    assert "27.9 kW exceeds the 20.0 kW generator cap (panel site power: no reading for EV Charger)" in fb.status()["budget"]["why"]
+    rig.panel.ebus.site_power = 1_000.0                    # the load drops: the circuit is still unread, the budget is not
     await rig.step(fb)
     assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
 
@@ -641,7 +658,7 @@ async def hub_breaker(ctl, op="close", *, budget=None, circuit="Buffer Tank", **
 
 
 def winter_load(rig):
-    """The gate's normal winter close: 1.2 kW base + 5.1 kW pump + 16.5 + 2.4 = 25.2 kW against the 24 kW cap."""
+    """The gate's normal winter close: 1.2 kW base + 5.1 kW pump + 16.5 + 2.4 = 25.2 kW against the 20 kW cap."""
     rig.panel.set("Air-Water 1", instantPowerW=-5100.0)
     rig.panel.set("Kitchen", instantPowerW=-1192.0)
 
@@ -660,7 +677,7 @@ async def test_gate_close_on_the_generator_is_held_on_a_fresh_over_budget_read(r
     winter_load(rig)                                       # the load the close would land on
     ack = await hub_breaker(rig.ctl, **GENERATOR)
     assert rig.panel.writes == [] and rig.panel.relay("Buffer Tank") == "OPEN"
-    why = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 24.0 kW generator cap"
+    why = "house 6.3 kW + element 16.5 kW + margin 2.4 kW = 25.2 kW exceeds the 20.0 kW generator cap"
     assert ack["ok"] is False and ack["detail"] == why, "the planner's notice quotes this, with no 'refused: precheck:'"
     assert ack["result"]["budget_held"] is True and ack["result"]["refused"] is True
     ev = [e for e in await rig.store.get_events("span", 1) if e["type"] == "span_breaker"]
@@ -669,6 +686,7 @@ async def test_gate_close_on_the_generator_is_held_on_a_fresh_over_budget_read(r
     assert not any(a[0] in ("push", "email") for a in rig.alerts), "the planner's episode carries the notice"
     # the load drops: the same command closes
     rig.panel.set("Air-Water 1", instantPowerW=-8.0)
+    rig.panel.set("Kitchen", instantPowerW=-50.0)
     assert (await hub_breaker(rig.ctl, **GENERATOR))["ok"] is True
     assert rig.panel.writes == [("Buffer Tank", "CLOSED")]
 
@@ -734,9 +752,9 @@ async def test_the_gates_budget_check_is_the_fallbacks(rig):
 
 
 def test_generator_budget_needs_no_fallback_and_no_read():
-    cfg = SimpleNamespace(element_w=16500.0, generator_margin_w=2400.0, generator_cap_w=24000.0)
-    assert generator_budget({"house_w": 5100.0}, cfg)["fits"] is True, "exactly at the cap fits"
-    assert generator_budget({"house_w": 5101.0}, cfg)["fits"] is False
+    cfg = SimpleNamespace(element_w=16500.0, generator_margin_w=2400.0, generator_cap_w=20000.0)
+    assert generator_budget({"house_w": 1100.0}, cfg)["fits"] is True, "exactly at the cap fits"
+    assert generator_budget({"house_w": 1101.0}, cfg)["fits"] is False
     unknown = {"fits": False, "house_w": None, "projected_w": None,
                "why": "the live house load is unknown (no fresh panel read)"}
     assert generator_budget(None, cfg) == unknown
@@ -746,6 +764,7 @@ def test_generator_budget_needs_no_fallback_and_no_read():
 
 def test_generator_budget_config_bounds():
     c = BackupFallbackConfig()
-    assert (c.generator_cap_w, c.generator_margin_w, c.element_w) == (24000.0, 2400.0, 16500.0)
+    assert (c.generator_cap_w, c.generator_margin_w, c.element_w) == (20000.0, 2400.0, 16500.0), \
+        "Kohler 20RESA: 20 kW (owner, 2026-11-02)"
     with pytest.raises(ValidationError):
         BackupFallbackConfig(generator_cap_w=100000)
