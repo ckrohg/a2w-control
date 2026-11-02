@@ -43,7 +43,7 @@ import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
-import { StageWatch, parseStagePumpMap, partitionRestore, type StagePump } from "./stagewatch";
+import { StageWatch, parseStagePumpMap, partitionRestore, stopOf, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
 import { OutageFeed, ZoneAges, assess, budgetLine, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type GenAssessment, type ZoneTemp } from "./generator";
 import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
@@ -52,8 +52,8 @@ import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
 import { HousePages, f0 } from "./housepages";
 import {
-  PH, TREND, evaluatePump, evaluateTankFlat, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
-  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut,
+  PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
+  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut, type StoppedPump,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -1009,8 +1009,8 @@ async function checkPumpHealth(): Promise<void> {
   const readings = await store.pumpReadingsWindow(ids, from, nowPi + 60);
   const span = await store.spanWindow(ids.map((id) => PUMP_SPAN_CIRCUITS[id]), from, nowPi + 60);
   if (!readings || !span) { pumpHealthGate = "mirror tables absent (readings / span_readings)"; return; }
-  const tank = (await store.tankWindow(new Date((nowS - PH.LOOKBACK_S) * 1000)))
-    .map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
+  const hbx = await store.tankWindow(new Date((nowS - Math.max(PH.LOOKBACK_S, PH.TANK_LOOKBACK_S)) * 1000));
+  const tank = hbx.map((t) => ({ ...t, ts: t.ts - (offsetS as number) })); // planner clock → Pi clock, like the readings
   const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
   const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
   const verdicts: Verdict[] = [];
@@ -1018,6 +1018,18 @@ async function checkPumpHealth(): Promise<void> {
   for (const [stage, id] of Object.entries(STAGE_MAP.map)) {
     if (!PUMP_SPAN_CIRCUITS[id]) continue;
     verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
+  }
+  // #172 stage_never_called: stage 2 (the lag stage in the Oct incident) — planner clock, the HBX series and config
+  // versions as stored. Either mapped pump switched off by a person (#212) → not judged.
+  const stage2Pump = STAGE_MAP.map["2"];
+  if (stage2Pump) {
+    const curves = await store.curveVersionsSince(new Date((nowS - PH.STAGE_IDLE_WINDOW_S - PH.MAX_SLX_GAP_S) * 1000));
+    const stopped: StoppedPump[] = Object.values(STAGE_MAP.map).flatMap((id) => {
+      const p = state.pumps.find((x) => x.id === id);
+      const s = stopOf(p);
+      return s ? [{ pumpId: id, label: pumpNames[id] ?? id, since: s.since }] : [];
+    });
+    verdicts.push(evaluateStageNeverCalled("2", stage2Pump, hbx, curves, stopped, nowS));
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();

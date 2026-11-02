@@ -15,7 +15,7 @@ import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 import type { PiLinkInputs } from "./pilink";
-import type { PumpReading, SpanSample, TankReading, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
+import type { PumpReading, SpanSample, TankReading, CurveVersion, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
 
 export interface SlxReading {
   ts: Date;
@@ -2046,12 +2046,28 @@ export class Store {
     return out;
   }
 
-  /** HBX tank + stage calls since `from` (planner clock), ascending, as epoch seconds. */
+  /** HBX tank + outdoor + stage calls since `from` (planner clock), ascending, as epoch seconds. */
   async tankWindow(from: Date): Promise<TankReading[]> {
     const rows = await this.boundedRows(
-      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
+      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, outdoor_f, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
     return (rows ?? []).map((x) => ({ ts: Number(x.ts), tank_f: x.tank_f == null ? null : Number(x.tank_f),
+      outdoor_f: x.outdoor_f == null ? null : Number(x.outdoor_f),
       stages_called: Array.isArray(x.stages_called) ? x.stages_called.map((b: unknown) => b === true) : null }));
+  }
+
+  /**
+   * #172: the curve in force over [from, now] — every hbx_config_versions row observed since `from`, plus the newest one
+   * before it (the curve already in force at `from`). Planner clock, ascending. curve = null when the row lacks one.
+   */
+  async curveVersionsSince(from: Date): Promise<CurveVersion[]> {
+    const rows = await this.boundedRows(
+      `SELECT extract(epoch FROM observed_at)::float8 AS ts, config FROM hbx_config_versions
+       WHERE observed_at >= $1 OR id = (SELECT max(id) FROM hbx_config_versions WHERE observed_at < $1) ORDER BY observed_at, id`, [from]);
+    return (rows ?? []).map((x) => {
+      const c = (x.config ?? {}) as Record<string, unknown>;
+      const ok = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number" && Number.isFinite(v));
+      return { ts: Number(x.ts), curve: ok ? { dot: c.dot as number, wwsd: c.wwsd as number, dbt: c.dbt as number, mbt: c.mbt as number } : null };
+    });
   }
 
   async upsertPumpHealthDay(day: string, pumpId: string, metrics: DayMetrics): Promise<void> {
