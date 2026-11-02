@@ -1132,8 +1132,8 @@ let backupGateHub: { relay: string | null; element_w: number | null; pi_fallback
 let backupGateEpisodes7d: number | null = null;
 /**
  * #241 generator-aware outage mode (generator.ts), SHADOW with the gate: on the generator (or when the supply is unknown)
- * the gate may close the element breaker only if the live house load leaves room for 16.5 kW under GEN_CAP_KW and the
- * house is getting cold (TempIQ). Notices are alert_episodes of kind genKind (attention: one email per episode): key
+ * the gate never closes the element breaker (owner, 2026-11-02); the house-load budget under GEN_CAP_KW and TempIQ
+ * comfort are still reported. Notices are alert_episodes of kind genKind (attention: one email per episode): key
  * "lockout" = the gate wanted the element and the generator rule refused it; key "shed" = the breaker is ON while on the
  * generator without headroom or with the load unknown. The one-pump staging hint is /health + log only.
  */
