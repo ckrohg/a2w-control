@@ -263,6 +263,12 @@ class SpanClient:
     def _note(self, kind: str, transport: str) -> None:
         self._answered[kind] = {"transport": transport, "ts": time.time()}
 
+    def site_power_w(self) -> float | None:
+        """The panel's own whole-site draw, when v2 answered the last read (v1 has no such value)."""
+        if self.v2 is None or self._answered["read"].get("transport") != "v2":
+            return None
+        return self.v2.site_power_w()
+
     def v2_auth_alarm(self) -> dict | None:
         """The v2 session (active or soak) has registered AUTH_ALARM_STRIKES times without getting a session: the
         broker keeps refusing what the panel issues. None while that is not the case."""
@@ -272,12 +278,6 @@ class SpanClient:
                 if st["auth_alarm"]:
                     return st
         return None
-
-    def site_power_w(self) -> float | None:
-        """The panel's own whole-site draw, when v2 answered the last read (v1 has no such value)."""
-        if self.v2 is None or self._answered["read"].get("transport") != "v2":
-            return None
-        return self.v2.site_power_w()
 
     def transport_status(self) -> dict:
         """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
