@@ -6,15 +6,16 @@
  *   - both pump circuits drew ~8 W through the incident window (span_readings), so the base is the whole house;
  *   - a pump heating: p50 5.1 kW, p95 6.1 kW (span_readings Jul 31 – Oct 29, n = 17.7k). With today's lagT 60 the HBX
  *     would have added HP1 an hour into that call, so "normal load on the generator" = 1.2 + 5.1 kW.
- * Pins the three cases the owner asked for: generator + normal load → locked out; cold house + headroom → would close;
- * unknown supply → treated as the generator (locked out without a live load).
+ * Pins the owner's rule of 2026-11-02 on the 20 kW generator: the element NEVER closes automatically on the generator
+ * or an unknown supply, whatever the budget and comfort say (they are still reported, and `shed` still works); the grid
+ * and an assumed grid are unchanged.
  * Run with: npx tsx planner/src/generator.test.ts
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { BackupGate, type GateEvent, type GatePump } from "./backupgate";
 import { StageWatch, DEFAULT_STAGE_PUMP_MAP } from "./stagewatch";
-import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type Comfort, type ZoneTemp } from "./generator";
+import { DEFAULT_COMFORT_EXCLUDE, GEN, OutageFeed, ZoneAges, assess, comfortRisk, genEpisodeKind, houseLoadW, parseComfortExclude, parseGenConfig, shedNotice, type Comfort, type Supply, type ZoneTemp } from "./generator";
 import { episodeTier } from "./alertpolicy";
 
 const BASE_W = 1_211;  // SPAN power-flows/site, 2026-10-29
@@ -23,11 +24,11 @@ const PUMP_W = 5_100;  // measured p50 heating draw
 // ── 1. config ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 {
   const d = parseGenConfig({});
-  assert.deepEqual(d.cfg, { capW: 24_000, marginW: 2_400 });
+  assert.deepEqual(d.cfg, { capW: 20_000, marginW: 2_400 }, "Kohler 20RESA: 20 kW (owner, 2026-11-02)");
   assert.deepEqual(d.errors, []);
   assert.deepEqual(parseGenConfig({ GEN_CAP_KW: "22", GEN_MARGIN_KW: "3" }).cfg, { capW: 22_000, marginW: 3_000 });
   const bad = parseGenConfig({ GEN_CAP_KW: "100", GEN_MARGIN_KW: "-1" });
-  assert.deepEqual(bad.cfg, { capW: 24_000, marginW: 2_400 }, "out-of-range values fall back to the defaults");
+  assert.deepEqual(bad.cfg, { capW: 20_000, marginW: 2_400 }, "out-of-range values fall back to the defaults");
   assert.equal(bad.errors.length, 2);
   assert.equal(episodeTier("generator_shadow"), "attention", "a generator would-have is one email per episode");
 }
@@ -254,23 +255,51 @@ const GENR = { supply: "generator" as const, why: "National Grid reports an outa
 const GRID = { supply: "grid" as const, why: "no outage reported (6bb feed)" };
 const UNK = { supply: "unknown" as const, why: "the outage feed has not answered since the planner started" };
 {
-  const a = (houseW: number | null, comfort: Comfort, supply = GENR, relay: "OPEN" | "CLOSED" | null = "OPEN", pumpsEngaged = 0) =>
+  const a = (houseW: number | null, comfort: Comfort, supply: { supply: Supply; why: string } = GENR, relay: "OPEN" | "CLOSED" | null = "OPEN", pumpsEngaged = 0) =>
     assess({ nowMs: 0, supply, houseW, relay, pumpsEngaged, comfort });
-  assert.equal(a(BASE_W, cold).element_allowed, true, "both pumps down, base load, mom cold: 1.2 + 16.5 + 2.4 = 20.1 kW fits");
-  assert.equal(a(BASE_W + PUMP_W, cold).element_allowed, false, "one pump heating: 1.2 + 5.1 + 16.5 + 2.4 = 25.2 kW > 24");
-  assert.match(a(BASE_W + PUMP_W, cold).element_why, /25\.2 kW exceeds the 24\.0 kW cap/);
-  assert.equal(a(24_000 - GEN.ELEMENT_W - GEN.MARGIN_W, cold).element_allowed, true, "exactly at the cap fits");
-  assert.equal(a(24_000 - GEN.ELEMENT_W - GEN.MARGIN_W + 1, cold).element_allowed, false);
-  assert.equal(a(BASE_W, warm).element_allowed, false, "headroom, but the house is not getting cold: last resort only");
-  assert.equal(a(BASE_W, unknownComfort).element_allowed, true, "comfort unknown counts as at risk; the budget still binds");
-  assert.equal(a(null, cold).element_allowed, false, "unknown load on the generator: locked out");
-  assert.equal(a(BASE_W + PUMP_W, warm, GRID).element_allowed, true, "on the grid nothing changes");
-  assert.equal(a(null, warm, GRID).element_allowed, true);
-  assert.equal(a(BASE_W, cold, UNK).element_allowed, true, "unknown supply = the generator rule, which this load passes");
-  assert.equal(a(BASE_W + PUMP_W, cold, UNK).element_allowed, false);
+  // owner 2026-11-02: on the generator or an unknown supply, NO combination of budget and comfort lets the element close
+  const atCap = 20_000 - GEN.ELEMENT_W - GEN.MARGIN_W; // 1.1 kW: the most house load the 20 kW budget leaves
+  for (const supply of [GENR, UNK]) {
+    for (const houseW of [0, 1_000, atCap, atCap + 1, BASE_W, BASE_W + PUMP_W, BASE_W + 2 * PUMP_W, null]) {
+      for (const comfort of [cold, warm, unknownComfort]) {
+        const r = a(houseW, comfort, supply);
+        assert.equal(r.element_allowed, false, `${supply.supply}, house ${houseW} W, comfort ${comfort.at_risk}`);
+        assert.equal(r.budget_applies, true);
+      }
+    }
+  }
+  assert.equal(a(1_000, cold).element_why, "on the generator: the element is never used there (owner, 2026-11-02)");
+  assert.equal(a(1_000, cold, UNK).element_why,
+    "the supply is unknown, so it is treated as the generator: the element is never used there (owner, 2026-11-02)");
+  // ... and the budget and comfort are still reported (/health)
+  const fit = a(atCap, cold);
+  assert.equal(fit.cap_w, 20_000);
+  assert.equal(fit.budget_fits, true, "exactly at the cap fits the budget");
+  assert.equal(fit.projected_w, 20_000);
+  assert.equal(fit.comfort, cold);
+  assert.equal(a(atCap + 1, cold).budget_fits, false);
+  assert.equal(a(BASE_W, cold).budget_fits, false, "both pumps down, base load: 1.2 + 16.5 + 2.4 = 20.1 kW > 20");
+  assert.equal(a(BASE_W + PUMP_W, cold).projected_w, 25_211, "one pump heating: 25.2 kW");
+  assert.equal(a(null, cold).budget_fits, null, "unknown load: unknown budget");
+  // the grid and an assumed grid (a silent feed, no outage plausible) are unchanged
+  const assumedGrid = new OutageFeed(0).supply(GEN.FEED_STARTUP_GRACE_MS);
+  assert.equal(assumedGrid.assumed, true);
+  for (const supply of [GRID, assumedGrid]) {
+    for (const houseW of [BASE_W, BASE_W + PUMP_W + 7_200, null]) {
+      for (const comfort of [cold, warm, unknownComfort]) {
+        const r = a(houseW, comfort, supply);
+        assert.equal(r.element_allowed, true, `on the grid nothing changes (${supply.why}, house ${houseW} W)`);
+        assert.equal(r.element_why, supply === GRID ? "on the grid: no generator limit" : "assumed on the grid (the outage feed is silent): no generator limit");
+        assert.equal(r.budget_applies, false);
+      }
+    }
+  }
   // advisories
   assert.equal(a(BASE_W + PUMP_W, cold, GENR, "CLOSED").shed, true, "breaker ON on the generator without headroom");
-  assert.equal(a(BASE_W, cold, GENR, "CLOSED").shed, false);
+  assert.equal(a(BASE_W, cold, GENR, "CLOSED").shed, true, "the base load alone leaves no room for the element on 20 kW");
+  assert.equal(a(BASE_W, cold, UNK, "CLOSED").shed, true, "unknown supply = the generator");
+  assert.equal(a(1_000, cold, GENR, "CLOSED").shed, false);
+  assert.equal(a(BASE_W + PUMP_W, cold, GENR, "OPEN").shed, false, "the breaker is OFF: nothing to shed");
   assert.equal(a(BASE_W + PUMP_W, cold, GRID, "CLOSED").shed, false, "never on the grid");
   assert.equal(a(null, cold, GENR, "CLOSED").shed, true, "the load nobody can see is what the lockout refuses on: the shed warns on it too");
   assert.equal(a(null, cold, UNK, "CLOSED").shed, true);
@@ -287,9 +316,9 @@ const UNK = { supply: "unknown" as const, why: "the outage feed has not answered
   assert.match(sh.body, /an owner decision before going live/);
   assert.equal(lv.title, "Backup element: breaker is ON on the generator without headroom");
   assert.doesNotMatch(lv.title + lv.body, /shadow|going live/i, "promoted to live, the notice must not assert shadow");
-  assert.match(lv.body, /House 6311 W \+ element 16500 W \+ margin 2400 W = 25211 W against the 24000 W cap/);
+  assert.match(lv.body, /House 6311 W \+ element 16500 W \+ margin 2400 W = 25211 W against the 20000 W cap/);
   assert.equal(unk.title, "Backup element (shadow): breaker is ON on the generator with the house load unknown");
-  assert.match(unk.body, /The live house load is unknown, so nothing shows the 16500 W element fits under the 24000 W cap/);
+  assert.match(unk.body, /The live house load is unknown, so nothing shows the 16500 W element fits under the 20000 W cap/);
   assert.doesNotMatch(unk.title + unk.body, /headroom|\?/);
   assert.equal(genEpisodeKind("shadow"), "generator_shadow");
   assert.equal(genEpisodeKind("off"), "generator_shadow");
@@ -358,31 +387,34 @@ const outage = () => GENR;
   assert.equal(a[0].at, gridClose, "refused at the moment the grid replay would close");
   assert.match(a[0].e.title, /shadow.*generator rule says no/i);
   assert.match(a[0].e.body, /SHADOW — nothing was switched/);
-  assert.match(a[0].e.body, /house 6\.3 kW \+ element 16\.5 kW \+ margin 2\.4 kW = 25\.2 kW exceeds the 24\.0 kW cap/);
+  assert.match(a[0].e.body, /on the generator: the element is never used there \(owner, 2026-11-02\)/);
   assert.equal(a[0].e.priority, "default", "never a phone push");
 
-  // (b) cold house + headroom (both pumps idle at 8 W, base load only, mom's room at 61 °F) → would close, same time
-  const b = replay({ supply: outage, houseW: () => BASE_W, comfort: () => cold });
-  assert.deepEqual(kinds(b), kinds(grid), "with headroom and a cold house the generator changes nothing");
+  // (b) cold house AND a load inside the budget (1.0 kW: 1.0 + 16.5 + 2.4 = 19.9 kW) → still locked out (owner 2026-11-02)
+  const b = replay({ supply: outage, houseW: () => 1_000, comfort: () => cold });
+  assert.deepEqual(b.map((x) => x.e.kind), ["generator_lockout"], "headroom and a cold house no longer let it close");
+  assert.equal(b[0].at, gridClose);
 
-  // (b') headroom but the house holding temperature → locked out (last resort)
-  const bw = replay({ supply: outage, houseW: () => BASE_W, comfort: () => warm });
-  assert.deepEqual(bw.map((x) => x.e.kind), ["generator_lockout"]);
-  assert.match(bw[0].e.body, /not getting cold/);
+  // (b') headroom, the house holding temperature or comfort unknown → locked out
+  for (const comfort of [warm, unknownComfort]) {
+    assert.deepEqual(replay({ supply: outage, houseW: () => 1_000, comfort: () => comfort }).map((x) => x.e.kind), ["generator_lockout"]);
+  }
 
-  // (c) unknown supply (feed silent) and no live load (a bridge without house_w) → locked out
+  // (c) unknown supply (feed silent, outage plausible), with no live load or a load that fits → locked out
   const c = replay({ supply: () => UNK, houseW: () => null, comfort: () => cold });
   assert.deepEqual(c.map((x) => x.e.kind), ["generator_lockout"]);
-  assert.match(c[0].e.body, /possibly on the generator \(supply unknown\) and the live house load is unknown/);
-  // ... and unknown supply with a measured load that fits behaves like the generator: closes
-  assert.deepEqual(kinds(replay({ supply: () => UNK, houseW: () => BASE_W, comfort: () => cold })), kinds(grid));
+  assert.match(c[0].e.body, /the supply is unknown, so it is treated as the generator: the element is never used there/);
+  assert.deepEqual(replay({ supply: () => UNK, houseW: () => 1_000, comfort: () => cold }).map((x) => x.e.kind), ["generator_lockout"]);
 
-  // (d) the load drops mid-episode (the EV charger stops at 15:00): locked out, then the close the moment it fits
+  // (d) the load drops mid-episode (the EV charger stops at 15:00): still locked out, no close for the rest of the episode
   const evStop = etMs("2026-10-15T15:00:00-04:00");
-  const d = replay({ supply: outage, houseW: (ts) => (ts < evStop ? BASE_W + 7_200 : BASE_W), comfort: () => cold });
-  assert.deepEqual(d.map((x) => x.e.kind), ["generator_lockout", "close", "open"], kinds(d).join(", "));
+  const d = replay({ supply: outage, houseW: (ts) => (ts < evStop ? BASE_W + 7_200 : 1_000), comfort: () => cold });
+  assert.deepEqual(d.map((x) => x.e.kind), ["generator_lockout"], kinds(d).join(", "));
   assert.equal(d[0].at, gridClose);
-  assert.ok(d[1].at >= evStop && d[1].at - evStop <= 300, `closes on the first poll after the load drops (${et(d[1].at)})`);
+
+  // (d') an assumed grid (silent feed, no outage plausible) behaves as the grid
+  const assumed = { supply: "grid" as const, why: "the outage feed has not answered for 16 min; assuming the grid (no outage seen in the last 6 h)" };
+  assert.deepEqual(kinds(replay({ supply: () => assumed, houseW: () => null, comfort: () => warm })), kinds(grid));
 
   // (e) the outage starts mid-episode, at 13:00: the hold clocks keep running, the generator rule judges at close time
   const start = etMs("2026-10-15T13:00:00-04:00");
