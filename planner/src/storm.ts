@@ -73,7 +73,12 @@ export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAle
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`NWS alerts fetch failed: ${res.status}`);
-  const body = (await res.json()) as any;
+  return parseNwsAlerts(await res.json());
+}
+
+/** Pure half of fetchNwsAlerts — exported so the event filter, tier and #118 window end are testable without a fetch. */
+export function parseNwsAlerts(raw: unknown): StormAlert[] {
+  const body = raw as any;
   const alerts: StormAlert[] = [];
   for (const feature of body?.features ?? []) {
     const p = feature?.properties ?? {};
