@@ -204,9 +204,11 @@ const Z = (id: string, roomF: number | null, setpointF: number | null, name = id
   assert.deepEqual(parseComfortExclude({}), DEFAULT_COMFORT_EXCLUDE);
   assert.deepEqual(parseComfortExclude({ COMFORT_EXCLUDE_ZONES: " Barn - Tack , Garage " }), ["Barn - Tack", "Garage"]);
   // target at risk
-  const behind = comfortRisk([Z("mom", 65.9, 68, "Mom's room"), Z("kit", 67, 68)], ["mom", "kit"], { nowMs: T });
-  assert.equal(behind.at_risk, true, "2 °F below its setpoint = target at risk");
-  assert.match(behind.why, /Mom's room is 65.9 °F, 2.1 °F below its 68 °F setpoint/);
+  const behind = comfortRisk([Z("mom", 63.9, 68, "Mom's room"), Z("kit", 67, 68)], ["mom", "kit"], { nowMs: T });
+  assert.equal(behind.at_risk, true, "4 °F below its setpoint = target at risk (owner 2026-11-04)");
+  assert.match(behind.why, /Mom's room is 63.9 °F, 4.1 °F below its 68 °F setpoint/);
+  const slightly = comfortRisk([Z("mom", 65.9, 68, "Mom's room"), Z("kit", 67, 68)], ["mom", "kit"], { nowMs: T });
+  assert.equal(slightly.at_risk, false, "2 °F behind is no longer at risk: the bathrooms sat there half the time");
   // a calling zone with no temperature is never dropped: unknown
   const noTemp = comfortRisk([kit, Z("mom", null, 68, "Mom's room")], ["mom"], { nowMs: T });
   assert.equal(noTemp.at_risk, null);
