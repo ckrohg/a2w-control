@@ -927,6 +927,49 @@ async def test_scheduler_fires_once_per_day(rig):
     assert await store.list_schedules("p1") == []
 
 
+async def test_scheduler_rule_added_after_its_time_waits_for_tomorrow(rig):
+    # a timer added at 14:00 for 06:00 must not fire on the next tick: the <= catch-up
+    # is for restarts, not new rules — that would be a write nobody asked for right now
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 14, 0))
+    sched = Scheduler(store, {"p1": poller})
+
+    await sched.check_once(datetime(2026, 7, 4, 14, 0, 20))
+    assert poller.snapshot["on"] is True
+    assert await pump.get_reg(R.REG_ON_OFF) == 1
+
+    await sched.check_once(datetime(2026, 7, 5, 6, 0))
+    assert poller.snapshot["on"] is False
+    fired = [e for e in await store.get_events("p1", 1)
+             if e["type"] == "power_write" and e["code"] == "accepted"]
+    assert len(fired) == 1
+
+
+async def test_scheduler_rule_added_before_its_time_fires_same_day(rig):
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 5, 0))
+    sched = Scheduler(store, {"p1": poller})
+
+    await sched.check_once(datetime(2026, 7, 4, 5, 59))   # not yet
+    assert poller.snapshot["on"] is True
+    await sched.check_once(datetime(2026, 7, 4, 6, 0))
+    assert poller.snapshot["on"] is False
+
+
 async def test_runtime_edges_become_events(rig):
     pump, poller, store = rig
     await poller.poll_once()   # seeds the baseline — no events yet
