@@ -194,7 +194,9 @@ domain and is not built.
     grid, so for that window the planner gate does not apply the generator rule. Like the email-lag window (Residual
     risk 1), this needs a gate episode to reach its close while the house is on the generator. The Pi fallback has no
     outage input and always applies its budget check, which is not the never-on-the-generator rule (blocker above).
-  - drift-check [5] asserts the feed daily (#242); `assumed: true` in /health shows when the grid is a guess.
+  - drift-check [5] asserts the feed daily (#242) from `/health.backup_gate.generator.feed`: red when `last_answer_at` is
+    null or over 2 h old, when `last_failure` is set, or when the field is missing; `assumed: true` in /health shows
+    when the grid is a guess.
   - **Silence reaches the owner (#252 review):** a feed silent for 2 h sends one email (`outage-feed-silent`, attention)
     naming the failure, whichever way the supply reads. A planner restart restarts that 2 h clock.
   - **A restart keeps the outage (#252 review):** the feed's last answer and last outage live in `outage_feed_memory`, so

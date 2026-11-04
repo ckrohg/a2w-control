@@ -228,17 +228,38 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
-echo "[5] storm-mode inputs — OutageWatch (eval 2026-10-18 F4)"
-# storm.ts treats an unreachable OutageWatch as "no signal", never as an outage -- correct, and also
-# why nobody noticed it had been CRASHED since 2026-03-15: a fail-soft input that is permanently
-# absent is drift the system cannot see about itself. The grid-outage trigger (#115: zero positive
-# examples) has had no source all year.
-OW="${OUTAGEWATCH_URL:-https://victorious-light-production.up.railway.app}"
-OW_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$OW/api/status" 2>/dev/null || echo 000)"
-if [ "$OW_CODE" = "200" ]; then
-  pass "OutageWatch /api/status answers 200"
+echo "[5] storm-mode inputs — the 6bb outage feed, as the planner sees it (eval 2026-10-18 F4, #194)"
+# The grid-outage input is 6bb's National Grid email feed, which the planner polls at its OUTAGEWATCH_URL env. That
+# URL carries the feed key, so this script never prints it and never curls it: it reads what the planner reports at
+# /health.backup_gate.generator.feed. OutageWatch, the previous source, is retired; it had been CRASHED since
+# 2026-03-15 and nobody noticed, because an unreachable feed reads as "no signal", never as an outage -- correct, and
+# also why a fail-soft input that is permanently absent is drift the system cannot see about itself (#175 N5).
+# The planner assumes the grid on a silent feed (`assumed: true`) and emails the owner after FEED_SILENT_ALERT_MS
+# (2 h, planner/src/generator.ts); this check fails on the same 2 h, on a recorded poll failure (an HTTP status, or
+# "unreachable or unreadable"), and on a planner that does not report the feed at all.
+FEED_SILENT_MAX=7200
+if [ -z "$HEALTH" ]; then
+  skip "planner unreachable — cannot assert the outage feed"
 else
-  fail "OutageWatch /api/status answers HTTP ${OW_CODE} — storm mode has no grid-outage input (#175 N5)"
+  FEED_PRESENT="$(jq -r 'if .backup_gate.generator.feed == null then "" else "y" end' <<<"$HEALTH")"
+  FEED_WHY="$(jq -r '.backup_gate.generator.feed.why // empty' <<<"$HEALTH")"
+  FEED_FAIL="$(jq -r '.backup_gate.generator.feed.last_failure // empty' <<<"$HEALTH")"
+  FEED_ASSUMED="$(jq -r '.backup_gate.generator.feed.assumed // false' <<<"$HEALTH")"
+  # seconds since the feed last answered; empty when it never has since the planner started (last_answer_at null)
+  FEED_AGE="$(jq -r '.backup_gate.generator.feed.last_answer_at // empty | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | now - . | floor' <<<"$HEALTH")"
+  if [ -z "$FEED_PRESENT" ]; then
+    fail "planner /health has no backup_gate.generator.feed — the planner predates the 6bb outage feed (#194) or the field moved; storm mode has no grid-outage input this check can see (#175 N5)"
+  elif [ -n "$FEED_FAIL" ]; then
+    fail "the 6bb outage feed's last poll failed: ${FEED_FAIL} (${FEED_WHY:-no reason reported})$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+    fail "  -> the planner's OUTAGEWATCH_URL (key included) vs 6bb's OUTAGE_FEED_KEY, and that 6bb is running (#175 N5)"
+  elif [ -z "$FEED_AGE" ]; then
+    fail "the 6bb outage feed has not answered since the planner started (${FEED_WHY:-no reason reported})$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+  elif [ "$FEED_AGE" -le "$FEED_SILENT_MAX" ]; then
+    pass "6bb outage feed answered $((FEED_AGE / 60)) min ago (≤ $((FEED_SILENT_MAX / 60)) min): ${FEED_WHY:-no reason reported}"
+  else
+    fail "the 6bb outage feed last answered $((FEED_AGE / 60)) min ago (> $((FEED_SILENT_MAX / 60)) min): ${FEED_WHY:-no reason reported}$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+    fail "  -> a silent feed hides the next outage; the planner's own 2 h silence email should have arrived too (#175 N5)"
+  fi
 fi
 
 echo
