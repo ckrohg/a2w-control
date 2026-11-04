@@ -146,8 +146,9 @@ treated as the generator only while an outage is plausible; otherwise the grid i
   controller's fresh read, by the same rule: over budget or unknown holds it for the next tick.
 - **The Pi's budget binds only its own fallback close.** A close from the dashboard or a person has no budget check, on
   purpose. Neither does the planner gate's close: the Pi can't tell the grid from the generator, and on the grid the
-  gate's normal winter close (every pump running) would fail the budget. The planner applies its own generator rule, on a
-  read up to 120 s old.
+  gate's normal winter close (every pump running) would fail the budget. On the generator or an unknown supply the
+  planner sends no close at all (owner, 2026-11-02), so no panel read decides one. A Pi-side re-check for the gate's
+  close, in case that rule is ever relaxed, is on the closed #274 (`claude/gate-close-generator-budget`).
 - **Knobs:** `backup_fallback.generator_cap_w` (20000), `generator_margin_w` (2400), `element_w` (16500).
 - **House load source:** the bridge now computes `house_w` from each `/circuits` read and puts it in the hub frame
   (`span.house_w`). The planner's budget and `shed` advisory need it; the planner's element decision on the generator
