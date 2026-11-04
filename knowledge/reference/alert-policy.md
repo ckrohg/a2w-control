@@ -103,6 +103,13 @@ engineer or a Claude session can act, it is record-tier; it does not email the o
 - **Element alarm blind (owner's decision, 2026-11-02):** an hour with no SPAN reading of the element's circuit (planner
   `housepages.ts`, `spanwatch.ts` `blindness`). One email per blind spell, sent again until a channel acknowledges it. Same
   exception as the outage feed: an alarm that can't read can't say so, and #257 proved it.
+- **R02 three or more times in one day (owner's decision, 2026-11-04):** R02 ("Drive 1 compressor abnormal start: phase
+  loss / reverse", register 2112 bit 8) on one pump 3+ times within one local day (planner `housepages.ts` `r02Recurring`,
+  counted from the mirror's `pump_events` fault_on/fault_off rows, so a code held across polls is one occurrence). One
+  email per pump per day, sent again until a channel acknowledges it; the day rolling over is record-only and re-arms it.
+  Action: book a service visit for that pump, the manual says R02 needs service. Nothing switches. HP1 had logged R02 9
+  times all time, 5 since Oct 18, 2 on Nov 1, each self-clearing in 1–3 min; the owner chose to watch it by email and book
+  service only if it keeps rising. Today's count per pump is on `/health.pump_health.r02`.
 - **Pumps and faults:**
   - a heat-pump breaker switched off outside A2W (#212: 6bb, the SPAN app or the panel), once it has stayed off
     3 min: switch it back on if that was not meant. Then quiet until it is back; the back-on note is record-only.

@@ -9,9 +9,13 @@
  * heard even if the 6bb push failed, so the phone can still show an alert that is over. Same rule as Phase B's two pages
  * (phaseb.ts ownerAlerts). Not AlertOutbox: its send path carries no key, action or facts, so a re-sent page would lose
  * its email layout and the 6bb replace-by-tag.
+ *
+ * The two attention emails (outage feed silent, element alarm blind) and the R02 daily watch (owner's decision,
+ * 2026-11-04: R02 three or more times on one pump in a local day → one email per pump per day) ride the same PageEdge.
  */
 import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import type { HubState } from "./hub";
+import { etDay, etDayStart } from "./pumphealth";
 import { calledStagesAllStopped } from "./stagewatch";
 import type { SlxReading, Store } from "./store";
 import { piStateUnverifiable } from "./writes";
@@ -106,6 +110,56 @@ const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
 const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
 const PI_QUIET_ALERT_S = 600;
 
+// ── R02 daily watch (owner's decision, 2026-11-04) ──────────────────────────────────────────────────────────────────
+/** R02 occurrences on one pump within one local (America/New_York) day that make the email. */
+export const R02_DAILY_COUNT = 3;
+/** How far back the mirror is read: the email's 30-day count, and the window index.ts asks store.faultEdges for. */
+export const R02_HISTORY_DAYS = 30;
+
+/**
+ * A fault_on this soon after an onset that has no fault_off yet is the same occurrence re-logged (the bridge restarted
+ * while the code was held: its in-memory edge state starts empty, so it logs the onset again). Later than this it is a new
+ * occurrence whose predecessor's clear was never logged (the code cleared while the bridge was down): R02 holds 1–3 min,
+ * so an unbounded merge would have swallowed every later onset for the rest of the window.
+ */
+export const FAULT_RELOG_S = 10 * 60;
+
+/** One edge of a fault code in the bridge's event log (store.faultEdges): `on` = fault_on, else fault_off. */
+export interface FaultEdge { pumpId: string; ts: number; on: boolean }
+/** One occurrence: the code appeared after being absent. clearedAfterS = null when no fault_off was logged (still set if it is the latest). */
+export interface FaultOccurrence { ts: number; clearedAfterS: number | null }
+
+/**
+ * Edges → occurrences per pump, oldest first. A fault_on opens one, the next fault_off closes it. A second fault_on with
+ * no fault_off between is the SAME occurrence when it comes within FAULT_RELOG_S (a code held across polls counts once,
+ * whatever the log says), else a new one. A fault_off with nothing open (its onset is before the window) is ignored.
+ */
+export function faultOccurrences(edges: FaultEdge[]): Record<string, FaultOccurrence[]> {
+  const out: Record<string, FaultOccurrence[]> = {};
+  const open: Record<string, FaultOccurrence | undefined> = {};
+  for (const e of [...edges].sort((a, b) => a.ts - b.ts)) {
+    const cur = open[e.pumpId];
+    if (e.on) {
+      if (cur && e.ts - cur.ts <= FAULT_RELOG_S) continue;
+      const o: FaultOccurrence = { ts: e.ts, clearedAfterS: null };
+      (out[e.pumpId] ??= []).push(o);
+      open[e.pumpId] = o;
+    } else if (cur) {
+      cur.clearedAfterS = Math.max(0, Math.round(e.ts - cur.ts));
+      open[e.pumpId] = undefined;
+    }
+  }
+  return out;
+}
+
+/** "3:12 PM" in the house's time zone. */
+const hhmm = (s: number) => new Date(s * 1000).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+/** `latest`: the pump's newest occurrence, the only one a missing fault_off means "still set" for. */
+const clearedWords = (o: FaultOccurrence, latest: boolean) =>
+  o.clearedAfterS != null ? `cleared itself after ${Math.max(1, Math.round(o.clearedAfterS / 60))} min` : latest ? "still set" : "cleared, time not logged";
+
+interface R02Watch { edge: PageEdge; today: FaultOccurrence[]; days30: number }
+
 export class HousePages {
   private readonly queue = new SendQueue();
   private readonly noHeat = new PageEdge("no-heat", this.queue);
@@ -120,6 +174,8 @@ export class HousePages {
   private piDisconnectedSince: number | null = null;
   private piQuietAlerted = false;
   private piPageDue = false;
+  /** R02 daily watch, one edge per pump (`r02-recurring:<pumpId>`), created the first time a pump shows an R02. */
+  private readonly r02 = new Map<string, R02Watch>();
 
   constructor(private readonly d: {
     send: SendPage;
@@ -252,6 +308,64 @@ export class HousePages {
         action: "Until this clears, nothing warns you if the element runs. If SPAN's own app is working, the fault is on the planner's side: ask a Claude session to look.",
         facts: [["No reading for", `${blind.minutes} min`], ["Last error", error]] },
     ), () => "attention");
+  }
+
+  /**
+   * R02 keeps coming back (owner's decision, 2026-11-04). R02 is "Drive 1 compressor abnormal start (phase loss /
+   * reverse)", register 2112 bit 8; on HP1 it sets and clears itself in 1–3 min, but the manual says it needs service.
+   * The owner chose to watch it: R02_DAILY_COUNT or more occurrences on one pump within one local day is one ATTENTION
+   * email for that pump that day, sent again until a channel acknowledges it, and never again that day however many
+   * more there are. Nothing switches. No all-clear email: the day rolling over is a record-only "cleared" that releases
+   * the latch, so the next day that reaches the count emails again (alertpolicy.ts route). Only R02 is counted (index.ts
+   * asks store.faultEdges for that code alone), so P17 anti-freeze or any other code can never reach this.
+   *
+   * `edges` are the mirror's fault_on/fault_off rows for R02 over R02_HISTORY_DAYS (store.faultEdges): the bridge's
+   * own edge detector, so a code held across polls is one row and one occurrence (faultOccurrences), and a 1–3 min R02
+   * the 5-min hub poll would miss still counts. null = the read failed: can't judge, so nothing moves this cycle. The
+   * local day because the owner's word was "today", the mirror's timestamps make it one filter, and a rolling 24 h would
+   * let one bad evening email twice (its evening and the next morning).
+   */
+  r02Recurring(edges: FaultEdge[] | null, nowS: number, nameOf: (id: string) => string): void {
+    if (!edges) return;
+    const dayStartS = etDayStart(etDay(nowS));
+    const all = faultOccurrences(edges);
+    for (const id of new Set([...Object.keys(all), ...this.r02.keys()])) {
+      const occ = all[id] ?? [];
+      const today = occ.filter((o) => o.ts >= dayStartS);
+      let w = this.r02.get(id);
+      if (!w) this.r02.set(id, w = { edge: new PageEdge(`r02-recurring:${id}`, this.queue), today: [], days30: 0 });
+      w.today = today; w.days30 = occ.length;
+      const key = `r02-recurring:${id}`;
+      const name = nameOf(id);
+      if (today.length < R02_DAILY_COUNT) {
+        // a new day (or a quiet one): record-only by policy, and it releases the latch for the next day's email
+        w.edge.cleared((heard) => this.d.send(`${name}: R02 count reset for the day`, `A new day: ${name}'s R02 count starts from zero.`, "default",
+          { tier: "attention", resolved: true, key, heard }));
+        continue;
+      }
+      const n = today.length;
+      const list = today.map((o, i) => `${hhmm(o.ts)} (${clearedWords(o, i === n - 1)})`);
+      const stillSet = today[n - 1].clearedAfterS == null;
+      w.edge.holding((tier) => this.d.send(
+        `${name}: R02 ${n} times today`,
+        `${name} has shown fault R02 (compressor abnormal start: phase loss or reverse rotation) ${n} times today: ${list.join(", ")}. ` +
+          (stillSet ? "The latest one is still set. " : "Each one cleared itself. ") +
+          `${occ.length} in the last ${R02_HISTORY_DAYS} days. Nothing has been switched: the manual says R02 needs service, so this is a note to book it.`,
+        "default",
+        { tier, key,
+          action: `Book a service visit for ${name}: the manual says R02 needs service.`,
+          facts: [["Pump", name], ["R02 today", `${n}`], ["Times", list.join(" · ")],
+                  ["Self-cleared", stillSet ? "not yet (the latest is still set)" : "yes, every one"],
+                  [`Last ${R02_HISTORY_DAYS} days`, `${occ.length}`]] },
+      ), () => "attention");
+    }
+  }
+
+  /** /health.pump_health.r02: today's R02 count per pump, when, whether the email reached someone, and the 30-day count. */
+  r02Status(): Record<string, { today: number; times_et: string[]; emailed: boolean; days_30: number }> {
+    return Object.fromEntries([...this.r02].map(([id, w]) => [id, {
+      today: w.today.length, times_et: w.today.map((o, i) => `${hhmm(o.ts)} ${clearedWords(o, i === w.today.length - 1)}`), emailed: w.edge.heard, days_30: w.days30,
+    }]));
   }
 
   /** Freeze-risk advisory (owner ask 2026-07-16): deep cold AND a low buffer at the same time. The HBX
