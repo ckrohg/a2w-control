@@ -59,6 +59,17 @@ ck "docs + scripts are INERT"                "inert"     "$(printf 'knowledge/re
 # `railway config apply` is the step that changes the services. Bracket that by hand (see .railway/railway.ts).
 ck ".railway/ IaC is INERT at merge"         "inert"     "$(printf '.railway/railway.ts\n.railway/package.json\n.railway/package-lock.json\n' | classify_files)"
 
+# #181: the services have different post-merge observables, so classify_services names WHICH deploy.
+# The pair is always printed "planner hub" regardless of input order; the wrapper above stays coarse.
+ck "services: hub-only list -> hub"          "hub"          "$(printf 'hub/src/index.ts\nhub/src/dropouts.ts\n' | classify_services)"
+ck "services: planner-only -> planner"       "planner"      "$(printf 'planner/src/storm.test.ts\nplanner/src/storm.ts\n' | classify_services)"
+ck "services: mixed -> planner hub"          "planner hub"  "$(printf 'hub/src/index.ts\nplanner/src/index.ts\n' | classify_services)"
+ck "services: docs -> inert"                 "inert"        "$(printf 'knowledge/reference/x.md\nscripts/deploy-gate.sh\n' | classify_services)"
+ck "services: empty -> unknown"              "unknown"      "$(printf '' | classify_services)"
+ck "services: whitespace -> unknown"         "unknown"      "$(printf '\n  \n' | classify_services)"
+ck "services: hub/ must be a path prefix"    "inert"        "$(printf 'docs/hub/notes.md\nhubris.md\nplanner-notes.md\n' | classify_services)"
+ck "wrapper: hub-only is still DEPLOYING"    "deploying"    "$(printf 'hub/src/index.ts\n' | classify_files)"
+
 # ---- 6. #166 dropout counts on the detail line. Absent (pre-#166 hub) must render EMPTY so the
 #         probe output is unchanged until the hub actually deploys; present must show the counts;
 #         an open dropout adds its running length. Never a gate input -- that is drift-check [6].
@@ -68,6 +79,27 @@ ck "counts shown when present"      "dropouts24h=2 longest=130min" \
 ck "open dropout shows its length"  "dropouts24h=0 longest=0min current=45min" \
   "$(dropout_summary '{"ok":true,"pi_connected":false,"pi_dropouts_24h":0,"longest_dropout_min":0,"current_dropout_min":45}')"
 ck "garbage json -> empty, not a crash" "" "$(dropout_summary 'not json')"
+
+# ---- 7. #181 hub-only wait verdict. hub_recovered <json> <now> <stale_s> is the whole decision the
+#         hub poll makes, with the clock injected. Returns 0 ONLY for connected + fresh. A brand-new
+#         container reports pi_connected:false / last_state_ts:null until the Pi reconnects -- that
+#         must read as disconnected, never as a crash or a pass.
+rc() { hub_recovered "$@" >/dev/null && echo yes || echo no; }
+FRESH='{"ok":true,"pi_connected":true,"last_state_ts":1000}'
+ck "connected + fresh -> recovered"       "recovered(last push 30s ago)" "$(hub_recovered "$FRESH" 1030 180)"
+ck "connected + fresh returns 0"          "yes"                          "$(rc "$FRESH" 1030 180)"
+ck "connected + stale -> stale(age)"      "stale(400s)"                  "$(hub_recovered "$FRESH" 1400 180)"
+ck "connected + stale returns 1"          "no"                           "$(rc "$FRESH" 1400 180)"
+ck "exactly STALE_S old is still fresh"   "yes"                          "$(rc "$FRESH" 1180 180)"
+DISC='{"ok":true,"pi_connected":false,"last_state_ts":1000,"current_dropout_min":0.5}'
+ck "disconnected -> disconnected"         "disconnected"                 "$(hub_recovered "$DISC" 1030 180)"
+ck "disconnected returns 1"               "no"                           "$(rc "$DISC" 1030 180)"
+NEWBOX='{"ok":true,"pi_connected":false,"last_state_ts":null}'
+ck "fresh container (null ts) -> disconnected" "disconnected"            "$(hub_recovered "$NEWBOX" 1030 180)"
+ck "connected but never pushed -> stale"  "no"                           "$(rc '{"ok":true,"pi_connected":true,"last_state_ts":null}' 1030 180)"
+ck "empty body -> unreachable"            "unreachable"                  "$(hub_recovered '' 1030 180)"
+ck "empty body returns 1"                 "no"                           "$(rc '' 1030 180)"
+ck "garbage json -> unreachable"          "unreachable"                  "$(hub_recovered 'not json' 1030 180)"
 
 echo
 [ "$fails" -eq 0 ] && echo "deploy-gate.test.sh: all assertions passed" || { echo "deploy-gate.test.sh: FAILURES"; exit 1; }
