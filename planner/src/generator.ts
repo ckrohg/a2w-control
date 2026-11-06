@@ -54,7 +54,9 @@ export const GEN = {
   HOUSE_FRESH_S: 120,
   FLOOR_F: 60,
   FLOOR_BUFFER_F: 2,
-  TARGET_DEFICIT_F: 2,
+  /** owner 2026-11-04: 4 °F, not 2. At 2 the bathrooms alone kept the flag up 47 % of hydronic hours (Oct 30 – Nov 2).
+   *  Reported only: it never decides switching. */
+  TARGET_DEFICIT_F: 4,
 } as const;
 
 export interface GenConfig { capW: number; marginW: number }
