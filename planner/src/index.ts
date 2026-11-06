@@ -10,6 +10,7 @@
 import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
+import { toReading } from "./slx-reading";
 import { extractConfig, handlePolledConfig, PendingTracker, type CurveDiagnosis } from "./drift";
 import { piHealth, withLiveAges, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S, FUTURE_S, SETTLE_S, type PiHealth } from "./pilink";
 import crypto from "node:crypto";
@@ -548,28 +549,6 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   const heard = acknowledged({ ownerConfigured, ownerAcked: pushed || emailed, ntfyConfigured: !!NTFY_TOPIC, ntfyAcked: delivered });
   if (heard && opts.key && !resolved) await latches.record(opts.key, tier);
   return heard;
-}
-
-function toReading(dev: Record<string, any>): SlxReading {
-  const demands: { name: string; activated: boolean }[] = dev.demands ?? [];
-  const byName = (n: string) => demands.find((d) => d.name === n)?.activated ?? null;
-  const relStat: number[] | undefined = dev.relStat;
-  return {
-    ts: new Date(),
-    tankF: dev.temps?.temp1?.actual ?? null,
-    tankTargetF: dev.temps?.temp1?.target ?? null,
-    outdoorF: dev.temps?.temp3?.actual ?? null,
-    hdActive: byName("hd"),
-    cdActive: byName("cd"),
-    stagesCalled: Array.isArray(dev.stages)
-      ? dev.stages.map((s: { activated?: boolean }) => s.activated === true)
-      : null,
-    backupCalled: dev.backup?.activated ?? null,
-    relays: Array.isArray(relStat)
-      ? relStat.reduce((acc, bit, i) => acc | ((bit ? 1 : 0) << i), 0)
-      : null,
-    connected: dev.connected ?? null,
-  };
 }
 
 /**
