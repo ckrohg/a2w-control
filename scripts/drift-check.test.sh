@@ -45,4 +45,44 @@ ck "mixed: the unknown one is STALE"   1 "$(grep -c 'pump2: unrecognised phase_b
 OUT="$(run_2a '{"pump1":"ok 61°C — ⚠ NO LEASE ARMED"}')"
 ck "no lease is still DRIFT"           1 "$(grep -c 'DRIFT.*armed NO lease' <<<"$OUT")"
 
+# ---- 3. [11]'s readers (#164) on the REAL files, so a PR that drops a watch pattern from either config fails CI here
+# rather than surfacing as a redeploy storm (or a missed deploy) after it lands.
+for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+  svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"
+  ck "${svc}: declared set has both spellings" 6 "$(wc -w <<<"$want" | tr -d ' ')"
+  ck "${svc}: .railway/railway.ts = declared"  "$want" "$(iac_watch .railway/railway.ts "$svc")"
+  [ -f "$dir/railway.toml" ] && ck "${dir}/railway.toml = declared" "$want" "$(toml_watch "$dir/railway.toml")"
+done
+# a dropped pattern must read as a difference, not as a match
+sed 's|\["planner/\*\*", |[|' .railway/railway.ts > "$TMP/dropped.ts"
+ck "a dropped planner/** reads as 5 patterns" "package-lock.json package.json railway.toml src/** tsconfig.json" \
+   "$(iac_watch "$TMP/dropped.ts" a2w-planner)"
+ck "an unknown service reads as empty" "" "$(iac_watch .railway/railway.ts a2w-nonexistent)"
+
+# ---- 4. [5] over a /health fixture carrying backup_gate.generator.feed, the shape generator.ts status() writes
+# (toISOString() timestamps with fractional seconds). The dead OutageWatch app made [5] permanently red; it now reads
+# the 6bb feed's health from the planner and must go green on a fresh answer and red on each way the feed can be absent.
+run_5() { # $1 = feed JSON, or "none" for a planner that predates the feed; prints the [5] lines
+  if [ "$1" = none ]; then printf '{"ok":true}' > "$TMP/health"
+  else printf '{"ok":true,"backup_gate":{"generator":{"feed":%s}}}' "$1" > "$TMP/health"; fi
+  PLANNER_URL="file://$TMP" HUB_URL="file://$TMP/nohub" HUB_CLIENT_TOKEN="" DRIFT_ACK_FILE=/dev/null \
+    bash scripts/drift-check.sh 2>/dev/null | awk '/^\[5\]/{on=1} /^\[6\]/{on=0} on'
+}
+FRESH="$(date -u +%Y-%m-%dT%H:%M:%S).038Z"   # BSD and GNU date; the fraction is what the planner writes
+OUT="$(run_5 "{\"supply\":\"grid\",\"why\":\"no outage reported (6bb feed)\",\"assumed\":false,\"last_answer_at\":\"$FRESH\",\"outage_active\":false,\"last_outage_seen_at\":null,\"last_failure\":null}")"
+ck "fresh answer: passes with the age"      1 "$(grep -c '6bb outage feed answered 0 min ago' <<<"$OUT")"
+ck "fresh answer: prints why"               1 "$(grep -c 'no outage reported (6bb feed)' <<<"$OUT")"
+ck "fresh answer: no DRIFT line in [5]"     0 "$(grep -c 'DRIFT' <<<"$OUT")"
+OUT="$(run_5 '{"supply":"grid","why":"the outage feed has not answered for 181 min; assuming the grid (no outage seen in the last 6 h)","assumed":true,"last_answer_at":"2026-01-01T00:00:00.000Z","outage_active":false,"last_outage_seen_at":null,"last_failure":null}')"
+ck "stale answer (> 2 h): DRIFT with the age" 1 "$(grep -c 'DRIFT.*last answered [0-9][0-9]* min ago (> 120 min)' <<<"$OUT")"
+ck "stale answer: says the grid is assumed" 1 "$(grep -c 'the planner is assuming the grid' <<<"$OUT")"
+OUT="$(run_5 '{"supply":"unknown","why":"the outage feed has not answered in the 12 min since the planner started","assumed":false,"last_answer_at":null,"outage_active":false,"last_outage_seen_at":null,"last_failure":"unreachable or unreadable"}')"
+ck "recorded failure: DRIFT names it"       1 "$(grep -c 'DRIFT.*last poll failed: unreachable or unreadable' <<<"$OUT")"
+OUT="$(run_5 "{\"supply\":\"grid\",\"why\":\"no outage reported (6bb feed)\",\"assumed\":false,\"last_answer_at\":\"$FRESH\",\"outage_active\":false,\"last_outage_seen_at\":null,\"last_failure\":\"HTTP 401\"}")"
+ck "fresh but failing: still DRIFT"         1 "$(grep -c 'DRIFT.*last poll failed: HTTP 401' <<<"$OUT")"
+OUT="$(run_5 '{"supply":"unknown","why":"the outage feed has not answered in the 12 min since the planner started","assumed":false,"last_answer_at":null,"outage_active":false,"last_outage_seen_at":null,"last_failure":null}')"
+ck "never answered: DRIFT"                  1 "$(grep -c 'DRIFT.*has not answered since the planner started' <<<"$OUT")"
+OUT="$(run_5 none)"
+ck "planner predates the feed: DRIFT"       1 "$(grep -c 'DRIFT.*has no backup_gate.generator.feed' <<<"$OUT")"
+
 [ "$fails" = 0 ] && echo "drift-check.test: all passed" || { echo "drift-check.test: FAILURES"; exit 1; }

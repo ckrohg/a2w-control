@@ -36,8 +36,10 @@ export interface ShadowBlock {
 export interface PreBoost {
   windowStart: number; // local hour the PEAK draw window opens (dhw.ts peakWindows, not the padded floor window)
   windowEnd: number;   // local hour, exclusive
-  boostF: number;      // the rise above dhwFloorF the trough needs (sag p75), before decay allowance
+  boostF: number;      // the rise above dhwFloorF the trough needs (sag p90 since 2026-10-30; p75 before), before decay allowance
   sagP75F: number;
+  /** the 90th-percentile sag the boost was sized from (absent on pre-2026-10-30 plans — the reason then names p75) */
+  sagP90F?: number;
   n: number;           // draws it was measured from
 }
 
@@ -114,9 +116,11 @@ export const MIN_PREBOOST_F = 3;
 export const MIN_PREBOOST_DRAWS = 6;
 /**
  * #135: the most a pre-boost may add above the floor. A shower is ~9 °F of this buffer (20 gal at
- * 105 °F over C_eff 917 Btu/°F); a measured sag beyond this is not a draw the plan should chase.
+ * 105 °F over C_eff 917 Btu/°F); back-to-back morning showers measured 13–18 °F (Oct 2026). Raised 12 → 16 on
+ * 2026-10-30 (owner: showers ran lukewarm at the 120 °F floor; the mixing valve is set to ~120 °F, so any draw from a
+ * 120 °F tank delivers below it). strictCapF (135) still bounds the commanded target: 120 + 16 = 136 → 135.
  */
-export const MAX_PREBOOST_F = 12;
+export const MAX_PREBOOST_F = 16;
 /**
  * #135: standby loss the boosted heat suffers per hour before the window opens (dhw.ts: 0.65 kW over
  * C_eff ≈ 110 gal ⇒ ~2.4 °F/h, measured). A boost placed h hours ahead is raised by this much per hour
@@ -124,13 +128,31 @@ export const MAX_PREBOOST_F = 12;
  */
 export const STANDBY_F_PER_H = 2.4;
 
+/**
+ * DHW-ready floor (°F) — the number that sets the tank target in almost every hour (deep dive 2026-10-19 §2),
+ * and an assumption: 120 = delivery + an assumed 5–8 °F coil approach, never measured (#138.2). Owner decision
+ * 2026-10-29: step it to 116 for a week and watch the morning-draw troughs (/health.dhw). Env DHW_FLOOR_F,
+ * clamped to [DHW_FLOOR_MIN_F, DHW_FLOOR_MAX_F]; unset, empty or unparseable = 120 (behaviour unchanged).
+ * idleF follows it: the off-window target was set equal to the floor, so moving only dhwFloorF would leave
+ * the idle plan at 120. The I8 soak (sanitizeF) is independent and unchanged.
+ */
+export const DHW_FLOOR_DEFAULT_F = 120;
+export const DHW_FLOOR_MIN_F = 112;
+export const DHW_FLOOR_MAX_F = 125;
+export function parseDhwFloorF(raw: string | undefined): number {
+  const v = Number(raw);
+  if (raw == null || raw.trim() === "" || !Number.isFinite(v)) return DHW_FLOOR_DEFAULT_F;
+  return Math.min(DHW_FLOOR_MAX_F, Math.max(DHW_FLOOR_MIN_F, v));
+}
+export const DHW_FLOOR_F = parseDhwFloorF(process.env.DHW_FLOOR_F);
+
 export const DEFAULT_OPTS: ShadowOpts = {
   dhwWindows: [[6, 9], [17, 22]],
-  dhwFloorF: 120, // minimum DHW-ready buffer temp — below this an unexpected draw is lukewarm
+  dhwFloorF: DHW_FLOOR_F, // minimum DHW-ready buffer temp — below this an unexpected draw is lukewarm (env DHW_FLOOR_F)
   // Off-window target. The buffer feeds DHW and draws are unpredictable / year-round, so we never
   // coast below DHW-ready — a cold shower isn't worth the trivial standby saving of a 110°F idle.
   // Enforced ≥ dhwFloorF at the use site; raise this only to bank EXTRA capacity, never below it.
-  idleF: 120,
+  idleF: DHW_FLOOR_F, // follows the floor (env DHW_FLOOR_F) — see DHW_FLOOR_F above
   prechargeLookbackH: 3,
   i1MarginF: 5, // A-4-measured 2026-07-14: tank sensor terminated at +3.1°F; 5 keeps a cushion
   hpMinF: 113,
@@ -318,7 +340,7 @@ export function computeShadowPlan(
     if (chosen.to <= chosen.d.target) continue; // a bank / soak already sits higher — it IS the pre-boost
     chosen.d.target = chosen.to;
     chosen.d.boost = true;
-    chosen.d.reason = `pre-boost to ${Math.round(chosen.to)}°F for ${String(start).padStart(2, "0")}:00 window (sag p75 ${pb.sagP75F}°F over ${pb.n} draws${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}${chosen.hoursAhead > 0 ? `, +${Math.round(STANDBY_F_PER_H * chosen.hoursAhead)}°F standby over ${chosen.hoursAhead} h` : ""}; ${chosen === warmest ? "warmest lead hour" : "hour before the bell"}, ${chosen.d.f.outdoorF.toFixed(0)}°F)`;
+    chosen.d.reason = `pre-boost to ${Math.round(chosen.to)}°F for ${String(start).padStart(2, "0")}:00 window (sag ${pb.sagP90F != null ? `p90 ${pb.sagP90F}` : `p75 ${pb.sagP75F}`}°F over ${pb.n} draws${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}${chosen.hoursAhead > 0 ? `, +${Math.round(STANDBY_F_PER_H * chosen.hoursAhead)}°F standby over ${chosen.hoursAhead} h` : ""}; ${chosen === warmest ? "warmest lead hour" : "hour before the bell"}, ${chosen.d.f.outdoorF.toFixed(0)}°F)`;
   }
 
   // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven

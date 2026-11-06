@@ -9,6 +9,8 @@
  */
 import assert from "node:assert/strict";
 import {
+  feedFailure,
+  fetchOutageStatus,
   parseStormForecast,
   unitConverter,
   deriveSyntheticTriggers,
@@ -341,4 +343,26 @@ const REAL_KMH_BODY = {
   assert.ok(fresh.state.kind === "armed" && Date.parse(fresh.state.windowStart) === Date.parse("2026-09-27T10:00") - 2 * 3600_000, "with its own 2 h lead off ITS onset");
 }
 
-console.log("storm.test.ts: all assertions passed");
+// ── the outage feed: why there was no answer, and never the URL (it carries the feed key) ──────────
+(async () => {
+  const real = globalThis.fetch;
+  const answer = (status: number, body: unknown) => (async () => new Response(JSON.stringify(body), { status })) as typeof fetch;
+  try {
+    globalThis.fetch = answer(200, [{ hasActiveOutage: false }, { hasActiveOutage: true }]);
+    assert.deepEqual(await fetchOutageStatus("http://x/k/secret"), { hasActiveOutage: true });
+    globalThis.fetch = answer(200, [{ monitor: "no flag" }]);
+    assert.deepEqual(await fetchOutageStatus("http://x/k/secret"), { failure: "it answered without an outage flag" });
+    globalThis.fetch = answer(401, { error: "unauthorized" });
+    assert.deepEqual(await fetchOutageStatus("http://x/k/secret"), { failure: "it refused the planner's key (HTTP 401)" });
+    globalThis.fetch = answer(503, { error: "not_tracking_yet" });
+    assert.match((await fetchOutageStatus("http://x/k/secret")).failure!, /not tracking outages yet/);
+    globalThis.fetch = (async () => { throw new Error("connect failed http://x/k/secret"); }) as typeof fetch;
+    const dead = await fetchOutageStatus("http://x/k/secret");
+    assert.equal(dead.failure, "unreachable or unreadable");
+    assert.doesNotMatch(JSON.stringify(dead), /secret/, "the key never reaches an email");
+    assert.equal(feedFailure(500), "HTTP 500");
+  } finally {
+    globalThis.fetch = real;
+  }
+  console.log("storm.test.ts: all assertions passed");
+})().catch((e) => { console.error(e); process.exit(1); });

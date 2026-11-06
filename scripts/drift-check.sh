@@ -75,6 +75,16 @@ phaseb_result_class() {
     *)                                                        echo STALE ;;
   esac
 }
+
+# [11]'s readers (#164). Each prints a service's watch patterns sorted and space-joined, so two sources compare as
+# strings. LC_ALL=C: a locale sort orders "package-lock.json" and "package.json" differently from jq's sort.
+# railway_watch_want <dir>: the DECLARED set -- both spellings on purpose (see .railway/railway.ts).
+railway_watch_want() { printf '%s\n' "$1/**" "src/**" package.json package-lock.json tsconfig.json railway.toml | LC_ALL=C sort | paste -sd' ' -; }
+# iac_watch <file> <service>: the one-line list after `nodeService("<service>"` in .railway/railway.ts
+iac_watch() { grep -A1 "nodeService(\"$2\"" "$1" 2>/dev/null | tail -n +2 | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort | paste -sd' ' -; }
+# toml_watch <file>: the `watchPatterns = [ ... ]` block of a railway.toml
+toml_watch() { sed -n '/^watchPatterns *= *\[/,/^\]/p' "$1" 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort | paste -sd' ' -; }
+
 # scripts/drift-check.test.sh sources the helpers above and stops here.
 [ -n "${DRIFT_CHECK_LIB_ONLY:-}" ] && return 0
 
@@ -218,17 +228,38 @@ if [ -n "$HEALTH" ]; then
 fi
 
 echo
-echo "[5] storm-mode inputs — OutageWatch (eval 2026-10-18 F4)"
-# storm.ts treats an unreachable OutageWatch as "no signal", never as an outage -- correct, and also
-# why nobody noticed it had been CRASHED since 2026-03-15: a fail-soft input that is permanently
-# absent is drift the system cannot see about itself. The grid-outage trigger (#115: zero positive
-# examples) has had no source all year.
-OW="${OUTAGEWATCH_URL:-https://victorious-light-production.up.railway.app}"
-OW_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$OW/api/status" 2>/dev/null || echo 000)"
-if [ "$OW_CODE" = "200" ]; then
-  pass "OutageWatch /api/status answers 200"
+echo "[5] storm-mode inputs — the 6bb outage feed, as the planner sees it (eval 2026-10-18 F4, #194)"
+# The grid-outage input is 6bb's National Grid email feed, which the planner polls at its OUTAGEWATCH_URL env. That
+# URL carries the feed key, so this script never prints it and never curls it: it reads what the planner reports at
+# /health.backup_gate.generator.feed. OutageWatch, the previous source, is retired; it had been CRASHED since
+# 2026-03-15 and nobody noticed, because an unreachable feed reads as "no signal", never as an outage -- correct, and
+# also why a fail-soft input that is permanently absent is drift the system cannot see about itself (#175 N5).
+# The planner assumes the grid on a silent feed (`assumed: true`) and emails the owner after FEED_SILENT_ALERT_MS
+# (2 h, planner/src/generator.ts); this check fails on the same 2 h, on a recorded poll failure (an HTTP status, or
+# "unreachable or unreadable"), and on a planner that does not report the feed at all.
+FEED_SILENT_MAX=7200
+if [ -z "$HEALTH" ]; then
+  skip "planner unreachable — cannot assert the outage feed"
 else
-  fail "OutageWatch /api/status answers HTTP ${OW_CODE} — storm mode has no grid-outage input (#175 N5)"
+  FEED_PRESENT="$(jq -r 'if .backup_gate.generator.feed == null then "" else "y" end' <<<"$HEALTH")"
+  FEED_WHY="$(jq -r '.backup_gate.generator.feed.why // empty' <<<"$HEALTH")"
+  FEED_FAIL="$(jq -r '.backup_gate.generator.feed.last_failure // empty' <<<"$HEALTH")"
+  FEED_ASSUMED="$(jq -r '.backup_gate.generator.feed.assumed // false' <<<"$HEALTH")"
+  # seconds since the feed last answered; empty when it never has since the planner started (last_answer_at null)
+  FEED_AGE="$(jq -r '.backup_gate.generator.feed.last_answer_at // empty | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | now - . | floor' <<<"$HEALTH")"
+  if [ -z "$FEED_PRESENT" ]; then
+    fail "planner /health has no backup_gate.generator.feed — the planner predates the 6bb outage feed (#194) or the field moved; storm mode has no grid-outage input this check can see (#175 N5)"
+  elif [ -n "$FEED_FAIL" ]; then
+    fail "the 6bb outage feed's last poll failed: ${FEED_FAIL} (${FEED_WHY:-no reason reported})$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+    fail "  -> the planner's OUTAGEWATCH_URL (key included) vs 6bb's OUTAGE_FEED_KEY, and that 6bb is running (#175 N5)"
+  elif [ -z "$FEED_AGE" ]; then
+    fail "the 6bb outage feed has not answered since the planner started (${FEED_WHY:-no reason reported})$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+  elif [ "$FEED_AGE" -le "$FEED_SILENT_MAX" ]; then
+    pass "6bb outage feed answered $((FEED_AGE / 60)) min ago (≤ $((FEED_SILENT_MAX / 60)) min): ${FEED_WHY:-no reason reported}"
+  else
+    fail "the 6bb outage feed last answered $((FEED_AGE / 60)) min ago (> $((FEED_SILENT_MAX / 60)) min): ${FEED_WHY:-no reason reported}$([ "$FEED_ASSUMED" = "true" ] && echo ' — the planner is assuming the grid')"
+    fail "  -> a silent feed hides the next outage; the planner's own 2 h silence email should have arrived too (#175 N5)"
+  fi
 fi
 
 echo
@@ -316,6 +347,111 @@ if [ -n "$HEALTH" ]; then
   else
     fail "SPAN local stream ${SPANAGE}s old (> 900 s) — the Pi's LAN poller is not landing span_readings (#187)"
   fi
+fi
+
+echo
+echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199)"
+# The Pi reports its SPAN transport in the hub state frame (span.transport). Rollout (owner 2026-10-29): the release
+# ships pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
+# fallback). In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
+if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
+  skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
+else
+  [ -n "${STATE:-}" ] || STATE="$(curl -sf -m 20 -H "Authorization: Bearer $HUB_CLIENT_TOKEN" "$HUB/api/state" 2>/dev/null)" || STATE=""
+  SPANMODE="$(jq -r 'if .span == null then "nospan" elif .span.transport == null then "absent" else (.span.transport.mode // "absent") end' <<<"${STATE:-null}" 2>/dev/null)"
+  SPANTX="$(jq -r '.span.transport.read // "none"' <<<"${STATE:-null}" 2>/dev/null)"
+  SPANV2ERR="$(jq -r '.span.transport.v2_error // empty' <<<"${STATE:-null}" 2>/dev/null)"
+  SOAK="$(jq -r 'if .span.transport.soak == null then "" else (.span.transport.soak | "\(.compared) \(.disagree) \(.unavailable)") end' <<<"${STATE:-null}" 2>/dev/null)"
+  case "$SPANMODE" in
+    v1)
+      if [[ ! "$TODAY" < "2026-12-15" ]]; then
+        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; set span.transport: auto on the Pi"
+      elif [ -n "$SOAK" ] && [ "$(cut -d' ' -f2 <<<"$SOAK")" -gt 0 ]; then
+        fail "SPAN v2 soak: v2 disagreed with v1 on $(cut -d' ' -f2 <<<"$SOAK") of $(cut -d' ' -f1 <<<"$SOAK") reads — see /api/health.span.soak.last_disagreement"
+      elif [ -n "$SOAK" ]; then
+        pass "SPAN pinned to v1 (rollout); v2 soak agrees on $(cut -d' ' -f1 <<<"$SOAK") reads ($(cut -d' ' -f3 <<<"$SOAK") with v2 unavailable)"
+      else
+        pass "SPAN pinned to v1 by config (rollout step 1; next: span.v2_soak: true)"
+      fi ;;
+    auto|v2)
+      case "$SPANTX" in
+        v2) pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE" ;;
+        v1) fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
+        *)  fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
+      esac ;;
+    absent) skip "the Pi's bridge predates #199 (no span.transport) — cut a release to assert it" ;;
+    *)      skip "hub /api/state has no span frame (unreachable, or SPAN not configured on the Pi)" ;;
+  esac
+fi
+
+echo
+echo "[11] Railway deploy config — watch patterns, build, start, restart (#164: railway.toml stops being read 2026-12-01)"
+# The watch patterns are the only thing that stops a docs-, knowledge/- or scripts/-only push from redeploying the
+# planner (a writer-lease handover on live heating) and the hub. Until #164 they lived only in planner/ and
+# hub/railway.toml, which Railway stops reading on 2026-12-01, and nothing would go red when that happened.
+# .railway/railway.ts now declares them. It takes effect only through `railway config apply`, so the files can be
+# correct while the services still are not. The second half of this section reads what the newest BUILT
+# deployment of each service actually ran with. That needs a logged-in railway CLI and skips without one,
+# like [2b] without a token.
+# The toml files were deleted after the 2026-11-02 apply, so deploys read the service settings. That apply stored
+# the builder, build, start and watch patterns, but `railway config plan` kept reporting restartPolicyType
+# null → ON_FAILURE and restartPolicyMaxRetries null → 10 on both services, so the policy may not be stored at
+# all. The live half therefore also requires the newest build to have come from the service settings, not a
+# toml, and to have run with ON_FAILURE×10: a build that still read a toml proves nothing about the settings.
+IAC="$REPO_ROOT/.railway/railway.ts"
+TOML_CUTOFF=2026-12-01
+RAILWAY_PROJECT="${RAILWAY_PROJECT_ID:-bbd24081-be2f-46df-a892-c3040565585c}"   # a2w-hub (planner + hub + Postgres)
+WANT_REST="NIXPACKS|npm install && npm run build|npm start|ON_FAILURE|10"       # builder|build|start|restart policy|retries
+if [ ! -f "$IAC" ]; then
+  fail ".railway/railway.ts is missing — nothing carries the watch patterns past ${TOML_CUTOFF} (#164)"
+else
+  MISSING=""
+  for needle in 'builder: "NIXPACKS"' 'buildCommand: "npm install && npm run build"' 'startCommand: "npm start"' \
+                'restartPolicyType: "ON_FAILURE"' 'restartPolicyMaxRetries: 10' 'variables: { managed: false }'; do
+    grep -qF -- "$needle" "$IAC" || MISSING="${MISSING:+$MISSING; }$needle"
+  done
+  [ -z "$MISSING" ] && pass ".railway/railway.ts declares nixpacks, build, npm start, ON_FAILURE×10, unmanaged variables" \
+                    || fail ".railway/railway.ts lacks: ${MISSING}"
+fi
+for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+  svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"
+  if [ -f "$IAC" ]; then
+    got="$(iac_watch "$IAC" "$svc")"
+    [ "$got" = "$want" ] && pass "${svc}: railway.ts watch patterns = the declared set (both spellings)" \
+                         || fail "${svc}: railway.ts watch patterns [${got}] ≠ declared [${want}]"
+  fi
+  TOML="$REPO_ROOT/$dir/railway.toml"
+  if [ ! -f "$TOML" ]; then
+    pass "${dir}/railway.toml is gone — deploys read the service settings (the live half below checks they were applied)"
+  elif [[ ! "$TODAY" < "$TOML_CUTOFF" ]]; then
+    fail "${dir}/railway.toml still exists on/after ${TOML_CUTOFF}, when Railway stopped reading it — delete it, and check the live half below (#164)"
+  elif [ "$(toml_watch "$TOML")" = "$want" ]; then
+    pass "${dir}/railway.toml matches (it overrides the service settings at deploy until deleted or ${TOML_CUTOFF})"
+  else
+    fail "${dir}/railway.toml watch patterns [$(toml_watch "$TOML")] ≠ declared [${want}] — the two configs disagree"
+  fi
+done
+if command -v railway >/dev/null 2>&1 && railway whoami >/dev/null 2>&1; then
+  for pair in "a2w-planner:planner" "a2w-hub:hub"; do
+    svc="${pair%%:*}"; dir="${pair##*:}"; want="$(railway_watch_want "$dir")"
+    # SKIPPED deployments carry no manifest. The newest one that was built shows the config Railway actually used.
+    BUILT="$(railway deployment list -p "$RAILWAY_PROJECT" -e production -s "$svc" --json --limit 30 2>/dev/null \
+             | jq -c '[.[] | select(.meta.serviceManifest != null)][0] // empty' 2>/dev/null)"
+    if [ -z "$BUILT" ]; then skip "${svc}: no built deployment readable from the railway CLI"; continue; fi
+    got="$(jq -r '.meta.serviceManifest.build.watchPatterns // [] | sort | join(" ")' <<<"$BUILT")"
+    rest="$(jq -r '.meta.serviceManifest | "\(.build.builder)|\(.build.buildCommand)|\(.deploy.startCommand)|\(.deploy.restartPolicyType)|\(.deploy.restartPolicyMaxRetries)"' <<<"$BUILT")"
+    from="$(jq -r '.meta.configFile | if . == null or . == "" then "service settings" else . end' <<<"$BUILT")"
+    dep="$(jq -r '"\(.id[0:8]) \(.createdAt[0:16])Z"' <<<"$BUILT")"
+    if [ "$got" != "$want" ] || [ "$rest" != "$WANT_REST" ]; then
+      fail "${svc}: newest build ${dep} ran with watch [${got}], ${rest} (from ${from}) — not the declared config; \`railway config plan\` from the repo root shows what is unapplied (a null restart policy on a build from the service settings means the 2026-11-02 apply did not store it, #164)"
+    elif [ ! -f "$REPO_ROOT/$dir/railway.toml" ] && [ "$from" != "service settings" ]; then
+      fail "${svc}: newest build ${dep} still read ${from}, which the repo no longer has — no build from the service settings yet; the first one must show ON_FAILURE×10 (#164)"
+    else
+      pass "${svc}: newest build ${dep} ran with the declared config, ON_FAILURE×10 included (from ${from})"
+    fi
+  done
+else
+  skip "railway CLI absent or logged out — the config live builds ran with is not asserted (files only)"
 fi
 
 echo

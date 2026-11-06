@@ -10,7 +10,21 @@
 # the unit, from 6bb, or its circuit OPEN at the panel — #212's deliberate stop), never a failure; UNKNOWN — stale with no fresh panel read, or no
 # draw reading: a Pi Wi-Fi/LAN drop loses Modbus AND SPAN together, so it must never read as "every pump down" — any
 # UNKNOWN pump resets the episode; UP — anything else.
-# Default SHADOW: audit + EMAIL "would close" once per cooldown (never a phone push) and switch nothing until
+# GENERATOR BUDGET (#241): the Pi cannot tell the grid from the generator (the transfer switch is upstream of the panel
+# and no outage information reaches the Pi), so it always applies the generator rule: no close unless the live house
+# load (every circuit but the element's, from a fresh panel read) + element_w + generator_margin_w ≤ generator_cap_w.
+# Unknown load = no close. A refused episode is re-checked every tick (the load may drop) and noted once. With a circuit
+# unread, v2's panel-level site power stands in; with neither, the refusal names the circuit, because the fix is at the
+# panel, not the Pi's network. The tick judges a read up to SPAN_FRESH_S old, so the close re-runs the budget on the
+# controller's fresh read (precheck), by the same rule: a fresh "does not fit" or a fresh unknown holds it for the next
+# tick. A hold noted before a fit is noted again after one (the owner may think the shed load fixed it), at most once per
+# RETRY_S, because a load flapping across the cap must not page every minute.
+# OWNER RULE 2026-11-02 — NOT ENFORCED HERE: the element never closes automatically on the generator (a 20 kW Kohler
+# 20RESA). This budget is not that rule. With the 20 kW cap and 2.4 kW margin it fits only when the rest of the house
+# draws ≤ 1.1 kW, so on the generator it can still close at a very low load, and on the grid it will usually refuse.
+# The Pi has no generator signal; backup_fallback.live must not be set until it has one (transfer-switch aux contact to
+# a Pi input — knowledge/reference/generator-outage-mode.md, pre-live gaps).
+# Default SHADOW: audit + record "would close" once per cooldown (never a phone push) and switch nothing until
 # backup_fallback.live = true.
 # Live, it acts regardless of the arm intent (going live IS the owner's opt-in for this one emergency case).
 from __future__ import annotations
@@ -54,6 +68,9 @@ class BackupFallback:
         self._next_ok: float | None = None        # monotonic: no decision before this (cooldown / retry)
         self._decided = False                     # one decision per all-down episode
         self._refusal_paged = False
+        self._budget_noted = False                # this hold has been noted (cleared by a fit)
+        self._budget_note_at: float | None = None # monotonic: the last budget note of this episode
+        self.budget: dict | None = None           # the last generator-budget check (status)
         self.down: dict[str, str | None] = {}      # pump -> why it is DOWN (None: not down)
         self.pumps: dict[str, dict] = {}            # pump -> {state: down|off|unknown|up, why}
         self.last: dict | None = None
@@ -90,6 +107,8 @@ class BackupFallback:
             "down": dict(self.down), "pumps": dict(self.pumps), "all_down_min": held,
             "all_down_since": self._since_wall,
             "relay": (self._backup() or {}).get("relay_state"),
+            "generator_cap_w": self.cfg.generator_cap_w, "generator_margin_w": self.cfg.generator_margin_w,
+            "budget": self.budget,
             "last": self.last,
         }
 
@@ -153,6 +172,53 @@ class BackupFallback:
             return "up", f"is offline but its circuit draws {draw:.0f} W (running)"
         return "down", f"is offline and its circuit draws {draw:.0f} W (not running)"
 
+    def budget_check(self) -> dict:
+        """#241: would the element fit on the 20 kW generator right now? {fits, house_w, projected_w, why}."""
+        snap = self._span()
+        house = snap.get("house_w") if snap else None
+        detail = (snap.get("house") if snap else None) or {}
+        unread = ", ".join(detail.get("unread") or [])
+        if not isinstance(house, (int, float)) or isinstance(house, bool):
+            return {"fits": False, "house_w": None, "projected_w": None, "why": (
+                f"the live house load is unknown: the panel gives no power reading for {unread} (the other circuits add "
+                f"up to {detail.get('partial_w', 0) / 1000:.1f} kW)" if unread
+                else "the live house load is unknown (no fresh panel read)")}
+        projected = house + self.cfg.element_w + self.cfg.generator_margin_w
+        fits = projected <= self.cfg.generator_cap_w
+        return {"fits": fits, "house_w": round(house), "projected_w": round(projected),
+                "why": (f"house {house / 1000:.1f} kW + element {self.cfg.element_w / 1000:.1f} kW + margin "
+                        f"{self.cfg.generator_margin_w / 1000:.1f} kW = {projected / 1000:.1f} kW "
+                        f"{'fits under' if fits else 'exceeds'} the {self.cfg.generator_cap_w / 1000:.1f} kW generator cap"
+                        + (f" (panel site power: no reading for {unread})" if unread else ""))}
+
+    def _budget_precheck(self, circ: dict) -> str | None:
+        """The close's last look: the budget again, on the read the controller took an instant ago (it refreshed the
+        snapshot this reads, so no I/O). Same rule as the tick, unknown included: had this read come one tick sooner, the
+        tick would have held the close on it, and an element on a load nobody can see is what trips the generator."""
+        self.budget = self.budget_check()
+        return None if self.budget["fits"] else self.budget["why"]
+
+    async def _note_budget(self, held_min: float, relay) -> None:
+        """The element stays off for the generator budget: noted once per hold, at most once per RETRY_S."""
+        now = self._mono()
+        if self._budget_noted or (self._budget_note_at is not None and now - self._budget_note_at < RETRY_S):
+            return
+        self._budget_noted, self._budget_note_at = True, now
+        await self._decide(
+            "generator_budget", "high" if self.cfg.live else "info",
+            f"{'' if self.cfg.live else 'SHADOW — nothing was switched. '}Every heat pump has been down "
+            f"{held_min:.0f} min ({self._why_down()}), but the element stays OFF: {self.budget['why']}. The Pi cannot "
+            "tell the grid from the generator, so it always keeps the generator inside its budget. If the "
+            f"house is on the grid, switch the '{BACKUP_ELEMENT_CIRCUIT}' breaker ON yourself; on the "
+            "generator, shed a big load (EV charger, mini-splits). A2W re-checks every 30 s.", relay,
+            title=("Both heat pumps down — element held OFF (generator budget)" if self.cfg.live
+                   else "Backup fallback (shadow): would close, but the generator budget says no"),
+            priority="urgent" if self.cfg.live else "default", tier="page" if self.cfg.live else "record")
+
+    def _why_down(self) -> str:
+        return "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
+                         for p, d in self.down.items())
+
     # --- the decision -----------------------------------------------------------
     async def tick(self) -> None:
         if not self.cfg.enabled:
@@ -167,6 +233,9 @@ class BackupFallback:
             self._since = self._since_wall = None
             self._decided = False
             self._refusal_paged = False
+            self._budget_noted = False
+            self._budget_note_at = None
+            self.budget = None
             return
         now = self._mono()
         if self._since is None:
@@ -176,12 +245,18 @@ class BackupFallback:
             return
         if self._next_ok is not None and now < self._next_ok:
             return
-        self._decided = True
-        self._next_ok = now + self.cfg.cooldown_h * 3600
-        why = "; ".join(f"{self.pollers[p].cfg.name if hasattr(self.pollers[p], 'cfg') else p} {d}"
-                        for p, d in self.down.items())
         backup = self._backup()
         relay = (backup or {}).get("relay_state")
+        if relay != "CLOSED" and self.breakers is not None:   # no breaker control: no panel read to budget on
+            self.budget = self.budget_check()
+            if not self.budget["fits"]:
+                await self._note_budget(held_min, relay)
+                return
+            self._budget_noted = False           # it fits: a hold after this is a new one
+        self._decided = True
+        self._next_ok = now + self.cfg.cooldown_h * 3600
+        why = self._why_down()
+        budget = f" ({self.budget['why']})" if self.budget else ""
         if relay == "CLOSED":
             await self._decide("already_available", "info",
                                f"every heat pump down {held_min:.0f} min ({why}); the backup element breaker is "
@@ -191,8 +266,8 @@ class BackupFallback:
             await self._decide("would_close", "high",
                                f"SHADOW — nothing was switched. Every heat pump has been down {held_min:.0f} min "
                                f"({why}). Live, A2W would close the '{BACKUP_ELEMENT_CIRCUIT}' breaker (now "
-                               f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element. This runs on the Pi, "
-                               "with no cloud.", relay,
+                               f"{relay or 'unknown'}) so the HBX can fire the 16.5 kW element{budget}. This runs on "
+                               "the Pi, with no cloud.", relay,
                                title="Backup fallback (shadow): WOULD close the element breaker", tier="record")
             return
         if self.breakers is None:
@@ -203,10 +278,11 @@ class BackupFallback:
                                priority="urgent", tier="page")
             return
         try:
-            res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback")
+            res = await self.breakers.execute(BACKUP_ELEMENT_CIRCUIT, "close", source="backup-fallback",
+                                              precheck=self._budget_precheck)
             ok = bool(res.get("ok"))
             await self._decide("closed" if ok else "close_unverified", "high" if ok else "critical",
-                               f"Every heat pump has been down {held_min:.0f} min ({why}). A2W closed the "
+                               f"Every heat pump has been down {held_min:.0f} min ({why}){budget}. A2W closed the "
                                f"'{BACKUP_ELEMENT_CIRCUIT}' breaker → {res.get('detail')}. The HBX can now fire the "
                                "element on its own backup call.", res.get("relay_state"),
                                title=("A2W closed the backup element breaker (both pumps down)" if ok
@@ -215,6 +291,10 @@ class BackupFallback:
         except Exception as exc:  # noqa: BLE001 — a refusal (BreakerRefused) or any error: retried, never latched
             # refused before anything was switched: retry in RETRY_S, page the first refusal of the episode
             self._decided = False
+            if not self.budget["fits"]:      # the fresh read says no: a budget hold, re-checked next tick
+                self._next_ok = None
+                await self._note_budget(held_min, relay)
+                return
             self._next_ok = now + RETRY_S
             await self._decide("refused", "critical",
                                f"Every heat pump has been down {held_min:.0f} min ({why}) but closing the "
@@ -230,7 +310,8 @@ class BackupFallback:
         log.warning("backup fallback %s: %s", code, message)
         try:
             await self.store.add_event(EVENT_PUMP_ID, EVENT_TYPE, code=code, severity=severity, message=message,
-                                       detail={"down": dict(self.down), "relay_state": relay, "live": self.cfg.live})
+                                       detail={"down": dict(self.down), "relay_state": relay, "live": self.cfg.live,
+                                               "budget": self.budget})
         except Exception as exc:  # noqa: BLE001 — an audit failure never blocks the decision
             log.warning("backup fallback audit failed: %s", exc)
         # owner alert policy (alert-policy.md): shadow and already-on are record; A2W switching the element on

@@ -7,9 +7,19 @@
  *                                        thermal mass BTU/°F, emitter type, confidence
  *                                        + source — latest row per zone)
  *   GET /api/insights/cop-measurements → tempiq_cop_points (COP w/ outdoor + sink temps
- *                                        for the COP(outdoor, water) fit; insert-only,
- *                                        deduped on measured_at + system, incremental
- *                                        via ?since=<newest stored point, else 7d>)
+ *                                        for the COP(outdoor, water) fit; UPSERT on
+ *                                        measured_at + system, re-read from a rolling
+ *                                        window ?since=<newest stored point − COP_OVERLAP_DAYS,
+ *                                        else 7d>, paged backwards with ?before= so the
+ *                                        endpoint's 2000-row cap never truncates — see
+ *                                        walkCopPagesInto. TempIQv2#2124 made TempIQ's
+ *                                        writer defer a point until the charge's end is
+ *                                        observable and re-upsert its overlap day each
+ *                                        run, so the newest mirrored point is not a safe
+ *                                        cursor and a mirrored row can legitimately change.
+ *                                        POST /api/tempiq/cop-refetch (index.ts) runs the
+ *                                        same walk from an explicit since — the one-off that
+ *                                        mirrors a backfill older than the window.)
  *   GET /api/insights/zone-energy      → tempiq_zone_energy (latest snapshot JSON,
  *                                        single-row upsert — shadow model picks fields)
  *   GET /api/insights/dhw-usage        → tempiq_dhw_usage (gtm#1431 — DHW-vs-space-ISOLATED
@@ -29,14 +39,56 @@
 import type { Store } from "./store";
 import { fetchInsightSpatialGraph, summarizeWarmAdjacency } from "./spatial";
 
-const COP_BACKFILL_MS = 7 * 24 * 60 * 60 * 1000; // first fetch reaches back 7 days
-const COP_PAGE_LIMIT = 2000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const COP_BACKFILL_MS = 7 * DAY_MS; // first fetch (empty table) reaches back 7 days
+const COP_PAGE_LIMIT = 2000; // the endpoint's cap: copMeasurementsHandler clamps limit to [1, 2000]
+const COP_OVERLAP_DAYS_DEFAULT = 3; // TempIQ's writer re-upserts ~1 day behind its watermark; 3 covers a missed run or two
+// Page bounds. Two pumps make ~13–17 charges a day and the session calculator keeps a fraction of those, so a
+// 3-day tick is a few dozen rows and ONE page; the bounds exist so a misbehaving endpoint can never hold the
+// reader (tick) or the HTTP caller (refetch) indefinitely. A walk stopped by its bound reports truncated: true.
+const COP_TICK_MAX_PAGES = 10;
+export const COP_REFETCH_MAX_PAGES = 50;
+export const COP_REFETCH_MAX_AGE_DAYS = 400;
 
 export interface TempiqReadStatus {
   enabled: boolean;
   lastFetchAt: string | null;
   lastResult: string | null;
   consecutiveFailures: number;
+  /** Days behind the newest mirrored COP point each tick re-reads (COP_OVERLAP_DAYS). */
+  copOverlapDays: number;
+  /** The last POST /api/tempiq/cop-refetch on this instance (null until one ran). */
+  lastCopRefetch: CopRefetchSummary | null;
+}
+
+/** What one walk of /api/insights/cop-measurements did. `fetched` counts rows as received, so a row from another
+ *  system that shares a page-boundary timestamp is counted twice (it repeats by design — see walkCopPagesInto);
+ *  inserted + updated ≤ fetched, and the difference is rows TempIQ re-sent unchanged. */
+export interface CopFetchSummary {
+  since: string;
+  before: string | null;
+  fetched: number;
+  inserted: number;
+  updated: number;
+  pages: number;
+  oldest: string | null;
+  newest: string | null;
+  /** The page bound stopped the walk with a full page in hand — rows older than `oldest` were NOT fetched. */
+  truncated: boolean;
+}
+
+export interface CopRefetchSummary extends CopFetchSummary {
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  /** The first HTTP/store error, if the walk stopped on one; the counts above are what landed before it. */
+  error: string | null;
+}
+
+export interface CopPoint {
+  measuredAt: Date; system: string; outdoorTempF: number | null; sinkTempF: number | null;
+  cop: number | null; thermalKwh: number | null; electricalKwh: number | null;
+  quality: string | null; qualityScore: number | null;
 }
 
 interface ZonesResponse {
@@ -136,16 +188,92 @@ export function summarizeWinterScoreboard(body: WinterScoreboardResponse | null 
   return `scoreboard: ${season} ${cur.toFixed(2)} kWh/HDD${base != null ? ` vs ${base.toFixed(2)} last winter` : ""}${chg != null ? ` (${chg})` : ""}, ${numOrNull(c?.weeksCompared) ?? 0} wk compared`;
 }
 
+/** The tick's lower bound: the newest mirrored point minus the overlap — never the newest point itself, because
+ *  since TempIQv2#2124 TempIQ defers a point until the charge's end is observable and re-upserts its overlap day on
+ *  every hourly run, so a point older than the newest can still appear or change. 7 days back on an empty table.
+ *  PURE. */
+export function copFetchSince(newest: Date | null, now: Date, overlapDays: number): Date {
+  if (newest == null) return new Date(now.getTime() - COP_BACKFILL_MS);
+  const days = Number.isFinite(overlapDays) ? Math.max(0, overlapDays) : COP_OVERLAP_DAYS_DEFAULT;
+  return new Date(newest.getTime() - days * DAY_MS);
+}
+
+/** Validate a POST /api/tempiq/cop-refetch body: `since` (ISO, required, within the last COP_REFETCH_MAX_AGE_DAYS,
+ *  not in the future) and an optional `before` (ISO, after since). PURE; the route turns ok:false into a 422. */
+export function parseCopRefetchRequest(
+  body: unknown, now: Date,
+): { ok: true; since: Date; before: Date | null } | { ok: false; error: string } {
+  const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  const since = parseIsoDate(b.since);
+  if (since == null) return { ok: false, error: "since must be an ISO date (e.g. 2026-09-29 or 2026-09-29T00:00:00Z)" };
+  if (since.getTime() > now.getTime()) return { ok: false, error: "since is in the future" };
+  if (now.getTime() - since.getTime() > COP_REFETCH_MAX_AGE_DAYS * DAY_MS) {
+    return { ok: false, error: `since must be within the last ${COP_REFETCH_MAX_AGE_DAYS} days` };
+  }
+  let before: Date | null = null;
+  if (b.before !== undefined && b.before !== null) {
+    before = parseIsoDate(b.before);
+    if (before == null) return { ok: false, error: "before must be an ISO date" };
+    if (before.getTime() <= since.getTime()) return { ok: false, error: "before must be after since" };
+  }
+  return { ok: true, since, before };
+}
+
+function parseIsoDate(v: unknown): Date | null {
+  if (typeof v !== "string" || v.trim() === "") return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** The lastResult / log line for a walk: "cop: +3 new / 2 updated / 41 seen", the page count when it took more
+ *  than one, and a loud TRUNCATED when the page bound cut it short. PURE. */
+export function summarizeCopFetch(s: CopFetchSummary): string {
+  let out = `cop: +${s.inserted} new / ${s.updated} updated / ${s.fetched} seen`;
+  if (s.pages > 1 || s.truncated) out += ` (${s.pages} pages${s.truncated ? `, TRUNCATED at the page bound — rows older than ${s.oldest ?? "?"} not fetched` : ""})`;
+  return out;
+}
+
+/** The endpoint's rows → store points; a row without a parseable timestamp is dropped. PURE. */
+export function toCopPoints(body: CopMeasurementsResponse | null | undefined): CopPoint[] {
+  return (body?.measurements ?? [])
+    .filter((m) => typeof m.timestamp === "string" && !Number.isNaN(new Date(m.timestamp).getTime()))
+    .map((m) => ({
+      measuredAt: new Date(m.timestamp as string),
+      system: `${m.systemType ?? "unknown"}:${m.systemId ?? "unknown"}`,
+      outdoorTempF: numOrNull(m.outdoorTempF),
+      sinkTempF: numOrNull(m.sinkTempF),
+      cop: numOrNull(m.cop),
+      thermalKwh: numOrNull(m.thermalKwh),
+      electricalKwh: numOrNull(m.electricalKwh),
+      quality: m.confidence ?? null,
+      qualityScore: numOrNull(m.qualityScore),
+    }));
+}
+
+function emptyCopSummary(since: Date, before: Date | null): CopFetchSummary {
+  return {
+    since: since.toISOString(), before: before ? before.toISOString() : null,
+    fetched: 0, inserted: 0, updated: 0, pages: 0, oldest: null, newest: null, truncated: false,
+  };
+}
+
 export class TempiqReader {
   private lastFetchAt: string | null = null;
   private lastResult: string | null = null;
   private consecutiveFailures = 0;
+  private readonly copOverlapDays: number;
+  private copRefetchInFlight = false;
+  private lastCopRefetch: CopRefetchSummary | null = null;
 
   constructor(
     private readonly store: Store,
     private readonly baseUrl: string,
     private readonly token: string,
-  ) {}
+    opts: { copOverlapDays?: number } = {},
+  ) {
+    const d = opts.copOverlapDays;
+    this.copOverlapDays = typeof d === "number" && Number.isFinite(d) && d >= 0 ? d : COP_OVERLAP_DAYS_DEFAULT;
+  }
 
   status(): TempiqReadStatus {
     return {
@@ -153,6 +281,8 @@ export class TempiqReader {
       lastFetchAt: this.lastFetchAt,
       lastResult: this.lastResult,
       consecutiveFailures: this.consecutiveFailures,
+      copOverlapDays: this.copOverlapDays,
+      lastCopRefetch: this.lastCopRefetch,
     };
   }
 
@@ -241,28 +371,92 @@ export class TempiqReader {
     return `zones: ${rows.length}`;
   }
 
-  /** COP points since the newest stored one (7d back on first run) → tempiq_cop_points. */
+  /** COP points from (newest stored − COP_OVERLAP_DAYS; 7d back on an empty table) → tempiq_cop_points, upserted,
+   *  paged until the endpoint has nothing older in the window. */
   private async fetchCopMeasurements(): Promise<string> {
     const newest = await this.store.latestTempiqCopAt();
-    const since = newest ?? new Date(Date.now() - COP_BACKFILL_MS);
-    const body = await this.get<CopMeasurementsResponse>(
-      `/api/insights/cop-measurements?since=${encodeURIComponent(since.toISOString())}&limit=${COP_PAGE_LIMIT}`,
-    );
-    const points = (body.measurements ?? [])
-      .filter((m) => typeof m.timestamp === "string" && !Number.isNaN(new Date(m.timestamp).getTime()))
-      .map((m) => ({
-        measuredAt: new Date(m.timestamp as string),
-        system: `${m.systemType ?? "unknown"}:${m.systemId ?? "unknown"}`,
-        outdoorTempF: numOrNull(m.outdoorTempF),
-        sinkTempF: numOrNull(m.sinkTempF),
-        cop: numOrNull(m.cop),
-        thermalKwh: numOrNull(m.thermalKwh),
-        electricalKwh: numOrNull(m.electricalKwh),
-        quality: m.confidence ?? null,
-        qualityScore: numOrNull(m.qualityScore),
-      }));
-    const inserted = await this.store.insertTempiqCopPoints(points);
-    return `cop: +${inserted}/${points.length}`;
+    const since = copFetchSince(newest, new Date(), this.copOverlapDays);
+    const s = emptyCopSummary(since, null);
+    await this.walkCopPagesInto(s, since, null, COP_TICK_MAX_PAGES);
+    return summarizeCopFetch(s);
+  }
+
+  /** Walk GET /api/insights/cop-measurements over [since, before) newest-first, upserting each page as it arrives
+   *  and accumulating into `s` (so a caller that catches an error mid-walk still has the counts that landed).
+   *  The endpoint orders by timestamp desc, applies since inclusive / before exclusive, and caps a page at 2000
+   *  rows — one call can therefore truncate silently, which is why we page: the next page's `before` is this
+   *  page's oldest timestamp + 1 ms, so rows from another system that share the boundary timestamp REPEAT (and
+   *  upsert as unchanged) rather than drop. Stops on an empty or short page (nothing older in the window), at
+   *  `since`, when a page makes no progress (every row one timestamp), or at `maxPages` — then `truncated`. */
+  private async walkCopPagesInto(s: CopFetchSummary, since: Date, beforeStart: Date | null, maxPages: number): Promise<void> {
+    let before = beforeStart;
+    let oldest: Date | null = s.oldest ? new Date(s.oldest) : null;
+    let newest: Date | null = s.newest ? new Date(s.newest) : null;
+    let more = false;
+    while (s.pages < maxPages) {
+      more = false;
+      const q = `since=${encodeURIComponent(since.toISOString())}` +
+        (before ? `&before=${encodeURIComponent(before.toISOString())}` : "") +
+        `&limit=${COP_PAGE_LIMIT}`;
+      const body = await this.get<CopMeasurementsResponse>(`/api/insights/cop-measurements?${q}`);
+      s.pages++;
+      const rows = body?.measurements ?? [];
+      if (rows.length === 0) break;
+      const points = toCopPoints(body);
+      const r = await this.store.insertTempiqCopPoints(points);
+      s.fetched += points.length;
+      s.inserted += r.inserted;
+      s.updated += r.updated;
+      let pageOldest: Date | null = null;
+      for (const p of points) {
+        if (pageOldest == null || p.measuredAt.getTime() < pageOldest.getTime()) pageOldest = p.measuredAt;
+        if (oldest == null || p.measuredAt.getTime() < oldest.getTime()) oldest = p.measuredAt;
+        if (newest == null || p.measuredAt.getTime() > newest.getTime()) newest = p.measuredAt;
+      }
+      s.oldest = oldest ? oldest.toISOString() : null;
+      s.newest = newest ? newest.toISOString() : null;
+      if (rows.length < COP_PAGE_LIMIT) break; // a short page: the endpoint has nothing older in [since, before)
+      if (pageOldest == null || pageOldest.getTime() <= since.getTime()) break; // reached the lower bound
+      const next = new Date(pageOldest.getTime() + 1); // exclusive bound re-includes the boundary timestamp's rows
+      if (before != null && next.getTime() >= before.getTime()) break; // no progress — a whole page at one timestamp
+      before = next;
+      more = true;
+    }
+    s.truncated = more;
+  }
+
+  /** Whether a one-off refetch is running on this instance (the route answers 409 rather than doubling the load). */
+  refetchInFlight(): boolean {
+    return this.copRefetchInFlight;
+  }
+
+  /** One-off (POST /api/tempiq/cop-refetch): the same walk from an explicit `since` (and optional exclusive
+   *  `before`), bounded at COP_REFETCH_MAX_PAGES, run inline on the caller's request with the same 20 s per-request
+   *  timeout as the tick. Never throws: an HTTP/store error ends the walk and is reported with the partial counts
+   *  (the route answers 502 then). The summary is kept for /health.tempiq_read.lastCopRefetch. The hourly tick is
+   *  unaffected — both paths upsert idempotently, so overlapping with it is harmless. */
+  async refetchCop(since: Date, before: Date | null): Promise<CopRefetchSummary> {
+    const startedAt = new Date();
+    const s: CopRefetchSummary = {
+      ...emptyCopSummary(since, before),
+      startedAt: startedAt.toISOString(), finishedAt: startedAt.toISOString(), durationMs: 0, error: null,
+    };
+    this.copRefetchInFlight = true;
+    try {
+      await this.walkCopPagesInto(s, since, before, COP_REFETCH_MAX_PAGES);
+    } catch (e) {
+      s.error = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.copRefetchInFlight = false;
+    }
+    const finishedAt = new Date();
+    s.finishedAt = finishedAt.toISOString();
+    s.durationMs = finishedAt.getTime() - startedAt.getTime();
+    this.lastCopRefetch = s;
+    const line = `[tempiq-read] cop-refetch since=${s.since}${s.before ? ` before=${s.before}` : ""}: ${summarizeCopFetch(s)} in ${s.durationMs} ms`;
+    if (s.error) console.error(`${line} — stopped: ${s.error}`);
+    else console.log(line);
+    return s;
   }
 
   /** Latest zone-energy snapshot (whole response JSON) → tempiq_zone_energy row 1. */

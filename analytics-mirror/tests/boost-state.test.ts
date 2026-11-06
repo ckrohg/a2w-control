@@ -1,6 +1,7 @@
 // @purpose node:assert suite for lib/boost-state.ts (#186): no success text before read-back;
 // "commanded X °F · adopts on the next reheat cycle" → "in force"; planner rejections verbatim and
-// classified; preflight warns on limits the planner enforces; estimates start from the CURRENT tank.
+// classified; preflight warns on limits the planner enforces; estimates start from the CURRENT tank;
+// #231 arming read-back, including the rate-limit wait (reason "rate_limit") that never claims warming.
 // Run: npx tsx tests/boost-state.test.ts
 import assert from "node:assert/strict";
 import {
@@ -164,6 +165,67 @@ t("preflight: minutes over 120, target over cap, outside I4, I1 offenders", () =
   assert.ok(w.some((x) => /outside the planner's I4 envelope right now \(104–124 °F\)/.test(x)));
   assert.ok(w.some((x) => /^I1: HP1 setpoint 125\.6 °F is below 141 °F/.test(x)));
   assert.ok(!w.some((x) => /HP2/.test(x))); // 61 °C = 141.8 °F clears 136 + 5
+  // #231: low setpoints are no longer a refusal — the planner warms the heat pumps first
+  const i1 = w.find((x) => x.startsWith("I1:"))!;
+  assert.match(i1, /warm the heat pumps up first and start the boost when they reach 141 °F \(it gives up after 20 min\)/);
+  assert.doesNotMatch(i1, /refuse/);
+});
+
+// ── #231: the 202 "arming" read-back ───────────────────────────────────────────────────────────────────────────
+const arming: BoostPhase = { phase: "arming", req: { target_f: 135, minutes: 60 }, atMs: NOW, setpointsNeededF: 140, expiresAt: new Date(NOW + 20 * 60_000).toISOString() };
+const pendingSt: WriterStatus = { ...before, pending_boost: { target_f: 135, minutes: 60, setpoints_needed_f: 140, requested_at: new Date(NOW).toISOString(), expires_at: new Date(NOW + 20 * 60_000).toISOString() } };
+
+t("arming: worded for the household, pending, not a success and not drawn", () => {
+  const v = boostView(arming, pendingSt, NOW + 5_000);
+  assert.equal(v.key, "arming");
+  assert.equal(v.tone, "pending");
+  assert.equal(v.text, "Warming up the heat pumps first, the boost starts when they reach 140 °F");
+  assert.ok(!SUCCESS.test(v.text));
+  assert.equal(chartShowsBoost(v), false);
+  assert.equal(boostView(arming, null, NOW + 5_000).key, "arming", "no read-back yet: the 202 answer stands");
+  assert.equal(boostView({ phase: "idle" }, pendingSt, NOW).key, "arming", "a page reload while arming reads it back");
+});
+
+t("arming → the boost lands: the read-back shows it commanded (between sending and commanded)", () => {
+  const landed: WriterStatus = { ...commanded, commanded_target_f: 135, active_boost: { target_f: 135, restore_at: new Date(NOW + 70 * 60_000).toISOString() }, pending_boost: null,
+    pending_boost_ended: { target_f: 135, outcome: "landed", detail: "written", at: new Date(NOW + 600_000).toISOString() } };
+  const v = boostView(arming, landed, NOW + 600_000);
+  assert.equal(v.key, "commanded");
+  assert.match(v.text, /^commanded 135 °F · adopts on the next reheat cycle/);
+  // landed but the active_boost row not in this read yet → still verifying, never "not started"
+  assert.equal(boostView(arming, { ...landed, active_boost: null }, NOW + 600_000).key, "verifying");
+});
+
+t("arming → it never started: expired / cancelled / refused / planner restarted — said plainly, tank unchanged", () => {
+  const ended = (outcome: "expired" | "replaced" | "refused", detail = "x"): WriterStatus => ({ ...before, pending_boost: null,
+    pending_boost_ended: { target_f: 135, outcome, detail, at: new Date(NOW + 20 * 60_000).toISOString() } });
+  const exp = boostView(arming, ended("expired"), NOW + 21 * 60_000);
+  assert.equal(exp.key, "not_started"); assert.equal(exp.tone, "bad");
+  assert.equal(exp.text, "The heat pumps did not warm up within 20 minutes, so the boost did not start. The tank was not changed.");
+  assert.equal(boostView(arming, ended("replaced"), NOW + 60_000).tone, "neutral");
+  assert.match(boostView(arming, ended("refused", "target 135°F outside the I4 envelope"), NOW + 60_000).text, /refused the boost: target 135°F outside/);
+  const gone = boostView(arming, before, NOW + 60_000);
+  assert.equal(gone.key, "not_started"); assert.match(gone.text, /may have restarted/);
+});
+
+t("arming inside the rate-limit window (owner 2026-11-02): waits, and never claims the heat pumps are warming", () => {
+  const WAIT = "Waiting a few minutes for the last heating change to settle, the boost starts after that";
+  const waiting: BoostPhase = { ...arming, reason: "rate_limit" } as BoostPhase;
+  const waitSt: WriterStatus = { ...pendingSt, pending_boost: { ...pendingSt.pending_boost!, reason: "rate_limit" } };
+  for (const v of [boostView(waiting, waitSt, NOW + 5_000), boostView(waiting, null, NOW + 5_000), boostView({ phase: "idle" }, waitSt, NOW)]) {
+    assert.equal(v.key, "arming"); assert.equal(v.tone, "pending");
+    assert.equal(v.text, WAIT);
+    assert.doesNotMatch(v.text, /warm/i);
+    assert.equal(chartShowsBoost(v), false);
+  }
+  // a setpoints boost whose pumps are now covered but the window holds: the planner's reason wins over the 202's
+  assert.equal(boostView(arming, waitSt, NOW + 600_000).text, WAIT);
+  assert.match(boostView(arming, { ...pendingSt, pending_boost: { ...pendingSt.pending_boost!, reason: "setpoints" } }, NOW + 5_000).text, /^Warming up the heat pumps first/);
+  // how a rate-limit wait ends: no warming claim either
+  const ended = (outcome: "expired" | "refused" | "landed"): WriterStatus => ({ ...before, pending_boost: null,
+    pending_boost_ended: { target_f: 135, outcome, detail: "x", at: new Date(NOW + 20 * 60_000).toISOString() } });
+  for (const o of ["expired", "refused", "landed"] as const) assert.doesNotMatch(boostView(waiting, ended(o), NOW + 21 * 60_000).text, /warm/i, o);
+  assert.match(boostView(waiting, ended("expired"), NOW + 21 * 60_000).text, /could not start within 20 minutes.*The tank was not changed/);
 });
 
 t("preflight: stale Pi state is called out (the planner refuses I1 on it)", () => {

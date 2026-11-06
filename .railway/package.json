@@ -1,0 +1,8 @@
+{
+  "name": "a2w-railway-iac",
+  "private": true,
+  "description": "Railway SDK that evaluates .railway/railway.ts for `railway config plan|apply`. Not part of any service build.",
+  "devDependencies": {
+    "railway": "3.16.0"
+  }
+}

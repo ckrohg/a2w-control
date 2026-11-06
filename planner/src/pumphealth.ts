@@ -12,11 +12,18 @@
  *                      SUSPENDS its clock in defrost, so a stuck "defrost" while called was invisible (Oct 18, 83 min)
  *   called_tank_flat — stage called + its pump engaged (heating/defrost) ≥ 90 % of 45 min, tank net rise + standby loss
  *                      ≤ 2 °F AND the unit's mean ΔT over it < 1.5 °C, for 30 min (a flat tank ALONE is house load — measured)
+ *   stage_never_called — #172: the tank more than 3 °F below the CURVE IN FORCE (not SensorLinx's tank_target_f, which
+ *                      freezes while the HBX idles) for 2 h straight, under HEAT DEMAND and below the curve's WWSD the
+ *                      whole time, and HBX stage 2 never called in that time: half the plant sat out a recovery (pump2
+ *                      idle at a 16 °C inlet while pump1 recovered alone at 32 °F). Not judged during a deliberate stop
+ *                      (#212), a lowering of the curve (a setback), a spell without heat demand or above WWSD (the HBX
+ *                      calls nothing then and the tank coasts — "staging didn't call it (normal)"), or blind/stale data
  * Thresholds are MEASURED: knowledge/reference/pump-health-baseline-20261019.md. A window whose data is stale or gappy is
  * "unknown" and moves nothing — the stagewatch rule: a blind spell never opens or closes an episode.
  * The daily rollup (rollupDay) and trend (trend) feed /health.pump_health and the daily digest. Pure — no I/O.
  */
 import { C, esc, shell, footer } from "./alertemail";
+import { curveTargetF } from "./shadow";
 
 export const PH = {
   NO_LIFT_WINDOW_S: 15 * 60,
@@ -40,19 +47,29 @@ export const PH = {
   MAX_READING_GAP_S: 150,       // readings arrive ~60 s; a skipped push is tolerated, two are not
   MAX_SPAN_GAP_S: 120,          // span samples ~25 s
   MAX_SLX_GAP_S: 450,           // HBX poll 5 min (+ jitter) — stagewatch MAX_STEP_MS
+  STAGE_IDLE_WINDOW_S: 2 * 3600, // #172: tank below target this long with the stage never called
+  STAGE_IDLE_DEADBAND_F: 3,     // "below target" = more than this under the curve in force (the HBX calls at target − htDif/2 = −2 °F)
+  STAGE_IDLE_SETBACK_F: 3,      // a curve change that lowers the target by more than this is a setback (stale-target ADOPTION_TOLERANCE_F)
+  STAGE_IDLE_MIN_SAMPLES: 18,   // of the 24 five-minute HBX polls in 2 h
   /** how far back index.ts must read for every window above */
   LOOKBACK_S: 80 * 60,          // called_tank_flat: 45-min window + 30-min persistence + margin
+  TANK_LOOKBACK_S: 2 * 3600 + 10 * 60, // the HBX series: stage_never_called's 2 h + margin
 } as const;
 
 export const TREND = { CUR_DAYS: 7, BASE_DAYS: 14, MIN_RUN_H: 2, DRIFT_PCT: 20, SHORT_CYCLE_STARTS_60: 6, BIN_C: 5 } as const;
 
-export type CheckKind = "running_no_lift" | "heating_no_draw" | "idle_draw" | "defrost_overlong" | "called_tank_flat";
-export const CHECK_KINDS: readonly CheckKind[] = ["running_no_lift", "heating_no_draw", "idle_draw", "defrost_overlong", "called_tank_flat"];
+export type CheckKind = "running_no_lift" | "heating_no_draw" | "idle_draw" | "defrost_overlong" | "called_tank_flat" | "stage_never_called";
+export const CHECK_KINDS: readonly CheckKind[] = ["running_no_lift", "heating_no_draw", "idle_draw", "defrost_overlong", "called_tank_flat", "stage_never_called"];
 
 export interface PumpReading { ts: number; online: boolean; state: string | null; inlet_c: number | null; outlet_c: number | null; ambient_c: number | null }
 /** raw SPAN power_w — consumption is NEGATIVE on this panel; every use takes the magnitude */
 export interface SpanSample { ts: number; power_w: number | null }
-export interface TankReading { ts: number; tank_f: number | null; stages_called: boolean[] | null }
+/** hd_active: the HBX's heat-demand input (slx_readings.hd_active); null when the poll did not report it */
+export interface TankReading { ts: number; tank_f: number | null; stages_called: boolean[] | null; outdoor_f?: number | null; hd_active?: boolean | null }
+/** One hbx_config_versions row: the curve the device held from `ts` (planner clock) until the next row. */
+export interface CurveVersion { ts: number; curve: { dot: number; wwsd: number; dbt: number; mbt: number } | null }
+/** #212: a pump a PERSON switched off (stagewatch stopOf), as index.ts reads it from the hub frame */
+export interface StoppedPump { pumpId: string; label: string; since: number }
 
 export type VerdictState = "ok" | "tripped" | "unknown";
 export interface Verdict {
@@ -228,6 +245,99 @@ export function evaluateTankFlat(stage: string, pumpId: string, readings: PumpRe
   return v("tripped", `${latest.reason}; flat for ≥ ${persistS / 60} min`, latest.metrics);
 }
 
+/** "3:12 PM" in the house's time zone (stagewatch's hhmm) */
+const etClock = (s: number) => new Date(s * 1000).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+
+/**
+ * stage_never_called (#172) for one stage → pump, at `nowS`. PLANNER clock throughout: `hbx` is slx_readings as stored
+ * (with outdoor_f) and `curves` the hbx_config_versions rows covering the window, ascending. The target at each poll is
+ * the curve in force then, at that poll's outdoor — never SensorLinx's tank_target_f, which reads an old, higher target
+ * for 7–16 h after a lowering (knowledge/reference/stale-slx-target-2026-10-19.md). Trips when EVERY poll of the last
+ * 2 h has the tank more than STAGE_IDLE_DEADBAND_F under that target and NO poll shows the stage called. `stopped` = the
+ * pumps a person has switched off now (#212): then nothing is judged. A curve change in the window that lowers the
+ * target is a setback: not judged either. The HBX calls a stage only under heat demand (hd_active) and below the curve's
+ * own WWSD, so a window with a poll without demand, or at/above the WWSD of the curve in force then, is not judged
+ * either (stale-target.ts: an idle device proves nothing) — that is the "staging didn't call it (normal)" case #172
+ * separates from a fault, and it must not pollute the shadow record. Missing, gappy or stale HBX data, a missing demand
+ * flag, or a window whose curve is unknown → unknown.
+ */
+export function evaluateStageNeverCalled(stage: string, pumpId: string, hbx: TankReading[], curves: CurveVersion[], stopped: StoppedPump[], nowS: number): Verdict {
+  const v = (state: VerdictState, reason: string, metrics: Record<string, number | null> = {}): Verdict => ({ kind: "stage_never_called", pumpId, state, reason, metrics });
+  if (stopped.length) {
+    const who = stopped.map((s) => `${s.label} was switched off outside A2W at ${etClock(s.since)}`).join("; ");
+    return v("ok", `not judged: ${who}. That is a deliberate stop (#212), so the missing capacity is the owner's choice, not a fault`);
+  }
+  const idx = Number(stage) - 1;
+  const fin = (x: number | null | undefined): x is number => typeof x === "number" && Number.isFinite(x);
+  const slx = hbx.filter((x) => fin(x.tank_f) && fin(x.outdoor_f) && x.stages_called != null);
+  const newest = slx.length ? slx[slx.length - 1].ts : null;
+  if (newest == null || nowS - newest > PH.MAX_SLX_GAP_S) {
+    return v("unknown", newest == null ? "not judged: no HBX readings (blind)" : `not judged: the newest HBX reading is ${Math.round((nowS - newest) / 60)} min old (stale)`);
+  }
+  const w = covered(slx, nowS - PH.STAGE_IDLE_WINDOW_S, nowS, PH.MAX_SLX_GAP_S);
+  if (!w || w.length < PH.STAGE_IDLE_MIN_SAMPLES) return v("unknown", "not judged: the HBX readings have gaps in the last 2 h (blind)");
+  const called = w.find((x) => x.stages_called![idx] === true);
+  if (called) return v("ok", `stage ${stage} was called at ${etClock(called.ts)}`);
+  // heat demand for the whole window, else the HBX had no reason to call anything: not judged (not tripped, not clean).
+  // "ok" so an episode opened under demand closes when the demand ends, as a deliberate stop or a setback closes it.
+  const noDemand = w.find((x) => x.hd_active === false);
+  if (noDemand) {
+    return v("ok", `not judged: no heat demand at ${etClock(noDemand.ts)} — the HBX calls no stage without demand, so an idle stage ${stage} ` +
+      `proves nothing (the tank coasts). That is staging not calling it, which is normal, not missing capacity`);
+  }
+  const demandUnknown = w.find((x) => x.hd_active == null);
+  if (demandUnknown) return v("unknown", `not judged: the HBX heat-demand flag is missing at ${etClock(demandUnknown.ts)} (blind)`);
+
+  // the curve in force at each poll: the newest version observed at or before it
+  const at = (ts: number): number => { let i = -1; for (let k = 0; k < curves.length && curves[k].ts <= ts; k++) i = k; return i; };
+  const i0 = at(w[0].ts);
+  if (i0 < 0) return v("unknown", "not judged: the curve in force is not known for the whole 2 h");
+  for (let k = i0 + 1; k < curves.length && curves[k].ts <= nowS; k++) {
+    const prev = curves[k - 1].curve, next = curves[k].curve;
+    if (!prev || !next) return v("unknown", "not judged: an HBX config version in the window has no readable curve");
+    const o = (w.filter((x) => x.ts <= curves[k].ts).pop() ?? w[0]).outdoor_f as number;
+    const before = curveTargetF(prev, o), after = curveTargetF(next, o);
+    if (before != null && after != null && before - after > PH.STAGE_IDLE_SETBACK_F) {
+      return v("ok", `not judged: the curve in force was lowered at ${etClock(curves[k].ts)} (${r1(before)} → ${r1(after)} °F at ${r1(o)} °F outdoor). ` +
+        `That is a setback, not missing capacity`);
+    }
+  }
+  let minBelow = Infinity, maxBelow = -Infinity, lastNear: TankReading | null = null;
+  const rows: { x: TankReading; target: number; below: number }[] = [];
+  let wwsdF: number | null = null;
+  for (const x of w) {
+    const c = curves[at(x.ts)].curve;
+    const target = c ? curveTargetF(c, x.outdoor_f as number) : null;
+    if (!c || target == null) return v("unknown", "not judged: the curve in force is unreadable");
+    // at or above the WWSD of the curve in force THEN (the live /health.curve.wwsd comes from the same rows) the HBX
+    // calls nothing and the curve sits clamped at its minimum while the tank coasts: not judged, like no demand
+    if ((x.outdoor_f as number) >= c.wwsd) {
+      return v("ok", `not judged: ${r1(x.outdoor_f ?? null)} °F outdoor at ${etClock(x.ts)} is at or above the warm-weather shutdown of the curve in force ` +
+        `(WWSD ${r1(c.wwsd)} °F) — the HBX calls no stage above it, so an idle stage ${stage} proves nothing (the tank coasts). ` +
+        `That is staging not calling it, which is normal, not missing capacity`);
+    }
+    wwsdF = c.wwsd;
+    const below = target - (x.tank_f as number);
+    rows.push({ x, target, below });
+    if (below <= PH.STAGE_IDLE_DEADBAND_F) lastNear = x;
+    minBelow = Math.min(minBelow, below); maxBelow = Math.max(maxBelow, below);
+  }
+  const last = rows[rows.length - 1];
+  const other = w.filter((x) => x.stages_called!.some((c, i) => c && i !== idx)).length / w.length;
+  const m = { tank_f: r1(last.x.tank_f), target_f: r1(last.target), below_f: r1(last.below), min_below_f: r1(minBelow), max_below_f: r1(maxBelow),
+    outdoor_f: r1(last.x.outdoor_f ?? null), wwsd_f: r1(wwsdF), other_stage_called_pct: Math.round(other * 100), samples: w.length };
+  if (lastNear) {
+    return v("ok", `the tank was within ${PH.STAGE_IDLE_DEADBAND_F} °F of the curve in force at ${etClock(lastNear.ts)}` +
+      (last.below > PH.STAGE_IDLE_DEADBAND_F ? ` (below it for ${Math.round((nowS - lastNear.ts) / 60)} min since)` : ""), m);
+  }
+  return v("tripped", `was never called: for 2 h the tank stayed ${r1(minBelow)}–${r1(maxBelow)} °F below the curve in force ` +
+    `(now ${r1(last.x.tank_f)} °F against ${r1(last.target)} °F at ${r1(last.x.outdoor_f ?? null)} °F outdoor), and in all that time the HBX never called stage ${stage}` +
+    (other > 0 ? `, while another stage was called ${m.other_stage_called_pct} % of the time: one pump carried the recovery alone and half the capacity sat idle`
+      : `, nor any other stage`) +
+    `. This is not a deliberate stop (no pump is switched off), not a setback (the curve was not lowered) and not a data gap (the HBX readings cover all 2 h), ` +
+    `and staging had every reason to call: heat demand was active and outdoor stayed below the curve's WWSD (${r1(wwsdF)} °F) for all 2 h`, m);
+}
+
 // ── episodes ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 export interface HealthEvent { kind: "open" | "close"; check: CheckKind; pumpId: string; title: string; body: string }
 
@@ -280,6 +390,7 @@ const TITLES: Record<CheckKind, string> = {
   idle_draw: "idle but drawing power",
   defrost_overlong: "stuck in defrost",
   called_tank_flat: "called and heating but the tank is flat",
+  stage_never_called: "tank below target for 2 h but never called",
 };
 
 /** PUMP_HEALTH_LIVE env: comma-separated check kinds the owner has promoted to paging. Unknown names are reported. */
@@ -296,6 +407,28 @@ export const episodeKind = (c: CheckKind, live: boolean) => `${live ? "" : "shad
 export function parseEpisodeKind(kind: string): { check: CheckKind; live: boolean } | null {
   const m = /^(shadow_)?pump_(.+)$/.exec(kind);
   return m && (CHECK_KINDS as readonly string[]).includes(m[2]) ? { check: m[2] as CheckKind, live: !m[1] } : null;
+}
+
+/**
+ * The checks this tick's verdicts actually judged: an "unknown" verdict judged nothing. index.ts accumulates these after
+ * the alert restore, because the checks read DIFFERENT sources — the mirror (readings / span_readings) for the four
+ * per-pump checks and called_tank_flat, the HBX series for stage_never_called — and either can be blind while the other
+ * answers. One flag for all of them (#257) let a stage-2 verdict release a re-adopted, unheard pump_idle_draw row that
+ * no mirror check had looked at yet, and alerts.retry re-paged it unevaluated.
+ */
+export function evaluatedChecks(verdicts: Verdict[]): Set<CheckKind> {
+  const out = new Set<CheckKind>();
+  for (const x of verdicts) if (x.state !== "unknown") out.add(x.kind);
+  return out;
+}
+/**
+ * alerts.retry's gate for a promoted pump_* row adopted at restore: re-sent only once ITS check has judged its own data
+ * since the restore, so a resolved incident is closed by that judgement instead of re-paged. `evaluated` is the union of
+ * evaluatedChecks over the ticks since the restore. A kind no check owns any more waits for any check at all.
+ */
+export function pumpRetryAllowed(kind: string, evaluated: ReadonlySet<CheckKind>): boolean {
+  const p = parseEpisodeKind(kind);
+  return p ? evaluated.has(p.check) : evaluated.size > 0;
 }
 
 // ── daily rollup ──────────────────────────────────────────────────────────────────────────────────────────────────────

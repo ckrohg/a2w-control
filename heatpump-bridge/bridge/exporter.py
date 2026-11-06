@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .config import AnalyticsConfig
 from .poller import PumpPoller
+from .span_local import read_arm_intent, write_arm_intent
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -221,19 +222,13 @@ class Exporter:
             self._apply_arm_intent(resp["span_arm_desired"])
 
     def _apply_arm_intent(self, armed: bool) -> None:
+        # span_local owns span-arm.json; default=not armed so a missing/unreadable file reads
+        # as "differs" and gets written
+        path = str(self._arm_intent_path)
         try:
-            try:
-                cur = bool(json.loads(self._arm_intent_path.read_text()).get("armed"))
-            except (OSError, ValueError):
-                cur = None
-            if cur == armed:
+            if read_arm_intent(path, default=not armed) == armed:
                 return
-            tmp = self._arm_intent_path.with_suffix(".tmp")
-            with open(tmp, "w") as f:
-                json.dump({"armed": bool(armed)}, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._arm_intent_path)
+            write_arm_intent(path, armed)
             log.info("span-arm intent updated from portal: armed=%s", armed)
         except OSError as exc:  # noqa: BLE001
             log.warning("span-arm intent apply failed: %s", exc)

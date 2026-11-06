@@ -22,9 +22,12 @@
  * SAFETY, in order: the plan's own safeToProbe verdict (fail-closed on unknowns), the actuator's own
  * bounds (dhwFloorF, strictCapF, sanitizeCapF), I1 (setpoints must cover the target), the 15-min
  * write rate limit, and live aborts — I1 violated, room deficit on a down-probe (setpoint − 1 °F),
- * a DHW draw during a down-probe, hub/SLX stale, storm armed, boost active. A DOWN-probe abort
- * RESTORES the as-found curve immediately (the one write the rate limit never blocks; hotter is the
- * safe direction) and lets the auto-pilot re-plan; an up-probe abort just releases.
+ * a DHW draw during a down-probe, hub/SLX stale, storm armed, boost active. An abort returns the plant
+ * to the plan's command through the rate-limit-exempt plan restore (#232: the auto-pilot's own write,
+ * I4/I1/lease guarded, so the next tick reads "already commanded"); only when THAT is refused — the hub
+ * or SensorLinx cannot vouch for it, the pumps do not cover the plan — is the as-found curve written
+ * unguarded, hotter being the safe direction on an abort. A window that ended normally never writes
+ * unguarded: it stays pending and retries.
  *
  * Every window is persisted (identification_windows) so a planner restart resumes or closes it, and
  * posted to TempIQ as kind awt_identification WITH its drawn assignment — the only kind U4 may fit.
@@ -74,7 +77,7 @@ const INTERLOCK_HORIZON_MAX_MIN = 24 * 60;
 const INTERLOCK_SOURCES = new Set(["not_armed", "none_dispatched", "arm_log", "legacy_history"]);               // washout + normal operation between windows
 const ARMING_MAX_TICKS = 4;           // ~20 min for Phase B to lead the setpoints, else give up
 const WRITE_RETRY_MAX = 3;            // 429 (rate limit) retries, one per poll
-const CLEANUP_TRANSIENT_MAX = 6;      // transient cleanup failures tolerated before falling back to the as-found restore
+const CLEANUP_TRANSIENT_MAX = 6;      // transient re-command failures tolerated before the plan restore is tried anyway
 const CLEANUP_ALERT_EVERY = 12;       // a cleanup that will not resolve pages every N ticks (~1 h)
 const MIN_STEP_F = 3;                 // below the 3 °F adoption tolerance a step is not a perturbation
 const DEFICIT_F = 1;                  // room below setpoint − this = deficit (thermostat hysteresis)
@@ -146,8 +149,9 @@ export interface IdentWindow {
   /**
    * Returning the plant to its base after a LIVE probe is the driver's job, not the auto-pilot's
    * (codex 2026-09-29 critical: with the auto-pilot in shadow a completed 145 °F probe stayed
-   * commanded indefinitely). 'pending' retries every tick until a guarded re-command of baseF —
-   * or, when the rate limit refuses it, the as-found restore — is confirmed.
+   * commanded indefinitely). 'pending' retries every tick until a guarded re-command of baseF — or, when
+   * the rate limit refuses it, the rate-limit-exempt plan restore (#232; an abort falls back to the as-found
+   * curve when that too is refused) — is confirmed.
    */
   cleanupState: CleanupState;
   cleanupDetail: string | null;
@@ -841,10 +845,17 @@ export class IdentificationDriver {
 
   /**
    * Return the plant to the window's base. First choice: a guarded re-command of baseF through the
-   * same writer (I4/I1/rate limit/audit). When the rate limit refuses it — an abort inside 15 min of
-   * the probe write — fall back to the as-found restore, the one write the rate limit never blocks;
-   * for a down-probe abort that is the safe direction and for an up-probe it is only cost. Any other
-   * failure stays 'pending' and is retried next tick.
+   * same writer (I4/I1/rate limit/audit). When that is refused — most often the rate limit, an abort
+   * inside 15 min of the probe write — the PLAN restore (#232): the auto-pilot's own command for the
+   * block in force through the same I4/I1/lease guards, rate-limit exempt, so the auto-pilot's next
+   * tick reads "already commanded" and the plant never sees the July as-found curve (≈ 158 °F at 46 °F
+   * outdoor under SHAPED_CURVE live: an I1 violation Phase B then chases to the 140 °F cap). Only an
+   * ABORT whose plan restore is refused too — the hub or SensorLinx cannot vouch for it (503), the
+   * pumps do not cover the plan (409), envelope (422), lease (423) — falls to that as-found curve,
+   * unguarded, because an abort must end with a landed write and hotter is the safe direction. A
+   * window that ended normally stays 'pending' instead and retries next tick: the guards that refused
+   * the plan refuse the auto-pilot's own command too, and the plant sits at the probe's own guarded
+   * target until they clear. Any other failure stays 'pending' and is retried next tick.
    */
   private async cleanup(w: IdentWindow, urgent: boolean): Promise<string | null> {
     // Where the plant goes: the window's base, or — after plan_moved — the plan's new command (persisted on the
@@ -879,11 +890,12 @@ export class IdentificationDriver {
     // 0. Is there anything to return? Cleanup may re-command a base ONLY after positively confirming the
     //    device still commands THIS window's probe target (codex pass 6: an unavailable status must not
     //    fall through to overwriting a later human or auto-pilot command). If the status cannot be read,
-    //    a non-urgent cleanup stays pending and retries; an urgent abort still restores the as-found
-    //    curve — that write depends on no saved base and hotter is the safe direction.
+    //    a non-urgent cleanup stays pending and retries; an urgent abort still restores — the plan's command,
+    //    or the as-found curve when that is refused: neither depends on the saved base, and hotter is the safe
+    //    direction.
     // 0a. An active boost is a NEWER human command than this probe (no window opens while one is active, and the boost
     //     row is written only after its write landed): there is nothing to return, and either cleanup write — the
-    //     re-command or the urgent as-found restore — would erase it. The boost's own expiry restores the curve and the
+    //     re-command or a restore — would erase it. The boost's own expiry restores the curve and the
     //     auto-pilot resumes after it (codex pass 1 on the boost hold). An unreadable boost table keeps a non-urgent
     //     cleanup pending; an urgent abort still proceeds — hotter is the safe direction.
     let boost: { targetF: number; restoreAt: Date } | null = null;
@@ -901,8 +913,8 @@ export class IdentificationDriver {
     // 1. The guarded re-command of the base. A 429 (rate limit) or any other 4xx guard rejection
     //    (422 envelope: the saved base may be outside I4 at the new outdoor; 409 I1; 423 lease) is
     //    PERMANENT for this tick — retrying it forever would leave the plant at the probe target
-    //    (codex pass 2, high). Those fall through to the restore. 5xx/network are transient and are
-    //    retried up to CLEANUP_TRANSIENT_MAX before the restore is used anyway.
+    //    (codex pass 2, high). Those fall through to the plan restore below. 5xx/network are transient and are
+    //    retried up to CLEANUP_TRANSIENT_MAX before the plan restore is tried anyway.
     let permanent = urgent;
     if (commanded != null) {
       try {
@@ -917,14 +929,31 @@ export class IdentificationDriver {
         if (!permanent) return stillPending(`re-command failed (transient): ${(e as Error).message.slice(0, 120)}`);
       }
     }
-    // 2. The as-found restore — the one write the rate limit never blocks; hotter is the safe direction.
-    //    Explicitly `to: "as-found"` since #232 made the writer's default the plan's command: that one runs the same
-    //    guards the re-command above was just refused by, so as a LAST RESORT it would be refused too and the plant
-    //    would sit at the probe target. Whether an identification abort should prefer the plan's command (it does
-    //    land on a 429) and only then the as-found curve is a separate decision — see #232's follow-up.
+    // 2. The PLAN restore (#232): the plan's command for the block in force — the shaped curve on a curve hour, the
+    //    flat excursion target otherwise — through the same I4 / I1 / lease guards, rate-limit EXEMPT. The common
+    //    refusal above is a 429, and this lands where the auto-pilot would put the plant anyway, so its next tick
+    //    reads "already commanded" (no 15-min hole). It resolves the block in force inside the writer's slot, so it
+    //    needs no handoff refresh. When nothing of the plan is being commanded (no auto-pilot, Off/shadow, no plan
+    //    block) the writer writes the as-found endpoints itself and says so in its detail, carried below.
+    let planRefusal: string;
+    try {
+      const r = await this.d.writer.restore(cleanupSource(w.id, urgent), { yieldToBoost: true, to: "plan" });
+      return await done(`plan's command restored (base re-command refused${urgent ? "; abort" : ""})${typeof r?.detail === "string" ? ` — ${r.detail}` : ""}`);
+    } catch (e) {
+      if (isBoostYield(e)) return done(`a boost took over during cleanup — ${(e as Error).message}; nothing to return`);
+      planRefusal = `${e instanceof WriteError ? `${e.status} ` : ""}${(e as Error).message.slice(0, 120)}`;
+      // A window that ended normally has no safety case for an unguarded write: the guards that refused the plan
+      // (I1 short, Pi/hub unverifiable, lease, envelope) refuse the auto-pilot's own command too, and the plant
+      // sits at the probe's own guarded target until they clear — retried every tick, paged if stuck.
+      if (!urgent) return stillPending(`plan restore refused: ${planRefusal}`);
+    }
+    // 3. ABORT only: the as-found curve — the unguarded write (no I1, no Pi-freshness check), the one that lands
+    //    when the hub or SensorLinx cannot vouch for the plan. Hotter is the safe direction; under SHAPED_CURVE live
+    //    it is ≈ 158 °F at 46 °F outdoor (#232), which the auto-pilot replaces once its rate-limit slot clears.
+    //    Explicitly `to: "as-found"`: the writer's default is the plan restore that was just refused.
     try {
       await this.d.writer.restore(cleanupSource(w.id, urgent), { yieldToBoost: true, to: "as-found" });
-      return await done(`as-found curve restored (base re-command refused${urgent ? "; abort" : ""})`);
+      return await done(`as-found curve restored (abort; base re-command and plan restore refused: ${planRefusal})`);
     } catch (e) {
       if (isBoostYield(e)) return done(`a boost took over during cleanup — ${(e as Error).message}; nothing to return`);
       return stillPending(`restore failed: ${(e as Error).message.slice(0, 120)}`);

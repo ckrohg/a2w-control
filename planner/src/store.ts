@@ -11,11 +11,12 @@
 import { Pool } from "pg";
 import type { PendingCurveWrite, WindowStats, WindowPost } from "./tempiq-windows";
 import type { ZoneCallSample } from "./demand";
+import type { FeedMemory } from "./generator";
 import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT_F } from "./stale-target";
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 import type { PiLinkInputs } from "./pilink";
-import type { PumpReading, SpanSample, TankReading, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
+import type { PumpReading, SpanSample, TankReading, CurveVersion, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
 
 export interface SlxReading {
   ts: Date;
@@ -454,6 +455,13 @@ export class Store {
       ALTER TABLE controller_flags  ADD COLUMN IF NOT EXISTS identification_mode text NOT NULL DEFAULT 'off';
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_mode text;
       ALTER TABLE controller_status ADD COLUMN IF NOT EXISTS identification_result text;
+      -- What the outage feed last said (generator.ts FeedMemory): a planner restart must not forget an outage in progress.
+      CREATE TABLE IF NOT EXISTS outage_feed_memory (
+        id             integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        active         boolean,
+        last_active_at timestamptz,
+        updated_at     timestamptz NOT NULL DEFAULT now()
+      );
       CREATE TABLE IF NOT EXISTS tempiq_window_posts (
         write_id    integer PRIMARY KEY,
         external_id text NOT NULL,
@@ -633,6 +641,23 @@ export class Store {
     return { mode: x.mode, autopilotDryRun: x.autopilot_dry_run, phasebDryRun: x.phaseb_dry_run, autoSanitize: x.auto_sanitize, identificationMode: x.identification_mode ?? "off" };
   }
 
+  /** generator.ts FeedMemory. null before the feed has ever changed. */
+  async getOutageFeedMemory(): Promise<FeedMemory | null> {
+    const r = await this.pool.query(`SELECT active, last_active_at FROM outage_feed_memory WHERE id = 1`);
+    if (!r.rowCount) return null;
+    const x = r.rows[0];
+    return { active: x.active, lastActiveMs: x.last_active_at ? new Date(x.last_active_at).getTime() : null };
+  }
+
+  async saveOutageFeedMemory(m: FeedMemory): Promise<void> {
+    const at = m.lastActiveMs == null ? null : new Date(m.lastActiveMs);
+    await this.pool.query(
+      `INSERT INTO outage_feed_memory (id, active, last_active_at) VALUES (1, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET active = $1, last_active_at = $2, updated_at = now()`,
+      [m.active, at],
+    );
+  }
+
   /** identify.ts: the runtime identification mode (off | shadow | armed), independent of the autonomy switch. */
   async setIdentificationMode(mode: string, updatedBy: string): Promise<void> {
     await this.pool.query(
@@ -793,24 +818,41 @@ export class Store {
   }
 
   /** Insert-only COP points, deduped on (measured_at, system). Returns rows actually inserted. */
+  /** UPSERT on the PK (measured_at, system). Since TempIQv2#2124 TempIQ's hydronic COP writer defers a point until
+   *  the charge's end is observable and re-upserts its overlap day on every hourly run, so a mirrored row can
+   *  legitimately change (a short or provisional row completed later); the old DO NOTHING kept whatever version
+   *  arrived first, forever. A row whose mirrored fields are unchanged is left alone (the WHERE on DO UPDATE —
+   *  row-wise IS DISTINCT FROM, so null ↔ value counts as a change), which keeps the counts honest: inserted = a
+   *  new PK, updated = an existing row whose fields moved, and the rest of `points` were re-sent unchanged.
+   *  `xmax = 0` on the returned row distinguishes an insert from an update. Proof: scripts/tempiq-cop-upsert-local-check.ts. */
   async insertTempiqCopPoints(points: Array<{
     measuredAt: Date; system: string; outdoorTempF: number | null; sinkTempF: number | null;
     cop: number | null; thermalKwh: number | null; electricalKwh: number | null;
     quality: string | null; qualityScore: number | null;
-  }>): Promise<number> {
-    let inserted = 0;
+  }>): Promise<{ inserted: number; updated: number }> {
+    let inserted = 0, updated = 0;
     for (const p of points) {
       const res = await this.pool.query(
-        `INSERT INTO tempiq_cop_points
+        `INSERT INTO tempiq_cop_points AS t
            (measured_at, system, outdoor_temp_f, sink_temp_f, cop, thermal_kwh, electrical_kwh, quality, quality_score)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (measured_at, system) DO NOTHING`,
+         ON CONFLICT (measured_at, system) DO UPDATE SET
+           outdoor_temp_f = EXCLUDED.outdoor_temp_f, sink_temp_f = EXCLUDED.sink_temp_f, cop = EXCLUDED.cop,
+           thermal_kwh = EXCLUDED.thermal_kwh, electrical_kwh = EXCLUDED.electrical_kwh,
+           quality = EXCLUDED.quality, quality_score = EXCLUDED.quality_score
+         WHERE (t.outdoor_temp_f, t.sink_temp_f, t.cop, t.thermal_kwh, t.electrical_kwh, t.quality, t.quality_score)
+           IS DISTINCT FROM
+           (EXCLUDED.outdoor_temp_f, EXCLUDED.sink_temp_f, EXCLUDED.cop, EXCLUDED.thermal_kwh, EXCLUDED.electrical_kwh,
+            EXCLUDED.quality, EXCLUDED.quality_score)
+         RETURNING (xmax = 0) AS inserted`,
         [p.measuredAt, p.system, p.outdoorTempF, p.sinkTempF, p.cop,
          p.thermalKwh, p.electricalKwh, p.quality, p.qualityScore],
       );
-      inserted += res.rowCount ?? 0;
+      const row = res.rows[0];
+      if (!row) continue; // conflict, nothing changed
+      if (row.inserted) inserted++; else updated++;
     }
-    return inserted;
+    return { inserted, updated };
   }
 
   /** Latest TempIQ zone-energy snapshot (single-row upsert; shadow model picks fields). */
@@ -1052,7 +1094,8 @@ export class Store {
 
   /**
    * #185: active fault CODES per pump from the mirror's pump_snapshots (the Pi attaches each pump's full snapshot every
-   * ~5 min, including active_faults [{code, message, severity, since}]). The hub's state frame carries only a COUNT.
+   * ~5 min, including active_faults [{code, message, severity, since}]). The hub's state frame carried only a COUNT before
+   * #190; checkStages now reads the frame's own list when the bridge sends one and falls back to this.
    * Non-info severities only. Read-only; an absent table (rehearsal DB) → {}.
    */
   async pumpFaultCodes(): Promise<Record<string, { codes: string[]; ts: number }>> {
@@ -2029,12 +2072,29 @@ export class Store {
     return out;
   }
 
-  /** HBX tank + stage calls since `from` (planner clock), ascending, as epoch seconds. */
+  /** HBX tank + outdoor + heat demand + stage calls since `from` (planner clock), ascending, as epoch seconds. */
   async tankWindow(from: Date): Promise<TankReading[]> {
     const rows = await this.boundedRows(
-      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
+      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, outdoor_f, hd_active, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
     return (rows ?? []).map((x) => ({ ts: Number(x.ts), tank_f: x.tank_f == null ? null : Number(x.tank_f),
+      outdoor_f: x.outdoor_f == null ? null : Number(x.outdoor_f),
+      hd_active: typeof x.hd_active === "boolean" ? x.hd_active : null, // stage_never_called: no demand → not judged
       stages_called: Array.isArray(x.stages_called) ? x.stages_called.map((b: unknown) => b === true) : null }));
+  }
+
+  /**
+   * #172: the curve in force over [from, now] — every hbx_config_versions row observed since `from`, plus the newest one
+   * before it (the curve already in force at `from`). Planner clock, ascending. curve = null when the row lacks one.
+   */
+  async curveVersionsSince(from: Date): Promise<CurveVersion[]> {
+    const rows = await this.boundedRows(
+      `SELECT extract(epoch FROM observed_at)::float8 AS ts, config FROM hbx_config_versions
+       WHERE observed_at >= $1 OR id = (SELECT max(id) FROM hbx_config_versions WHERE observed_at < $1) ORDER BY observed_at, id`, [from]);
+    return (rows ?? []).map((x) => {
+      const c = (x.config ?? {}) as Record<string, unknown>;
+      const ok = [c.dot, c.wwsd, c.dbt, c.mbt].every((v) => typeof v === "number" && Number.isFinite(v));
+      return { ts: Number(x.ts), curve: ok ? { dot: c.dot as number, wwsd: c.wwsd as number, dbt: c.dbt as number, mbt: c.mbt as number } : null };
+    });
   }
 
   async upsertPumpHealthDay(day: string, pumpId: string, metrics: DayMetrics): Promise<void> {

@@ -19,6 +19,9 @@ export interface SpanCloudState {
   backup_kwh_last_hour?: number | null;
   backup_kwh_today?: number | null;
   backup_alarmed?: boolean;
+  /** energy that arrived across the newest blind spell longer than the alarm window — kept out of backup_kwh_last_hour
+   *  because when inside the spell it was drawn is unknown; still inside backup_kwh_today */
+  backup_kwh_blind_spell?: { kwh: number; from: string; to: string; minutes: number } | null;
 }
 
 export interface SpanHealth {

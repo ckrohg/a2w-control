@@ -13,6 +13,10 @@ import { sql } from "@/lib/sql";
 import { isAuthed } from "@/lib/auth";
 import { normalizePi, normalizeHub, esc } from "@/lib/pi-tile";
 import { summarizeAlerts, alertsHeadline, type AlertRow } from "@/lib/alerts-digest";
+import {
+  INK, INK2, MUTED, SERIES, GOOD, BAD, TILE_BG, RULE,
+  fmt, day, delta, headline as pickHeadline, faultLines as buildFaultLines, subjectLine, type FaultRow,
+} from "@/lib/digest-render";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,15 +24,6 @@ export const dynamic = "force-dynamic";
 const DASH_URL = "https://a2w-analytics-mirror.vercel.app";
 const ELEMENT_KW = 16.5;
 const RATE = Number(process.env.DIGEST_RATE_USD_KWH ?? "0.31");
-
-// Email-safe palette (light surface committed — email clients force their own dark
-// transforms; near-black ink + one validated series hue survive them best).
-const INK = "#0b0b0b", INK2 = "#52514e", MUTED = "#9b9a94";
-// SERIES is mark-grade (bars, links; ≥3:1 on white, validated). GOOD/BAD are darkened
-// text-grade steps of the status hues — the palette's mark-grade status colors don't
-// clear small-text contrast on white.
-const SERIES = "#2a78d6", GOOD = "#067806", BAD = "#b3261e";
-const TILE_BG = "#f4f5f7", RULE = "#e8e7e3";
 
 type WeekAgg = {
   wk: string; saved: number; kwh: number; outdoor: number | null; cop: number | null;
@@ -43,31 +38,6 @@ type FloorRow = {
   last_zone: string | null; last_source: string | null;
   last_ceiling: number | null; last_local: number | null;
 };
-type FaultRow = {
-  pump_id: string; code: string; severity: string; message: string | null;
-  n: number; last_ts: number;
-};
-
-const fmt = (v: number | null | undefined, digits = 1) =>
-  v == null || Number.isNaN(Number(v)) ? "—" : Number(v).toFixed(digits);
-
-const day = (epoch: number) =>
-  new Date(epoch * 1000).toLocaleDateString("en-US", {
-    month: "short", day: "numeric", timeZone: "America/New_York",
-  });
-
-/** Week-over-week delta chip. goodWhen says which direction is a win — the color follows
- *  the BENEFIT, the glyph carries the direction, so neither is color-alone. */
-function delta(cur: number | null, prev: number | null | undefined, goodWhen: "up" | "down"): string {
-  if (cur == null || prev == null || !isFinite(prev) || Math.abs(prev) < 1e-9) return "";
-  const pct = ((cur - prev) / Math.abs(prev)) * 100;
-  if (!isFinite(pct) || Math.abs(pct) < 0.5) return `<span style="color:${INK2}">· flat vs last wk</span>`;
-  const up = pct > 0;
-  const win = (up && goodWhen === "up") || (!up && goodWhen === "down");
-  const glyph = up ? "▲" : "▼";
-  return `<span style="color:${win ? GOOD : BAD}">${glyph} ${Math.abs(pct).toFixed(0)}%</span>` +
-         `<span style="color:${INK2}"> vs last wk</span>`;
-}
 
 async function buildDigest() {
   const weeks = (await sql<WeekAgg>`
@@ -239,33 +209,17 @@ async function buildDigest() {
            (SELECT local_f        FROM b ORDER BY ts DESC LIMIT 1) AS last_local
     FROM b`).rows[0];
 
-  const activeKeys = new Set(active.map((f) => `${f.pump_id}:${f.code}`));
   const backupH = plant.backup_h != null ? Number(plant.backup_h) : 0;
   const backupKwh = backupH * ELEMENT_KW;
   const hygDays = hygiene.days_ago != null ? Number(hygiene.days_ago) : null;
   const floorN = Number(floor?.n ?? 0);
   const pegShare = floorN > 0 ? Number(floor.pegged) / floorN : 0;
 
-  // ---- headline: one sentence, most important thing first --------------------------
-  let headline: string;
-  if (active.length) {
-    headline = `⚠ ${active.length} fault${active.length === 1 ? "" : "s"} currently active — see below.`;
-  } else if (pegShare >= 0.25) {
-    // A floor pinned at the everyday cap is the week's most important fact: it means the
-    // house is asking for more than the cap allows, so we are either giving up the winter
-    // savings or under-heating, and only real cold tells us which (#89).
-    headline = `The demand floor sat at the 135°F cap ${(pegShare * 100).toFixed(0)}% of the week` +
-      `${floor.last_zone ? ` (binding zone: ${floor.last_zone})` : ""} — the sizing question (#89) is live.`;
-  } else if (backupH > 1) {
-    headline = `The backup element ran ${fmt(backupH, 1)} h this week (~${fmt(backupKwh, 0)} kWh at COP 1) — worth a look.`;
-  } else if (prev && prev.saved > 0.5) {
-    const d = ((cur.saved - prev.saved) / prev.saved) * 100;
-    headline = d >= 0
-      ? `Saved $${fmt(cur.saved, 2)} — up ${d.toFixed(0)}% on last week. No active faults.`
-      : `Saved $${fmt(cur.saved, 2)} — down ${Math.abs(d).toFixed(0)}% on last week (weather-dependent). No active faults.`;
-  } else {
-    headline = `A quiet week: $${fmt(cur.saved, 2)} saved, no active faults.`;
-  }
+  // ---- headline: one sentence, most important thing first (lib/digest-render.ts) ---
+  const headline = pickHeadline({
+    activeFaults: active.length, pegShare, lastZone: floor?.last_zone,
+    backupH, backupKwh, curSaved: cur.saved, prevSaved: prev?.saved,
+  });
 
   // ---- Pi link (#165) ------------------------------------------------------------------
   // Two independent sources that should corroborate: the planner's /health.pi (windows from its own phase_b_log
@@ -331,7 +285,7 @@ async function buildDigest() {
         <div style="height:${zero ? 2 : h}px;background:${zero ? RULE : SERIES};border-radius:4px 4px 0 0"></div>
       </td>`;
     }).join("");
-    const dows = daily.map((r) => `<td style="font-size:10px;color:${MUTED};text-align:center;padding-top:3px">${r.dow.trim()[0]}</td>`).join("");
+    const dows = daily.map((r) => `<td style="font-size:10px;color:${MUTED};text-align:center;padding-top:3px">${esc(r.dow.trim()[0] ?? "")}</td>`).join("");
     barStrip = `
     <div style="font-size:12px;color:${INK2};margin:18px 0 0">Saved per day ($)</div>
     <table cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;margin-top:6px">
@@ -341,19 +295,7 @@ async function buildDigest() {
   }
 
   // ---- faults ----------------------------------------------------------------------
-  const faultLines = faults.map((f) => {
-    const still = activeKeys.has(`${f.pump_id}:${f.code}`)
-      ? ` — <b style="color:${BAD}">still active</b>` : " — cleared";
-    const times = f.n > 1 ? ` (×${f.n} this week)` : "";
-    return `<li style="margin:4px 0"><b>${f.pump_id.toUpperCase()} ${f.code}</b>
-      (${f.severity}): ${f.message ?? ""}${times}, last ${day(f.last_ts)}${still}</li>`;
-  });
-  for (const f of active) {
-    if (!faults.some((w) => w.pump_id === f.pump_id && w.code === f.code)) {
-      faultLines.push(`<li style="margin:4px 0"><b>${f.pump_id.toUpperCase()} ${f.code}</b>
-        (${f.severity}): ${f.message ?? ""} — <b style="color:${BAD}">still active</b> since ${day(f.last_ts)}</li>`);
-    }
-  }
+  const faultLines = buildFaultLines(faults, active);
 
   // ---- alerts & events ---------------------------------------------------------------
   let alertsBlock = "";
@@ -382,7 +324,7 @@ async function buildDigest() {
   }
   for (const c of comm) {
     const rising = c.drops > c.prev && c.drops >= 3;
-    notes.push(`${c.pump_id.toUpperCase()} comm: ${c.drops} dropout${c.drops === 1 ? "" : "s"} (prev wk ${c.prev})${c.err != null ? ` · ${fmt(Number(c.err), 1)}% err` : ""}${rising ? ` — <b style="color:${BAD}">degrading, keep an eye on it</b>` : ""}.`);
+    notes.push(`${esc(String(c.pump_id ?? "").toUpperCase())} comm: ${c.drops} dropout${c.drops === 1 ? "" : "s"} (prev wk ${c.prev})${c.err != null ? ` · ${fmt(Number(c.err), 1)}% err` : ""}${rising ? ` — <b style="color:${BAD}">degrading, keep an eye on it</b>` : ""}.`);
   }
   // Winter scoreboard (TempIQ, mirrored hourly into tempiq_winter_scoreboard by the planner — wave plan B2b):
   // this winter's kWh per HDD65 against last winter over the SAME weeks. Omitted until the first rated week; the
@@ -417,7 +359,7 @@ async function buildDigest() {
         ? ` <span style="color:${MUTED}">· ${ageH == null ? "mirror age unknown" : ageH < 0 ? "mirror timestamp is in the future" : `mirror ${fmt(ageH / 24, 1)} d old`} — no verdict</span>`
         : !hasBaseline ? ` <span style="color:${MUTED}">· no same-week baseline yet — no verdict</span>` : "";
       notes.push(
-        `Winter scoreboard (${sb.season ?? "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
+        `Winter scoreboard (${sb.season != null ? esc(String(sb.season)) : "this winter"}): <b>${fmt(c.current.kwhPerHdd, 2)} kWh per HDD</b>` +
         (hasBaseline ? ` vs ${fmt(c.baseline!.kwhPerHdd, 2)} last winter over the same ${weeksCompared} week${weeksCompared === 1 ? "" : "s"}` : "") +
         verdict +
         (c.current.coldShare != null ? `; hydronic rooms below 66°F ${fmt(c.current.coldShare * 100, 1)}% of sampled hours${hasBaseline && c.baseline?.coldShare != null ? ` (last winter ${fmt(c.baseline.coldShare * 100, 1)}%)` : ""}` : "") +
@@ -440,7 +382,7 @@ async function buildDigest() {
     const lines: string[] = [];
     const pegged = Number(floor.pegged);
     lines.push(
-      `Binding zone: <b>${floor.last_zone ?? "—"}</b> — tank floor reached ${fmt(floor.max_target, 1)}°F` +
+      `Binding zone: <b>${floor.last_zone != null ? esc(floor.last_zone) : "—"}</b> — tank floor reached ${fmt(floor.max_target, 1)}°F` +
       (pegged > 0
         ? `, <b style="color:${BAD}">at the 135°F cap in ${pegged} of ${floorN} samples</b>.`
         : `, never at the 135°F cap.`));
@@ -450,7 +392,7 @@ async function buildDigest() {
         (floor.max_gap != null ? ` (widest gap ${fmt(floor.max_gap, 1)}°F this week)` : "") + ".");
     }
     const label = floor.last_source
-      ? (SOURCE_LABEL[floor.last_source] ?? floor.last_source)
+      ? (SOURCE_LABEL[floor.last_source] ?? esc(floor.last_source))
       : "unknown — TempIQ's payload predates gtm#1593";
     lines.push(`That ceiling's anchor is <b>${label}</b>.`);
     if (floor.max_escalated != null && Number(floor.max_escalated) > 0) {
@@ -492,10 +434,9 @@ async function buildDigest() {
     </div>
   </div>`;
 
-  const faultBit = active.length ? ` · ${active.length} active fault${active.length === 1 ? "" : "s"}` : "";
-  const deltaBit = prev && prev.saved > 0.5
-    ? ` (${cur.saved >= prev.saved ? "▲" : "▼"}${Math.abs(((cur.saved - prev.saved) / prev.saved) * 100).toFixed(0)}%)` : "";
-  const subject = `A2W weekly: $${fmt(cur.saved, 2)} saved${deltaBit} · COP ${fmt(cur.cop, 2)} · ${fmt(cur.kwh, 0)} kWh${faultBit}`;
+  const subject = subjectLine({
+    curSaved: cur.saved, prevSaved: prev?.saved, cop: cur.cop, kwh: cur.kwh, activeFaults: active.length,
+  });
   return { subject, html };
 }
 

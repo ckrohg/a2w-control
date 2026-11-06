@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,32 @@ from sim.fake_pump import FakePump
 
 MIN_OUTAGE_S = 0.2
 HOLD_S = 0.4
+
+
+class FakeTime:
+    """The clock bridge.poller sees. On real time a stalled commit or a busy event loop could
+    outlast a window under test, so a guard working as designed failed the test. Here time
+    moves only when a test sleeps or the poller paces itself; bus and store work takes none."""
+
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+    def mono(self) -> float:
+        return self.t
+
+    async def sleep(self, s: float) -> None:
+        self.t += s
+        await asyncio.sleep(0)
+
+
+@pytest.fixture(autouse=True)
+def ft(monkeypatch):
+    """Swaps the poller's own names, never time.monotonic itself: asyncio's event loop reads
+    that, and freezing it would stall every timer in the test."""
+    ft = FakeTime()
+    monkeypatch.setattr(poller_mod, "time", SimpleNamespace(**{**vars(time), "monotonic": ft.mono}))
+    monkeypatch.setattr(poller_mod, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": ft.sleep}))
+    return ft
 
 
 def free_port() -> int:
@@ -56,15 +83,15 @@ async def rig(tmp_path):
     await store.close()
 
 
-def _outage_switch(poller: PumpPoller) -> dict:
+def _outage_switch(poller: PumpPoller, ft: FakeTime) -> dict:
     """Wrap the client's read_block so a test can turn the gateway 'unreachable'."""
-    state = {"down": False, "reads": []}
+    state = {"down": False, "reads": [], "ft": ft}
     real = poller.client.read_block
 
     async def read_block(block):
         if state["down"]:
             raise ModbusError("cannot connect to 127.0.0.1", "connect")
-        state["reads"].append(time.monotonic())
+        state["reads"].append(ft.t)
         return await real(block)
 
     poller.client.read_block = read_block
@@ -74,7 +101,7 @@ def _outage_switch(poller: PumpPoller) -> dict:
 async def _outage(poller: PumpPoller, sw: dict, seconds: float) -> None:
     sw["down"] = True
     await poller.poll_once()
-    await asyncio.sleep(seconds)
+    await sw["ft"].sleep(seconds)
     await poller.poll_once()
     sw["down"] = False
 
@@ -83,9 +110,9 @@ async def _codes(store: Store) -> list[str]:
     return [e["code"] for e in await store.get_events("p1", 1)]
 
 
-async def test_long_outage_holds_writes_then_releases(rig):
+async def test_long_outage_holds_writes_then_releases(rig, ft):
     pump, poller, store = rig
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
 
@@ -104,17 +131,22 @@ async def test_long_outage_holds_writes_then_releases(rig):
     with pytest.raises(GuardrailError):            # mode/param/power-off writes too
         await poller.write_mode("heating", source="hub:phase-b")
 
-    await asyncio.sleep(HOLD_S + 0.05)
+    await ft.sleep(HOLD_S - 0.05)
+    with pytest.raises(GuardrailError):            # held right up to the end of the window
+        await poller.write_setpoint(48, source="hub:phase-b")
+
+    await ft.sleep(0.1)
     result = await poller.write_setpoint(48, source="hub:phase-b")
     assert result["setpoint_c"] == 48 and result["verified"] is True
 
 
-async def test_short_blip_does_not_hold_writes(rig):
+async def test_short_blip_does_not_hold_writes(rig, ft):
     pump, poller, store = rig
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     sw["down"] = True
-    await poller.poll_once()                       # one failed poll, well under the minimum
+    await poller.poll_once()
+    await ft.sleep(MIN_OUTAGE_S - 0.05)            # back just under the minimum
     sw["down"] = False
     await poller.poll_once()
 
@@ -123,10 +155,10 @@ async def test_short_blip_does_not_hold_writes(rig):
     assert result["verified"] is True
 
 
-async def test_first_polls_after_outage_are_paced(rig, monkeypatch):
+async def test_first_polls_after_outage_are_paced(rig, ft, monkeypatch):
     pump, poller, store = rig
     monkeypatch.setattr(poller_mod, "RECONNECT_BLOCK_GAP_S", 0.2)
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
 
@@ -136,17 +168,17 @@ async def test_first_polls_after_outage_are_paced(rig, monkeypatch):
     assert len(paced) >= 2
     assert all(b - a >= 0.15 for a, b in zip(paced, paced[1:]))
 
-    await asyncio.sleep(HOLD_S + 0.05)
+    await ft.sleep(HOLD_S + 0.05)
     sw["reads"].clear()
     await poller.poll_once()                       # quarantine over: back to a tight burst
     healthy = sw["reads"]
     assert all(b - a < 0.15 for a, b in zip(healthy, healthy[1:]))
 
 
-async def test_safety_and_owner_writes_are_never_held(rig, monkeypatch):
+async def test_safety_and_owner_writes_are_never_held(rig, ft, monkeypatch):
     pump, poller, store = rig
     monkeypatch.setattr(poller_mod, "RECONNECT_BLOCK_GAP_S", 0.0)  # keep the hold window
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
     await poller.poll_once()
@@ -161,12 +193,12 @@ async def test_safety_and_owner_writes_are_never_held(rig, monkeypatch):
     assert "reconnect quarantine" in str(exc.value)
 
 
-async def test_baseline_revert_lands_during_a_hold(tmp_path):
+async def test_baseline_revert_lands_during_a_hold(tmp_path, ft):
     """FINDING-1 is armed on the Pi: a lapsed lease must revert to the warm baseline even
     if it lapses inside a reconnect hold."""
     pump, poller, store = await _make_rig(tmp_path, baseline_setpoint_c=52)
     try:
-        sw = _outage_switch(poller)
+        sw = _outage_switch(poller, ft)
         await poller.poll_once()
         await poller.write_setpoint(60, source="hub:phase-b", unattended=True,
                                     lease_minutes=90)
@@ -184,15 +216,15 @@ async def test_baseline_revert_lands_during_a_hold(tmp_path):
         await store.close()
 
 
-async def test_flapping_gateway_gets_one_hold_per_window(rig, monkeypatch):
+async def test_flapping_gateway_gets_one_hold_per_window(rig, ft, monkeypatch):
     """Down >= the minimum, back, down again: the second return must not restart the
     hold, or a flapping link would keep every planner write out indefinitely."""
     pump, poller, store = rig
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
     await poller.poll_once()                       # hold #1
-    await asyncio.sleep(HOLD_S + 0.05)
+    await ft.sleep(HOLD_S + 0.05)
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
     await poller.poll_once()                       # inside the spacing window: no hold
     assert (await _codes(store)).count("reconnect_hold") == 1
@@ -205,9 +237,9 @@ async def test_flapping_gateway_gets_one_hold_per_window(rig, monkeypatch):
     assert (await _codes(store)).count("reconnect_hold") == 2
 
 
-async def test_audit_failure_does_not_fail_the_reconnect_poll(rig, monkeypatch):
+async def test_audit_failure_does_not_fail_the_reconnect_poll(rig, ft, monkeypatch):
     pump, poller, store = rig
-    sw = _outage_switch(poller)
+    sw = _outage_switch(poller, ft)
     await poller.poll_once()
     await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
     real_add_event = store.add_event
@@ -227,10 +259,10 @@ async def test_audit_failure_does_not_fail_the_reconnect_poll(rig, monkeypatch):
         await poller.write_setpoint(48, source="hub:phase-b")
 
 
-async def test_hold_zero_disables_quarantine(tmp_path):
+async def test_hold_zero_disables_quarantine(tmp_path, ft):
     pump, poller, store = await _make_rig(tmp_path, hold_s=0)
     try:
-        sw = _outage_switch(poller)
+        sw = _outage_switch(poller, ft)
         await poller.poll_once()
         await _outage(poller, sw, MIN_OUTAGE_S + 0.05)
         await poller.poll_once()
