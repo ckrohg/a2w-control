@@ -53,7 +53,7 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_
 import { HousePages, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
-  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut, type StoppedPump,
+  digest, etDay, etHour, etDayStart, evaluatedChecks, pumpRetryAllowed, type Verdict, type DayRow, type TrendOut, type StoppedPump, type CheckKind,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -939,7 +939,7 @@ async function checkSpanLocal(): Promise<void> {
     // the backup-element alarm's inputs: energy the element drew in the trailing 60 min (what pages at
     // SPAN_BACKUP_ALARM_KWH) and SPAN's day-cumulative reading it is differenced from.
     backup_kwh_last_hour: spanWatch?.lastHourKwh ?? null, backup_kwh_today: spanWatch?.lastDayKwh ?? null,
-    backup_alarmed: spanWatch?.alarmed ?? false,
+    backup_alarmed: spanWatch?.alarmed ?? false, backup_kwh_blind_spell: spanWatch?.lastBlindSpell ?? null,
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   spanLocalError = null;
@@ -986,7 +986,12 @@ let pumpHealthGate: string | null = "not evaluated yet";
 let pumpHealthError: string | null = null;
 let pumpDailyError: string | null = null;
 let pumpHealthAt: string | null = null;
-let pumpEvaluatedSinceRestore = false;
+// The restore path's invariant (restoreAlertState → alerts.retry): a re-adopted, unheard pump_* row is re-sent only once
+// the CHECK THAT OWNS IT has judged its own data since the restore — a resolved incident is then closed by that
+// judgement, not re-paged. The checks read different sources (mirror readings/span vs the HBX series for
+// stage_never_called) and go blind independently, so this is a set of checks, not one boolean: #257 made a single flag
+// settable by a stage-2 verdict that needed no mirror data, which let a restart re-page an unevaluated pump_idle_draw.
+const pumpEvaluatedSinceRestore = new Set<CheckKind>();
 // shadow episodes: same outbox machinery, but the "channel" is the log line — never ntfy, never email
 const shadowAlerts = new AlertOutbox(store, async (title, body) => { console.warn(`[pumphealth][shadow] ${title}: ${body}`); return true; });
 
@@ -1040,7 +1045,7 @@ async function checkPumpHealth(): Promise<void> {
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();
-  if (alertStateRestored && verdicts.some((v) => v.state !== "unknown")) pumpEvaluatedSinceRestore = true;
+  if (alertStateRestored) for (const c of evaluatedChecks(verdicts)) pumpEvaluatedSinceRestore.add(c); // only a verdict that judged ITS data
   pumpWatch.setNames(pumpNames);
   for (const e of pumpWatch.step(verdicts)) {
     const live = PH_LIVE.live.has(e.check);
@@ -2367,7 +2372,7 @@ async function loopBody(): Promise<void> {
   await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
     : kind === "backup_gate_shadow" ? false // its own outbox (default priority, email) re-sends it, never the high one
     : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
-    : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
+    : kind.startsWith("pump_") ? pumpRetryAllowed(kind, pumpEvaluatedSinceRestore) // per check: its own source judged
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore
     : kind === genKind ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));
