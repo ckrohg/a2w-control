@@ -75,7 +75,9 @@ export class SensorLinxClient {
 
   /** Full device object (all config fields + live temps/relays/stages). */
   async getDevice(buildingId: string, syncCode: string): Promise<Record<string, any>> {
-    const devices = (await this.get(`/buildings/${buildingId}/devices`)) as Record<string, any>[];
+    const raw = await this.get(`/buildings/${buildingId}/devices`);
+    if (!Array.isArray(raw)) throw new Error(`sensorlinx: /buildings/${buildingId}/devices did not return a list`);
+    const devices = raw as Record<string, any>[];
     const dev = devices.find((d) => d.syncCode === syncCode);
     if (!dev) {
       throw new Error(
