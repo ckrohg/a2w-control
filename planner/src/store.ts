@@ -1116,6 +1116,25 @@ export class Store {
   }
 
   /**
+   * R02 daily watch (owner's decision, 2026-11-04; housepages.ts r02Recurring): one fault code's on/off edges from the
+   * mirror's pump_events, the Pi's own event log shipped on every push. A `fault_on` row is the bridge's edge detector
+   * firing (poller.py _update_faults), so one row IS one occurrence: a code held across polls never repeats a row, and a
+   * 1–3 min R02 that the planner's 5-min hub poll would never see is still here. Oldest first; ts = Pi epoch seconds; a
+   * range scan on idx_pump_events_ts. [] when the table is absent (rehearsal DB).
+   */
+  async faultEdges(code: string, sinceS: number): Promise<{ pumpId: string; ts: number; on: boolean }[]> {
+    try {
+      const r = await this.locked.query(
+        `SELECT pump_id, ts::float8 AS ts, type FROM pump_events
+         WHERE type IN ('fault_on', 'fault_off') AND code = $1 AND ts >= $2 ORDER BY ts, id`, [code, sinceS]);
+      return r.rows.map((x: any) => ({ pumpId: String(x.pump_id), ts: Number(x.ts), on: String(x.type) === "fault_on" }));
+    } catch (e) {
+      if ((e as { code?: string }).code === "42P01") return [];
+      throw e;
+    }
+  }
+
+  /**
    * #187: the newest SPAN LOCAL sample per circuit name (the mirror's span_readings, fed by the Pi's LAN poller; Pi
    * epoch seconds) at ANY age — a planner started during a multi-day outage must still see that reporting stopped
    * (codex pass 1). A loose index scan over (name, ts): one index probe per distinct name, never a table scan. Samples
