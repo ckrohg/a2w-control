@@ -9,7 +9,11 @@
  *   heating_no_draw  — reports heating ≥ 7 min, SPAN 5-min mean < 1 kW
  *   idle_draw        — reports idle/off ≥ 10 min, SPAN 9-min mean > 1 kW (stuck contactor, internal heater)
  *   defrost_overlong — reports defrost continuously > 12 min (register 2016 max defrost time: default 8, range 5–20; weekly review 2026-10-26): stagewatch
- *                      SUSPENDS its clock in defrost, so a stuck "defrost" while called was invisible (Oct 18, 83 min)
+ *                      SUSPENDS its clock in defrost, so a stuck "defrost" while called was invisible (Oct 18, 83 min). Counts ONLY
+ *                      while the HBX stage mapped to the pump calls (owner 2026-11-10, from the 2026-11-09 review): all 5 shadow
+ *                      episodes Oct 31–Nov 2 were an idle pump still reporting "defrost" after the call ended (~55 W, ΔT ≈ 0,
+ *                      heating again within 20 s of the next call); the rule keeps Oct 18 and drops all 7 false trips since Oct 15.
+ *                      No stage-call data for the window → unknown
  *   called_tank_flat — stage called + its pump engaged (heating/defrost) ≥ 90 % of 45 min, tank net rise + standby loss
  *                      ≤ 2 °F AND the unit's mean ΔT over it < 1.5 °C, for 30 min (a flat tank ALONE is house load — measured)
  *   stage_never_called — #172: the tank more than 3 °F below the CURVE IN FORCE (not SensorLinx's tank_target_f, which
@@ -36,7 +40,7 @@ export const PH = {
   IDLE_DRAW_WINDOW_S: 10 * 60,
   IDLE_DRAW_SKIP_S: 60,         // the first minute after a stop still shows run-down draw
   IDLE_DRAW_W: 1000,            // measured idle 4-min mean maximum 672 W; >1 kW idle samples last ≤ 0.8 min
-  DEFROST_OVERLONG_S: 12 * 60,  // measured normal 2–9.4 min (19 spells); stuck spells 17.6, 30, 82 min. Was 20 (missed pump2 Oct 19)
+  DEFROST_OVERLONG_S: 12 * 60,  // measured normal 2–9.4 min (19 spells); stuck spells 17.6, 30, 82 min. Was 20 (missed pump2 Oct 19). Counts only while its stage calls (2026-11-09 review)
   TANK_FLAT_WINDOW_S: 45 * 60,
   TANK_FLAT_ENGAGED_SHARE: 0.9,  // heating or defrost
   TANK_FLAT_PERSIST_S: 30 * 60, // every 45-min window ending in the last 30 min must be flat (doc §5)
@@ -104,9 +108,12 @@ const idleish = (r: PumpReading) => r.online && (r.state === "idle" || r.state =
 
 /**
  * The four per-pump window checks at `nowPi` (Pi clock — the readings' own clock; index.ts corrects the planner's now
- * by the measured Pi clock offset). `readings` / `span` ascending, at least PH.LOOKBACK_S deep.
+ * by the measured Pi clock offset). `readings` / `span` ascending, at least PH.LOOKBACK_S deep. `hbx` = the HBX stage
+ * STAGE_PUMP_MAP maps to this pump and the HBX series (Pi clock, ascending), for defrost_overlong only: without it a
+ * 12-min defrost is "unknown", never "tripped" (2026-11-09 review).
  */
-export function evaluatePump(pumpId: string, readings: PumpReading[], span: SpanSample[], nowPi: number): Verdict[] {
+export function evaluatePump(pumpId: string, readings: PumpReading[], span: SpanSample[], nowPi: number,
+  hbx?: { stage: string; tank: TankReading[] } | null): Verdict[] {
   const v = (kind: CheckKind, state: VerdictState, reason: string, metrics: Record<string, number | null> = {}): Verdict => ({ kind, pumpId, state, reason, metrics });
   const newest = readings.length ? readings[readings.length - 1].ts : null;
   const kinds: CheckKind[] = ["running_no_lift", "heating_no_draw", "idle_draw", "defrost_overlong"];
@@ -163,20 +170,39 @@ export function evaluatePump(pumpId: string, readings: PumpReading[], span: Span
     }
   }
 
-  // defrost_overlong
+  // defrost_overlong — counts only while the pump's mapped HBX stage calls (2026-11-09 review: every idle-hold "defrost"
+  // after a call ended was a false trip; the one real stuck defrost, Oct 18, was called throughout)
   {
     const lead = covered(readings, nowPi - PH.DEFROST_OVERLONG_S, nowPi, PH.MAX_READING_GAP_S);
     if (!lead) out.push(v("defrost_overlong", "unknown", "readings do not cover the window"));
     else if (!lead.every(defrosting)) out.push(v("defrost_overlong", "ok", "no defrost longer than 12 min"));
+    else if (!hbx) out.push(v("defrost_overlong", "unknown", "in defrost 12 min, but no HBX stage maps to this pump (stage calls unknown)"));
     else {
-      // how long it has been in defrost, as far back as the readings stay contiguous
-      let start = lead[0].ts;
-      const before = readings.filter((r) => r.ts < lead[0].ts);
-      for (let i = before.length - 1, next = lead[0].ts; i >= 0 && defrosting(before[i]) && next - before[i].ts <= PH.MAX_READING_GAP_S; next = before[i].ts, i--) start = before[i].ts;
-      const min = Math.round((nowPi - start) / 60);
-      const last = lead[lead.length - 1];
-      out.push(v("defrost_overlong", "tripped", `reports defrost continuously for ${min} min (normal 2–9 min; the unit's max defrost time is 8 min by default)`,
-        { defrost_min: min, outlet_c: last.outlet_c, inlet_c: last.inlet_c }));
+      const idx = Number(hbx.stage) - 1;
+      const slx = hbx.tank.filter((x) => x.stages_called != null && typeof x.stages_called[idx] === "boolean");
+      /** the stage's call at `t`: the newest HBX poll at or before it, within MAX_SLX_GAP_S; null when there is none (blind) */
+      const calledAt = (t: number): boolean | null => {
+        let p: TankReading | null = null;
+        for (const x of slx) { if (x.ts <= t) p = x; else break; }
+        return p && t - p.ts <= PH.MAX_SLX_GAP_S ? p.stages_called![idx] : null;
+      };
+      const calls = lead.map((r) => calledAt(r.ts));
+      const idleAt = lead.find((_, i) => calls[i] === false);
+      if (idleAt) {
+        out.push(v("defrost_overlong", "ok", `defrost reported while its HBX stage is not calling (idle hold, not a stuck defrost): stage ${hbx.stage} not called at ${etClock(idleAt.ts)}`));
+      } else if (calls.some((c) => c == null)) {
+        out.push(v("defrost_overlong", "unknown", `in defrost 12 min, but the HBX stage ${hbx.stage} readings do not cover the window`));
+      } else {
+        // how long it has been in CALLED defrost, as far back as the readings stay contiguous and the stage calls
+        let start = lead[0].ts;
+        const before = readings.filter((r) => r.ts < lead[0].ts);
+        for (let i = before.length - 1, next = lead[0].ts; i >= 0 && defrosting(before[i]) && next - before[i].ts <= PH.MAX_READING_GAP_S && calledAt(before[i].ts) === true;
+          next = before[i].ts, i--) start = before[i].ts;
+        const min = Math.round((nowPi - start) / 60);
+        const last = lead[lead.length - 1];
+        out.push(v("defrost_overlong", "tripped", `reports defrost continuously for ${min} min while HBX stage ${hbx.stage} calls (normal 2–9 min; the unit's max defrost time is 8 min by default)`,
+          { defrost_min: min, outlet_c: last.outlet_c, inlet_c: last.inlet_c }));
+      }
     }
   }
   return out;

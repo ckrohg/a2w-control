@@ -21,14 +21,21 @@ const S = (n: string): SpanSample[] => fx.span[n].map(([ts, w]: [number, number]
 const iso = (s: number) => new Date(s * 1000).toISOString().slice(0, 16);
 const at = (hhmm: string) => Date.parse(`2026-10-18T${hhmm}:00Z`) / 1000;
 
-/** Replay like index.ts: every 5 min, the data the planner would have seen at `now`. */
+/**
+ * Replay like index.ts: every 5 min, the data the planner would have seen at `now`. The fixture holds no HBX series, so
+ * the pump's mapped stage is modelled as called throughout (pump1 was called across its stuck defrost) — defrost_overlong
+ * counts only while its stage calls (2026-11-09 review; the not-called cases are pumphealth-defrost.test.ts).
+ */
 function replay(p: string, rd: PumpReading[], sp: SpanSample[]): { opens: { at: string; check: string; body: string }[]; closes: { at: string; check: string }[]; states: Record<string, number> } {
   const w = new PumpHealthWatch({ [p]: p });
   const opens: { at: string; check: string; body: string }[] = [], closes: { at: string; check: string }[] = [];
   const states: Record<string, number> = {};
   const t0 = rd[0].ts, t1 = rd[rd.length - 1].ts;
+  const stage = p === "pump1" ? "1" : "2";
+  const tank: TankReading[] = [];
+  for (let ts = t0 - 300; ts <= t1; ts += 300) tank.push({ ts, tank_f: 118, stages_called: [stage === "1", stage === "2"] });
   for (let now = Math.ceil((t0 + PH.LOOKBACK_S) / 300) * 300; now <= t1; now += 300) {
-    const v = evaluatePump(p, rd.filter((r) => r.ts <= now), sp.filter((s) => s.ts <= now), now);
+    const v = evaluatePump(p, rd.filter((r) => r.ts <= now), sp.filter((s) => s.ts <= now), now, { stage, tank: tank.filter((x) => x.ts <= now) });
     for (const x of v) states[`${x.kind}:${x.state}`] = (states[`${x.kind}:${x.state}`] ?? 0) + 1;
     for (const e of w.step(v)) (e.kind === "open" ? opens : closes).push({ at: iso(now), check: e.check, body: e.body } as never);
   }
