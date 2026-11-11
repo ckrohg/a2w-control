@@ -1,9 +1,12 @@
 /**
  * @purpose The four house pages survive a delivery failure (housepages.ts): a page nobody heard goes out again while the
  * condition holds, a condition that clears first owes no all-clear, and an all-clear nobody heard goes out again too.
+ * Plus the R02 daily watch (owner 2026-11-04): 2 occurrences → nothing; 3 → one attention email; 5 → still one that day;
+ * a code held across polls (or re-logged by a bridge restart) counts once; pump2 counts on its own; the next day resets
+ * and emails again; an email nobody heard goes out again.
  */
 import assert from "node:assert/strict";
-import { HousePages } from "./housepages";
+import { HousePages, faultOccurrences, type FaultEdge } from "./housepages";
 import { Latches, acknowledged, type LatchStore, type Tier } from "./alertpolicy";
 import type { HubState } from "./hub";
 import type { SlxReading } from "./store";
@@ -568,6 +571,126 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     assert.equal(clears().length, 1, "a reading alarm sends nothing");
     await r.cycles(1, async () => r.pages.elementAlarm({ minutes: 60, error: "x".repeat(500) }));
     assert.ok(!r.heard.at(-1)!.body.includes("x".repeat(201)), "an error can't fill the email");
+  }
+
+  // ── R02 three or more times in one local day: one attention email per pump per day, re-sent until heard ──────────
+  // January: EST, so the America/New_York day starts at 05:00Z. The rig's clock starts 2027-01-15T08:00Z = 3:00 AM ET.
+  const T = (iso: string) => Date.parse(iso) / 1000;
+  /** one occurrence: fault_on, then fault_off `clearMin` later (null = still set) */
+  const on = (pumpId: string, iso: string, clearMin: number | null = 2): FaultEdge[] =>
+    clearMin == null ? [{ pumpId, ts: T(iso), on: true }] : [{ pumpId, ts: T(iso), on: true }, { pumpId, ts: T(iso) + clearMin * 60, on: false }];
+  const names = (id: string) => (id === "pump1" ? "Heat Pump 1" : id === "pump2" ? "Heat Pump 2" : id);
+  const r02 = (r: Rig, edges: FaultEdge[] | null, n = 1) => r.cycles(n, async () => r.pages.r02Recurring(edges, now / 1000, names));
+  const emails = (r: Rig) => r.heard.filter((l) => !l.resolved && /R02 \d+ times today/.test(l.title));
+  const three = [...on("pump1", "2027-01-15T05:10:00Z"), ...on("pump1", "2027-01-15T06:20:00Z", 3), ...on("pump1", "2027-01-15T07:30:00Z", 1)];
+  {
+    now = Date.parse("2027-01-15T08:00:00Z");
+    const r = rig();
+    // two: nothing, however many polls see them
+    let edges = three.slice(0, 4);
+    await r02(r, edges, 3);
+    assert.equal(r.tried.length, 0, "two R02 are not a pattern");
+    assert.deepEqual(r.pages.r02Status().pump1,
+      { today: 2, times_et: ["12:10 AM cleared itself after 2 min", "1:20 AM cleared itself after 3 min"], emailed: false, days_30: 2 });
+    // the third: one email, and the same three rows seen on three more polls stay one email
+    await r02(r, three, 3);
+    assert.equal(emails(r).length, 1, "the third makes one email; held across polls it is still one");
+    const n = emails(r)[0];
+    assert.equal(n.tier, "attention", "an email: nothing is wrong with the house right now");
+    assert.equal(n.key, "r02-recurring:pump1");
+    assert.equal(n.title, "Heat Pump 1: R02 3 times today");
+    assert.match(n.body, /12:10 AM \(cleared itself after 2 min\), 1:20 AM \(cleared itself after 3 min\), 2:30 AM \(cleared itself after 1 min\)/);
+    assert.match(n.body, /Each one cleared itself/);
+    assert.match(n.body, /3 in the last 30 days/);
+    assert.ok(n.facts?.some(([k, v]) => k === "R02 today" && v === "3"));
+    assert.ok(n.facts?.some(([k, v]) => k === "Self-cleared" && v === "yes, every one"));
+    assert.equal(r.rows.get("r02-recurring:pump1")?.tier, "attention", "latched once heard");
+    // the fourth and fifth, the fifth still set: the count climbs on /health, the email does not repeat
+    edges = [...three, ...on("pump1", "2027-01-15T07:45:00Z"), ...on("pump1", "2027-01-15T07:55:00Z", null)];
+    await r02(r, edges, 2);
+    assert.equal(emails(r).length, 1, "five: still the one email that day");
+    assert.equal(r.logged.filter((l) => /R02/.test(l.title)).length, 0, "not even a record line: the edge is heard");
+    assert.equal(r.pages.r02Status().pump1.today, 5);
+    assert.equal(r.pages.r02Status().pump1.emailed, true);
+    assert.match(r.pages.r02Status().pump1.times_et.at(-1)!, /2:55 AM still set/);
+    // the bridge restarted while that fifth was still set and logged its onset again: the same occurrence
+    edges = [...edges, { pumpId: "pump1", ts: T("2027-01-15T07:56:00Z"), on: true }];
+    await r02(r, edges);
+    assert.equal(r.pages.r02Status().pump1.today, 5, "a held code counts once, whatever the log says");
+    // pump2 counts on its own
+    edges = [...edges, ...on("pump2", "2027-01-15T06:00:00Z"), ...on("pump2", "2027-01-15T07:00:00Z")];
+    await r02(r, edges);
+    assert.equal(r.pages.r02Status().pump2.today, 2);
+    assert.equal(emails(r).length, 1, "pump2 at two: no email for it");
+    edges = [...edges, ...on("pump2", "2027-01-15T07:50:00Z")];
+    await r02(r, edges);
+    assert.equal(emails(r).length, 2);
+    assert.equal(emails(r)[1].title, "Heat Pump 2: R02 3 times today");
+    assert.equal(emails(r)[1].key, "r02-recurring:pump2");
+    assert.ok(emails(r)[1].facts?.some(([k, v]) => k === "Pump" && v === "Heat Pump 2"));
+    // the next local day: the counts reset, the latch is released record-only (no all-clear email), and 3 more email again
+    now = Date.parse("2027-01-16T05:30:00Z"); // 12:30 AM ET, Jan 16
+    await r02(r, edges, 2);
+    assert.equal(r.pages.r02Status().pump1.today, 0);
+    assert.equal(r.pages.r02Status().pump1.days_30, 5, "the 30-day count keeps yesterday's");
+    const resets = [...r.heard, ...r.logged].filter((l) => l.resolved && l.key === "r02-recurring:pump1");
+    assert.equal(resets.length, 1, "one reset per day roll");
+    assert.equal(resets[0].tier, "attention", "route() keeps an attention all-clear off every channel");
+    assert.equal(r.rows.has("r02-recurring:pump1"), false, "the latch is released, so today can email again");
+    assert.equal(r.rows.has("r02-recurring:pump2"), false);
+    assert.equal(emails(r).length, 2, "a reset is not an email");
+    edges = [...edges, ...on("pump1", "2027-01-16T05:05:00Z"), ...on("pump1", "2027-01-16T05:12:00Z"), ...on("pump1", "2027-01-16T05:20:00Z")];
+    await r02(r, edges, 2);
+    assert.equal(emails(r).length, 3, "the new day's third: one email");
+    assert.equal(emails(r)[2].title, "Heat Pump 1: R02 3 times today");
+    assert.match(emails(r)[2].body, /8 in the last 30 days/);
+    assert.equal(r.pages.r02Status().pump1.today, 3);
+  }
+  {
+    // nobody heard it: sent again every cycle with that cycle's numbers until a channel acknowledges it, then never again
+    now = Date.parse("2027-01-15T08:00:00Z");
+    const r = rig();
+    r.channels.up = false;
+    await r02(r, three, 3);
+    assert.equal(r.heard.length, 0);
+    assert.equal(r.tried.length, 3, "nobody got it: it goes out again");
+    assert.equal(r.pages.r02Status().pump1.emailed, false, "/health tells an unheard email from a heard one");
+    r.channels.up = true;
+    const four = [...three, ...on("pump1", "2027-01-15T07:50:00Z")];
+    await r02(r, four);
+    assert.equal(emails(r).length, 1);
+    assert.equal(emails(r)[0].title, "Heat Pump 1: R02 4 times today", "the newest numbers");
+    assert.equal(r.pages.r02Status().pump1.emailed, true);
+    await r02(r, four, 2);
+    assert.equal(r.tried.length, 4, "heard: never sent again");
+  }
+  {
+    // a failed read judges nothing; a redeploy's re-fire is the latch's record line; the day roll still releases the latch
+    now = Date.parse("2027-01-15T08:00:00Z");
+    const r = rig();
+    await r02(r, three);
+    assert.equal(emails(r).length, 1);
+    await r02(r, null, 2);
+    assert.equal(r.tried.length, 1, "a failed read sends nothing");
+    assert.equal(r.pages.r02Status().pump1.today, 3, "and keeps the last count");
+    r.redeploy();
+    await r02(r, three, 2);
+    assert.equal(r.tried.length, 1, "no re-email after a redeploy");
+    assert.equal(titled(r.logged, /R02 3 times today/).length, 1, "the suppressed re-fire, once");
+    now = Date.parse("2027-01-16T05:30:00Z");
+    await r02(r, three);
+    assert.equal(r.rows.has("r02-recurring:pump1"), false, "the day rolled over: the latch goes even across the redeploy");
+    assert.equal(r.pages.r02Status().pump1.today, 0);
+  }
+  {
+    // the pairing: order on the wire doesn't matter, an off with no on (its onset before the window) is ignored
+    assert.deepEqual(faultOccurrences([{ pumpId: "pump1", ts: 100, on: false }, { pumpId: "pump1", ts: 300, on: false }, { pumpId: "pump1", ts: 200, on: true }]),
+      { pump1: [{ ts: 200, clearedAfterS: 100 }] });
+    assert.deepEqual(faultOccurrences([]), {});
+    // a clear the bridge never logged (it was down while the code cleared): the next onset, 10+ min on, is a new occurrence,
+    // not swallowed by the open one for the rest of the window; one within 10 min is the restart's re-log of the same one
+    assert.deepEqual(faultOccurrences([{ pumpId: "pump1", ts: 0, on: true }, { pumpId: "pump1", ts: 60, on: true }, { pumpId: "pump1", ts: 601, on: true }, { pumpId: "pump1", ts: 700, on: false }]),
+      { pump1: [{ ts: 0, clearedAfterS: null }, { ts: 601, clearedAfterS: 99 }] });
   }
 
   finished = true;

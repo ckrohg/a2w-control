@@ -51,7 +51,7 @@ import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
-import { HousePages, f0 } from "./housepages";
+import { HousePages, R02_HISTORY_DAYS, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, evaluatedChecks, pumpRetryAllowed, type Verdict, type DayRow, type TrendOut, type StoppedPump, type CheckKind,
@@ -2363,6 +2363,12 @@ async function loopBody(): Promise<void> {
 
   // Out here for the same reason as the storm step below: a SensorLinx failure must not hide a blind alarm.
   if (spanWatch) housePages.elementAlarm(spanWatch.blindness());
+  // R02 daily watch (owner's decision, 2026-11-04; housepages.ts r02Recurring): the mirror's R02 edges for the last 30 days,
+  // R02 only, so no other code (P17 included) can reach it. Out here too: a SensorLinx failure must not hide a recurring
+  // fault. A failed read judges nothing this tick. Names come from checkPumpHealth's hub read (pumpNames), else the id.
+  const r02Edges = await store.faultEdges("R02", Date.now() / 1000 - R02_HISTORY_DAYS * 86_400)
+    .catch((e) => { console.error("R02 watch read failed:", (e as Error).message); return null; });
+  housePages.r02Recurring(r02Edges, Date.now() / 1000, (id) => pumpNames[id] ?? id);
 
   // §6.11: the outage check + storm machine step ride the same 5-min cadence, outside
   // the poll try/catch so a SensorLinx failure never skips a storm evaluation.
@@ -2567,6 +2573,9 @@ async function main(): Promise<void> {
                 error: pumpDailyError,
               },
               digest: { enabled: PUMP_HEALTH_DIGEST, hour_et: PUMP_HEALTH_DIGEST_HOUR, last: pumpDigestLast },
+              // R02 daily watch (owner 2026-11-04, housepages.ts): per pump, today's R02 occurrences (local day), when,
+              // whether the attention email reached someone, and the 30-day count. {} until a pump has shown an R02.
+              r02: housePages.r02Status(),
             },
             // the backup element's dynamic gate (backupgate.ts). mode shadow = gate_state is VIRTUAL (what it would have
             // done); relay / element_w are the REAL Buffer Tank breaker from the Pi's SPAN snapshot; pi_fallback is the
