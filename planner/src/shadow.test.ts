@@ -201,10 +201,11 @@ console.log("shadow.test.ts: all assertions passed ✓");
   console.log("shadow.test.ts (forecast fallback): all assertions passed");
 })().catch((e) => { console.error(e); process.exit(1); });
 
-// #135 pre-boost: sized from the window's sag, placed in the warmest lead hour with a standby allowance.
+// #135 pre-boost: sized from the window's sag, placed in the hour before the window (#285 — the warmest-lead-hour
+// rule with its standby allowance let the charge coast away under the floor blocks that followed it).
 {
   // Cold-enough day (no winter guard): 40..50 °F, warmest at h=23. Windows 6–9 and 17–22; the 17:00
-  // window's lead hours are 14, 15, 16 (all non-window). Outdoor rises with h, so 16 is the warmest lead.
+  // window's lead hours are 14, 15, 16 (all non-window). The boost takes 16, the hour before the bell.
   const fc: ForecastHour[] = Array.from({ length: 24 }, (_, h) => ({ ts: new Date(2026, 9, 15, h, 0, 0), outdoorF: 55 + h * 0.5 }));
   const opts = { ...DEFAULT_OPTS, dhwWindows: [[6, 9], [17, 22]] as [number, number][], preBoosts: [
     { windowStart: 17, windowEnd: 20, boostF: 6, sagP75F: 6.2, n: 11 },
@@ -215,23 +216,24 @@ console.log("shadow.test.ts: all assertions passed ✓");
   const boosts = plan.filter((b) => b.boost === true);
   assert.equal(boosts.length, 1, "exactly one pre-boost (the 06:00 window's 2 °F is below the floor)");
   const b = boosts[0];
-  assert.equal(new Date(b.ts).getHours(), 16, "the warmest lead hour (16:00) is chosen");
-  assert.equal(b.tank_target_f, 126, "floor 120 + sag 6, no standby allowance for the hour right before the bell");
-  assert.match(b.reason, /pre-boost to 126°F for 17:00 window \(sag p75 6.2°F over 11 draws; warmest lead hour/);
+  assert.equal(new Date(b.ts).getHours(), 16, "the hour before the bell (16:00) is chosen");
+  assert.equal(b.tank_target_f, 126, "floor 120 + sag 6, no standby allowance");
+  assert.match(b.reason, /pre-boost to 126°F for 17:00 window \(sag p75 6.2°F over 11 draws; hour before the bell/);
   assert.ok(b.hp1_setpoint_f >= b.tank_target_f + DEFAULT_OPTS.i1MarginF, "Phase B leads the pump setpoints off the boost (I1)");
   assert.equal(plan.filter((x) => x.reason.includes("pre-charge")).length, 0, "the dormant pre-charge label is gone");
 
-  // Warmest lead hour two hours early → +2.4 °F/h standby allowance for the 1 h of coasting.
+  // #285: a much warmer hour two hours before the bell no longer attracts the boost — the floor blocks between it and
+  // the window would let the charge coast away (Nov 2–4 2026: 03:00 boost, 122–128 °F at the 06:00 showers).
   const fc2: ForecastHour[] = fc.map((f, h) => ({ ...f, outdoorF: h === 14 ? 90 : f.outdoorF }));
   const b2 = computeShadowPlan(fc2, null, opts, null, false).filter((x) => x.boost)[0];
-  assert.equal(new Date(b2.ts).getHours(), 14);
-  assert.equal(b2.tank_target_f, Math.round(120 + 6 + 2.4 * 2), "two hours ahead: 1 h charging + 2 h standby … allowance per elapsed hour");
-  assert.match(b2.reason, /standby over 2 h/);
+  assert.equal(new Date(b2.ts).getHours(), 16, "the warm 14:00 hour is not chosen");
+  assert.equal(b2.tank_target_f, 126, "floor + sag, no standby allowance");
+  assert.doesNotMatch(b2.reason, /standby over/);
 
-  // If the allowance would breach strictCap, the hour before the bell is used instead.
+  // A bigger sag changes the size, never the hour.
   const big = { ...opts, preBoosts: [{ windowStart: 17, windowEnd: 20, boostF: 12, sagP75F: 12, n: 6 }] };
   const b3 = computeShadowPlan(fc2, null, big, null, false).filter((x) => x.boost)[0];
-  assert.equal(new Date(b3.ts).getHours(), 16, "14:00 would need 120+12+4.8 = 136.8 > 135 → the hour before the bell");
+  assert.equal(new Date(b3.ts).getHours(), 16);
   assert.equal(b3.tank_target_f, 132);
   assert.match(b3.reason, /hour before the bell/);
 
