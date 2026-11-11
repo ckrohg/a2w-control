@@ -16,14 +16,17 @@ import {
   unitConverter,
   deriveSyntheticTriggers,
   evaluateStormState,
+  nwsAlertFromProperties,
   stormCeilingF,
+  HIGH_WIND_GUST_MPH,
+  HIGH_WIND_MIN_HOURS,
   type StormForecastHour,
   type StormInputs,
   type StormState,
 } from "./storm";
 
 /** The real Open-Meteo body for 2026-09-25 as fetched on 2026-09-23 — gusts in km/h, temps in °F.
- *  Peak gust 50.4 km/h = 31.3 mph: a breezy Friday, nowhere near the 45 mph storm bar. */
+ *  Peak gust 50.4 km/h = 31.3 mph: a breezy Friday, nowhere near the storm bar (45 mph then, 50 since #115). */
 const REAL_KMH_BODY = {
   hourly_units: { time: "iso8601", temperature_2m: "°F", wind_gusts_10m: "km/h", snowfall: "inch", weather_code: "wmo code" },
   hourly: {
@@ -37,7 +40,9 @@ const REAL_KMH_BODY = {
 
 // 1. #112 REGRESSION. The body that armed storm mode must now normalise to real mph and trigger
 //    NOTHING. The second half proves the test isn't vacuous: relabel the identical numbers as mph
-//    and the high-wind trigger fires with exactly the 11 hours the live planner acted on.
+//    and the high-wind trigger fires. Under the 2026-09-23 bar (> 45 for ≥ 3 h) that was the 11 hours
+//    the live planner acted on; under #115's bar (> 50 for ≥ 2 h) it is the two 50.4 "mph" hours at
+//    21:00–22:00 — still a trip, which is the point: the units contract, not the bar, is the guard.
 {
   const hours = parseStormForecast(REAL_KMH_BODY);
   const peak = Math.max(...hours.map((h) => h.gustMph));
@@ -47,12 +52,13 @@ const REAL_KMH_BODY = {
   const mislabelled = parseStormForecast({ ...REAL_KMH_BODY, hourly_units: { ...REAL_KMH_BODY.hourly_units, wind_gusts_10m: "mp/h" } });
   const wind = deriveSyntheticTriggers(mislabelled).find((t) => t.kind === "high-wind");
   assert.ok(wind, "taken as mph the same numbers DO trip the bar — this is what happened on 2026-09-23");
-  assert.match(wind!.detail, /across 11 h/, "…across the same 11 hours the live planner banked heat for");
+  assert.match(wind!.detail, /across 2 h/, "…on the two 50.4 'mph' hours that clear the #115 bar");
 }
 
 // 2. Units contract: every unit Open-Meteo can return converts, and anything else is a hard fail
 //    rather than a silent misread. The temperature case is the live twin of #112 — 8.8 °C is a mild
-//    September night that would trip the <10 °F extreme-cold bar if it were read as Fahrenheit.
+//    September night that would have tripped the old <10 °F extreme-cold bar if read as Fahrenheit.
+//    (#115 removed that trigger; the temperature contract stays pinned because tempF is still parsed.)
 {
   assert.ok(Math.abs(unitConverter("wind_gusts_10m", "km/h")(50.4) - 31.32) < 0.01, "km/h → mph");
   assert.ok(Math.abs(unitConverter("wind_gusts_10m", "m/s")(20) - 44.74) < 0.01, "m/s → mph");
@@ -80,30 +86,72 @@ const REAL_KMH_BODY = {
 }
 
 // 3. Sustained-count bars. Each trigger needs its dwell, not a single qualifying hour: a one-hour
-//    dip or gust is weather, not a storm.
+//    gust is weather, not a storm. Bars as recalibrated by #115 (2026-11-10): wind > 50 mph for ≥ 2 h,
+//    no cold trigger at all; freezing rain and heavy snow unchanged.
 {
   const mk = (over: Partial<StormForecastHour>[], base: Partial<StormForecastHour> = {}): StormForecastHour[] =>
     over.map((o, i) => ({
       ts: `2026-01-15T${String(i).padStart(2, "0")}:00`,
       tempF: 30, gustMph: 10, snowfallIn: 0, weatherCode: 3, ...base, ...o,
     }));
+  const rep = (n: number, o: Partial<StormForecastHour>) => Array.from({ length: n }, () => o);
 
   const kinds = (h: StormForecastHour[]) => deriveSyntheticTriggers(h).map((t) => t.kind);
-  assert.deepEqual(kinds(mk([{ tempF: 5 }, { tempF: 5 }])), [], "2 cold hours is under the ≥3 bar");
-  assert.deepEqual(kinds(mk([{ tempF: 5 }, { tempF: 5 }, { tempF: 5 }])), ["extreme-cold"], "3 cold hours arms");
-  assert.deepEqual(kinds(mk([{ tempF: 10 }, { tempF: 10 }, { tempF: 10 }])), [], "exactly 10 °F is not below 10");
-  assert.deepEqual(kinds(mk([{ gustMph: 46 }, { gustMph: 46 }])), [], "2 gust hours is under the ≥3 bar");
-  assert.deepEqual(kinds(mk([{ gustMph: 46 }, { gustMph: 46 }, { gustMph: 46 }])), ["high-wind"], "3 gust hours arms");
+  assert.equal(HIGH_WIND_GUST_MPH, 50, "#115 gust bar");
+  assert.equal(HIGH_WIND_MIN_HOURS, 2, "#115 dwell");
+  // Cold alone never arms any more: 0 of 9 outage storms, every long armed run (#115).
+  assert.deepEqual(kinds(mk(rep(12, { tempF: 5 }))), [], "5 °F for 12 h is a cold spell, not a storm — no trigger");
+  assert.deepEqual(kinds(mk(rep(6, { tempF: -5 }))), [], "nor is −5 °F for 6 h");
+  // Wind: between the old bar and the new one is a Wind Advisory, not an outage risk.
+  assert.deepEqual(kinds(mk(rep(4, { gustMph: 48 }))), [], "48 mph for 4 h — cleared the old 45 bar, not the 50 bar");
+  assert.deepEqual(kinds(mk(rep(3, { gustMph: 50 }))), [], "exactly 50 mph is not above 50");
+  assert.deepEqual(kinds(mk([{ gustMph: 52 }])), [], "1 gust hour is under the ≥2 bar");
+  assert.deepEqual(kinds(mk(rep(2, { gustMph: 52 }))), ["high-wind"], "52 mph for 2 h arms");
+  assert.deepEqual(kinds(mk(rep(2, { gustMph: 52, tempF: 5 }))), ["high-wind"], "cold + wind is still just the wind trigger");
   assert.deepEqual(kinds(mk([{ weatherCode: 66 }])), [], "1 icy hour is under the ≥2 bar");
-  assert.deepEqual(kinds(mk([{ weatherCode: 66 }, { weatherCode: 67 }])), ["freezing-rain"], "2 icy hours arm");
+  assert.deepEqual(kinds(mk([{ weatherCode: 66 }, { weatherCode: 67 }])), ["freezing-rain"], "2 icy hours arm (unchanged)");
   assert.deepEqual(kinds(mk([{ snowfallIn: 4 }, { snowfallIn: 3.9 }])), [], "7.9 in is under the 8 in bar");
-  assert.deepEqual(kinds(mk([{ snowfallIn: 4 }, { snowfallIn: 4 }])), ["heavy-snow"], "8 in arms");
+  assert.deepEqual(kinds(mk([{ snowfallIn: 4 }, { snowfallIn: 4 }])), ["heavy-snow"], "8 in arms (unchanged)");
 
   // Window: onset is the first qualifying hour; expiry is the END of the last qualifying hour.
   // (#114: was +6 h, which together with armFrom's old +6 h tail shaped the plan 12 h past a storm's end.)
-  const t = deriveSyntheticTriggers(mk([{ gustMph: 46 }, { gustMph: 46 }, { gustMph: 46 }]))[0];
+  const t = deriveSyntheticTriggers(mk(rep(3, { gustMph: 52 })))[0];
   assert.equal(t.onset, "2026-01-15T00:00");
   assert.equal(Date.parse(t.expires) - Date.parse("2026-01-15T02:00"), 1 * 3600_000, "expiry = end of the last qualifying hour (#114)");
+}
+
+// 3b. #115 NWS tiering. Storm mode is outage preparation: only High Wind, Blizzard and Ice Storm
+//     WARNINGS arm. Winter Storm Warnings (4–9 arms, no outage behind them) and Wind Chill / Extreme
+//     Cold Warnings no longer arm; Watches of the kept families stay at the non-arming notice tier;
+//     Advisories and everything else are dropped before they reach the machine.
+{
+  const props = (event: string) => ({ event, severity: "Severe", onset: "2026-01-15T10:00:00Z", expires: "2026-01-15T12:00:00Z", ends: "2026-01-15T20:00:00Z", headline: event });
+  const tier = (event: string) => nwsAlertFromProperties(props(event))?.tier ?? null;
+  assert.equal(tier("High Wind Warning"), "arm");
+  assert.equal(tier("Blizzard Warning"), "arm");
+  assert.equal(tier("Ice Storm Warning"), "arm");
+  assert.equal(tier("Winter Storm Warning"), null, "a Winter Storm Warning no longer arms (#115)");
+  assert.equal(tier("Winter Storm Watch"), null);
+  assert.equal(tier("Extreme Cold Warning"), null, "cold is the planner's normal job, not storm mode's");
+  assert.equal(tier("Wind Chill Warning"), null);
+  assert.equal(tier("Wind Advisory"), null, "a Wind Advisory (46 mph criterion) sits below the bar");
+  assert.equal(tier("High Wind Watch"), "notice", "a Watch of a kept family still maps, at the non-arming tier");
+  assert.equal(tier("Blizzard Watch"), "notice");
+  assert.equal(tier("Winter Weather Advisory"), null);
+  assert.equal(nwsAlertFromProperties(props("High Wind Warning"))!.expires, "2026-01-15T20:00:00Z", "#118: `ends` still wins over `expires`");
+
+  // …and through the machine: the Winter Storm Warning that used to arm is now invisible to it,
+  // the High Wind Warning arms, the Wind Advisory does nothing.
+  const now = new Date("2026-01-15T09:00:00Z");
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const through = (event: string) => {
+    const alert = nwsAlertFromProperties(props(event));
+    return evaluateStormState({ kind: "idle" }, { ...base, alerts: alert ? [alert] : [] }, now);
+  };
+  assert.deepEqual(through("High Wind Warning").transitions, ["arm"], "High Wind Warning arms");
+  assert.equal(through("Winter Storm Warning").state.kind, "idle", "Winter Storm Warning does not arm");
+  assert.equal(through("Wind Advisory").state.kind, "idle", "Wind Advisory does not arm");
+  assert.equal(through("High Wind Watch").state.kind, "idle", "a Watch notifies at most — never arms");
 }
 
 // 4. State machine. now sits INSIDE the trigger window throughout.
@@ -293,10 +341,10 @@ const REAL_KMH_BODY = {
     ({ ts, tempF: 50, gustMph, snowfallIn: 0, weatherCode: 3 });
   const twoStorms: StormForecastHour[] = [
     // storm A: 3 h on the 26th
-    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52), mk("2026-09-26T14:00", 48),
+    mk("2026-09-26T12:00", 55), mk("2026-09-26T13:00", 57), mk("2026-09-26T14:00", 53),
     // ~2 days of calm (below the bar, so absent from the qualifying set entirely)
     // storm B: 3 h on the 28th
-    mk("2026-09-28T12:00", 49), mk("2026-09-28T13:00", 51), mk("2026-09-28T14:00", 47),
+    mk("2026-09-28T12:00", 54), mk("2026-09-28T13:00", 56), mk("2026-09-28T14:00", 52),
   ];
   const t = deriveSyntheticTriggers(twoStorms).filter((x) => x.kind === "high-wind");
   assert.equal(t.length, 2, "two fronts must produce TWO triggers, not one merged span");
@@ -307,8 +355,8 @@ const REAL_KMH_BODY = {
 
   // A short lull inside one storm must NOT split it — that would re-introduce churn.
   const oneStormWithLull: StormForecastHour[] = [
-    mk("2026-09-26T12:00", 50), mk("2026-09-26T13:00", 52),
-    mk("2026-09-26T16:00", 48), mk("2026-09-26T17:00", 49),
+    mk("2026-09-26T12:00", 55), mk("2026-09-26T13:00", 57),
+    mk("2026-09-26T16:00", 53), mk("2026-09-26T17:00", 54),
   ];
   assert.equal(deriveSyntheticTriggers(oneStormWithLull).filter((x) => x.kind === "high-wind").length, 1,
     "a 3 h lull is one storm, not two");
@@ -334,16 +382,16 @@ const REAL_KMH_BODY = {
 //     keeps the old unfiltered behaviour so fixtures and the replay are unaffected.
 {
   const mk = (ts: string, g: number): StormForecastHour => ({ ts, tempF: 55, gustMph: g, snowfallIn: 0, weatherCode: 3 });
-  const morning = [mk("2026-09-27T00:00", 47), mk("2026-09-27T02:00", 47), mk("2026-09-27T05:00", 47)]; // all past by afternoon
+  const morning = [mk("2026-09-27T00:00", 52), mk("2026-09-27T02:00", 52), mk("2026-09-27T05:00", 52)]; // all past by afternoon
   const noon = Date.parse("2026-09-27T14:00");
   assert.equal(deriveSyntheticTriggers(morning, noon).length, 0, "a storm that ended this morning must not arm this afternoon");
   assert.equal(deriveSyntheticTriggers(morning).length, 1, "omitting nowMs keeps the unfiltered contract (fixtures/replay)");
-  const inProgress = [...morning, mk("2026-09-27T15:00", 48), mk("2026-09-27T16:00", 49), mk("2026-09-27T17:00", 46)];
+  const inProgress = [...morning, mk("2026-09-27T15:00", 53), mk("2026-09-27T16:00", 54), mk("2026-09-27T17:00", 51)];
   const t = deriveSyntheticTriggers(inProgress, noon);
   assert.equal(t.length, 1, "an in-progress storm still arms");
   assert.equal(t[0].onset, "2026-09-27T15:00", "onset is the first hour still ahead, not one already gone");
   // the current partial hour is kept (now - 1h), matching shadow.ts
-  assert.equal(deriveSyntheticTriggers([mk("2026-09-27T13:30", 47), mk("2026-09-27T15:00", 47), mk("2026-09-27T16:00", 47)], noon).length, 1);
+  assert.equal(deriveSyntheticTriggers([mk("2026-09-27T13:30", 52), mk("2026-09-27T15:00", 52), mk("2026-09-27T16:00", 52)], noon).length, 1);
 }
 
 // 12. #114 — armed DURATION is capped. (a) The tail: shaping ends 1 h after a trigger's expiry, and
@@ -353,7 +401,7 @@ const REAL_KMH_BODY = {
 //     showed the old code failing (armed to 21:00Z on a storm that ended 12:00Z).
 {
   const mk = (ts: string, g: number): StormForecastHour => ({ ts, tempF: 55, gustMph: g, snowfallIn: 0, weatherCode: 3 });
-  const storm = [mk("2026-09-26T18:00", 48), mk("2026-09-26T19:00", 50), mk("2026-09-26T20:00", 47)];
+  const storm = [mk("2026-09-26T18:00", 53), mk("2026-09-26T19:00", 55), mk("2026-09-26T20:00", 52)];
   const t = deriveSyntheticTriggers(storm);
   assert.equal(t[0].expires, new Date(Date.parse("2026-09-26T20:00") + 3600_000).toISOString(), "expiry = end of the last qualifying hour");
   const base: StormInputs = { alerts: [], synthetic: t, outageActive: null };
@@ -371,6 +419,61 @@ const REAL_KMH_BODY = {
   const fresh = evaluateStormState(lapsed.state, { ...base, synthetic: [next] }, afterA);
   assert.deepEqual(fresh.transitions, ["arm"], "…and the next tick arms the next storm on its own window");
   assert.ok(fresh.state.kind === "armed" && Date.parse(fresh.state.windowStart) === Date.parse("2026-09-27T10:00") - 2 * 3600_000, "with its own 2 h lead off ITS onset");
+}
+
+// 13. #115 re-arm stretching. #114 made a LAPSED window stand down instead of chaining into the next
+//     storm (test 12b) — but the re-time branch (#119) runs first, while the window is still current.
+//     In the 1 h tail after a trigger expires, `liveTriggers` has already dropped it, so live[0] is
+//     the NEXT storm, and "re-time" quietly slid the window onto it: no stand-down, no fresh arm, one
+//     armed run across every night of a spell. Re-timing must only follow a trigger that belongs to
+//     the held episode (onset within SEGMENT_GAP_H of the held trigger's expiry); a distinct storm
+//     waits for the stand-down and arms on its own window.
+{
+  const mk = (ts: string, g: number): StormForecastHour => ({ ts, tempF: 30, gustMph: g, snowfallIn: 0, weatherCode: 3 });
+  // Three windy nights 22:00–01:00Z (4 qualifying hours each), 20 h apart: three DISTINCT storms by
+  // the module's own 6 h gap rule, all inside one 3-day forecast body.
+  const nights: StormForecastHour[] = [];
+  for (const d of [15, 16, 17]) {
+    nights.push(mk(`2026-01-${d}T22:00:00Z`, 52), mk(`2026-01-${d}T23:00:00Z`, 55), mk(`2026-01-${d + 1}T00:00:00Z`, 53), mk(`2026-01-${d + 1}T01:00:00Z`, 52));
+  }
+  const base: StormInputs = { alerts: [], synthetic: [], outageActive: null };
+  const at = (iso: string) => new Date(iso);
+  const inputsAt = (now: Date): StormInputs => ({ ...base, synthetic: deriveSyntheticTriggers(nights, now.getTime()) });
+
+  // (a) The tail hour. Night 1's trigger expired at 02:00Z, its window runs to 03:00Z, and night 2 is
+  //     live 20 h out. That must HOLD, not re-time.
+  const armed = evaluateStormState({ kind: "idle" }, inputsAt(at("2026-01-15T12:00:00Z")), at("2026-01-15T12:00:00Z"));
+  assert.ok(armed.state.kind === "armed");
+  assert.equal(armed.state.windowEnd, "2026-01-16T03:00:00.000Z", "night 1's window: end of its last hour + 1 h tail");
+  const held = evaluateStormState(armed.state, inputsAt(at("2026-01-16T02:30:00Z")), at("2026-01-16T02:30:00Z"));
+  assert.deepEqual(held.transitions, [], "a distinct later storm must not re-time the window during the tail");
+  assert.deepEqual(held.state, armed.state, "the held window is unchanged");
+
+  // (b) The same storm growing a longer tail in the next forecast IS the same episode and still re-times:
+  //     gusts now run on to 05:00Z, so the trigger seen at 02:30Z spans 02:00–05:00Z (onset = held expiry).
+  const longer = [...nights.slice(0, 4), mk("2026-01-16T02:00:00Z", 52), mk("2026-01-16T03:00:00Z", 52), mk("2026-01-16T04:00:00Z", 52), mk("2026-01-16T05:00:00Z", 52)];
+  const grew = evaluateStormState(armed.state, { ...base, synthetic: deriveSyntheticTriggers(longer, Date.parse("2026-01-16T02:30:00Z")) }, at("2026-01-16T02:30:00Z"));
+  assert.deepEqual(grew.transitions, ["re-time"], "the held storm running longer than forecast still re-times (#119 intact)");
+  assert.equal(grew.state.kind === "armed" && grew.state.windowEnd, "2026-01-16T07:00:00.000Z");
+
+  // (c) The whole spell, ticked every 10 min like the live planner: three arms, three stand-downs, no
+  //     re-time, and every stand-down lands within one tick of its own night's expiry + tail.
+  let state: StormState = { kind: "idle" };
+  const seen: string[] = [];
+  const standDowns: string[] = [];
+  for (let t = Date.parse("2026-01-15T12:00:00Z"); t <= Date.parse("2026-01-18T12:00:00Z"); t += 10 * 60_000) {
+    const r = evaluateStormState(state, inputsAt(new Date(t)), new Date(t));
+    state = r.state;
+    seen.push(...r.transitions);
+    if (r.transitions.includes("stand-down")) standDowns.push(new Date(t).toISOString());
+    if (state.kind === "armed") {
+      assert.ok(Date.parse(state.windowEnd) - Date.parse(state.windowStart) <= 10 * 3600_000,
+        `an armed window spans one night (lead 2 h + 4 h + tail 1 h), not a spell: ${state.windowStart} → ${state.windowEnd}`);
+    }
+  }
+  assert.deepEqual(seen, ["arm", "stand-down", "arm", "stand-down", "arm", "stand-down"], "three storms, three separate armed runs, never a re-time onto the next");
+  assert.deepEqual(standDowns, ["2026-01-16T03:10:00.000Z", "2026-01-17T03:10:00.000Z", "2026-01-18T03:10:00.000Z"],
+    "each stand-down follows ITS night's expiry + 1 h tail by one tick");
 }
 
 // ── the outage feed: why there was no answer, and never the URL (it carries the feed key) ──────────

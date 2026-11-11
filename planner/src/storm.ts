@@ -1,7 +1,8 @@
 /**
  * @purpose Storm-mode triggers + pure state machine for the planner (plan §6.11,
- * issue #10). Watches NWS active alerts and the OpenMeteo hourly forecast for
- * storm-grade conditions (extreme cold, high wind, freezing rain, heavy snow),
+ * issue #10). Watches NWS active alerts (High Wind / Blizzard / Ice Storm Warnings) and
+ * the OpenMeteo hourly forecast for outage-grade conditions (high wind, freezing rain,
+ * heavy snow — recalibrated against a 10-year outage backtest in #115, 2026-11-10),
  * polls OutageWatch for grid outages, and folds every signal — plus manual
  * arm/disarm — through evaluateStormState, a pure idle/armed/active machine the
  * caller drives once per tick. stormCeilingF caps the storm pre-charge target
@@ -61,7 +62,36 @@ const H = 3600_000;
 const PRECHARGE_LEAD_H = 2;
 /** #119: don't re-time an armed window for forecast jitter smaller than this. */
 const RETIME_MIN_SHIFT_MS = 1 * H;
-const NWS_EVENT_RE = /winter storm|ice storm|blizzard|high wind|extreme cold|wind chill/i;
+/**
+ * #115 (owner approved 2026-11-10; 10-year backtest 2026-11-05 against the NWS warning archive):
+ * storm mode is OUTAGE preparation, so it arms on the three warning products that preceded the
+ * verified outage storms — High Wind, Blizzard and Ice Storm Warnings (14 of 14 kept). Winter Storm
+ * Warnings started 4–9 arms with no outage behind them, and Wind Chill / Extreme Cold Warnings are a
+ * heating-load problem the planner's normal curve already answers — neither arms any more. Watches
+ * for the three kept families are still mapped at the non-arming "notice" tier, exactly as before;
+ * Advisories (Wind Advisory, 46 mph criterion) sit below the bar and are dropped.
+ */
+const NWS_FAMILY_RE = /\b(high wind|blizzard|ice storm)\b/i;
+const NWS_ARM_RE = /\b(high wind|blizzard|ice storm) warning\b/i;
+
+/** Pure half of fetchNwsAlerts — one GeoJSON feature's properties to a StormAlert, or null when the
+ *  product is not one storm mode watches. Exported so the arm/notice tiering is testable without a fetch. */
+export function nwsAlertFromProperties(p: any): StormAlert | null {
+  const event = String(p?.event ?? "");
+  if (!NWS_FAMILY_RE.test(event)) return null;
+  return {
+    event,
+    severity: String(p?.severity ?? "Unknown"),
+    tier: NWS_ARM_RE.test(event) ? "arm" : "notice",
+    onset: p?.onset ?? p?.effective ?? null,
+    // #118: `ends` is when the WEATHER stops; `expires` is only when NWS must reissue the
+    // bulletin. `expires` is always present on an active alert, so the old `expires ?? ends`
+    // made `ends` dead code and read every warning short — 31 h short on the 2026-09-25 High
+    // Wind Warning. `ends` can legitimately be null on some alert types, so keep the fallback.
+    expires: p?.ends ?? p?.expires ?? null,
+    headline: String(p?.headline ?? event),
+  };
+}
 
 export async function fetchNwsAlerts(lat: string, lon: string): Promise<StormAlert[]> {
   const url = `${process.env.NWS_URL || "https://api.weather.gov"}/alerts/active?point=${lat},${lon}`;
@@ -81,21 +111,8 @@ export function parseNwsAlerts(raw: unknown): StormAlert[] {
   const body = raw as any;
   const alerts: StormAlert[] = [];
   for (const feature of body?.features ?? []) {
-    const p = feature?.properties ?? {};
-    const event = String(p.event ?? "");
-    if (!NWS_EVENT_RE.test(event)) continue;
-    alerts.push({
-      event,
-      severity: String(p.severity ?? "Unknown"),
-      tier: event.includes("Warning") ? "arm" : "notice",
-      onset: p.onset ?? p.effective ?? null,
-      // #118: `ends` is when the WEATHER stops; `expires` is only when NWS must reissue the
-      // bulletin. `expires` is always present on an active alert, so the old `expires ?? ends`
-      // made `ends` dead code and read every warning short — 31 h short on the 2026-09-25 High
-      // Wind Warning. `ends` can legitimately be null on some alert types, so keep the fallback.
-      expires: p.ends ?? p.expires ?? null,
-      headline: String(p.headline ?? event),
-    });
+    const alert = nwsAlertFromProperties(feature?.properties ?? {});
+    if (alert) alerts.push(alert);
   }
   return alerts;
 }
@@ -200,6 +217,18 @@ const STORM_TAIL_H = 1;
 const SEGMENT_GAP_H = 6;
 
 /**
+ * High-wind bar — #115, owner approved 2026-11-10. A 10-year backtest (2026-11-05, Open-Meteo
+ * forecast/reanalysis vs. the NWS warning archive and the house's outage record) found the old
+ * `> 45 mph for ≥ 3 h` bar caught all 9 verified outage storms but, together with the cold trigger,
+ * armed 9–10 times a year for 29–35 days in total. `> 50 mph for ≥ 2 h` still keeps 9 of 9 storms
+ * and all 14 High Wind / Blizzard / Ice Storm warnings while arming ~4–5.5 times a year, longest
+ * run 76–98 h. 50 mph sits between the NWS Wind Advisory (46) and High Wind Warning (58) criteria.
+ * Exported so storm.replay.ts reports the same bar it replays.
+ */
+export const HIGH_WIND_GUST_MPH = 50;
+export const HIGH_WIND_MIN_HOURS = 2;
+
+/**
  * Split qualifying hours into one group per STORM.
  *
  * OWNER SPEC 2026-09-25: "understand each storm, when it will hit and when it ends, always keeping
@@ -233,22 +262,16 @@ export function deriveSyntheticTriggers(allHours: StormForecastHour[], nowMs?: n
   const hours = nowMs == null ? allHours : allHours.filter((h) => Date.parse(h.ts) >= nowMs - H); // keep the current partial hour
   const triggers: SyntheticTrigger[] = [];
 
-  // North Shore (5A coastal) design temp ~7°F: a sub-0°F bar almost never fires here, so a
-  // genuine cold snap never pre-charged. Bar is <10°F sustained ≥3 h (matches the wind ≥3 h /
-  // freezing-rain ≥2 h sustained-count pattern) — fires on a real cold event, not every dip.
+  // #115 (2026-11-10): the synthetic extreme-cold trigger (temp < 10 °F for ≥ 3 h) is GONE. In the
+  // 10-year backtest it caught 0 of the 9 outage storms, caused about half of all arms, and was behind
+  // every long armed run (466 h, Jan 22 – Feb 10 2026; 337 h, Dec 2017 – Jan 2018). Storm mode banks
+  // DHW against a power loss; keeping the house warm through a cold spell is the planner's normal
+  // job — the reset curve and the winter solver — not storm mode's.
+
   // Each family is segmented per storm, so back-to-back events get their own windows rather than
   // one span bridging the calm between them.
-  for (const cold of segmentByStorm(hours.filter((h) => h.tempF < 10))) {
-    if (cold.length < 3) continue;
-    triggers.push({
-      kind: "extreme-cold",
-      detail: `forecast low ${Math.min(...cold.map((h) => h.tempF))}F across ${cold.length} h`,
-      ...triggerWindow(cold),
-    });
-  }
-
-  for (const windy of segmentByStorm(hours.filter((h) => h.gustMph > 45))) {
-    if (windy.length < 3) continue;
+  for (const windy of segmentByStorm(hours.filter((h) => h.gustMph > HIGH_WIND_GUST_MPH))) {
+    if (windy.length < HIGH_WIND_MIN_HOURS) continue;
     triggers.push({
       kind: "high-wind",
       detail: `gusts to ${Math.max(...windy.map((h) => h.gustMph))} mph across ${windy.length} h`,
@@ -407,7 +430,16 @@ export function evaluateStormState(
     // Re-timing applies only while the held window is still CURRENT. Once it has lapsed the
     // existing stand-down / re-arm path owns the decision — re-time must not pre-empt it.
     if (Number.isFinite(prevWindowEndMs) && nowMs <= prevWindowEndMs) {
-      if (prev.trigger !== "manual" && live.length > 0) {
+      // #115 (2026-11-10): re-time only onto a trigger that belongs to THIS episode. `liveTriggers`
+      // drops a trigger the moment it expires, so for the STORM_TAIL_H after a storm's last hour
+      // live[0] is already the NEXT storm — and this branch, which runs before the #114 stand-down
+      // below, slid the window onto it as a "re-time". Every night of a spell then chained into one
+      // armed run with no stand-down and no fresh arm. A trigger is the same episode only if its
+      // onset falls within SEGMENT_GAP_H of the held trigger's expiry (the window end minus the
+      // tail) — the same gap segmentByStorm uses to split storms. Anything later is a distinct
+      // storm: hold, let the window lapse, and arm it fresh on its own window through rule 4.
+      const heldExpiryMs = prevWindowEndMs - STORM_TAIL_H * H;
+      if (prev.trigger !== "manual" && live.length > 0 && live[0].onsetMs - heldExpiryMs <= SEGMENT_GAP_H * H) {
         const candidate = armFrom(live[0]);
         if (Math.abs(Date.parse(candidate.windowEnd) - prevWindowEndMs) > RETIME_MIN_SHIFT_MS) {
           return { state: candidate, transitions: ["re-time"] };

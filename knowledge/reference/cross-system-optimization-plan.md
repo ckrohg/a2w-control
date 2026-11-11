@@ -776,6 +776,21 @@ delivery with zero compressor load on the generator.
     Grid's Kubra feed every 5 min for this address) — in-outage / restored; `/api/stats`
     supplies outage-frequency priors. Unreachable = *no signal*, never = outage.
   - *Manual:* a Storm Mode button on the dashboard (and it always wins).
+  - **Recalibrated 2026-11-10 (#115, owner approved).** A 10-year backtest (2026-11-05, Open-Meteo
+    forecast/reanalysis vs. the NWS warning archive and the house's outage record) showed the
+    triggers above arming 9–10×/yr for 29–35 days a year. The 45 mph gust trigger caught all 9
+    verified outage storms; the extreme-cold trigger (< 10 °F ≥ 3 h) caught none, caused about half
+    of all arms and every long armed run (466 h Jan 22 – Feb 10 2026; 337 h Dec 2017 – Jan 2018).
+    Now in `planner/src/storm.ts`: NWS arms **only** on High Wind / Blizzard / Ice Storm *Warnings*
+    (Winter Storm, Extreme Cold and Wind Chill no longer arm; Watches stay notice-only); synthetic
+    high-wind is gusts **> 50 mph for ≥ 2 h** (was > 45 for ≥ 3 h; 50 sits between the Wind
+    Advisory 46 and High Wind Warning 58 criteria); the synthetic extreme-cold trigger is removed —
+    cold-weather heating is the planner's normal job, not storm mode's. Freezing rain and heavy snow
+    unchanged. Backtest: 9 of 9 storms and 14 of 14 warnings kept at ~4–5.5 arms/yr, longest run
+    76–98 h. Same change fixed a re-arm stretching defect: during the 1 h post-storm tail the
+    #119 re-time branch could slide the armed window onto the *next* storm instead of standing
+    down, chaining a spell into one run; re-timing now only follows a trigger whose onset is within
+    SEGMENT_GAP_H (6 h) of the held trigger's expiry.
 - **Action ladder:** from T−24 h, ramp the tank to the **storm ceiling** =
   min(as-found curve + 3 °F, HP ceiling − I1 margin) in the best-COP hours; fold the
   day's I8 sanitize into the ramp (one charge, two jobs); stage both pumps early
