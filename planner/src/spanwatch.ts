@@ -15,7 +15,9 @@
  * #124: `value` is normalized by the `unit` SPAN reports beside it (Wh or kWh, any case). A missing or unknown unit, or a
  * non-numeric value, is never guessed: the alarm path reports itself blind (lastError, failStreak) and logs it once.
  * An alarm that cannot read is silent by nature, so blindness() is the separate check that tells the owner (#257 ran
- * blind for 25 minutes with nothing but /health to show it).
+ * blind for 25 minutes with nothing but /health to show it). Energy that arrives across a blind spell LONGER than the
+ * alarm window is not stamped on the last 60 min (a run that ended hours ago must not page as "in the last 60 min"):
+ * it is reported apart as lastBlindSpell, emailed once if it is an element run, and stays in the day total.
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
 import type { Notify } from "./alertpolicy";
@@ -82,8 +84,14 @@ export class SpanWatch {
   /** #187: when the cloud path last answered, and how many ticks in a row have failed since (/health.span.cloud) */
   public lastOkAt: string | null = null;
   public failStreak = 0;
-  // The day counter at the previous poll, and the per-poll increments still inside the window.
+  /**
+   * Energy that arrived across the newest blind spell longer than BACKUP_WINDOW_MS, kept OUT of lastHourKwh because when
+   * inside the spell it was drawn is unknown (/health.span.cloud.backup_kwh_blind_spell). It is still in lastDayKwh.
+   */
+  public lastBlindSpell: { kwh: number; from: string; to: string; minutes: number } | null = null;
+  // The day counter at the previous good poll, when that poll was, and the per-poll increments still inside the window.
   private prevDayKwh: number | null = null;
+  private prevOkMs: number | null = null;
   private increments: { t: number; kwh: number }[] = [];
   private startedAtMs: number | null = null;
 
@@ -177,13 +185,29 @@ export class SpanWatch {
    * planner's clock never needs to know where that is. That step counts as 0: at most one poll interval
    * (~0.275 kWh at 16.5 kW) of real energy is lost at the crossing, and the following polls keep adding
    * at that rate if the element is still running. The first sample after a start only sets the baseline.
+   *
+   * An increment is stamped at `nowMs`, which is honest only while the previous good reading is inside the window: the
+   * energy arrived in the last 60 min. After a BLIND spell longer than the window (polls failing, or unreadable, #124)
+   * the increment is the whole gap's energy, and a run that ended hours ago would page as "in the last 60 min". Such an
+   * increment is kept out of the window and returned as `blind` instead (lastBlindSpell, one email if it is an element
+   * run): it is not lost — the day total is SPAN's own counter — but it is not pretended to be recent either. A spell
+   * shorter than the window is attributed as before: the energy did arrive within the last hour.
    */
-  private accrue(dayKwh: number, nowMs: number): number {
-    if (this.prevDayKwh !== null && dayKwh > this.prevDayKwh) this.increments.push({ t: nowMs, kwh: dayKwh - this.prevDayKwh });
+  private accrue(dayKwh: number, nowMs: number): { hourKwh: number; blind: SpanWatch["lastBlindSpell"] } {
+    let blind: SpanWatch["lastBlindSpell"] = null;
+    if (this.prevDayKwh !== null && dayKwh > this.prevDayKwh) {
+      const kwh = dayKwh - this.prevDayKwh;
+      const gapMs = this.prevOkMs === null ? 0 : nowMs - this.prevOkMs;
+      if (gapMs > BACKUP_WINDOW_MS) {
+        blind = { kwh, from: new Date(this.prevOkMs as number).toISOString(), to: new Date(nowMs).toISOString(), minutes: Math.round(gapMs / 60_000) };
+        this.lastBlindSpell = blind;
+      } else this.increments.push({ t: nowMs, kwh });
+    }
     this.prevDayKwh = dayKwh;
+    this.prevOkMs = nowMs;
     const cutoff = nowMs - BACKUP_WINDOW_MS;
     this.increments = this.increments.filter((x) => x.t > cutoff);
-    return this.increments.reduce((s, x) => s + x.kwh, 0);
+    return { hourKwh: this.increments.reduce((s, x) => s + x.kwh, 0), blind };
   }
 
   /** #124: warn about an unreadable energy reading the first time it is seen, not every poll. */
@@ -242,7 +266,7 @@ export class SpanWatch {
       const dayKwh = hit.e.kwh;
       for (const k of this.loggedBlind) if (k.startsWith(BACKUP_BLIND)) this.loggedBlind.delete(k); // a recurrence logs again
       this.lastError = null;
-      const hourKwh = this.accrue(dayKwh, now.getTime());
+      const { hourKwh, blind } = this.accrue(dayKwh, now.getTime());
       this.lastDayKwh = dayKwh;
       this.lastHourKwh = hourKwh;
       this.lastOkAt = now.toISOString();
@@ -250,6 +274,23 @@ export class SpanWatch {
       if (!this.loggedOk) {
         this.loggedOk = true;
         console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${dayKwh} kWh (SPAN: ${hit.raw}) so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
+      }
+      if (blind) {
+        // energy from a blind spell longer than the window: said once, apart from the trailing-hour alarm (whose edge
+        // state is untouched), at the alarm's own tier when it is an element run — never as "in the last 60 min"
+        const when = `between ${blind.from.slice(11, 16)}Z and ${blind.to.slice(11, 16)}Z (${blind.minutes} min with no reading)`;
+        console.warn(`[spanwatch] "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when}: when inside that spell is unknown, so it is not counted toward the last 60 min; today's total is ${dayKwh.toFixed(2)} kWh`);
+        if (blind.kwh > this.alarmKwh) {
+          await this.notify(
+            "16.5 kW backup element drew power while the alarm was blind",
+            `SPAN "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when} — the resistive element ran at some point in that spell, which the alarm could not see at the time ` +
+              `(${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}). Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
+            "default",
+            { tier: "attention",
+              action: "If it wasn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
+              facts: [["Blind spell", when], ["Drew", `${blind.kwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
+          );
+        }
       }
       if (hourKwh > this.alarmKwh && !this.alarmed) {
         this.alarmed = true;

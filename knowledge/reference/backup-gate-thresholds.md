@@ -174,6 +174,9 @@ lesson: 14 h passed with nothing restoring heat.
 - **Re-validate after the first design-cold week**, with `BACKUP_GATE_*` overrides on a fresh restore. At ≤ 10 °F two
   pumps may legitimately run flat out with the tank in the low 100s. That is the owner's "massive load" case and must
   not cross the floor rule.
+- **What counts as the cold snap that unlocks going live (owner, 2026-11-04):** the first night the HBX calls BOTH
+  stages for an hour or more. Until then the element gate stays in shadow, whatever its record. The Oct 20 – Nov 2
+  shadow period never saw it: coldest 30 °F, both stages never called together, tank never below 107 °F.
 - **Going live, planner:** `BACKUP_GATE=live` and `HUB_ARM_TOKEN` on the planner service (the same second factor the
   dashboard uses). `/health.backup_gate.live_ready` must be true.
 - **Going live, Pi:** `backup_fallback.live: true` in `~/bridge-data/config.yaml`, after the bridge release that carries

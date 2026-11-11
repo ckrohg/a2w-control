@@ -2091,12 +2091,13 @@ export class Store {
     return out;
   }
 
-  /** HBX tank + outdoor + stage calls since `from` (planner clock), ascending, as epoch seconds. */
+  /** HBX tank + outdoor + heat demand + stage calls since `from` (planner clock), ascending, as epoch seconds. */
   async tankWindow(from: Date): Promise<TankReading[]> {
     const rows = await this.boundedRows(
-      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, outdoor_f, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
+      `SELECT extract(epoch FROM ts)::float8 AS ts, tank_f, outdoor_f, hd_active, stages_called FROM slx_readings WHERE ts >= $1 ORDER BY ts`, [from]);
     return (rows ?? []).map((x) => ({ ts: Number(x.ts), tank_f: x.tank_f == null ? null : Number(x.tank_f),
       outdoor_f: x.outdoor_f == null ? null : Number(x.outdoor_f),
+      hd_active: typeof x.hd_active === "boolean" ? x.hd_active : null, // stage_never_called: no demand → not judged
       stages_called: Array.isArray(x.stages_called) ? x.stages_called.map((b: unknown) => b === true) : null }));
   }
 

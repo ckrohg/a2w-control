@@ -10,6 +10,7 @@
 import http from "node:http";
 import { SensorLinxClient } from "./sensorlinx";
 import { Store, SlxReading } from "./store";
+import { toReading } from "./slx-reading";
 import { extractConfig, handlePolledConfig, PendingTracker, type CurveDiagnosis } from "./drift";
 import { piHealth, withLiveAges, READING_GAP_MIN_S, BOOT_JUMP_S, CLOCK_STEP_S, DROPOUT_WINDOW_S, LOOKBACK_S, FUTURE_S, SETTLE_S, type PiHealth } from "./pilink";
 import crypto from "node:crypto";
@@ -53,7 +54,7 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_
 import { HousePages, R02_HISTORY_DAYS, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
-  digest, etDay, etHour, etDayStart, type Verdict, type DayRow, type TrendOut, type StoppedPump,
+  digest, etDay, etHour, etDayStart, evaluatedChecks, pumpRetryAllowed, type Verdict, type DayRow, type TrendOut, type StoppedPump, type CheckKind,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
 import { decayScanOnce } from "./decay";
@@ -550,28 +551,6 @@ async function ntfyDelivered(title: string, body: string, priority: string, opts
   return heard;
 }
 
-function toReading(dev: Record<string, any>): SlxReading {
-  const demands: { name: string; activated: boolean }[] = dev.demands ?? [];
-  const byName = (n: string) => demands.find((d) => d.name === n)?.activated ?? null;
-  const relStat: number[] | undefined = dev.relStat;
-  return {
-    ts: new Date(),
-    tankF: dev.temps?.temp1?.actual ?? null,
-    tankTargetF: dev.temps?.temp1?.target ?? null,
-    outdoorF: dev.temps?.temp3?.actual ?? null,
-    hdActive: byName("hd"),
-    cdActive: byName("cd"),
-    stagesCalled: Array.isArray(dev.stages)
-      ? dev.stages.map((s: { activated?: boolean }) => s.activated === true)
-      : null,
-    backupCalled: dev.backup?.activated ?? null,
-    relays: Array.isArray(relStat)
-      ? relStat.reduce((acc, bit, i) => acc | ((bit ? 1 : 0) << i), 0)
-      : null,
-    connected: dev.connected ?? null,
-  };
-}
-
 /**
  * The target the pumps must cover right now — phaseb.ts operativeLeadF on this poll's report and the config the
  * drift check just recorded: the report, or the curve in force's output when stale-target.ts proves the report a
@@ -939,7 +918,7 @@ async function checkSpanLocal(): Promise<void> {
     // the backup-element alarm's inputs: energy the element drew in the trailing 60 min (what pages at
     // SPAN_BACKUP_ALARM_KWH) and SPAN's day-cumulative reading it is differenced from.
     backup_kwh_last_hour: spanWatch?.lastHourKwh ?? null, backup_kwh_today: spanWatch?.lastDayKwh ?? null,
-    backup_alarmed: spanWatch?.alarmed ?? false,
+    backup_alarmed: spanWatch?.alarmed ?? false, backup_kwh_blind_spell: spanWatch?.lastBlindSpell ?? null,
   };
   spanLocal = spanHealth(await store.spanLocalLatest(nowS), nowS, cloud);
   spanLocalError = null;
@@ -986,7 +965,12 @@ let pumpHealthGate: string | null = "not evaluated yet";
 let pumpHealthError: string | null = null;
 let pumpDailyError: string | null = null;
 let pumpHealthAt: string | null = null;
-let pumpEvaluatedSinceRestore = false;
+// The restore path's invariant (restoreAlertState → alerts.retry): a re-adopted, unheard pump_* row is re-sent only once
+// the CHECK THAT OWNS IT has judged its own data since the restore — a resolved incident is then closed by that
+// judgement, not re-paged. The checks read different sources (mirror readings/span vs the HBX series for
+// stage_never_called) and go blind independently, so this is a set of checks, not one boolean: #257 made a single flag
+// settable by a stage-2 verdict that needed no mirror data, which let a restart re-page an unevaluated pump_idle_draw.
+const pumpEvaluatedSinceRestore = new Set<CheckKind>();
 // shadow episodes: same outbox machinery, but the "channel" is the log line — never ntfy, never email
 const shadowAlerts = new AlertOutbox(store, async (title, body) => { console.warn(`[pumphealth][shadow] ${title}: ${body}`); return true; });
 
@@ -1040,7 +1024,7 @@ async function checkPumpHealth(): Promise<void> {
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();
-  if (alertStateRestored && verdicts.some((v) => v.state !== "unknown")) pumpEvaluatedSinceRestore = true;
+  if (alertStateRestored) for (const c of evaluatedChecks(verdicts)) pumpEvaluatedSinceRestore.add(c); // only a verdict that judged ITS data
   pumpWatch.setNames(pumpNames);
   for (const e of pumpWatch.step(verdicts)) {
     const live = PH_LIVE.live.has(e.check);
@@ -2367,7 +2351,7 @@ async function loopBody(): Promise<void> {
   await alerts.retry((kind) => (kind.startsWith("shadow_") ? false
     : kind === "backup_gate_shadow" ? false // its own outbox (default priority, email) re-sends it, never the high one
     : kind === "backup_gate" ? true // open = the breaker is closed until the gate re-opens it
-    : kind.startsWith("pump_") ? pumpEvaluatedSinceRestore
+    : kind.startsWith("pump_") ? pumpRetryAllowed(kind, pumpEvaluatedSinceRestore) // per check: its own source judged
     : kind === "span_local_stale" ? spanEvaluatedSinceRestore
     : kind === genKind ? genEvaluatedSinceRestore : stageEvaluatedSinceRestore))
     .catch((e) => console.error("alert re-send failed:", (e as Error).message));

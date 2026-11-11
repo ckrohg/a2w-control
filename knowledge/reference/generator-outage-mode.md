@@ -95,7 +95,8 @@ treated as the generator only while an outage is plausible; otherwise the grid i
       - DHW;
       - `COMFORT_EXCLUDE_ZONES`. The default is the barn: "Barn - Tack" read exactly 59 °F in 344 of 344 samples (a
         stuck sensor), and "Barn Basement" is held at 55.4 °F.
-    - **at risk** when any occupied zone is < 62 °F (2 °F above the floor), or ≥ 2 °F below its own setpoint.
+    - **at risk** when any occupied zone is < 62 °F (2 °F above the floor), or ≥ 4 °F below its own setpoint (owner 2026-11-04; it was 2 °F, which the bathrooms alone tripped in 47 % of
+      hydronic hours Oct 30 – Nov 2).
     - **unknown** when an occupied zone has no temperature, or a stale one. TempIQ's payload has no per-zone reading
       time, so a reading unchanged for 6 h counts as stale. Such a zone is never silently dropped.
 
