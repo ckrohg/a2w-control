@@ -12,6 +12,7 @@
 
 // One-way dependency: storm.ts imports nothing from this module, so this cannot cycle.
 import { unitConverter } from "./storm";
+import { localDayKey } from "./dhw"; // dhw.ts imports nothing
 
 export interface ForecastHour {
   ts: Date;
@@ -87,7 +88,7 @@ export interface PriorExcursion {
 }
 
 /** Local-day key (the TZ env makes the Date getters local) — the unit the bank and the soak are planned per. */
-const dayKeyOf = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+const dayKeyOf = localDayKey;
 
 /**
  * The excursions the plan history has already placed at hours that have started — what computeShadowPlan's bank
