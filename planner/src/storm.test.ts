@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   feedFailure,
   fetchOutageStatus,
+  parseNwsAlerts,
   parseStormForecast,
   unitConverter,
   deriveSyntheticTriggers,
@@ -182,24 +183,53 @@ const REAL_KMH_BODY = {
       },
     }],
   };
-  // fetchNwsAlerts' mapping, exercised through the same shape it builds from.
-  const mapped = REAL_HIGH_WIND.features.map((f) => {
-    const p = f.properties as Record<string, string>;
-    return { expires: p.ends ?? p.expires ?? null };
-  });
-  assert.equal(mapped[0].expires, "2026-09-27T08:00:00-04:00", "the event end, not the refresh deadline");
+  const [alert] = parseNwsAlerts(REAL_HIGH_WIND);
+  assert.equal(alert.expires, "2026-09-27T08:00:00-04:00", "the event end, not the refresh deadline");
+  assert.equal(alert.tier, "arm", "a Warning arms");
+  assert.equal(alert.onset, "2026-09-25T12:30:00-04:00");
 
-  // And end-to-end through the machine: the armed window must outlast the bulletin.
+  // And end-to-end, parser → machine: the armed window is `ends` + the 1 h tail, not the bulletin refresh.
   const now = new Date("2026-09-25T17:00:00Z");
-  const alert = {
-    event: "High Wind Warning", severity: "Severe", tier: "arm" as const,
-    onset: "2026-09-25T12:30:00-04:00", expires: "2026-09-27T08:00:00-04:00",
-    headline: "hwo",
-  };
   const res = evaluateStormState({ kind: "idle" }, { alerts: [alert], synthetic: [], outageActive: null }, now);
   assert.equal(res.transitions[0], "arm");
-  assert.ok(res.state.kind === "armed" && Date.parse(res.state.windowEnd) > Date.parse("2026-09-27T08:00:00-04:00"),
-    "window must extend past the event end, not stop at the bulletin refresh");
+  assert.ok(res.state.kind === "armed");
+  assert.equal(Date.parse(res.state.windowEnd), Date.parse("2026-09-27T08:00:00-04:00") + 3600_000,
+    "windowEnd = ends + 1 h tail");
+}
+
+// 6b. The rest of parseNwsAlerts: what passes the event filter, which tier it gets, the fallbacks,
+//     and that a malformed body yields no alerts rather than a throw that empties the poll.
+{
+  const feat = (properties: Record<string, unknown>) => ({ properties });
+  const one = (properties: Record<string, unknown>) => parseNwsAlerts({ features: [feat(properties)] });
+
+  // `ends: null` is legitimate on some alert types — fall back to `expires`.
+  assert.equal(one({ event: "Winter Storm Warning", ends: null, expires: "2026-01-15T20:00:00Z" })[0].expires,
+    "2026-01-15T20:00:00Z", "ends null → expires");
+  assert.equal(one({ event: "Winter Storm Warning" })[0].expires, null, "neither → null");
+
+  // Filter and tier: an Advisory/Watch in the family is a notice; only "Warning" arms.
+  const chill = one({ event: "Wind Chill Advisory", expires: "2026-01-15T20:00:00Z" });
+  assert.equal(chill.length, 1, "Wind Chill Advisory passes the filter");
+  assert.equal(chill[0].tier, "notice", "…as a notice, not an arm");
+  assert.equal(one({ event: "Blizzard Warning" })[0].tier, "arm");
+  assert.deepEqual(one({ event: "Wind Advisory" }), [], "plain Wind Advisory is not storm-grade");
+  assert.deepEqual(one({ event: "Flood Warning" }), [], "a Warning outside the family is dropped");
+
+  // Onset falls back to `effective`, then null.
+  assert.equal(one({ event: "Ice Storm Warning", effective: "2026-01-15T08:00:00Z" })[0].onset, "2026-01-15T08:00:00Z");
+  assert.equal(one({ event: "Ice Storm Warning" })[0].onset, null);
+
+  // Defaults for the display fields.
+  const bare = one({ event: "Extreme Cold Warning" })[0];
+  assert.equal(bare.severity, "Unknown");
+  assert.equal(bare.headline, "Extreme Cold Warning", "headline falls back to the event name");
+
+  // Malformed bodies: no alerts, no throw.
+  assert.deepEqual(parseNwsAlerts({}), [], "no features");
+  assert.deepEqual(parseNwsAlerts({ features: null }), [], "features: null");
+  assert.deepEqual(parseNwsAlerts({ features: [{}] }), [], "a feature with no properties");
+  assert.deepEqual(parseNwsAlerts(null), [], "null body");
 }
 
 // 7. #119 re-timing. An armed window used to be frozen until it lapsed, so a storm that shifted
