@@ -1005,7 +1005,11 @@ async function checkPumpHealth(): Promise<void> {
   const uaRaw = Number((winterDpState as Record<string, unknown> | null)?.tank_ua);
   const ua = Number.isFinite(uaRaw) && uaRaw > 0 ? uaRaw : DEFAULT_TANK_UA;
   const verdicts: Verdict[] = [];
-  for (const id of ids) verdicts.push(...evaluatePump(id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], nowPi));
+  // defrost_overlong counts only while the pump's mapped stage calls (2026-11-09 review): no mapped stage → unknown
+  for (const id of ids) {
+    const stage = Object.entries(STAGE_MAP.map).find(([, p]) => p === id)?.[0];
+    verdicts.push(...evaluatePump(id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], nowPi, stage ? { stage, tank } : null));
+  }
   for (const [stage, id] of Object.entries(STAGE_MAP.map)) {
     if (!PUMP_SPAN_CIRCUITS[id]) continue;
     verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
