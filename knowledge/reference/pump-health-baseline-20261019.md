@@ -193,11 +193,21 @@ A **20 %** flag sits ~1.6× above the worst week-over-baseline swing seen.
 | `running_no_lift` | 15 min of steady heating (≥ 5 min into the run, ≥ 5 min after defrost), mean ΔT **< 1.5 °C** while SPAN draws ≥ 1 kW | observed min 3.4 / 3.9 °C (cold); 1.5 leaves room for winter's lower lift |
 | `heating_no_draw` | reported heating ≥ 7 min, trailing 5-min SPAN mean **< 1 000 W** | observed min 2 851 W |
 | `idle_draw` | reported idle/off ≥ 10 min, trailing 9-min SPAN mean **> 1 000 W** | observed max 672 W; isolated > 1 kW samples last ≤ 0.8 min |
-| `defrost_overlong` | continuous `defrost` **> 12 min** (was 20 until 2026-10-26) (the unit's own max defrost setting caps at 20) | normal 4–9.4 min; the two real anomalies were 31 and 83 min |
+| `defrost_overlong` | continuous `defrost` **> 12 min** (was 20 until 2026-10-26) (the unit's own max defrost setting caps at 20), **counted only while the mapped HBX stage calls** (since 2026-11-10) | normal 4–9.4 min; the two real anomalies were 31 and 83 min |
 | `called_tank_flat` | stage called + mapped pump engaged (heating/defrost) ≥ 90 % of 45 min; tank net rise + standby loss **≤ 2 °F** **and** engaged ΔT **< 1.5 °C**; held **30 min** | measured (§5): healthy engaged ΔT min 2.1 °C; 1 trip in 97 d, the stuck defrost |
 | daily `lift_drift` | 7-d pooled lift index vs own prior 14 d, same 5 °C bin (≥ 2 run-h each), **≤ −20 %** | noise max 12.7 % |
 | daily `twin_drift` | p1/p2 index ratio vs its own 14-d baseline, same bin, **≥ 20 %** change | 1 comparison so far |
 | daily `short_cycling` | **> 6** starts in any trailing 60 min | observed max 4 |
+
+**2026-11-10 retune of `defrost_overlong` (owner decision, from the 2026-11-09 weekly review).** All 5 shadow
+episodes from Oct 31 to Nov 2 were false alarms. In each one the HBX call had ended, but the pump kept reporting
+`defrost` while idle: standby ~53–65 W, inlet/outlet ΔT ≈ 0, and back to heating within 20 s of the next call. The
+real stuck defrost (pump1, 2026-10-18 02:07Z = 10-17 22:07 ET, 82 min) ran with stage 1 calling throughout. The
+check now trips only when every reading of the 12-min window is `defrost` **and** the `STAGE_PUMP_MAP` stage for
+that pump is called at each of them. The call at a reading comes from the newest HBX poll at or before it, no more
+than 450 s old. Defrost while the stage is not calling is "ok" (an idle hold). Missing or gappy stage-call data is
+"unknown". The reported minutes count only the called stretch. Replayed since Oct 15, the rule keeps Oct 18 and
+drops all 7 false trips. Tests: `planner/src/pumphealth-defrost.test.ts`.
 
 Stale-data gating follows stagewatch. Nothing is evaluated when the hub has no live Pi frame (#167
 `piStateUnverifiable`). The newest mirror reading must be ≤ 3 min old after correcting for the measured Pi clock

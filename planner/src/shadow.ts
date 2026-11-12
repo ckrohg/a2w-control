@@ -70,15 +70,20 @@ export interface ShadowOpts {
    * started (priorExcursionsFromPlans). The bank is chosen once per local day: a past bank or soak on a day means
    * its deliberate charge is spent; a bank on the current hour stays where it is. Absent / empty = no memory —
    * the pre-fix plan, which re-banked the current hour every recompute on a falling afternoon.
+   * #285: the same memory keeps a pre-boost the history placed on the CURRENT hour at the target the auto-pilot
+   * already commanded, so a replan late in the hour does not rewrite it.
    */
   priorExcursions?: PriorExcursion[];
 }
 
-/** A bank / soak block the plan history placed at an hour that has started (ts ≤ now). */
+/** A bank / soak / pre-boost block the plan history placed at an hour that has started (ts ≤ now). */
 export interface PriorExcursion {
   ts: string; // ISO hour start, as stored in the plan block
   bank?: boolean;
   sani?: boolean;
+  /** #285: a pre-boost the history placed, with the target it was commanded at (what a replan keeps in force). */
+  boost?: boolean;
+  tank_target_f?: number;
 }
 
 /** Local-day key (the TZ env makes the Date getters local) — the unit the bank and the soak are planned per. */
@@ -86,24 +91,27 @@ const dayKeyOf = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}
 
 /**
  * The excursions the plan history has already placed at hours that have started — what computeShadowPlan's bank
- * remembers across the hourly recompute. The NEWEST plan covering an hour decides that hour (a bank an older plan
- * placed and a newer plan moved never happened: the newer plan was the one in force); blocks whose hour has not
- * started yet are ignored (the recompute may still move them). Plans are taken oldest → newest (by `computedAt`
- * when present, else in the given order, which store.recentPlans already guarantees).
+ * (and, #285, its pre-boost) remembers across the hourly recompute. The NEWEST plan covering an hour decides that
+ * hour (a bank an older plan placed and a newer plan moved never happened: the newer plan was the one in force);
+ * blocks whose hour has not started yet are ignored (the recompute may still move them). Plans are taken oldest →
+ * newest (by `computedAt` when present, else in the given order, which store.recentPlans already guarantees). A
+ * pre-boost carries its stored tank_target_f: that is the number the auto-pilot commanded for the hour, and what a
+ * replan keeps.
  */
 export function priorExcursionsFromPlans(plans: { computedAt?: Date; plan: unknown }[], nowMs: number): PriorExcursion[] {
   const ordered = [...plans].sort((a, b) => (a.computedAt?.getTime() ?? 0) - (b.computedAt?.getTime() ?? 0));
   const byHour = new Map<number, PriorExcursion>();
   for (const p of ordered) {
     if (!Array.isArray(p.plan)) continue;
-    for (const b of p.plan as { ts?: unknown; bank?: unknown; sani?: unknown }[]) {
+    for (const b of p.plan as { ts?: unknown; bank?: unknown; sani?: unknown; boost?: unknown; tank_target_f?: unknown }[]) {
       const ts = typeof b?.ts === "string" ? b.ts : null;
       const t = ts == null ? NaN : new Date(ts).getTime();
       if (ts == null || !Number.isFinite(t) || t > nowMs) continue;
-      byHour.set(t, { ts, bank: b.bank === true, sani: b.sani === true });
+      const target = Number(b.tank_target_f);
+      byHour.set(t, { ts, bank: b.bank === true, sani: b.sani === true, boost: b.boost === true, ...(Number.isFinite(target) ? { tank_target_f: target } : {}) });
     }
   }
-  return [...byHour.values()].filter((e) => e.bank || e.sani);
+  return [...byHour.values()].filter((e) => e.bank || e.sani || e.boost);
 }
 
 /** #135: a pre-boost below this is noise (one sample of standby drift) and is not planned. */
@@ -121,12 +129,6 @@ export const MIN_PREBOOST_DRAWS = 6;
  * 120 °F tank delivers below it). strictCapF (135) still bounds the commanded target: 120 + 16 = 136 → 135.
  */
 export const MAX_PREBOOST_F = 16;
-/**
- * #135: standby loss the boosted heat suffers per hour before the window opens (dhw.ts: 0.65 kW over
- * C_eff ≈ 110 gal ⇒ ~2.4 °F/h, measured). A boost placed h hours ahead is raised by this much per hour
- * so the tank still arrives at floor + sag when the draws start.
- */
-export const STANDBY_F_PER_H = 2.4;
 
 /**
  * DHW-ready floor (°F) — the number that sets the tank target in almost every hour (deep dive 2026-10-19 §2),
@@ -302,25 +304,39 @@ export function computeShadowPlan(
 
   // #135 pre-boost: the flat DHW floor does not hold a hard draw (measured 2026-08-07: 102–117 °F with
   // both pumps at full call; the 16.5 kW element paid for the shortfall at COP 1.0). For each learned
-  // window present in the horizon, the boost is SIZED FROM THE DRAW — the window's measured sag p75
-  // (dhw.ts measureWindowSags) — and PLACED in the warmest of the preceding non-window hours (up to
-  // prechargeLookbackH; flat rate + net metering ⇒ ambient is the only cost lever), raised by the
-  // standby loss it will suffer before the bell so the trough, not the pre-draw peak, stays at the
-  // floor. If that decay allowance would push the warmest hour past strictCap, the hour right before
-  // the window (least decay) is used instead. Raises only, band-clamped below like every block; Phase B
+  // window present in the horizon, the boost is SIZED FROM THE DRAW — the window's measured sag p90
+  // (dhw.ts measureWindowSags) — and PLACED in the hour right before the window opens, so the tank is
+  // at boost height when the draws start. Raises only, band-clamped below like every block; Phase B
   // leads the pump setpoints off it as it does for the bank. A pre-boost can never make a shower colder.
   // (This replaces the dormant pre-charge branch that could not fire since idleF == dhwFloorF, #58.)
+  //
+  // #285 (2026-11-10): until now the boost went to the WARMEST lead hour with a 2.4 °F/h standby allowance,
+  // falling back to the hour before the bell only when that allowance breached the everyday cap. Sized at
+  // 15 °F the allowance always breached it, so the boost sat at 05:00 and the tank was at 130 °F by 06:00
+  // (Oct 30 – Nov 1). When the rolling p90 fell to 10 °F the allowance fit (120 + 10 + 4.8 = 134.8) and
+  // the boost moved to 03:00 — the warmest overnight hour — where it charged the tank to 135–138 °F and
+  // then the 120 °F floor blocks at 04:00 and 05:00 let it coast to 122–128 °F by the showers (Nov 2–4,
+  // 6, 7). Every hourly replan then re-placed it on whichever lead hour was current (04:00, then 05:00),
+  // so the auto-pilot wrote floor / boost / floor / boost each morning. The allowance modelled standby
+  // loss against a target the floor blocks did not hold. Now: the boost is always the hour before the
+  // bell (no block between it and the window can lower the target), sized floor + sag, and a boost the
+  // plan history already placed on the CURRENT hour is kept at its commanded target (priorExcursions, the
+  // bank's memory) so a replan late in the hour reads "already commanded" instead of rewriting it.
+  //
   // Scheduled AFTER the soak and the bank so a deliberate excursion already in the lead interval is
   // seen: a soak or bank anywhere in the lead hours IS the pre-boost (it banks more), and a draft that
   // carries sani/bank is never re-labelled (one excursion identity per block; codex, #148).
   // Keyed to the PEAK draw windows the boosts were measured over (dhw.ts peakWindows), not the padded
   // floor windows: on this house those cover nearly the whole day, so "before the window" would mean
-  // "before midnight". A lead hour must not itself lie inside a peak (that is where the draws are).
-  // Every learned peak excludes lead hours (a draw is predictable there whether or not its sag earned a
-  // boost); only the peaks with enough measured draws and sag RECEIVE a boost (codex, #148).
+  // "before midnight". A lead hour must not itself lie inside a peak (that is where the draws are), so
+  // the boost takes the latest lead hour outside every peak (the hour before the bell unless that hour
+  // belongs to another peak). Every learned peak excludes lead hours (a draw is predictable there whether
+  // or not its sag earned a boost); only the peaks with enough measured draws and sag RECEIVE a boost
+  // (codex, #148).
   const allPeaks = opts.preBoosts ?? [];
   const inPeak = (h: number) => allPeaks.some((b) => h >= b.windowStart && h < b.windowEnd);
   const peaks = allPeaks.filter((b) => b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F);
+  const priorBoosts = (opts.priorExcursions ?? []).filter((p) => p.boost);
   for (const pb of peaks) {
     const start = pb.windowStart;
     const idx = draft.findIndex((d) => d.localH === start);
@@ -328,19 +344,27 @@ export function computeShadowPlan(
     const lead = draft.slice(Math.max(0, idx - opts.prechargeLookbackH), idx)
       .filter((d) => !inPeak(d.localH));
     if (!lead.length) continue;
+    const window = `${String(start).padStart(2, "0")}:00 window`;
+    const sag = `sag ${pb.sagP90F != null ? `p90 ${pb.sagP90F}` : `p75 ${pb.sagP75F}`}°F over ${pb.n} draws`;
+    // #285: a boost the history placed on a lead hour that has STARTED (only the current hour can be) is kept there at
+    // the target the auto-pilot commanded — never re-derived, never moved. The reason still reads as a pre-boost
+    // (curveDecision, the poster, the identification driver all match on it) and says it was kept.
+    const prior = priorBoosts.find((p) => lead.some((d) => !d.sani && !d.bank && new Date(p.ts).getTime() === d.f.ts.getTime()));
+    if (prior) {
+      const kept = lead.find((d) => new Date(prior.ts).getTime() === d.f.ts.getTime())!;
+      kept.target = Math.min(Math.max(kept.target, prior.tank_target_f ?? kept.target), opts.strictCapF);
+      kept.boost = true;
+      kept.reason = `pre-boost to ${Math.round(kept.target)}°F for ${window} (${sag}; kept from the previous plan, ${kept.f.outdoorF.toFixed(0)}°F)`;
+      continue;
+    }
     if (lead.some((d) => d.sani || d.bank)) continue; // the soak / bank in the lead IS the pre-boost
     const boostF = Math.min(pb.boostF, MAX_PREBOOST_F);
-    const place = (d: Draft) => {
-      const hoursAhead = Math.max(0, ((draft[idx].f.ts.getTime() - d.f.ts.getTime()) / 3600_000) - 1); // the lead hour itself is spent charging
-      const raw = opts.dhwFloorF + boostF + STANDBY_F_PER_H * hoursAhead;
-      return { d, hoursAhead, raw, to: Math.min(raw, opts.strictCapF) };
-    };
-    const warmest = place(lead.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a)));
-    const chosen = warmest.raw > opts.strictCapF ? place(lead[lead.length - 1]) : warmest;
-    if (chosen.to <= chosen.d.target) continue; // a bank / soak already sits higher — it IS the pre-boost
-    chosen.d.target = chosen.to;
-    chosen.d.boost = true;
-    chosen.d.reason = `pre-boost to ${Math.round(chosen.to)}°F for ${String(start).padStart(2, "0")}:00 window (sag ${pb.sagP90F != null ? `p90 ${pb.sagP90F}` : `p75 ${pb.sagP75F}`}°F over ${pb.n} draws${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}${chosen.hoursAhead > 0 ? `, +${Math.round(STANDBY_F_PER_H * chosen.hoursAhead)}°F standby over ${chosen.hoursAhead} h` : ""}; ${chosen === warmest ? "warmest lead hour" : "hour before the bell"}, ${chosen.d.f.outdoorF.toFixed(0)}°F)`;
+    const to = Math.min(opts.dhwFloorF + boostF, opts.strictCapF);
+    const chosen = lead[lead.length - 1]; // the hour before the bell: nothing after it can let the charge coast away
+    if (to <= chosen.target) continue; // a bank / soak already sits higher — it IS the pre-boost
+    chosen.target = to;
+    chosen.boost = true;
+    chosen.reason = `pre-boost to ${Math.round(to)}°F for ${window} (${sag}${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}; hour before the bell, ${chosen.f.outdoorF.toFixed(0)}°F)`;
   }
 
   // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
