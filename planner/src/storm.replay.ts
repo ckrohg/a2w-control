@@ -14,8 +14,8 @@
  * Run: npx tsx planner/src/storm.replay.ts
  */
 import { readFileSync } from "node:fs";
-import { deriveSyntheticTriggers, evaluateStormState, type StormForecastHour,
-         type SyntheticTrigger, type StormState } from "./storm";
+import { deriveSyntheticTriggers, evaluateStormState, HIGH_WIND_GUST_MPH, HIGH_WIND_MIN_HOURS,
+         type StormForecastHour, type SyntheticTrigger, type StormState } from "./storm";
 
 const H = 3600_000;
 const POLL_H = 6;        // the live trigger poll is 30 min; 6 h keeps a 3-year replay tractable
@@ -25,12 +25,16 @@ const FORECAST_DAYS = 3; // fetchStormForecast uses forecast_days=3
 function oldWindow(q: StormForecastHour[]) {
   return { onset: q[0].ts, expires: new Date(Date.parse(q[q.length - 1].ts) + 6 * H).toISOString() };
 }
-/** No segmentation: ALL qualifying hours collapse into one first→last span. */
+/** No segmentation: ALL qualifying hours collapse into one first→last span.
+ *  The bars here are the 2026-07-14 ones ON PURPOSE — the "2026-07-14" column must keep meaning
+ *  what shipped then. #115 (2026-11-10) moved the LIVE bar to > HIGH_WIND_GUST_MPH for
+ *  ≥ HIGH_WIND_MIN_HOURS and deleted the cold trigger; the "current" column picks both up through
+ *  deriveSyntheticTriggers, and the raw-hour line below prints both bars so the delta is readable. */
 function oldTriggers(hours: StormForecastHour[]): SyntheticTrigger[] {
   const out: SyntheticTrigger[] = [];
   const cold = hours.filter((h) => h.tempF < 10);
   if (cold.length >= 3) out.push({ kind: "extreme-cold", detail: "", ...oldWindow(cold) });
-  const windy = hours.filter((h) => h.gustMph > 45);
+  const windy = hours.filter((h) => h.gustMph > 45); // 2026-07-14 bar; live is HIGH_WIND_GUST_MPH (#115)
   if (windy.length >= 3) out.push({ kind: "high-wind", detail: "", ...oldWindow(windy) });
   const icy = hours.filter((h) => h.weatherCode === 66 || h.weatherCode === 67);
   if (icy.length >= 2) out.push({ kind: "freezing-rain", detail: "", ...oldWindow(icy) });
@@ -100,7 +104,8 @@ const yrs = hrs.length / 8766;
 const pad = (s: string, n: number) => s.padEnd(n);
 
 console.log(`archive: ${hrs.length} h (${yrs.toFixed(2)} yr), 42.63/-70.87, poll ${POLL_H} h, forecast_days=${FORECAST_DAYS}`);
-console.log(`qualifying raw hours — gust>45: ${hrs.filter(h=>h.gustMph>45).length}   temp<10F: ${hrs.filter(h=>h.tempF<10).length}\n`);
+console.log(`qualifying raw hours — 2026-07-14 bars: gust>45: ${hrs.filter(h=>h.gustMph>45).length}   temp<10F: ${hrs.filter(h=>h.tempF<10).length}`);
+console.log(`                       current (#115):  gust>${HIGH_WIND_GUST_MPH}: ${hrs.filter(h=>h.gustMph>HIGH_WIND_GUST_MPH).length}   (≥${HIGH_WIND_MIN_HOURS} h dwell; no cold trigger)\n`);
 
 const O = replay("old"), N = replay("new");
 console.log(`${pad("metric",28)}${pad("2026-07-14",14)}${pad("current",14)}delta`);
@@ -117,8 +122,8 @@ row("max event length", Math.max(0,...O.events), Math.max(0,...N.events), " h");
 row("triggers emitted (all polls)", O.triggerCount, N.triggerCount);
 
 console.log("\nReading this:");
-console.log("- MORE triggers emitted is the intended direction: per-storm segmentation splits spans");
-console.log("  the old code merged, so two fronts now yield two windows instead of one bridging the");
-console.log("  calm between them. The count going up is the fix working, not regressing.");
+console.log("- Triggers emitted pulled two ways: per-storm segmentation splits spans the old code merged");
+console.log("  (two fronts → two windows, count UP), while #115's bars — gust > " + HIGH_WIND_GUST_MPH + " for ≥ " + HIGH_WIND_MIN_HOURS + " h and no");
+console.log("  cold trigger — drop most of the old arms (count DOWN). Since 2026-11-10 the net is down.");
 console.log("- FEWER armed hours is the intended direction: the lead now comes off onset (2 h) instead");
 console.log("  of min(onset-24h, now), which in practice meant 'start the moment a trigger appears'.");

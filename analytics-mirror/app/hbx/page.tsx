@@ -411,12 +411,13 @@ export default async function HbxPage({ searchParams }: { searchParams: { hours?
               and OutageWatch grid status. A dead feed never arms anything.
             </div>
             <div className="meta">
-              <b>What arms a raise:</b> an NWS <i>Warning</i> (Winter Storm · Ice Storm · Blizzard · High Wind ·
-              Extreme Cold / Wind Chill) · forecast &lt; 10°F for ≥3 h · gusts &gt; 45 mph for ≥3 h · freezing rain ≥2 h ·
-              ≥8 in total snow · a confirmed grid outage (activates immediately, to bank heat before power loss).
+              <b>What arms a raise:</b> an NWS <i>Warning</i> (High Wind · Blizzard · Ice Storm) · forecast gusts
+              &gt; 50 mph for ≥2 h · freezing rain ≥2 h · ≥8 in total snow · a confirmed grid outage (activates
+              immediately, to bank heat before power loss). Cold alone no longer arms it (#115, 2026-11-10).
             </div>
             <div className="meta dim">
-              Watches &amp; Advisories page you but do <b>not</b> raise. Tune any threshold in planner/src/storm.ts.
+              Watches for those three are noted but do <b>not</b> raise; other NWS products are ignored. Tune any
+              threshold in planner/src/storm.ts.
             </div>
           </div>
 
