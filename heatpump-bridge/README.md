@@ -47,15 +47,18 @@ Tests: `uv run pytest`
 ```
 bridge/
   main.py           FastAPI app factory; lifespan opens the store and starts the pollers,
-                    scheduler, exporter, hub client, SPAN poller, breaker controller, self-healer
+                    scheduler, exporter, hub client, SPAN poller, breaker controller,
+                    deliberate-stop watch, self-healer, backup fallback
   config.py         typed config from config.yaml (BRIDGE_CONFIG env); pump / guardrail / auth /
-                    notifications / analytics / hub / span / self_heal sections + bridge-owned
-                    state (gateway overrides, UI-added pumps)
+                    notifications / analytics / hub / span / self_heal / backup_fallback sections
+                    + bridge-owned state (gateway overrides, UI-added pumps)
   registers.py      single source of truth for the MAHRW030ZA register map, read blocks, scaling
   modbus_client.py  async RTU-over-TCP client per pump (W610 transparent mode), reconnects,
-                    comm error counters
+                    comm error counters; a timeout drops the socket with RST (SO_LINGER 0) so a
+                    stale queued frame never reaches the bus after the link returns (#208)
   poller.py         per-pump poll loop → snapshot cache + SQLite samples + fault edge detection;
-                    owns the guarded setpoint write path
+                    owns the guarded setpoint write path; reconnect quarantine after an outage
+                    (guardrails.reconnect_min_outage_s / reconnect_write_hold_s, #208)
   faults.py         fault/protection bitfields (2111–2117) → plain-English alerts with severity
                     (P17 anti-freeze is INFO, never pages)
   guardrails.py     write-path guardrails: clamp with explicit rejection, per-pump rate limit,
@@ -64,17 +67,25 @@ bridge/
   api.py            JSON API; reads only from in-memory snapshots, never triggers Modbus traffic
   auth.py           Bearer tokens for machines (audit `source`) + signed UI session cookie
   scheduler.py      daily on/off timers per pump through the same guarded write path
-  notify.py         best-effort ntfy push, Resend email for the intervention tier, dead-man
-                    heartbeat; never raises into the caller
+  notify.py         tiered alerts (page / attention / record): ntfy log, Resend email, 6bb phone
+                    push (sixbb_alert_url / sixbb_alert_key), dead-man heartbeat; never raises
+                    into the caller
   exporter.py       read-only analytics mirror push to Vercel; out of the control loop
   hub_client.py     outbound WebSocket to the Railway hub: state frames out, `setpoint`,
                     `write_enable` and `breaker` actions in, through the existing guarded paths
   span_local.py     SPAN panel LOCAL-API poller (circuit instantPowerW), headless token re-mint,
-                    CLOSE-ONLY relay writes unless an OpenPermit is held
+                    CLOSE-ONLY relay writes unless an OpenPermit is held; picks the transport
+                    (span.transport: v1 REST, auto, v2)
+  span_v2.py        #199 SPAN v2 local transport: one MQTT-over-TLS session to the panel's eBus
+                    broker, served to span_local in the v1 /circuits shape (v1 REST ends 2026-12-31)
   span_control.py   guarded breaker controller: allowlist, power_cycle / close / open, global
                     lock, mints the single-use OpenPermit
   self_heal.py      #189 fault-triggered power cycle of a pump's SPAN circuit via span_control;
                     shadow by default
+  deliberate_stop.py  #212 a heat-pump circuit a person switched OFF outside A2W: one email,
+                    self-heal and offline escalation stand down, flagged per pump to the hub
+  backup_fallback.py  #210 Pi-local backup-element gate: CLOSE "Buffer Tank" when every pump
+                    has been down for hold_min; close-only, shadow by default
   sysstat.py        stdlib-only Pi health sampler (CPU, load, RAM, disk, SoC temp, uptime)
   discovery.py      LAN discovery of W610 gateways (USR UDP broadcast + TCP sweep); MAC helpers
                     for the poller's identity check
@@ -83,6 +94,8 @@ sim/fake_pump.py    simulated MAHRW030ZA pumps + fault-injection HTTP API (also 
                     over a real USB-RS485 dongle)
 sim/fake_span.py    in-process fake of the SPAN local API for tests; relay writes validated
                     against the panel's own OpenAPI schema (sim/span_set_circuit_state.openapi.json)
+sim/fake_span_v2.py the v2 side of the same fake: a minimal MQTT broker over real TLS publishing
+                    the eBus tree recorded from the house panel (sim/span_v2_capture.json)
 ui/                 static mobile-first SPA (no build step), served at /
 tests/              unit + integration (integration runs a real in-process sim pump; SPAN tests
                     run against sim/fake_span.py)
@@ -101,6 +114,15 @@ tokens, hub commands) are setpoint-only under `guardrails.restrict_unattended_wr
 floored by `unattended_min_setpoint_c`; a remote setpoint is a lease that reverts to
 `baseline_setpoint_c` when the optimizer goes silent. The lease is dormant until
 `baseline_setpoint_c` is set (`deploy/config.production.yaml` sets it).
+
+**Reconnect quarantine** (#208). When a pump comes back after at least
+`guardrails.reconnect_min_outage_s` (default 60) of failed polls, writes to it are refused for
+`guardrails.reconnect_write_hold_s` (default 120), and polls during that hold are paced (1 s between the
+three block reads). The aim is to keep routine planner traffic off a bus that has just reconnected
+(HP2's E21 onsets cluster after the Pi's Wi-Fi outages). Some writes are never held: the lease's baseline
+revert, power-ON, and writes a person starts (local UI, dashboard via the hub). At most one hold runs per
+10 min, there is no hold after a bridge restart, and `reconnect_write_hold_s: 0` turns it off. Each hold
+is audited as a `reconnect_hold` event.
 
 ## SPAN local
 
@@ -184,6 +206,84 @@ so it works with the cloud down.
 Config keys (`self_heal:`): `enabled`, `live`, `fault_codes`, `grace_min`, `max_attempts`,
 `window_h`, `verify_min`, `off_s`, `running_power_w`, `circuits`, `circuits_verified`.
 
+## Backup fallback
+
+`bridge/backup_fallback.py` (#210). This is the Pi-local half of the backup-element gate. The planner's
+gate (`planner/src/backupgate.ts`) decides from the HBX tank and stage calls, which only reach
+the Pi through SensorLinx and the hub. This fallback needs neither. When every heat pump has
+been DOWN for `hold_min` without a break, it CLOSES the "Buffer Tank" breaker so the HBX can fire the
+element on its own backup call. The only breaker action it ever calls is `close`, so it cannot switch
+anything off.
+
+- **Per-pump state.** Each pump is judged every 30 s:
+  - DOWN: a fresh poll shows a blocking fault while the pump is not running. Or the pump is
+    Modbus-stale and a fresh panel read shows its circuit drawing under `running_power_w`.
+  - OFF: switched off on the unit, or its circuit is OPEN at the panel (a deliberate stop or a
+    self-heal cycle). Never treated as a failure.
+  - UNKNOWN: stale with no fresh panel read, or no draw reading. A Pi Wi-Fi drop loses Modbus
+    and SPAN together, so it must never read as "every pump down".
+  - UP: anything else, including a stale pump whose circuit still draws running power.
+
+  Only "every pump DOWN" counts. An OFF, UNKNOWN or UP pump ends the episode and restarts the clock.
+- **Generator budget** (#241). The Pi cannot tell the grid from the generator, so it always applies
+  the generator rule: no close unless the live house load from a fresh panel read (every circuit but
+  the element's; with a circuit unread, the panel's v2 site power stands in), plus `element_w` and
+  `generator_margin_w`, stays under `generator_cap_w`. Unknown load means no close, and the close
+  re-runs the same check on the controller's fresh read just before it switches. A held episode is
+  re-checked every tick and noted once per hold, at most once per 5 min. The owner's rule of
+  2026-11-02 is that the element never closes automatically on the generator (a 20 kW Kohler 20RESA).
+  This budget is not that rule: with the defaults it fits only when the rest of the house draws at
+  most 1.1 kW, so on the generator it can still close at a very low load, and on the grid it will
+  usually refuse. The Pi has no generator signal, so `backup_fallback.live` must stay `false` until it
+  has one (`../knowledge/reference/generator-outage-mode.md`, pre-live gaps).
+- **One decision per episode**, and none at all within `cooldown_h` of the last one. If the breaker
+  already reads CLOSED, the fallback only records that. A refused close is retried every 5 min, and the
+  first refusal of an episode pages.
+- **Shadow by default.** `backup_fallback.live` defaults to `false`. In shadow mode the fallback
+  records "would close" in the events table and the ntfy log, and switches nothing. Live, it acts
+  whatever the owner's arm intent is: going live is the opt-in for this one emergency. A verified close is
+  an email. A close that cannot be confirmed, or a live fallback on a bridge without breaker control,
+  pages.
+
+Status appears in `/api/health.backup_fallback` and in the hub state frame (`span.backup_fallback`).
+The pump→circuit map is `self_heal.circuits`.
+
+Config keys (`backup_fallback:`, a top-level section): `enabled` (evaluate at all, default `true`),
+`live` (actually close the breaker, default `false`), `hold_min` (how long every pump must stay down
+before acting, default 30, 10–240), `running_power_w` (circuit draw that means the compressor is running,
+default 500 W), `cooldown_h` (minimum gap between decisions, default 6, 1–48), `generator_cap_w`,
+`generator_margin_w`, `element_w` (the generator budget, defaults 20 kW / 2.4 kW / 16.5 kW).
+
+## Deliberate stops
+
+`bridge/deliberate_stop.py` (#212, bridge side #227). The 6bb app and the SPAN app can each
+switch Air-Water 1/2, and the panel reports both as USER, so A2W cannot tell who switched a circuit. It
+does know its own actions. A heat-pump circuit counts as a person's deliberate stop, not a fault,
+when a fresh panel read shows it OPEN and A2W has no breaker action on it in progress or in the last
+10 min.
+
+- **One email.** Once the circuit has stayed off for 3 min, the owner gets one attention email. A 6bb power
+  cycle (≥ 60 s off, then on) is shorter than that and is only logged as an event. When the circuit
+  comes back ON there is a record-only note.
+- **What stands down.** Self-heal never acts on that pump. The pump still counts as down for the other
+  pump's guards, so the remaining pump is never cycled. The poller stops escalating the pump's outage,
+  and the outage clock restarts when the stop ends. The backup fallback reads the pump as OFF, not
+  DOWN.
+- **Planner.** The hub state frame carries `deliberate_stop` per pump, so the planner's stage watch,
+  "no heat" check and pump health do not page it. The planner sends one reminder if the pump is still
+  off hours later while the HBX calls its stage. The Pi cannot see that call.
+- **In force only while backed.** A stale panel read changes nothing, so a Pi network drop
+  neither starts nor ends a stop. A held verdict only counts while the last fresh panel read is at
+  most 10 min old and the pump is not answering Modbus. A switched-off pump cannot answer, so a fresh
+  online poll means it is back on. This way a dead SPAN stream cannot keep a pump "deliberately
+  stopped" and silence its alerts.
+- `since` and `announced` are persisted to `deliberate-stops.json` next to the DB, so a restart never
+  re-announces a stop.
+
+There are no config keys. The watch runs whenever breaker control is configured (`span.host` +
+`span.passphrase`), uses the `self_heal.circuits` map, and its timings are module constants. Status
+appears in `/api/health.deliberate_stops`.
+
 ## Hub link
 
 `bridge/hub_client.py`. The Pi dials OUT to the Railway hub over WebSocket and holds the
@@ -203,6 +303,24 @@ without an ack, and those stay human-only on the direct path. If the hub is down
 Tailscale Funnel control are unaffected. Enabled only when both `hub.url` and `hub.token` are
 set. See `deploy/railway-hub.md`.
 
+## Alerts
+
+`bridge/notify.py`. Every alert declares one of the owner's three tiers
+(`../knowledge/reference/alert-policy.md`, #219/#224). The planner and hub use the same tiers:
+
+- `page`: 6bb phone push + email. The house is at risk, or a human must act soon.
+- `attention`: email only. Worth a look this week.
+- `record`: ntfy log and events table only. ntfy is the log and nobody subscribes to it.
+
+Everything also goes to ntfy. Only a page gets a pushed and emailed all-clear; the all-clear of an
+attention alert is record-only. The ntfy priority only sets loudness and never picks the channel.
+
+The phone push (#211/#237) POSTs to 6bb's token-protected `/api/external/alert`.
+`notifications.sixbb_alert_url` is that endpoint and `notifications.sixbb_alert_key` is the bearer key
+sent with it. If either is unset, pages arrive by email only. Each push carries a per-incident tag, so the
+all-clear replaces the page on the phone. Email needs `resend_api_key` + `resend_to`. Keep the keys
+out of the repo like the other tokens.
+
 ## Phases
 
 - **Phase 0** ✓ — everything against `sim/fake_pump.py`; still the dev loop (Quickstart above).
@@ -214,5 +332,6 @@ set. See `deploy/railway-hub.md`.
   auto-update timer and the watchdog timer alongside.
 - **Phase 4** (current) — the hub/planner link: the planner on Railway drives setpoints as
   leases through the hub, the dashboard mirrors state, and the Pi carries the SPAN local
-  link, breaker control and self-heal so the house can act with the cloud down. Weather/price
+  link, breaker control, self-heal, deliberate-stop detection and the backup fallback so the
+  house can act with the cloud down. Weather/price
   control logic and HBX coordination live planner-side; the bridge stays the guarded executor.
