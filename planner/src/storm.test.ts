@@ -252,26 +252,28 @@ const REAL_KMH_BODY = {
   const one = (properties: Record<string, unknown>) => parseNwsAlerts({ features: [feat(properties)] });
 
   // `ends: null` is legitimate on some alert types — fall back to `expires`.
-  assert.equal(one({ event: "Winter Storm Warning", ends: null, expires: "2026-01-15T20:00:00Z" })[0].expires,
+  assert.equal(one({ event: "Blizzard Warning", ends: null, expires: "2026-01-15T20:00:00Z" })[0].expires,
     "2026-01-15T20:00:00Z", "ends null → expires");
-  assert.equal(one({ event: "Winter Storm Warning" })[0].expires, null, "neither → null");
+  assert.equal(one({ event: "Blizzard Warning" })[0].expires, null, "neither → null");
 
-  // Filter and tier: an Advisory/Watch in the family is a notice; only "Warning" arms.
-  const chill = one({ event: "Wind Chill Advisory", expires: "2026-01-15T20:00:00Z" });
-  assert.equal(chill.length, 1, "Wind Chill Advisory passes the filter");
-  assert.equal(chill[0].tier, "notice", "…as a notice, not an arm");
-  assert.equal(one({ event: "Blizzard Warning" })[0].tier, "arm");
-  assert.deepEqual(one({ event: "Wind Advisory" }), [], "plain Wind Advisory is not storm-grade");
-  assert.deepEqual(one({ event: "Flood Warning" }), [], "a Warning outside the family is dropped");
+  // Filter and tier (#115, 2026-11-10): only High Wind / Blizzard / Ice Storm Warnings arm; their Watches
+  // are a notice; everything else — Winter Storm, Wind Chill, Extreme Cold, any Advisory — is dropped.
+  for (const ev of ["High Wind Warning", "Blizzard Warning", "Ice Storm Warning"])
+    assert.equal(one({ event: ev })[0].tier, "arm", `${ev} arms`);
+  for (const ev of ["High Wind Watch", "Blizzard Watch", "Ice Storm Watch"])
+    assert.equal(one({ event: ev })[0].tier, "notice", `${ev} is a notice`);
+  for (const ev of ["Winter Storm Warning", "Winter Storm Watch", "Wind Chill Warning", "Wind Chill Advisory",
+                    "Extreme Cold Warning", "Wind Advisory", "Winter Weather Advisory", "Flood Warning"])
+    assert.deepEqual(one({ event: ev, expires: "2026-01-15T20:00:00Z" }), [], `${ev} is dropped`);
 
   // Onset falls back to `effective`, then null.
   assert.equal(one({ event: "Ice Storm Warning", effective: "2026-01-15T08:00:00Z" })[0].onset, "2026-01-15T08:00:00Z");
   assert.equal(one({ event: "Ice Storm Warning" })[0].onset, null);
 
   // Defaults for the display fields.
-  const bare = one({ event: "Extreme Cold Warning" })[0];
+  const bare = one({ event: "High Wind Warning" })[0];
   assert.equal(bare.severity, "Unknown");
-  assert.equal(bare.headline, "Extreme Cold Warning", "headline falls back to the event name");
+  assert.equal(bare.headline, "High Wind Warning", "headline falls back to the event name");
 
   // Malformed bodies: no alerts, no throw.
   assert.deepEqual(parseNwsAlerts({}), [], "no features");

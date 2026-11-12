@@ -74,7 +74,7 @@ const RETIME_MIN_SHIFT_MS = 1 * H;
 const NWS_FAMILY_RE = /\b(high wind|blizzard|ice storm)\b/i;
 const NWS_ARM_RE = /\b(high wind|blizzard|ice storm) warning\b/i;
 
-/** Pure half of fetchNwsAlerts — one GeoJSON feature's properties to a StormAlert, or null when the
+/** One NWS GeoJSON feature's properties to a StormAlert, or null when the
  *  product is not one storm mode watches. Exported so the arm/notice tiering is testable without a fetch. */
 export function nwsAlertFromProperties(p: any): StormAlert | null {
   const event = String(p?.event ?? "");
