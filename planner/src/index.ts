@@ -20,7 +20,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { HubClient, type HubState } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, STANDBY_F_PER_H, priorExcursionsFromPlans } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -2689,7 +2689,8 @@ async function main(): Promise<void> {
               })),
               // the DHW-ready floor in force (env DHW_FLOOR_F, default 120) — what the troughs above are judged against
               floor_f: DEFAULT_OPTS.dhwFloorF,
-              min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F, standby_f_per_h: STANDBY_F_PER_H,
+              // #285: the boost is placed in the hour before the window at floor + sag — no standby allowance any more
+              min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F,
               // peaks = hours where ≥ 50 % of observed days had a draw (unpadded); the floor windows are the padded 25 % ones
               peak_threshold: 0.5, floor_windows: learnedWindowsForHealth,
               // owner-declared shower windows (env DHW_SHOWER_WINDOWS), merged into the peaks above; [] when unset
