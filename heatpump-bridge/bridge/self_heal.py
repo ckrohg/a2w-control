@@ -15,6 +15,14 @@
 # Deliberate stops (#212): a pump whose circuit a PERSON switched off (deliberate_stop.py) is left alone — no cycle,
 # no verification, no pages about it — and still counts as DOWN for the other pump's guards, so the one pump left is
 # never power-cycled. "Every pump down" is not reported while one of them is down because someone switched it off.
+# A blind Pi (2026-11-13): "every pump is offline" is evidence about the pumps only while the Pi can see SOMETHING.
+# When no pump has fresh telemetry AND the SPAN panel has not answered either, the Pi has lost its network, not the
+# pumps (its Wi-Fi dropped for 6 min and the all-down watcher paged "URGENT: both heat pumps down" while pump 2 was
+# heating). Then nothing here is evidence: no both-down page, the all-down clock does not run, one record-tier
+# `pi_blind` after ALL_DOWN_PAGE_S of blindness, and for FRESH_POLL_S after sight returns a still-stale pump does not
+# count (the pollers may lag the panel read after a reconnect). The cloud side pages if the plant really stops
+# (planner: unserved call, Pi unreachable). Needs SPAN local control; without it the page stands as before. A
+# both-down page that did go out gets an all-clear, under one incident tag, once a pump is back.
 # Time: in-process holds use the monotonic clock; the attempt budget is persisted with wall time
 # + boot id + monotonic time, so a clock step can neither expire attempts early nor (within a
 # boot) shorten a hold. Persisted history that can't be read counts as a spent budget.
@@ -43,6 +51,7 @@ SELF_HEAL_ATTENTION: frozenset[str] = frozenset()  # owner 2026-10-21: a mis-con
 # offline/switched off, no fault code), self-heal giving up after its attempt budget, and a cycle self-heal could not
 # make ("switch it OFF and ON by hand"). The Oct 14-16 incident was exactly "nobody was told in time".
 SELF_HEAL_PAGE: frozenset[str] = frozenset({"both_down", "escalated", "cycle_refused"})
+BOTH_DOWN_TAG = "a2w-self-heal-both-down"   # one incident tag, so the all-clear replaces the page on the phone
 
 TICK_S = 30.0
 FRESH_POLL_S = 90.0          # a pump snapshot older than this is not evidence of anything
@@ -121,8 +130,11 @@ class SelfHealer:
                 self._pumps[pid]["verify"]["restored"] = True
                 self._pumps[pid]["status"] = "verifying (restored after a restart)"
         self._startup_paged = False
-        self._both_down_paged = False          # one both-down page until a pump is back up
+        self._both_down_paged = False          # one both-down page until a pump is back up (then an all-clear)
         self._all_down_since: float | None = None
+        self._blind_since: float | None = None    # monotonic: since when the Pi sees neither pump nor panel
+        self._blind_noted = False                 # one pi_blind record per blind spell
+        self._sight_back_at: float | None = None  # monotonic: when the last blind spell ended
 
     # --- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -154,6 +166,7 @@ class SelfHealer:
                         "stage_call": "unavailable on the Pi (HBX stage call not visible) — fault trigger only"},
             "breaker_control": self.breakers is not None,
             "history_problem": self.history_problem,
+            "blind": self._pi_blind(),
             "pumps": {pid: {"circuit": self.cfg.circuits[pid], "status": st["status"],
                             "phase": st["phase"],
                             "unavailable": self.config_errors.get(pid),
@@ -232,6 +245,41 @@ class SelfHealer:
         if any(c["heat_pump"] and c["relay_state"] is None for c in snap["circuits"]):
             return None
         return snap
+
+    def _panel_silent_s(self) -> float | None:
+        """Seconds since the SPAN panel last answered the Pi, once that is longer than SPAN_FRESH_S (inf: never
+        read); None while the panel answers, or when SPAN local control is not configured (nothing to compare)."""
+        if self.breakers is None:
+            return None
+        snap = self.breakers.snapshot()
+        mono, ts = snap.get("mono"), snap.get("ts")
+        if isinstance(mono, (int, float)):
+            age = self._mono() - mono
+        elif ts is not None:
+            age = self._clock() - ts
+        else:
+            return math.inf
+        return None if 0 <= age < SPAN_FRESH_S else max(age, 0.0)
+
+    def _pi_blind(self, downs: dict[str, str | None] | None = None) -> str | None:
+        """Why nothing the Pi sees is evidence right now: NO pump has fresh telemetry and the SPAN panel is not
+        answering either — the Pi's network is gone, not the pumps (2026-11-13). A pump down for any other reason
+        (switched off, faulted, relay open, no poller) means the Pi IS seeing something, and a panel that answers
+        while every pump is silent is the real both-down case. None when not blind."""
+        silent = self._panel_silent_s()
+        if silent is None:
+            return None
+        if downs is None:
+            downs = {pid: self._pump_down(pid, span=None) for pid in self._expected_pumps()}
+        if any(d != "is offline" for d in downs.values()):
+            return None
+        panel = "never read" if silent == math.inf else f"silent {silent / 60:.0f} min"
+        return f"no fresh telemetry from any pump and the SPAN panel {panel}"
+
+    def _just_regained_sight(self) -> bool:
+        """True for FRESH_POLL_S after a blind spell ends: the panel answers again, but the pump pollers may not
+        have polled yet, so a still-stale pump is not evidence quite yet."""
+        return self._sight_back_at is not None and self._mono() - self._sight_back_at < FRESH_POLL_S
 
     def _circuit_power(self, pid: str) -> float | None:
         snap = self._span()
@@ -365,18 +413,37 @@ class SelfHealer:
         return None
 
     async def _watch_all_down(self) -> None:
-        """Independent of triggers and phases: every pump down for ALL_DOWN_PAGE_S pages once,
-        and re-arms when any pump is back. (Shares its de-dup with the per-pump both-down page.)"""
+        """Independent of triggers and phases: every pump down for ALL_DOWN_PAGE_S pages once, and re-arms (with an
+        all-clear) when any pump is back. (Shares its de-dup with the per-pump both-down page.) While the Pi is
+        blind nothing it sees is evidence: no page, the clock does not run, one record after ALL_DOWN_PAGE_S."""
         if not self.cfg.enabled or not self._pumps:
             return
         span = self._span()
         downs = {pid: self._pump_down(pid, span=span) for pid in self._expected_pumps()}
+        blind = self._pi_blind(downs)
+        if blind:
+            self._blind_since = self._blind_since or self._mono()
+        elif self._blind_since is not None:
+            self._blind_since, self._blind_noted = None, False
+            self._sight_back_at = self._mono()
         if not all(downs.values()):
             self._all_down_since = None
-            self._both_down_paged = False
+            if self._both_down_paged:
+                self._both_down_paged = False
+                await self._both_down_clear(downs)
             return
         if any(self._stopped(p) for p in downs):
             self._all_down_since = None    # #212: a person switched one off — the owner's choice, not a fault
+            return
+        if blind:
+            self._all_down_since = None    # the page clock starts over once the Pi can see again
+            if self._mono() - self._blind_since >= ALL_DOWN_PAGE_S and not self._blind_noted:
+                self._blind_noted = True
+                await self._step(next(iter(self._pumps)), "pi_blind", "warning",
+                                 f"Every heat pump reads offline, but so does the SPAN panel ({blind}): the Pi has "
+                                 f"lost its network, not the pumps. Not paging — the planner pages if the plant "
+                                 f"really stops (unserved call) or the Pi stays unreachable.",
+                                 {"pumps": downs, "blind": blind}, title="A2W self-heal: the Pi is blind")
             return
         self._all_down_since = self._all_down_since or self._mono()
         if self._mono() - self._all_down_since < ALL_DOWN_PAGE_S or self._both_down_paged:
@@ -387,7 +454,19 @@ class SelfHealer:
         await self._step(next(iter(self._pumps)), "both_down", "critical",
                          f"Every heat pump is down ({why}). Self-heal will not power-cycle while "
                          f"the other pump is down — check both units now.",
-                         {"pumps": downs}, title="URGENT: both heat pumps down", priority="urgent")
+                         {"pumps": downs}, title="URGENT: both heat pumps down", priority="urgent",
+                         tag=BOTH_DOWN_TAG)
+
+    async def _both_down_clear(self, downs: dict[str, str | None]) -> None:
+        """The all-clear for a both-down page: a pump is back (fresh, on, not faulted-and-stopped, relay closed)."""
+        def label(pid: str) -> str:
+            return self.pollers[pid].cfg.name if pid in self.pollers else pid
+        up = [f"{label(p)} ({self.pollers[p].snapshot.get('state') or 'on'})" for p, d in downs.items() if d is None]
+        still = [f"{label(p)} {d}" for p, d in downs.items() if d]
+        msg = (f"{' and '.join(up)} {'are' if len(up) > 1 else 'is'} back up"
+               + (f"; {'; '.join(still)}" if still else "") + ". Nothing to do.")
+        await self._step(next(iter(self._pumps)), "both_down_clear", "info", msg, {"pumps": downs},
+                         title="A heat pump is back up", priority="default", resolved=True, tag=BOTH_DOWN_TAG)
 
     async def _startup_notes(self) -> None:
         if not self.cfg.enabled:
@@ -417,20 +496,22 @@ class SelfHealer:
                                  {"code": code}, title=f"A2W self-heal: {name} identity check failed")
             return
         if not fresh:
-            st["status"] = f"{code} active but {name} is offline/stale — waiting"
             span = self._span()
             other = self._other_down(pid, span=span)
+            blind = self._pi_blind() if other else None
+            st["status"] = (f"{code} active but {name} is offline/stale — "
+                            + ("the Pi is blind (no pump, no panel), waiting" if blind else "waiting"))
             if other and self._others_down_only_by_choice(pid, span=span):
                 await self._peer_stopped(pid, name, code, other)
-            elif other and not self._both_down_paged:
+            elif other and not blind and not self._just_regained_sight() and not self._both_down_paged:
                 # Nothing to cycle on stale data — but a pump offline with a last-known fault
-                # AND its peer down is the both-down case, and it pages.
+                # AND its peer down is the both-down case, and it pages (a blind Pi is not: _watch_all_down).
                 self._both_down_paged = True
                 await self._step(pid, "both_down", "critical",
                                  f"{name} is offline (last known: {code}) AND {other}. Check both "
                                  f"units; '{circuit}' can be power-cycled at the SPAN panel by hand.",
                                  {"code": code, "other": other, "target_offline": True},
-                                 title="URGENT: both heat pumps down", priority="urgent")
+                                 title="URGENT: both heat pumps down", priority="urgent", tag=BOTH_DOWN_TAG)
             return
         age_wall = (self._clock() - float(fault.get("since") or self._clock())) / 60
         age_seen = (self._mono() - st["fault_seen"][1]) / 60
@@ -459,7 +540,7 @@ class SelfHealer:
                                  f"power-cycle while the other pump is down — check both units; "
                                  f"'{circuit}' can be cycled at the SPAN panel by hand.",
                                  {"code": code, "other": other},
-                                 title="URGENT: both heat pumps down", priority="urgent")
+                                 title="URGENT: both heat pumps down", priority="urgent", tag=BOTH_DOWN_TAG)
             return
         recent = self._recent(st)
         if len(recent) >= self.cfg.max_attempts:
@@ -756,19 +837,21 @@ class SelfHealer:
             log.warning("self-heal audit failed: %s", exc)
 
     async def _step(self, pid, code, severity, message, detail, *, title: str,
-                    priority: str = "high") -> None:
+                    priority: str = "high", resolved: bool = False, tag: str = "") -> None:
         """Audit one step (every step is in the events table and the dashboard) and route it through
         the owner alert policy. Steps are RECORD, except SELF_HEAL_PAGE (a person must act now: both pumps down,
         self-heal gave up, a cycle it could not make), which PAGE. Otherwise the incident the owner hears about is the pump fault
         itself, which the poller pages once it has stuck for 30 min (poller.FAULT_PAGE_AFTER_S) and
         clears when it clears; a stuck-OFF circuit pages from span_control. Only a self-heal that
-        cannot work as configured is worth an email (SELF_HEAL_ATTENTION)."""
+        cannot work as configured is worth an email (SELF_HEAL_ATTENTION). A `resolved` step is the all-clear
+        of a page, so it takes the page tier; `tag` names the incident so the all-clear replaces it on the phone."""
         log.info("self-heal [%s] %s: %s", pid, code, message)
         await self._audit(pid, code, severity, message, detail)
-        tags = "rotating_light" if priority == "urgent" else "wrench"
-        tier = "page" if code in SELF_HEAL_PAGE else "attention" if code in SELF_HEAL_ATTENTION else "record"
+        tags = "white_check_mark" if resolved else "rotating_light" if priority == "urgent" else "wrench"
+        tier = ("page" if (code in SELF_HEAL_PAGE or resolved)
+                else "attention" if code in SELF_HEAL_ATTENTION else "record")
         t = asyncio.create_task(notify.alert(self.notify_cfg, tier=tier, title=title, message=message,
-                                             priority=priority, tags=tags,
+                                             priority=priority, tags=tags, resolved=resolved, tag=tag,
                                              action="Self-heal can't run as configured. Check the self_heal section of the "
                                                     "Pi's config and the circuit map." if tier == "attention" else None))
         self._bg.add(t)
