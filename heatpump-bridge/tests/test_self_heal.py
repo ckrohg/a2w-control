@@ -511,6 +511,7 @@ async def test_stale_target_and_down_peer_pages_both_down_once(rig):
         r.ft.t += 300
         r.p2.snapshot["last_poll_mono"] = r.ft.mono() - 200   # pump2 went silent (E21 last known)
         r.p1.snapshot["online"] = False                       # and pump1 is offline
+        await r.prime()                                       # while the panel answers: the Pi is not blind
         await heal.tick()
     await settle()
     assert r.panel.writes == []
@@ -857,3 +858,74 @@ def test_health_reports_self_heal(tmp_path):
         assert h["self_heal"]["mode"] == "shadow"
         assert h["self_heal"]["breaker_control"] is False
         assert set(h["self_heal"]["pumps"]) == {"pump1", "pump2"}
+
+
+# --- a blind Pi (2026-11-13) ----------------------------------------------------------------------------------------
+# The Pi dropped off Wi-Fi for 6 min: both pump snapshots went stale, and the all-down watcher paged "URGENT: both
+# heat pumps down" while pump 2 was heating. "Every pump offline" is evidence only while the SPAN panel answers. In
+# this rig prime() IS the panel read, so a loop without it is a panel the Pi cannot reach.
+async def test_a_blind_pi_records_instead_of_paging_both_down(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p2.fault(age_min=12)                          # pump2's last known state is E21 (the stale-target path too)
+    await heal.tick()
+    r.p1.snapshot["online"] = False                 # the network drops: no pump answers, no panel read
+    for _ in range(4):                              # 20 min
+        r.ft.t += 300
+        await heal.tick()
+    await settle()
+    assert "both_down" not in await all_codes(r.store)
+    assert (await codes(r.store, "pump1")).count("pi_blind") == 1      # one record; nobody's phone, no email
+    assert [a for a in r.alerts if a[0] in ("push", "email")] == []
+    assert heal.status()["blind"] and "blind" in heal.status()["pumps"]["pump2"]["status"]
+    # the panel answers again but the pumps still do not: the real both-down case — after a fresh ALL_DOWN_PAGE_S,
+    # since the pump pollers may lag the panel read after a reconnect
+    await r.prime()
+    await heal.tick()
+    await settle()
+    assert "both_down" not in await all_codes(r.store)
+    assert heal.status()["blind"] is None
+    r.ft.t += sh_mod.ALL_DOWN_PAGE_S
+    await r.prime()
+    await heal.tick()
+    await settle()
+    assert (await all_codes(r.store)).count("both_down") == 1
+    assert len([a for a in r.alerts if a[0] == "push" and "both heat pumps down" in a[1].lower()]) == 1
+
+
+async def test_a_both_down_page_gets_an_all_clear_when_a_pump_is_back(rig):
+    r = rig
+    heal = r.make(live=True)
+    r.p1.snapshot["online"] = False
+    r.p2.snapshot["online"] = False                 # both silent while the panel answers (step primes it)
+    for _ in range(2):
+        await r.step(heal, 300)
+    await settle()
+    assert (await all_codes(r.store)).count("both_down") == 1
+    r.p2.snapshot.update(online=True, state="heating", running=True)
+    await r.step(heal)
+    await settle()
+    assert (await codes(r.store, "pump1")).count("both_down_clear") == 1
+    clears = [a for a in r.alerts if a[0] == "push" and "back up" in a[1].lower()]
+    assert len(clears) == 1 and clears[0][2] == "default"              # the all-clear replaces the page, quietly
+    assert any(a[0] == "email" and a[1].startswith("✅ A2W RESOLVED") for a in r.alerts)
+    # and the next episode pages afresh
+    r.p2.snapshot["online"] = False
+    for _ in range(2):
+        await r.step(heal, 300)
+    await settle()
+    assert (await all_codes(r.store)).count("both_down") == 2
+
+
+async def test_without_span_control_both_offline_still_pages(rig):
+    r = rig
+    heal = SelfHealer(SelfHealConfig(circuits_verified=True), {"pump1": r.p1, "pump2": r.p2}, None, r.store,
+                      state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.mono, boot_id="boot-A")
+    r.p1.snapshot["online"] = False
+    r.p2.snapshot["online"] = False
+    for _ in range(2):
+        r.ft.t += 300
+        await heal.tick()
+    await settle()
+    assert heal.status()["blind"] is None                              # nothing independent to compare against
+    assert (await all_codes(r.store)).count("both_down") == 1          # so the page stands, as before

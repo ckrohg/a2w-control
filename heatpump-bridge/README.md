@@ -189,6 +189,14 @@ so it works with the cloud down.
 - **Guards.** Never during defrost, never while the pump is heating, never if the other pump
   is also down (page instead), never on a pump whose gateway identity check failed, one breaker
   action at a time, and every guard is re-checked on the fresh panel read right before the OPEN.
+- **A blind Pi is not two dead pumps (2026-11-13).** "Every pump offline" counts only while the Pi
+  can see something. When no pump has fresh telemetry *and* the SPAN panel has not answered either,
+  the Pi has lost its network: no both-down page, the all-down clock stops, one record-tier
+  `pi_blind` event after the same 5 minutes (`/api/health.self_heal.blind` says why), and for 90 s
+  after sight returns a still-stale pump does not count (the pollers may lag the panel read).
+  Needs SPAN local control; without it the page stands as before. A both-down page that did go
+  out gets an all-clear, under one incident tag so it replaces the page on the phone, once a
+  pump is back.
 - **Budget.** At most `max_attempts` per pump per `window_h`, then escalate to a human. The
   budget is persisted with wall time + boot id + monotonic time so a clock step cannot expire
   it early; unreadable history counts as a spent budget.
