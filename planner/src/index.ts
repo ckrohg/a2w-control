@@ -20,7 +20,7 @@ import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { parseJsonObject, BODY_TOO_LARGE, MAX_BODY_BYTES } from "./httpbody";
-import { HubClient, type HubState } from "./hub";
+import { HubClient, type HubState, hubActuationsInFlight } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans, raiseBoostsToGuard } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
@@ -63,6 +63,7 @@ import { pushTankUa } from "./tank-ua-push";
 import { pushTankReheat } from "./tank-reheat-push";
 import { RealizedSavings } from "./realized";
 import { observePeers, peerLiveMs, type PeerHeartbeat } from "./singlewriter";
+import { runShutdown, describePredecessors } from "./shutdown";
 import { buildReadStatus, readGate, routeReadStatus } from "./readstatus";
 
 const env = (name: string, fallback?: string): string => {
@@ -1315,8 +1316,8 @@ const WRITER_LEASE_ENABLED = process.env.WRITER_LEASE_ENABLED === "1";
 let writerLeaseState: { held: boolean; holder: string | null } | null = null;
 // Graceful handover (2026-10-01): set on SIGTERM/SIGINT so no renew races the release and no timer fires again.
 let shuttingDown = false;
-// #177: the drift detector's 30 s re-read wait must never hold a poll past SIGTERM (shutdown settles loops for 9 s,
-// then refuses to release the lease over a still-running poll) — cleanup() aborts this and the wait returns false.
+// #177: the drift detector's 30 s re-read wait must never hold a poll past SIGTERM (shutdown waits up to 9 s for running
+// polls before it closes the pool) — cleanup() aborts this and the wait returns false.
 const shutdownAbort = new AbortController();
 function shutdownAwareWait(ms: number): Promise<boolean> {
   if (shuttingDown || shutdownAbort.signal.aborted) return Promise.resolve(false);
@@ -1348,7 +1349,7 @@ function track<T>(set: Set<Promise<unknown>>, p: Promise<T>): Promise<T> {
   p.then(() => set.delete(p), () => set.delete(p));
   return p;
 }
-async function settleAll(set: Set<Promise<unknown>>, boundMs: number): Promise<boolean> {
+async function settleAll(set: ReadonlySet<Promise<unknown>>, boundMs: number): Promise<boolean> {
   const all = Promise.allSettled([...set]);
   const done = await Promise.race([all.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), boundMs))]);
   return done;
@@ -1376,6 +1377,11 @@ function scheduleLeaseClaimRetry(): void {
       if (state.held) {
         console.log(`writer lease acquired by ${INSTANCE_ID} after ${Math.round((Date.now() - (leaseWaitingSince ?? Date.now())) / 1000)} s waiting`);
         clearInterval(leaseRetryTimer!); leaseRetryTimer = null; leaseWaitingSince = null;
+        // #180: on a rolling deploy the startup read runs while the predecessor is still up (Railway signals it only
+        // after this container is healthy), so report its fate again now that it has handed over.
+        void store.predecessors(INSTANCE_ID)
+          .then((rows) => { for (const line of describePredecessors(rows, INSTANCE_FRESH_MS)) console.log(line.replace("[startup]", "[handover]")); })
+          .catch((e) => console.error("[handover] predecessor read failed:", (e as Error).message));
       }
     } catch (e) { console.error("writer-lease claim retry failed:", (e as Error).message); }
     finally { leaseRetryBusy = false; }
@@ -2423,61 +2429,60 @@ async function main(): Promise<void> {
     identificationMode: IDENTIFICATION_MODE_SEED,
   }).catch((e) => console.error("controller_flags seed failed:", (e as Error).message));
 
-  // Graceful handover on redeploy (2026-10-01; codex pass 1 on #162 for the ordering). Railway SIGTERMs the old
-  // container while the new one is already up. Without this the lease row kept the dead holder until the 12-min
-  // staleness expiry + the successor's next poll (649–981 s measured). Order matters:
-  //   1. shuttingDown + write barrier: no new device write starts, no renew/claim is scheduled, no timer fires again;
-  //   2. wait (bounded) for every running poll and every pending lease op — actuation already on the wire finishes;
-  //   3. release ONLY if nothing is still writing (a release over an in-flight PATCH would let two planners command
-  //      the device) — otherwise exit WITHOUT releasing, which is the old, safe 12-min path;
-  //   4. drop the heartbeat row, release once more (a renew that landed late is undone), close, exit 0.
+  // Graceful handover on redeploy (2026-10-01; codex pass 1 on #162 for the ordering; #180 for the early release and
+  // the logging). Railway SIGTERMs the old container while the new one is already up. Without this the lease row kept
+  // the dead holder until the 12-min staleness expiry + the successor's next poll (649–981 s measured). The sequence
+  // lives in shutdown.ts (unit-tested there); the order:
+  //   1. log synchronously that the signal arrived, with the in-flight counts — before any await;
+  //   2. shuttingDown + write barrier: no new device write starts, no renew/claim is scheduled, no timer fires again;
+  //   3. release the lease AT ONCE if no device PATCH is on the wire (the barrier means none can start; a renew in
+  //      flight is undone by its own continuation and by the final check) — never over an in-flight PATCH, which
+  //      would let two planners command the device;
+  //   4. wait (bounded) for every running poll and every pending lease op; release then if a write had to finish first,
+  //      else leave the row to the staleness window (the old, safe path);
+  //   5. mark the heartbeat row shut down with the outcome, release once more (a renew that landed late is undone),
+  //      close, exit 0 — every branch logged.
   // The whole thing fits inside RAILWAY_DEPLOYMENT_DRAINING_SECONDS (set to 20 on the service) via a 12 s hard exit.
   // Registered BEFORE the one-shot branch so a local POLL_ONCE run can never strand the shared lease either.
-  let cleanupDone = false;
-  const cleanup = async (reason: string): Promise<void> => {
-    if (cleanupDone) return;
-    cleanupDone = true;
-    shuttingDown = true;
-    shutdownAbort.abort();
-    raiseWriteBarrier();
-    const hardExit = setTimeout(() => { console.error(`[shutdown] ${reason}: forced exit (in-flight work did not finish in time)`); process.exit(0); }, 12_000);
-    hardExit.unref?.();
-    // Drop the heartbeat row FIRST, right after the barrier: a barred, shutting-down instance is no longer a writer, and
-    // the lease is a separate row. Done last, the 12 s hard exit could beat it and the successor counted this dead
-    // container as a second planner for INSTANCE_FRESH_MS (every deploy, 2026-10). Not awaited here, so a slow DB cannot
-    // eat the loop-settle budget; the drop near the end is the retry.
-    void store.dropInstance(INSTANCE_ID).catch((e) => console.error("[shutdown] heartbeat row drop failed:", (e as Error).message));
-    if (leaseRetryTimer) { clearInterval(leaseRetryTimer); leaseRetryTimer = null; }
-    const loopsDone = await settleAll(activeLoops, 9_000);
-    const leaseOpsDone = await settleAll(pendingLeaseOps, 1_500);
-    if (WRITER_LEASE_ENABLED) {
-      const quiet = loopsDone && leaseOpsDone && deviceWritesInFlight() === 0;
-      if (quiet) {
-        const released = await store.releaseWriterLease(INSTANCE_ID).catch((e) => { console.error("[shutdown] lease release failed:", (e as Error).message); return false; });
-        console.log(`[shutdown] ${reason}: writer lease ${released ? "released" : "not held"} by ${INSTANCE_ID}`);
-      } else {
-        console.warn(`[shutdown] ${reason}: NOT releasing the writer lease — work still in flight (loops settled: ${loopsDone}, lease ops settled: ${leaseOpsDone}, device writes on the wire: ${deviceWritesInFlight()}); the successor takes over after the staleness window`);
-      }
-    } else {
-      console.log(`[shutdown] ${reason}: exiting (writer lease disabled)`);
-    }
-    await store.dropInstance(INSTANCE_ID).catch(() => {}); // retry of the early drop (and undoes a heartbeat that raced it)
-    // A renew/claim that landed between the wait and here could have re-claimed the row — undo it (conditional, safe),
-    // but ONLY when every lease op has settled: an op still pending could land after this release too, and its own
-    // compensating release needs the pool. So: give pending ops one more bounded chance, then release if quiet.
-    const leaseOpsSettled = leaseOpsDone || await settleAll(pendingLeaseOps, 1_500);
-    if (WRITER_LEASE_ENABLED && loopsDone && leaseOpsSettled && deviceWritesInFlight() === 0) {
-      const releasedLate = await store.releaseWriterLease(INSTANCE_ID).catch(() => false);
-      // the first gate may have refused over an in-flight write that has since finished — say what finally happened
-      if (releasedLate) console.log(`[shutdown] ${reason}: writer lease released on the final check (work finished during cleanup)`);
-    } else if (WRITER_LEASE_ENABLED && !leaseOpsSettled) {
-      console.warn(`[shutdown] ${reason}: a lease renew/claim is still pending — leaving the row to the staleness window rather than racing it`);
-    }
-    // the hard-exit timer stays armed THROUGH store.close(): a hung pool.end() must not outlive the drain window
-    await store.close().catch(() => {});
-    clearTimeout(hardExit);
+  // NB: it only runs if the signal REACHES node. With `npm start` as the container's start command npm was PID 1 and
+  // node its child; npm's own SIGTERM handler decides whether the child hears it (#180). .railway/railway.ts now starts
+  // node directly.
+  let cleanupRun: Promise<void> | null = null;
+  const cleanup = (reason: string): Promise<void> => {
+    if (cleanupRun) { console.log(`[shutdown] ${reason} received while already shutting down — waiting for the first cleanup`); return cleanupRun; }
+    cleanupRun = runShutdown(reason, {
+      instanceId: INSTANCE_ID,
+      leaseEnabled: WRITER_LEASE_ENABLED,
+      store,
+      activeLoops,
+      pendingLeaseOps,
+      // HBX PATCHes (writes.ts) plus pump-setpoint / breaker commands to the Pi (hub.ts): the lease is never released
+      // while any device actuation that passed the barrier is still on the wire.
+      deviceWritesInFlight: () => deviceWritesInFlight() + hubActuationsInFlight(),
+      raiseBarrier: () => {
+        shuttingDown = true;
+        shutdownAbort.abort();
+        raiseWriteBarrier();
+        if (leaseRetryTimer) { clearInterval(leaseRetryTimer); leaseRetryTimer = null; }
+      },
+      settleAll,
+      log: (l) => console.log(l), warn: (l) => console.warn(l), error: (l) => console.error(l),
+      exit: (code) => process.exit(code),
+    }).then(() => {});
+    return cleanupRun;
   };
-  for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, () => void cleanup(sig).then(() => process.exit(0)));
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, () => {
+      cleanup(sig).then(() => process.exit(0), (e) => { console.error(`[shutdown] ${sig}: cleanup threw: ${(e as Error).message} — exiting 0 anyway`); process.exit(0); });
+    });
+  }
+
+  // #180: the first thing a deploy says is what became of the instance it replaced (a row with no shutdown record is a
+  // container killed before its SIGTERM handler ran — every deploy from #163 to #287 looked like that). Read-only; a
+  // failed read costs one line.
+  await store.predecessors(INSTANCE_ID)
+    .then((rows) => { for (const line of describePredecessors(rows, INSTANCE_FRESH_MS)) console.log(line); })
+    .catch((e) => console.error("[startup] predecessor read failed:", (e as Error).message));
 
   if (process.env.POLL_ONCE === "1") {
     // Each step runs on its own, exactly like the long-running loop's hourly chain: a forecast outage (open-meteo 503

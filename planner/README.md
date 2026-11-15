@@ -221,6 +221,22 @@ guarded base re-command is refused (most often a 429 inside 15 min of the probe 
 whose plan restore is refused too falls back to the as-found curve, by name, because an abort must end
 with a landed write — a window that ended normally stays pending and retries instead.
 
+**Deploy handover (#162, #180).** Railway SIGTERMs the old container while the new one is already up.
+`shutdown.ts` logs the signal synchronously on its first line (`[shutdown] SIGTERM received at …;
+loops=… leaseOps=… writesOnWire=…`), raises the write barrier, releases the writer lease the moment no
+device PATCH is on the wire (never over one), drains running polls and lease ops, releases again if a
+late renew re-claimed the row, marks its `planner_instances` row with the outcome, and exits 0 inside a
+12 s hard exit (`RAILWAY_DEPLOYMENT_DRAINING_SECONDS=20` on the service). The successor's first log
+lines report its predecessor (`still running … normal during a rolling deploy`, since Railway signals the old
+container only after the new one is healthy), and it reports again the moment it acquires the lease
+(`[handover] predecessor … released the writer lease`). The lease is never released while an HBX PATCH or a
+pump-setpoint / breaker command to the Pi (hub.ts) is on the wire. Proof on a real deploy: `[shutdown] SIGTERM
+received at` in the OLD container and `writer lease acquired … after N s waiting` with N under ~30 in the new one. This only
+works if the signal reaches node: the Railway start command must be `node dist/index.js`, not
+`npm start` — with npm as PID 1 every deploy from #163 to #287 logged nothing and waited out the full
+600–700 s staleness window (#180). `scripts/drift-check.sh` [11] asserts the declared start command, and
+`scripts/rehearsal/handover.sh` rehearses the whole handover against a local Postgres.
+
 **Injecting external intent — use the API, never raw SensorLinx.** Anything outside the
 planner that wants to move the target (TempIQ, a scheduled agent, a human, a future
 integration) MUST call the planner so the guardrails apply:

@@ -401,16 +401,18 @@ echo "[11] Railway deploy config — watch patterns, build, start, restart (#164
 IAC="$REPO_ROOT/.railway/railway.ts"
 TOML_CUTOFF=2026-12-01
 RAILWAY_PROJECT="${RAILWAY_PROJECT_ID:-bbd24081-be2f-46df-a892-c3040565585c}"   # a2w-hub (planner + hub + Postgres)
-WANT_REST="NIXPACKS|npm install && npm run build|npm start|ON_FAILURE|10"       # builder|build|start|restart policy|retries
+# Start command is `node dist/index.js`, not `npm start` (#180): with npm as PID 1 Railway's SIGTERM reached npm, not
+# the planner, so the writer lease was never released and every deploy waited out the 600–700 s staleness window.
+WANT_REST="NIXPACKS|npm install && npm run build|node dist/index.js|ON_FAILURE|10"       # builder|build|start|restart policy|retries
 if [ ! -f "$IAC" ]; then
   fail ".railway/railway.ts is missing — nothing carries the watch patterns past ${TOML_CUTOFF} (#164)"
 else
   MISSING=""
-  for needle in 'builder: "NIXPACKS"' 'buildCommand: "npm install && npm run build"' 'startCommand: "npm start"' \
+  for needle in 'builder: "NIXPACKS"' 'buildCommand: "npm install && npm run build"' 'startCommand: "node dist/index.js"' \
                 'restartPolicyType: "ON_FAILURE"' 'restartPolicyMaxRetries: 10' 'variables: { managed: false }'; do
     grep -qF -- "$needle" "$IAC" || MISSING="${MISSING:+$MISSING; }$needle"
   done
-  [ -z "$MISSING" ] && pass ".railway/railway.ts declares nixpacks, build, npm start, ON_FAILURE×10, unmanaged variables" \
+  [ -z "$MISSING" ] && pass ".railway/railway.ts declares nixpacks, build, node dist/index.js start, ON_FAILURE×10, unmanaged variables" \
                     || fail ".railway/railway.ts lacks: ${MISSING}"
 fi
 for pair in "a2w-planner:planner" "a2w-hub:hub"; do
@@ -443,7 +445,7 @@ if command -v railway >/dev/null 2>&1 && railway whoami >/dev/null 2>&1; then
     from="$(jq -r '.meta.configFile | if . == null or . == "" then "service settings" else . end' <<<"$BUILT")"
     dep="$(jq -r '"\(.id[0:8]) \(.createdAt[0:16])Z"' <<<"$BUILT")"
     if [ "$got" != "$want" ] || [ "$rest" != "$WANT_REST" ]; then
-      fail "${svc}: newest build ${dep} ran with watch [${got}], ${rest} (from ${from}) — not the declared config; \`railway config plan\` from the repo root shows what is unapplied (a null restart policy on a build from the service settings means the 2026-11-02 apply did not store it, #164)"
+      fail "${svc}: newest build ${dep} ran with watch [${got}], ${rest} (from ${from}) — not the declared config; \`railway config plan\` from the repo root shows what is unapplied (a null restart policy on a build from the service settings means the 2026-11-02 apply did not store it, #164; a start of \`npm start\` means the #180 fix is not applied and SIGTERM still goes to npm, not node)"
     elif [ ! -f "$REPO_ROOT/$dir/railway.toml" ] && [ "$from" != "service settings" ]; then
       fail "${svc}: newest build ${dep} still read ${from}, which the repo no longer has — no build from the service settings yet; the first one must show ON_FAILURE×10 (#164)"
     else

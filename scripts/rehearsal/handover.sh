@@ -76,7 +76,9 @@ for i in $(seq 1 90); do read -r heldB holderB < <(health "$PB" | lease_field); 
 T1=$(date +%s)
 chk "$([ "$heldB" = "True" ] && echo true || echo false)" "B holds the lease $((T1-T0)) s after A's SIGTERM (holder $holderB) — the 20 s claim retry, not the 12-min staleness wait"
 chk "$([ $((T1-T0)) -le 60 ] && echo true || echo false)" "handover ≤ 60 s (was 649–981 s in prod)"
-chk "$([ "$(psql -Atq -h localhost -p 5432 -d "$DB" -c "select count(*) from planner_instances where instance_id='$holderA'")" = "0" ] && echo true || echo false)" "A's heartbeat row was dropped"
+chk "$([ "$(psql -Atq -h localhost -p 5432 -d "$DB" -c "select count(*) from planner_instances where instance_id='$holderA' and shutdown_at is null")" = "0" ] && echo true || echo false)" "A's heartbeat row is marked shut down (#180: marked, not dropped, so B can report it)"
+chk "$([ "$(psql -Atq -h localhost -p 5432 -d "$DB" -c "select lease_released from planner_instances where instance_id='$holderA'")" = "t" ] && echo true || echo false)" "A's row records lease_released = true"
+chk "$(grep -q '^\[shutdown\] SIGTERM received at ' "$OUT/planner-A.log" && echo true || echo false)" "A logged the signal's arrival synchronously (the #180 first line)"
 chk "$([ "$(psql -Atq -h localhost -p 5432 -d "$DB" -c "select count(*) from hbx_writes where result='rejected' and detail like '%does not hold the single-writer lease%'")" = "0" ] && echo true || echo false)" "no write was refused for lack of the lease during the handover"
 
 kill -TERM "$B_PID"; wait "$B_PID" && rcB=0 || rcB=$?

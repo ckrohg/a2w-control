@@ -74,6 +74,15 @@ export interface HubState {
   span?: HubSpan | null;
 }
 
+/**
+ * Pump-setpoint and breaker commands currently on their way to the Pi (#180). The planner's shutdown releases the writer
+ * lease early only when nothing is on the wire; HBX PATCHes are counted in writes.ts, and these are the other device
+ * actuations the planner issues. Incremented synchronously on entry (before the first await), so a command that passed
+ * the shutdown barrier is always counted.
+ */
+let hubActuations = 0;
+export function hubActuationsInFlight(): number { return hubActuations; }
+
 export class HubClient {
   constructor(
     private readonly baseUrl: string,
@@ -103,6 +112,7 @@ export class HubClient {
     leaseMinutes: number,
     source: string,
   ): Promise<{ ok: boolean; detail: string }> {
+    hubActuations++;
     try {
       const res = await fetch(`${this.baseUrl}/api/command`, {
         method: "POST",
@@ -115,12 +125,15 @@ export class HubClient {
       return { ok: false, detail: body.detail || `HTTP ${res.status}` };
     } catch (e) {
       return { ok: false, detail: (e as Error).message };
+    } finally {
+      hubActuations--;
     }
   }
 
   /** LIVE backup gate only: one breaker action through the hub → Pi BreakerController. ok = the Pi VERIFIED the relay
    *  read-back. Never throws; a refusal / timeout is a normal outcome the caller retries later. */
   async sendBreaker(circuit: string, action: "close" | "open", armToken: string, source: string): Promise<{ ok: boolean; refused: boolean; detail: string }> {
+    hubActuations++;
     try {
       const res = await fetch(`${this.baseUrl}/api/breaker`, {
         method: "POST",
@@ -137,6 +150,8 @@ export class HubClient {
       return { ok, refused, detail: body.detail || `HTTP ${res.status}` };
     } catch (e) {
       return { ok: false, refused: false, detail: (e as Error).message };
+    } finally {
+      hubActuations--;
     }
   }
 }

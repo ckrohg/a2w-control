@@ -132,7 +132,8 @@ npm run typecheck
 1. **New service from the `/hub` subdirectory.** In the Railway project, add a
    service pointing at this repo and set the **root directory** to `hub`
    (Settings → Root Directory = `hub`). The build (`npm install && npm run build`),
-   start (`npm start`), restart policy and watch patterns are **service settings**,
+   start (`node dist/index.js` — not `npm start`: with npm as PID 1 Railway's SIGTERM never
+   reached the service, a2w #180), restart policy and watch patterns are **service settings**,
    declared in `.railway/railway.ts` at the repo root and written to the service with
    `railway config apply` — which redeploys both services, so read that file's header
    first. There is no `railway.toml` any more (#164).
