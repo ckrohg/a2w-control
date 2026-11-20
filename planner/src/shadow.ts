@@ -7,7 +7,9 @@
  * chosen ONCE per local day — the plan history is the memory (priorExcursionsFromPlans), so the
  * hourly recompute cannot re-bank the current hour on a falling afternoon. Hours whose
  * forecast drops below WINTER_GUARD_F fall back to mimicking the HBX reset curve, so
- * plan-vs-actual stays meaningful into the season the winter solver isn't built for yet.
+ * plan-vs-actual stays meaningful into the season the winter solver isn't built for yet — except the
+ * #135 pre-boost, which keeps its own target through the guard (2026-11 winter mornings lost the boost
+ * to the winter guard; raiseBoostsToGuard covers the flat-write path).
  */
 
 // One-way dependency: storm.ts imports nothing from this module, so this cannot cycle.
@@ -31,6 +33,14 @@ export interface ShadowBlock {
   boost?: boolean;
   /** a2w#156: set by index.ts storm shaping — authorises the block to run up to STORM_CAP_F in the auto-pilot. */
   storm?: boolean;
+  /**
+   * 2026-11 winter mornings lost the boost to the winter guard: on a pre-boost block the as-found curve mimic no longer
+   * replaces the boost (the boost keeps its own target, flag and reason). This records what the guard WOULD have
+   * written — the neighbouring mimic hours' target — only on a boost block it would have raised. Read by
+   * raiseBoostsToGuard (index.ts, no shaped curve): when every block is written flat, a 130 °F boost between
+   * 135 °F mimic hours would be a dip, so the boost hour is held at least at this value.
+   */
+  guard_f?: number;
 }
 
 /** #135: a learned draw window's boost, sized from the measured sag (see dhw.ts measureWindowSags). */
@@ -338,6 +348,22 @@ export function computeShadowPlan(
   const inPeak = (h: number) => allPeaks.some((b) => h >= b.windowStart && h < b.windowEnd);
   const peaks = allPeaks.filter((b) => b.n >= MIN_PREBOOST_DRAWS && b.boostF >= MIN_PREBOOST_F);
   const priorBoosts = (opts.priorExcursions ?? []).filter((p) => p.boost);
+  // 2026-11 winter mornings lost the boost to the winter guard — and once (Nov 13) to a window shift: the 04:21 replan
+  // found the 04:00 boost the auto-pilot had written at 04:06, but the learned peaks had moved to [5,10) → [3,10), so
+  // 04:00 was no longer a lead hour of any window and the per-window lookup below never saw it; the block went back to
+  // the 120 °F floor with the showers an hour away. A boost the history placed on an hour that has STARTED is kept at
+  // its commanded target whatever the windows now say — inside a peak, outside every lead — and whichever window still
+  // leads from it refines the reason below. Pinned FIRST so no window can place a second boost on the same hour.
+  const pinned = new Set<Draft>();
+  for (const p of priorBoosts) {
+    const t = new Date(p.ts).getTime();
+    const kept = draft.find((d) => !d.sani && !d.bank && d.f.ts.getTime() === t);
+    if (!kept || pinned.has(kept)) continue;
+    kept.target = Math.min(Math.max(kept.target, p.tank_target_f ?? kept.target), opts.strictCapF);
+    kept.boost = true;
+    kept.reason = `pre-boost to ${Math.round(kept.target)}°F (kept from the previous plan after the learned windows moved, ${kept.f.outdoorF.toFixed(0)}°F)`;
+    pinned.add(kept);
+  }
   for (const pb of peaks) {
     const start = pb.windowStart;
     const idx = draft.findIndex((d) => d.localH === start);
@@ -348,13 +374,11 @@ export function computeShadowPlan(
     const window = `${String(start).padStart(2, "0")}:00 window`;
     const sag = `sag ${pb.sagP90F != null ? `p90 ${pb.sagP90F}` : `p75 ${pb.sagP75F}`}°F over ${pb.n} draws`;
     // #285: a boost the history placed on a lead hour that has STARTED (only the current hour can be) is kept there at
-    // the target the auto-pilot commanded — never re-derived, never moved. The reason still reads as a pre-boost
-    // (curveDecision, the poster, the identification driver all match on it) and says it was kept.
-    const prior = priorBoosts.find((p) => lead.some((d) => !d.sani && !d.bank && new Date(p.ts).getTime() === d.f.ts.getTime()));
-    if (prior) {
-      const kept = lead.find((d) => new Date(prior.ts).getTime() === d.f.ts.getTime())!;
-      kept.target = Math.min(Math.max(kept.target, prior.tank_target_f ?? kept.target), opts.strictCapF);
-      kept.boost = true;
+    // the target the auto-pilot commanded — never re-derived, never moved (pinned above, at that target). The reason
+    // still reads as a pre-boost (curveDecision, the poster, the identification driver all match on it), names this
+    // window and says it was kept.
+    const kept = lead.find((d) => pinned.has(d));
+    if (kept) {
       kept.reason = `pre-boost to ${Math.round(kept.target)}°F for ${window} (${sag}; kept from the previous plan, ${kept.f.outdoorF.toFixed(0)}°F)`;
       continue;
     }
@@ -378,14 +402,25 @@ export function computeShadowPlan(
   return draft.map((d) => {
     let target = d.target;
     let reason = d.reason;
+    let guardF: number | null = null;
     if (d.f.outdoorF < opts.winterGuardF) {
       // The winter floor only takes the block's REASON when it actually raises the target: a soak, bank
       // or pre-boost that already sits higher keeps its identity, so the poster and the auto-pilot
       // still see the excursion they are meant to see (#135 codex; previously the reason was rewritten
       // unconditionally and a winter soak read as "binding zone").
-      // When the floor wins, a bank / pre-boost did not happen: the block is demand-driven, so it
-      // drops that flag too (one identity per block — the poster must file it as autopilot, not
-      // bank, and a DP raise afterwards appends to the floor's reason). The soak is never subsumed.
+      // When the floor wins, a bank did not happen: the block is demand-driven, so it drops that flag
+      // (one identity per block — the poster must file it as autopilot, not bank, and a DP raise
+      // afterwards appends to the floor's reason). The soak is never subsumed — and, since 2026-11-19,
+      // neither is the pre-boost.
+      //
+      // 2026-11 winter mornings lost the boost to the winter guard (Nov 8–16, every night at 32–40 °F): the as-found
+      // curve (~135 °F) outran the 129–131 °F boost, the block became "winter guard: mimic HBX curve" with boost =
+      // false, and the auto-pilot — a non-excursion hour in shaped-curve mode — wrote the ~120 °F shaped curve
+      // instead. The tank never boosted before the showers, and with no boost in the plan the identification
+      // experiment moved into the lead hours. Owner decision 2026-11-19: the boost stays at its own target. A boost
+      // block keeps its flag and its pre-boost reason in both branches; the demand floor may still raise its TARGET
+      // (never lower it, the sani pattern), the curve mimic only records what it would have written (guard_f, for
+      // the flat-write path — raiseBoostsToGuard).
       if (demandFloor) {
         if (demandFloor.tankTargetF > target) {
           target = demandFloor.tankTargetF;
@@ -394,23 +429,28 @@ export function computeShadowPlan(
           // soak (its `sani` flag and its sanitizeCapF ceiling stay), so its reason must keep saying so: the
           // poster files it as the soak and the identification driver keeps its distance (planConflictAhead
           // matches /sanitize/). Before this the reason was rewritten to the floor's and the identity was lost.
-          reason = d.sani
+          // The pre-boost follows the same rule: its target becomes the floor's, its identity stays.
+          reason = d.sani || d.boost
             ? `${d.reason} — raised to the demand floor ${Math.round(target)}°F (${floorReason})`
             : floorReason;
-          d.bank = false; d.boost = false;
+          d.bank = false;
         }
       } else if (hbxConfig) {
         const curve = curveTargetF(hbxConfig, d.f.outdoorF);
         if (curve != null && curve > target) {
-          target = curve;
-          // a2w#168 (the #155 class, one branch over): when the as-found curve outruns the 140 °F soak the block is
-          // STILL the soak — its `sani` flag and sanitizeCapF ceiling stay, so the reason must keep saying so, or the
-          // poster files the hour as autopilot and the identification driver (planConflictAhead matches /sanitize/)
-          // stops keeping its distance. Measured twice on 2026-10-17: "set 145°F — winter guard: mimic HBX curve".
-          reason = d.sani
-            ? `${d.reason} — raised to the as-found curve ${Math.round(target)}°F (winter guard)`
-            : "winter guard: mimic HBX curve";
-          d.bank = false; d.boost = false;
+          if (d.boost) {
+            guardF = curve; // the boost stays at its own target; what the guard would have written rides along
+          } else {
+            target = curve;
+            // a2w#168 (the #155 class, one branch over): when the as-found curve outruns the 140 °F soak the block is
+            // STILL the soak — its `sani` flag and sanitizeCapF ceiling stay, so the reason must keep saying so, or the
+            // poster files the hour as autopilot and the identification driver (planConflictAhead matches /sanitize/)
+            // stops keeping its distance. Measured twice on 2026-10-17: "set 145°F — winter guard: mimic HBX curve".
+            reason = d.sani
+              ? `${d.reason} — raised to the as-found curve ${Math.round(target)}°F (winter guard)`
+              : "winter guard: mimic HBX curve";
+            d.bank = false;
+          }
         }
       }
     }
@@ -428,6 +468,8 @@ export function computeShadowPlan(
       : (d.bank || d.boost) ? opts.strictCapF + opts.i1MarginF
       : opts.hpMaxF;
     const hp1 = clamp(target + opts.i1MarginF, opts.hpMinF, hpCapF);
+    // guard_f is the mimic target the neighbouring hours get: the curve through the same band clamp and rounding.
+    const guard = guardF != null ? Math.round(clamp(guardF, band.lo, band.hi)) : null;
     return {
       ts: d.f.ts.toISOString(),
       outdoor_f: d.f.outdoorF,
@@ -437,6 +479,33 @@ export function computeShadowPlan(
       ...(d.sani ? { sani: true } : {}),
       ...(d.bank ? { bank: true } : {}),
       ...(d.boost ? { boost: true } : {}),
+      ...(guard != null && guard > Math.round(target) ? { guard_f: guard } : {}),
+    };
+  });
+}
+
+/**
+ * Degraded-mode safety for the pre-boost (2026-11 winter mornings lost the boost to the winter guard). Since the
+ * guard no longer raises a boost block to the as-found curve, a plan with NO shaped curve stamped (demand feed
+ * degraded, SHAPED_CURVE off — index.ts) is written flat block by block, and a 130 °F boost between 135 °F mimic
+ * hours would be a dip right before the showers. Pure: returns a new plan in which every boost block carrying a
+ * guard_f below which it sits is raised to that value, with the advisory HP line re-led the way the DP / storm
+ * passes do (target + i1MarginF, clamped to [hpMinF, strictCapF + i1MarginF]); every other block is the same object.
+ * With a shaped curve stamped the mimic hours run the curve (~120 °F) and the boost is the excursion above it, so
+ * the caller must NOT apply this there — it would turn the boost into the guard it was rescued from.
+ */
+export function raiseBoostsToGuard(
+  plan: ShadowBlock[],
+  opts: Pick<ShadowOpts, "i1MarginF" | "hpMinF" | "strictCapF"> = DEFAULT_OPTS,
+): ShadowBlock[] {
+  return plan.map((b) => {
+    if (b.boost !== true || typeof b.guard_f !== "number" || !(b.guard_f > b.tank_target_f)) return b;
+    const raised = Math.round(b.guard_f);
+    return {
+      ...b,
+      tank_target_f: raised,
+      hp1_setpoint_f: Math.round(clamp(raised + opts.i1MarginF, opts.hpMinF, opts.strictCapF + opts.i1MarginF)),
+      reason: `${b.reason}; held at the winter guard's ${raised}°F (no shaped curve: every block is written flat)`,
     };
   });
 }

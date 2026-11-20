@@ -286,7 +286,9 @@ console.log("shadow.test.ts: all assertions passed ✓");
 
   // WINTER: the demand floor takes a block's reason only when it raises the target. A pre-boost that
   // sits above the floor keeps its reason (so the poster files it as a bank) and its flag; a floor
-  // above the boost wins the target and the reason, and the flag still marks the intended excursion.
+  // above the boost raises the boost's TARGET and appends the floor note, and the block is still the boost
+  // (2026-11 winter mornings lost the boost to the winter guard — owner 2026-11-19: the boost keeps its identity,
+  // like the soak; before that the floor took the flag and the reason, and the block read as demand-driven).
   const winter: ForecastHour[] = fc.map((f, h) => ({ ...f, outdoorF: 20 + h * 0.5 })); // 20..31.5 °F, warmest lead still 16:00
   const floorLow = { tankTargetF: 122, bindingZone: "baseboard", awtF: 118 };
   const w1 = computeShadowPlan(winter, null, opts, floorLow, false);
@@ -296,9 +298,13 @@ console.log("shadow.test.ts: all assertions passed ✓");
   assert.ok(w1.filter((x) => !x.boost).every((x) => /binding zone/.test(x.reason) && x.tank_target_f >= 122), "every other block took the floor (the I4 band lifts the coldest hours a little higher)");
   const floorHigh = { tankTargetF: 130, bindingZone: "baseboard", awtF: 126 };
   const w2all = computeShadowPlan(winter, null, opts, floorHigh, false);
-  assert.equal(w2all.filter((x) => x.boost).length, 0, "a floor above the boost subsumes it: the block is demand-driven, no boost identity");
+  const w2b = w2all.filter((x) => x.boost);
+  assert.equal(w2b.length, 1, "a floor above the boost raises it but does not subsume it: the block keeps its boost identity");
+  assert.equal(w2b[0].tank_target_f, 130, "…at max(boost 126, floor 130)");
+  assert.match(w2b[0].reason, /^pre-boost to 126°F for 17:00 window .* — raised to the demand floor 130°F \(binding zone: baseboard needs 126°F/);
   assert.ok(w2all.every((x) => x.tank_target_f >= 130 && /binding zone/.test(x.reason)), "every block took the higher floor");
-  assert.equal(classifyKind({ source: "autopilot", reason: w2all[16].reason, stormActive: false, boostMatched: false, commandedTargetF: 130 }), "autopilot", "the poster files a floor-driven hour as autopilot, not bank");
+  assert.equal(classifyKind({ source: "autopilot", reason: w2all[0].reason, stormActive: false, boostMatched: false, commandedTargetF: 130 }), "autopilot", "the poster files a floor-driven hour as autopilot, not bank");
+  assert.equal(classifyKind({ source: "autopilot", reason: w2b[0].reason, stormActive: false, boostMatched: false, commandedTargetF: 130 }), "bank", "…a floor-raised pre-boost still as bank");
   assert.equal(classifyKind({ source: "autopilot", reason: wb.reason, stormActive: false, boostMatched: false, commandedTargetF: 126 }), "bank", "…and a real pre-boost as bank");
 
   // A qualifying peak's lead may not sit inside ANOTHER learned peak, even one that earned no boost.
