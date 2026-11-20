@@ -1,21 +1,15 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { isOpenPath, viewCookieOk } from "./lib/gate";
 
-// Gate the dashboard behind the view session cookie. /api/ingest (bearer-token, from the
-// Pi) and /login + /api/login are open. Everything else needs the cookie. Compares the
-// cookie to VIEW_SESSION_SECRET directly — no crypto, so it runs fine on the edge runtime.
+// Gate the dashboard behind the view session cookie. The open-path list and the cookie compare
+// live in lib/gate.ts (pure, edge-safe, tested); this file only wires them to Next.
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
-  const open =
-    pathname.startsWith("/api/ingest") ||
-    pathname.startsWith("/api/login") ||
-    pathname.startsWith("/api/webauthn/auth") ||
-    pathname.startsWith("/api/digest") || // guards itself: CRON_SECRET bearer/key or view cookie
-    pathname === "/login";
-  if (open) return NextResponse.next();
+  if (isOpenPath(pathname)) return NextResponse.next();
 
   const cookie = req.cookies.get("a2w_view")?.value;
-  if (cookie && cookie === process.env.VIEW_SESSION_SECRET) {
+  if (viewCookieOk(cookie, process.env.VIEW_SESSION_SECRET)) {
     return NextResponse.next();
   }
   const url = req.nextUrl.clone();
