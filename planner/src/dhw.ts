@@ -42,6 +42,9 @@ export interface LearnedWindows {
   hourScores: number[]; // 24 entries, fraction of days with a draw in that hour
 }
 
+/** Local-day key (the TZ env makes the Date getters local) — the same calendar getHours() reads. */
+export const localDayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
 export function learnDhwWindows(
   rows: { ts: Date; tankF: number }[],
   minDays = 5,
@@ -51,11 +54,13 @@ export function learnDhwWindows(
   const daysSeen = new Set<string>();
   const eventDaysByHour: Set<string>[] = Array.from({ length: 24 }, () => new Set());
 
-  for (let i = 1; i < rows.length; i++) daysSeen.add(rows[i].ts.toISOString().slice(0, 10));
+  // Days and draw hours on ONE calendar: local. A UTC date key here spans an extra day per local-midnight
+  // history and moves evening draws onto the next date, deflating every hour score.
+  for (const r of rows) daysSeen.add(localDayKey(r.ts));
   const drawTimes = detectDrawTimes(rows);
   const drawEvents = drawTimes.length;
   for (const ts of drawTimes) {
-    eventDaysByHour[ts.getHours()].add(ts.toISOString().slice(0, 10)); // TZ env → local hour
+    eventDaysByHour[ts.getHours()].add(localDayKey(ts)); // TZ env → local hour
   }
 
   const days = daysSeen.size;
