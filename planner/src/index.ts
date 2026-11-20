@@ -19,6 +19,7 @@ import { TempiqPusher } from "./tempiq";
 import { TempiqWindowPoster } from "./tempiq-windows";
 import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
+import { parseJsonObject, BODY_TOO_LARGE, MAX_BODY_BYTES } from "./httpbody";
 import { HubClient, type HubState } from "./hub";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
@@ -2528,13 +2529,33 @@ async function main(): Promise<void> {
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
   };
+  // Resolves to the raw body, or to BODY_TOO_LARGE once it passes MAX_BODY_BYTES — at which point we stop
+  // accumulating (drop the data listener; the stream keeps flowing so the rest is discarded, and Node dumps
+  // whatever is left when the response ends). Never rejects on size: parseJsonObject maps the marker to 413.
   const readBody = (req: http.IncomingMessage): Promise<string> =>
     new Promise((resolve, reject) => {
       let s = "";
-      req.on("data", (c) => { s += c; if (s.length > 4096) reject(new Error("body too large")); });
-      req.on("end", () => resolve(s));
-      req.on("error", reject);
+      let done = false;
+      const onData = (c: Buffer | string) => {
+        s += c;
+        if (s.length > MAX_BODY_BYTES) {
+          done = true;
+          req.removeListener("data", onData);
+          req.resume();
+          resolve(BODY_TOO_LARGE);
+        }
+      };
+      req.on("data", onData);
+      req.on("end", () => { if (!done) resolve(s); });
+      req.on("error", (e) => { if (!done) reject(e); });
     });
+  // Every POST route reads its body through this: 400 for non-JSON / null / array / primitive, 413 oversize,
+  // {} for an empty body. Returns null after answering so the route can `return` without touching body fields.
+  const readJsonBody = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<Record<string, unknown> | null> => {
+    const parsed = parseJsonObject(await readBody(req));
+    if (!parsed.ok) { json(res, parsed.status, { error: parsed.error }); return null; }
+    return parsed.body;
+  };
 
   http
     .createServer(async (req, res) => {
@@ -2825,7 +2846,8 @@ async function main(): Promise<void> {
             return json(res, 200, await writer.status());
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-          const body = JSON.parse((await readBody(req)) || "{}");
+          const body = await readJsonBody(req, res);
+          if (!body) return;
           if (req.url === "/api/hbx/restore") {
             // #232: the default returns the plant to the plan's command for the block in force; {"to":"as-found"}
             // (or {"as_found":true}) is the pre-#232 emergency path — the July as-found endpoints, unconditionally.
@@ -2843,7 +2865,8 @@ async function main(): Promise<void> {
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
           if (req.url === "/api/storm/arm") {
-            const body = JSON.parse((await readBody(req)) || "{}");
+            const body = await readJsonBody(req, res);
+            if (!body) return;
             const hours = Math.min(Math.max(Number(body.hours) || 24, 1), 72);
             pendingManual = { armHours: hours };
           } else {
@@ -2863,7 +2886,8 @@ async function main(): Promise<void> {
             return json(res, 200, f ?? { mode: "off", autopilotDryRun: true, phasebDryRun: true });
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-          const body = JSON.parse((await readBody(req)) || "{}");
+          const body = await readJsonBody(req, res);
+          if (!body) return;
           const mode = String(body.mode ?? "");
           if (mode !== "off" && mode !== "arm") {
             const future = mode === "set" || mode === "req";
@@ -2900,7 +2924,8 @@ async function main(): Promise<void> {
             return json(res, 200, { mode: cur?.identificationMode ?? IDENTIFICATION_MODE_SEED, driver: identification ? identification.status() : "disabled" });
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-          const body = JSON.parse((await readBody(req)) || "{}");
+          const body = await readJsonBody(req, res);
+          if (!body) return;
           const mode = String(body.mode ?? "");
           if (!(IDENT_MODES as readonly string[]).includes(mode)) return json(res, 400, { error: "mode must be 'off' | 'shadow' | 'armed'" });
           await store.setIdentificationMode(mode, "dashboard");
@@ -2924,7 +2949,8 @@ async function main(): Promise<void> {
             return json(res, 200, { enabled: cur?.autoSanitize ?? AUTO_SANITIZE_ENABLED });
           }
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
-          const body = JSON.parse((await readBody(req)) || "{}");
+          const body = await readJsonBody(req, res);
+          if (!body) return;
           if (typeof body.enabled !== "boolean") return json(res, 400, { error: "body.enabled must be a boolean" });
           const base = cur ?? { mode: "off", autopilotDryRun: AUTOPILOT_DRY_RUN, phasebDryRun: PHASE_B_DRY_RUN };
           const stored = await store.setControllerFlags({
@@ -2948,15 +2974,20 @@ async function main(): Promise<void> {
           // and upsert them — the hourly tick's own walk, just from a caller-chosen bound. Same bearer gate as
           // POST /api/hbx/target. Runs inline on this request (a one-off; the poll loop is a separate timer and the
           // upsert is idempotent, so overlapping with a tick is harmless) with the reader's 20 s per-request
-          // timeout and a 50-page bound. 401 no bearer · 405 not POST · 503 reader off · 422 malformed / future /
-          // > 400-day since or a before ≤ since · 409 one already running · 502 a page failed (partial counts in
-          // the body). The summary also sits on /health.tempiq_read.lastCopRefetch.
+          // timeout and a 50-page bound. 401 no bearer · 405 not POST · 503 reader off · 413 oversize body · 422
+          // malformed / future / > 400-day since or a before ≤ since · 409 one already running · 502 a page failed
+          // (partial counts in the body). The summary also sits on /health.tempiq_read.lastCopRefetch.
           if (!authed(req)) return json(res, 401, { error: "unauthorized" });
           if (req.method !== "POST") return json(res, 405, { error: "method not allowed" });
           if (!tempiqRead) return json(res, 503, { error: "tempiq read disabled (TEMPIQ_READ_ENABLED=1 + TEMPIQ_SURFACE_TOKEN)" });
-          let body: unknown;
-          try { body = JSON.parse((await readBody(req)) || "{}"); } catch { return json(res, 422, { error: "body must be JSON: {\"since\": ISO, \"before\"?: ISO}" }); }
-          const parsed = parseCopRefetchRequest(body, new Date());
+          // Same seam as the other write routes, but this route's documented contract (README) is 422 for a
+          // malformed body, so the helper's 400 stays 422 here; 413 passes through.
+          const raw = parseJsonObject(await readBody(req));
+          if (!raw.ok) {
+            if (raw.status === 413) return json(res, 413, { error: raw.error });
+            return json(res, 422, { error: "body must be JSON: {\"since\": ISO, \"before\"?: ISO}" });
+          }
+          const parsed = parseCopRefetchRequest(raw.body, new Date());
           if (!parsed.ok) return json(res, 422, { error: parsed.error });
           if (tempiqRead.refetchInFlight()) return json(res, 409, { error: "a cop-refetch is already running on this instance" });
           const summary = await tempiqRead.refetchCop(parsed.since, parsed.before);

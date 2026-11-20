@@ -474,7 +474,7 @@ A backfill older than the window (TempIQ wrote Sep 29 → Oct 27 on 2026-10-27) 
 ```
 POST /api/tempiq/cop-refetch  {"since": "2026-09-29", "before"?: ISO}   Authorization: Bearer $PLANNER_API_TOKEN
   → {fetched, inserted, updated, pages, oldest, newest, truncated, durationMs, error}
-  401 no bearer · 422 malformed / future / > 400-day since, before ≤ since · 503 reader off · 409 one running · 502 a page failed
+  401 no bearer · 413 body over 4096 bytes · 422 malformed / future / > 400-day since, before ≤ since · 503 reader off · 409 one running · 502 a page failed
 ```
 
 It runs inline on the request (same 20 s per-page timeout, 50-page bound) and the summary stays on
