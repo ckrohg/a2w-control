@@ -5,10 +5,14 @@
 # in-memory snapshots.
 from __future__ import annotations
 
+import math
 import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -29,7 +33,9 @@ human = require("human")   # SPAN breaker switching: UI session only, never a ma
 
 class SetpointRequest(BaseModel):
     value: float
-    lease_minutes: float | None = Field(default=None, gt=0)  # remote optimizer: renew before it lapses
+    # remote optimizer: renew before it lapses. Infinity/NaN are refused here (422) so the
+    # HTTP write path agrees with hub_client's own non-finite check on the WebSocket path.
+    lease_minutes: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class ModeRequest(BaseModel):
@@ -84,6 +90,39 @@ def _pump(request: Request, pump_id: str) -> PumpPoller:
     if not poller:
         raise HTTPException(404, f"unknown pump: {pump_id}")
     return poller
+
+
+def _json_safe(v):
+    """Non-finite floats as strings, recursively: JSON has no Infinity/NaN."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return str(v)
+    if isinstance(v, dict):
+        return {k: _json_safe(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    return v
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's default 422, except that a rejected non-finite input is echoed as a string.
+    The default handler copies each error's `input` into the reply, and a body such as
+    `{"lease_minutes": Infinity}` (which Starlette's json.loads accepts) then made the 422
+    itself fail to serialize: the client got a 500 for the very request the validator refused.
+    Registered in main.create_app."""
+    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
+
+
+HISTORY_MAX_HOURS = 24 * 90
+EVENTS_MAX_DAYS = 365
+
+
+def _window(x: float, lo: float, hi: float, name: str = "window") -> float:
+    """Clamp a history window to [lo, hi]. FastAPI parses `?hours=nan` / `?days=inf` as
+    floats, and `max(nan, 1)` is nan — so without this check a NaN reached the store and
+    came back as an empty list that looked exactly like 'no data'. Non-finite is a 422."""
+    if not math.isfinite(x):
+        raise HTTPException(422, f"{name} must be a finite number")
+    return min(max(x, lo), hi)
 
 
 @router.get("/pumps")
@@ -172,7 +211,7 @@ async def pump_status(request: Request, pump_id: str, _p: Principal = Depends(re
 async def pump_history(request: Request, pump_id: str, hours: float = 24,
                        _p: Principal = Depends(read)):
     poller = _pump(request, pump_id)
-    hours = min(max(hours, 1), 24 * 90)
+    hours = _window(hours, 1, HISTORY_MAX_HOURS, "hours")
     return await poller.store.get_history(pump_id, hours)
 
 
@@ -180,7 +219,7 @@ async def pump_history(request: Request, pump_id: str, hours: float = 24,
 async def pump_events(request: Request, pump_id: str, days: float = 7,
                       _p: Principal = Depends(read)):
     poller = _pump(request, pump_id)
-    days = min(max(days, 1), 365)
+    days = _window(days, 1, EVENTS_MAX_DAYS, "days")
     return await poller.store.get_events(pump_id, days)
 
 
@@ -194,7 +233,7 @@ async def system_now(request: Request, _p: Principal = Depends(read)):
 @router.get("/system/history")
 async def system_history(request: Request, hours: float = 24,
                          _p: Principal = Depends(read)):
-    hours = min(max(hours, 1), 24 * 90)
+    hours = _window(hours, 1, HISTORY_MAX_HOURS, "hours")
     return await request.app.state.store.get_system_history(hours)
 
 

@@ -9,7 +9,9 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from .api import router
+from fastapi.exceptions import RequestValidationError
+
+from .api import router, validation_error_handler
 from .auth import UI_COOKIE, cookie_secure, load_or_create_ui_secret, mint_session
 from .config import AppConfig, load_config
 from .exporter import Exporter
@@ -166,6 +168,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return response
 
     app.include_router(router)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     ui_dir = Path(cfg.ui_dir)
     if ui_dir.is_dir():
