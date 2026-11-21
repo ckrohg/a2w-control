@@ -329,6 +329,17 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: null })));
     assert.equal(r.tried.length, 1);
   }
+  {
+    // outdoor hovering 5 ↔ 6 °F on a design-cold night: one page, no all-clear inside the hysteresis band
+    const r = rig();
+    for (const outdoorF of [5, 6, 5, 6, 5]) await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF, tankF: 100 })));
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "paged once");
+    assert.equal(allClears(r).length, 0, "no all-clear while it hovers");
+    await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 108 })));
+    assert.equal(allClears(r).length, 0, "a 108 °F tank is still inside the band");
+    await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: 9, tankF: 100 })));
+    assert.equal(allClears(r).length, 1, "past 8 °F out it clears");
+  }
 
   // ── Pi unreachable ───────────────────────────────────────────────────────────────────────────────────────────
   {
