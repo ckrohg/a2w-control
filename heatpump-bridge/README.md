@@ -75,7 +75,7 @@ bridge/
                     `write_enable` and `breaker` actions in, through the existing guarded paths
   span_local.py     SPAN panel LOCAL-API poller (circuit instantPowerW), headless token re-mint,
                     CLOSE-ONLY relay writes unless an OpenPermit is held; picks the transport
-                    (span.transport: v1 REST, auto, v2)
+                    (span.transport: v2 — the default —, auto, or the deprecated v1 REST)
   span_v2.py        #199 SPAN v2 local transport: one MQTT-over-TLS session to the panel's eBus
                     broker, served to span_local in the v1 /circuits shape (v1 REST ends 2026-12-31)
   span_control.py   guarded breaker controller: allowlist, power_cycle / close / open, global
@@ -97,8 +97,9 @@ sim/fake_span.py    in-process fake of the SPAN local API for tests; relay write
 sim/fake_span_v2.py the v2 side of the same fake: a minimal MQTT broker over real TLS publishing
                     the eBus tree recorded from the house panel (sim/span_v2_capture.json)
 ui/                 static mobile-first SPA (no build step), served at /
-tests/              unit + integration (integration runs a real in-process sim pump; SPAN tests
-                    run against sim/fake_span.py)
+tests/              unit + integration (integration runs a real in-process sim pump; SPAN suites
+                    run twice against sim/fake_span.py: a v2-only panel on the default transport,
+                    and the v1 fake on the deprecated v1 fallback — tests/conftest.py)
 deploy/             Pi systemd units (bridge, auto-update timer, watchdog timer), production
                     config template, bootstrap/update scripts, W610 / Tailscale / cloudflared /
                     Railway-hub guides
@@ -142,12 +143,34 @@ and the bridge are unaffected.
 - **Close-only invariant.** `SpanClient` refuses to send OPEN unless the caller holds an
   `OpenPermit`, which only `span_control.BreakerController` mints. The backup-element ARM
   path (`arm_circuit`, close-only, DISARMED by default, shadow unless `arm_live`) never holds
-  a permit, so nothing on that path can disable the failsafe.
+  a permit, so nothing on that path can disable the failsafe. The check sits in
+  `SpanClient._set_relay_sync`, below every transport, so it is the same on v1 and v2.
+- **Transport (#199).** The panel removes its v1 REST API on **2026-12-31**. `span.transport`
+  picks `v2` (the default: MQTT on the panel, `bridge/span_v2.py`, the only transport), `auto`
+  (v2 first, v1 as a fallback while the panel still serves it) or `v1` (REST only, **deprecated**:
+  selectable only by explicit config, and the bridge logs a warning on every start that v1 dies
+  2026-12-31; it stays in the code for a few weeks in case a firmware surprise needs it). Every
+  consumer sees the same `/circuits` shape; `/api/health.span` and the hub frame
+  (`span.transport`) say which transport answered the last read and write, and carry
+  `deprecated` while pinned to v1. Design and the panel's v2 interface:
+  `../knowledge/reference/span-v2-local-api.md`.
+
+  Cutover plan (the live key is in `~/bridge-data/config.yaml` on the Pi, outside the repo):
+
+  1. **Auto soak** — the Pi runs `transport: auto` (release tag around 2026-11-24): v2 answers
+     every read and write, v1 only if v2 cannot. Watch `/api/health.span.read`/`write` and
+     drift-check `[10]`: a `v1` answer means v2 is failing.
+  2. **This change** — once the soak is clean the owner merges it: the default becomes `v2`
+     (drop the `transport` key on the Pi, or leave `auto`), `v1` warns on every start.
+  3. **Remove v1 after 2026-12-31** — delete the v1 code paths (`_v1_*`, the REST register,
+     `v2_soak`), the `v1`/`auto` values and the v1 run of the test suites.
 
 Config keys (`span:`): `host`, `ip_fallback`, `passphrase`, `circuits`, `poll_interval_s`,
-`down_alert_after_s`, `arm_circuit`, `arm`, `arm_live`, `arm_cooldown_s`. The poller is
-enabled only when both `host` and `passphrase` are set. Inject the passphrase via the
-bootstrap environment like the hub/analytics tokens; never commit it.
+`down_alert_after_s`, `transport` (`v2` default | `auto` | `v1` deprecated), `v2_soak` (with
+`transport: v1` only: read-only v2 comparison), `arm_circuit`, `arm`, `arm_live`,
+`arm_cooldown_s`. The poller is enabled only when both `host` and `passphrase` are set.
+Inject the passphrase via the bootstrap environment like the hub/analytics tokens; never
+commit it.
 Transport cutover (`transport`, `v2_soak`, #199): runbook in `../knowledge/reference/span-v2-cutover.md`.
 
 ## Breaker control

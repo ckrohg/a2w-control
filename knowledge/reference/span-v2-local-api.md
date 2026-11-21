@@ -21,17 +21,27 @@ cleared. Chain and hostname checks still apply. The cert verifies by the broker 
 `bridge/span_v2.py` holds one persistent MQTT session (paho, started on first use). `bridge/span_local.SpanClient`
 serves both transports behind the same interface, and every consumer keeps receiving the v1 `/circuits` shape.
 
-## Rollout (owner decision 2026-10-29) — the config keys
+## The config keys and the cutover
 
 Both keys live in the `span:` section of the Pi's live config, `~/bridge-data/config.yaml` (outside the repo: no
 merge, tag or deploy changes it; back it up first, then restart `heatpump-bridge`).
 
-| Step | Config | What it does |
+| `span.transport` | What it does |
+|---|---|
+| `v2` (**the default** since the cutover; the key may be absent) | v2 (MQTT on the panel) is the ONLY transport. Every read and write waits for the session; nothing is ever sent to v1 — not a register, not a read, not a relay write. |
+| `auto` | v2 first for reads and writes, v1 REST as the fallback while the panel still serves it. In `auto` nothing waits on v2 while v1 can answer (a CLOSE above all); when v1 cannot, a read or a CLOSE waits for v2. |
+| `v1` (**deprecated**) | v1 REST only, no v2 connection. Selectable by explicit config only, for a firmware surprise; the bridge logs `SPAN transport v1 is DEPRECATED … removes the v1 REST API on 2026-12-31` on every start and `/api/health.span.deprecated` (also in the hub frame) names it. With `v2_soak: true` the bridge also reads the v2 tree after each v1 read and compares name, relay state and controllable per circuit (read-only, never a v2 write; `/api/health.span.soak`). `v2_soak` is ignored under any other transport. |
+
+### Cutover plan (#199)
+
+The rollout so far (owner decision 2026-10-29): the release shipped pinned to `v1`, then `v2_soak: true` ran read-only
+on the Pi from 2026-11-01 (`release-20261101-1`), then the flip to `auto`.
+
+| Step | Where | What |
 |---|---|---|
-| 1. Release (default) | `transport: v1` (or the key absent) | Exactly today's behaviour: v1 REST only, no v2 connection at all. |
-| 2. Soak, a few days | `transport: v1` + `v2_soak: true` | Still v1 for every read and write. After each v1 read the bridge also reads the v2 tree and compares name, relay state and controllable per circuit. It never writes over v2, and a v2 failure never slows or fails the v1 read. Watch `/api/health.span.soak` (`compared`, `agree`, `disagree`, `last_disagreement`) and drift-check `[10]`. |
-| 3. Flip, with the owner's OK | `transport: auto` (drop `v2_soak`) | v2 first for reads and writes, v1 as the fallback while the panel still serves it. |
-| Later, optional | `transport: v2` | v2 only (no v1 attempts). Not required: `auto` already works after v1 is removed. |
+| 1. Auto soak | the Pi's config, release tag around 2026-11-24 | `transport: auto`. v2 answers every read and relay write; v1 is only the fallback. Clean = `/api/health.span.read` and `.write` stay `v2`, `v2_error` null, drift-check `[10]` passes, and the Air-Water 2 power-cycle test lands on v2 (issue #199 "Done when"). |
+| 2. This change (branch `delegate/span-v1-removal-199`) | the repo; the owner merges it before 2026-12-31 and cuts a release tag | The default becomes `v2` (`SpanConfig.transport`, `SpanClient`, `SpanLocalPoller`). `auto` is unchanged. `v1` stays selectable as an explicit, deprecated fallback that warns on every start; the v1 code is not deleted yet. On the Pi: drop the `transport` key (→ v2) or leave `auto`. Every safety invariant stays at its choke point: the OpenPermit close-only rule in `SpanClient._set_relay_sync`, the backup-element arm path (close-only, never holds a permit), the guards in `BreakerController`. The test suites run every SPAN suite twice: a v2-only panel on the default, and the v1 fake on the explicit `v1` fallback. |
+| 3. Remove v1 | the repo, after 2026-12-31 | Delete the v1 paths in `span_local.py` (`_register_sync`, `_circuits_sync`, `_v1_*`, `_soak_*`, the `v1` and `auto` values, `v2_soak`), the v1 run of `tests/conftest.py`'s `span_transport` fixture and the `v1_only` tests, and the v1 endpoints of `sim/fake_span.py`. `auto` goes with it: with no v1 to fall back to it is `v2`. |
 
 drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a soak disagreement fails it; in
 `auto`/`v2`, a read answered by v1 fails it (v2 is failing).
@@ -57,7 +67,7 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
   (removed, on cooldown, unreachable) the CLOSE then waits for v2, because a safety write is never refused when it could
   wait. Reads behave the same, and also wait during a process's first bring-up, outside the client lock, so a bridge
   restart doesn't land on v1. An OPEN always waits (it is not a safety write), and so does everything under
-  `transport: v2`.
+  `transport: v2` — the default since the cutover, where there is nothing else to send on.
 - **Registration backs off.** A broker that refuses what the panel just issued used to mean a new panel client every
   10 minutes. Re-registering now waits 10 min, then 20, 40 … capped at 6 h. The state is persisted in
   `span-v2-register.json`, so a restart doesn't reset it. After 3 registrations in a row without a session,
@@ -103,10 +113,14 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
 `sim/fake_span_v2.py` is a real MQTT broker on TLS plus the panel's Homie tree, built from
 `sim/span_v2_capture.json` (recorded read-only from the real panel by `deploy/span-v2-probe.py --capture`). A
 `/set` is checked against the circuit's own published `$description`, as the v1 fake checks the OpenAPI schema
-(#200). `tests/conftest.py` runs the breaker, self-heal, backup-gate and deliberate-stop suites twice: once on the v1
-fake, once on a v2-only panel with v1 removed.
+(#200). `tests/conftest.py` runs the breaker, self-heal, backup-gate and deliberate-stop suites twice: once on a
+v2-only panel with v1 removed, on the default transport; once on the v1 fake, on the explicit, deprecated `v1`
+fallback. `tests/test_span_v2.py` also proves the cutover on a panel that still serves both: the default resolves to
+v2, `transport: v1` logs the deprecation warning, `auto` still prefers v2, and each relay-write path — the dashboard's
+breaker control, the backup-element arm, the self-heal power cycle — lands on v2 while v1 is never asked.
 
 ## Still to do on the real panel
 
-The owner's release tag (no behaviour change), the soak, the flip to `auto`, then the Air-Water 2 power-cycle test
-on v2 (issue #199, "Done when").
+The `auto` soak on the Pi (release tag around 2026-11-24), the Air-Water 2 power-cycle test on v2 (issue #199, "Done
+when"), then the owner merges the v2-default change (step 2 above) and cuts a tag before 2026-12-31. v1 is deleted
+from the code after that date (step 3).

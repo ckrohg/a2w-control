@@ -25,7 +25,8 @@ from bridge.span_local import OpenPermit, SpanClient, SpanLocalPoller
 from bridge.store import Store
 from sim.fake_span import FakeSpan
 
-# #199: every test here runs against the v1 fake AND a v2-only (v1 removed) panel — tests/conftest.py
+# #199: every test here runs against a v2-only (v1 removed) panel on the default transport AND the v1 fake on the
+# deprecated v1 fallback — tests/conftest.py
 pytestmark = pytest.mark.usefixtures("span_transport")
 
 
@@ -891,8 +892,9 @@ async def test_hub_breaker_command_acks_with_readback_and_advertises_capability(
                 break
             await asyncio.sleep(0.01)
         tx = next(f for f in frames if f.get("type") == "state")["span"]["transport"]
-        assert tx["mode"] == ("v1" if span_transport == "v1" else "auto")
+        assert tx["mode"] == span_transport            # the shipped default is v2; v1 only by explicit config
         assert tx["read"] == span_transport and tx["write"] == span_transport
+        assert (tx["deprecated"] is None) == (span_transport == "v2")
 
         ack = await send("c2", circuit="Buffer Tank", op="open")
         assert ack["ok"] is False and ack["result"]["refused"] is True

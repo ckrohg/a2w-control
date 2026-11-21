@@ -352,8 +352,9 @@ fi
 echo
 echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199)"
 # The Pi reports its SPAN transport in the hub state frame (span.transport). Rollout (owner 2026-10-29): the release
-# ships pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
-# fallback). In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
+# shipped pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
+# fallback). Cutover: once the auto soak is clean the bridge default becomes v2 (mode v2) and v1 is a deprecated,
+# explicit fallback. In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
 if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
   skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
 else
@@ -365,13 +366,13 @@ else
   case "$SPANMODE" in
     v1)
       if [[ ! "$TODAY" < "2026-12-15" ]]; then
-        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; set span.transport: auto on the Pi"
+        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; drop span.transport: v1 on the Pi (v2 is the default) or set auto"
       elif [ -n "$SOAK" ] && [ "$(cut -d' ' -f2 <<<"$SOAK")" -gt 0 ]; then
         fail "SPAN v2 soak: v2 disagreed with v1 on $(cut -d' ' -f2 <<<"$SOAK") of $(cut -d' ' -f1 <<<"$SOAK") reads — see /api/health.span.soak.last_disagreement"
       elif [ -n "$SOAK" ]; then
         pass "SPAN pinned to v1 (rollout); v2 soak agrees on $(cut -d' ' -f1 <<<"$SOAK") reads ($(cut -d' ' -f3 <<<"$SOAK") with v2 unavailable)"
       else
-        pass "SPAN pinned to v1 by config (rollout step 1; next: span.v2_soak: true)"
+        pass "SPAN pinned to v1 by config (deprecated fallback — next: span.v2_soak: true, then auto, then drop the key for v2)"
       fi ;;
     auto|v2)
       case "$SPANTX" in

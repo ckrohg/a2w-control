@@ -245,14 +245,15 @@ class SpanConfig(BaseModel):
     ip_fallback: str | None = None     # last-known LAN IP, tried if the hostname won't resolve
     passphrase: str | None = None      # On-premise home-owner passphrase (enables auto-re-register)
     circuits: list[str] = ["Buffer Tank", "Air-Water 1", "Air-Water 2"]  # circuit NAMES to log
-    # #199: which local API to speak. v1 = REST only (the default: this release changes no behaviour). auto = v2 (MQTT
-    # on the panel) first, v1 as the fallback while the panel still serves it (removed 2026-12-31). v2 = v2 only.
-    # Rollout (owner 2026-10-29): ship on v1 → set v2_soak: true for a few days → with the owner's OK, transport: auto.
+    # #199: which local API to speak. v2 = MQTT on the panel, the ONLY transport (the default since the cutover). auto =
+    # v2 first, v1 REST as the fallback while the panel still serves it. v1 = REST only — DEPRECATED: the panel removes
+    # v1 on 2026-12-31; it stays selectable only as an explicit fallback for a firmware surprise, and the bridge warns on
+    # every start while it is set. Cutover: (1) soak on auto, (2) this default, (3) v1 removed after 2026-12-31.
     # See knowledge/reference/span-v2-local-api.md.
-    transport: Literal["v1", "auto", "v2"] = "v1"
-    # Read-only v2 soak, for transport: v1 only. After every v1 read the bridge also reads the v2 tree and compares relay
-    # state + controllable per circuit (/api/health.span.soak). It never writes over v2, and a v2 failure never touches
-    # the v1 read.
+    transport: Literal["v1", "auto", "v2"] = "v2"
+    # Read-only v2 soak, for transport: v1 only (ignored otherwise). After every v1 read the bridge also reads the v2 tree
+    # and compares relay state + controllable per circuit (/api/health.span.soak). It never writes over v2, and a v2
+    # failure never touches the v1 read.
     v2_soak: bool = False
     poll_interval_s: float = 25.0
     down_alert_after_s: float = 4 * 3600.0  # alert once if logging has been down this long

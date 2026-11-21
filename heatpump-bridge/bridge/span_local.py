@@ -12,13 +12,15 @@
 #     hourly-cloud record are all unaffected. urllib in a thread (no new dependency).
 # Relay writes are CLOSE-ONLY unless the caller holds an OpenPermit, which only the guarded
 # breaker controller (span_control.py) mints — see SpanClient._set_relay_sync.
-# Transport (#199): SPAN removes v1 REST on 2026-12-31. span.transport picks v1 (the default until the
-# owner flips it), auto (v2 MQTT first via span_v2.py, v1 fallback) or v2; v1 + v2_soak shadows v2
-# read-only. Every consumer sees the v1 /circuits shape, and transport_status() says which answered.
+# Transport (#199): SPAN removes v1 REST on 2026-12-31. span.transport picks v2 (the default since the cutover: v2
+# MQTT via span_v2.py is the ONLY transport), auto (v2 first, v1 fallback while the panel still serves it) or v1 —
+# DEPRECATED, selectable only explicitly, and every start on it logs a warning that v1 dies 2026-12-31; it stays in the
+# code for a few weeks in case a firmware surprise needs it, then goes. v1 + v2_soak shadows v2 read-only. Every consumer
+# sees the v1 /circuits shape, and transport_status() says which answered.
 # In auto nothing waits on v2 while v1 can answer, a CLOSE above all: only reads during a process's first bring-up give
 # the session time to come up, outside the client lock; every later (re)start runs in the background. When v1 cannot
 # answer (removed, on cooldown, unreachable) a read or a CLOSE does wait for v2: a safety write is never refused when it
-# could wait (#239 review).
+# could wait (#239 review). Under v2 every read and write waits for the session: there is nothing else to send on.
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +38,12 @@ from . import span_v2
 from .span_v2 import SpanV2, V2AuthError, V2NotSent, canon_id
 
 log = logging.getLogger(__name__)
-TRANSPORTS = ("auto", "v2", "v1")   # auto = v2 first, v1 fallback
+TRANSPORTS = ("auto", "v2", "v1")   # v2 = the default and only transport; auto = v2 first, v1 fallback; v1 = deprecated
+DEFAULT_TRANSPORT = "v2"
+V1_REMOVED_ON = "2026-12-31"        # the panel's own OpenAPI: v1 REST is removed on this date
+V1_DEPRECATION = (f"SPAN transport v1 is DEPRECATED: the panel removes the v1 REST API on {V1_REMOVED_ON}. "
+                  f"span.transport: v1 is an explicit fallback only — drop the key (the default is v2) or set auto. "
+                  f"After {V1_REMOVED_ON} this bridge cannot read or switch the panel on v1.")
 
 # SPAN rejects a duplicate client name ("Name already exists"), so every registration uses a
 # fresh unique name. Registration is rare — the minted token is long-lived and persisted, so we
@@ -70,9 +77,12 @@ class SpanClient:
 
     def __init__(self, host: str, passphrase: str, *, ip_fallback: str | None = None,
                  token: str | None = None, token_path: str | None = None, timeout_s: float = 8.0,
-                 transport: str = "v1", state_dir: str | None = None, v2_soak: bool = False):
+                 transport: str = DEFAULT_TRANSPORT, state_dir: str | None = None, v2_soak: bool = False):
         if transport not in TRANSPORTS:
             raise ValueError(f"span transport must be one of {TRANSPORTS}, not {transport!r}")
+        if transport == "v1":
+            # On every start (the client is built once per bridge process): v1 is a deprecated, explicit fallback.
+            log.warning("%s", V1_DEPRECATION)
         self.host = host
         self.ip_fallback = ip_fallback
         self.passphrase = passphrase
@@ -297,8 +307,11 @@ class SpanClient:
 
     def transport_status(self) -> dict:
         """Which SPAN transport answered the last read and the last relay write (#199), for /api/health + the hub
-        frame. `read` falling back to v1 means v2 is failing — v1 is removed 2026-12-31."""
+        frame. `read` falling back to v1 means v2 is failing — v1 is removed 2026-12-31. `deprecated` names the
+        problem when the bridge is pinned to v1."""
         return {"mode": self.transport,
+                "deprecated": (f"transport v1 is deprecated — the panel removes v1 REST on {V1_REMOVED_ON}"
+                               if self.transport == "v1" else None),
                 "read": self._answered["read"].get("transport"), "read_ts": self._answered["read"].get("ts"),
                 "write": self._answered["write"].get("transport"), "write_ts": self._answered["write"].get("ts"),
                 "v2": self.v2.status() if self.v2 is not None else None,
@@ -585,7 +598,7 @@ class SpanLocalPoller:
         self.store = store
         self.notify = notify
         self.client = SpanClient(cfg.host, cfg.passphrase, ip_fallback=cfg.ip_fallback,
-                                 token_path=token_path, transport=getattr(cfg, "transport", "v1"),
+                                 token_path=token_path, transport=getattr(cfg, "transport", DEFAULT_TRANSPORT),
                                  v2_soak=bool(getattr(cfg, "v2_soak", False)))
         self.arm_state_path = arm_state_path
         self._task: asyncio.Task | None = None

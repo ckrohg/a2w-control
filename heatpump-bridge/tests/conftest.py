@@ -1,7 +1,8 @@
-# @purpose: Shared fixtures. `span_transport` (#199) runs a SPAN suite twice: against the v1 REST fake, and against a
-# panel with v1 REMOVED that only speaks v2 (MQTT eBus, sim/fake_span_v2.py) — the panel after 2026-12-31. The v1
-# run uses the shipped default (transport "v1"); the v2 run uses the config the owner flips to later ("auto"). The
-# same assertions on both prove the flip changes no behaviour. Tests about v1's wire format are marked `v1_only`.
+# @purpose: Shared fixtures. `span_transport` (#199) runs a SPAN suite twice: against a panel with v1 REMOVED that only
+# speaks v2 (MQTT eBus, sim/fake_span_v2.py) — the panel after 2026-12-31 — on the shipped default (transport unset →
+# "v2"), and against the v1 REST fake on the explicit, deprecated fallback (transport "v1", kept for a few weeks in case
+# a firmware surprise needs it). The same assertions on both prove the cutover changes no behaviour at the choke points
+# (OpenPermit close-only, the backup-element arm path). Tests about v1's wire format are marked `v1_only`.
 from __future__ import annotations
 
 import pytest
@@ -31,10 +32,12 @@ def span_transport(request, monkeypatch):
                     ebus.flush(self)
             return real_fetch(self, wait)
         monkeypatch.setattr(span_v2.SpanV2, "fetch", fetch)
+        # every client in the suite runs the shipped default: transport unset → v2 (span_local.DEFAULT_TRANSPORT)
+    else:
         real_init = span_local.SpanClient.__init__
 
-        def init(self, *a, transport=None, **kw):   # every client in the suite runs the post-flip config
-            real_init(self, *a, transport="auto", **kw)
+        def init(self, *a, transport=None, **kw):   # every client in the suite runs the explicit, deprecated fallback
+            real_init(self, *a, transport="v1", **kw)
         monkeypatch.setattr(span_local.SpanClient, "__init__", init)
     # a /set the fake panel ignores must not cost every test the production echo wait
     monkeypatch.setattr(span_v2, "ECHO_WAIT_S", 0.5)
