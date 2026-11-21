@@ -10,12 +10,21 @@
  *   (c) a replan late in the lead hours keeps the boost the history placed on the current hour, at the target the
  *       auto-pilot commanded — no rewrite, no extra HBX write;
  *   (d) a normal day still boosts once per window, sized floor + p90, capped at 135.
+ * 2026-11 winter mornings lost the boost to the winter guard (Nov 8–16, every night at 32–40 °F — owner 2026-11-19:
+ * the boost stays at its own target):
+ *   (e) the as-found curve mimic (no demand floor) never cancels the boost: flag, target and reason stay, and the
+ *       auto-pilot / identification driver still see an excursion;
+ *   (f) (g) the demand floor raises the boost's target when it is higher, never lower, and the block stays the boost;
+ *   (h) a boost already written on the current hour is kept when the learned windows shift under it (Nov 13);
+ *   (i) with no shaped curve (every block written flat) raiseBoostsToGuard holds the boost hour at the guard's value;
+ *   (j) warm weather (≥ 50 °F) is untouched.
  * Plain node:assert script under tsx like the other planner suites: npx tsx planner/src/preboost-timing.test.ts.
  */
 process.env.TZ = "America/New_York"; // the planner runs in the house's zone (run.sh); the fall-back night is 2026-11-01
 import assert from "node:assert/strict";
-import { computeShadowPlan, priorExcursionsFromPlans, DEFAULT_OPTS, MAX_PREBOOST_F, type ForecastHour, type ShadowBlock } from "./shadow";
-import { AutoPilot } from "./autopilot";
+import { computeShadowPlan, priorExcursionsFromPlans, raiseBoostsToGuard, DEFAULT_OPTS, MAX_PREBOOST_F, type ForecastHour, type ShadowBlock, type ShadowOpts } from "./shadow";
+import { AutoPilot, curveDecision } from "./autopilot";
+import { planConflictAhead } from "./identify";
 
 // A November night like Nov 2 2026: falling overnight, 03:00 the warmest lead hour of [3, 4, 5]. Below the winter
 // guard, but with no demand floor and cfg = null the winter pass changes nothing (as bank-memory.test.ts).
@@ -154,6 +163,144 @@ if (run("d")) {
   // the plan is byte-identical to a plan with no memory on a day the history has nothing for
   assert.deepEqual(planAt(5, 0, 19, [], { memory: false }).plan, p.plan);
   console.log("preboost-timing.test.ts (d) normal day: ok");
+}
+
+// ---- 2026-11 winter mornings lost the boost to the winter guard ------------------------------------------------------
+// Nov 15 2026 (EST, no DST). One learned peak [3,10) with p90 10 °F over 37 draws → the boost is the 02:00 block at
+// floor 120 + 10 = 130. Outdoor 32 °F all night: the as-found curve below gives exactly 135 °F at 32 °F
+// (150 + (32 − 2) × (120 − 150) / (62 − 2)), the number the Nov 8–16 guard blocks carried.
+const coldCfg = { dot: 2, wwsd: 62, dbt: 150, mbt: 120 };
+const earlyPeak = { windowStart: 3, windowEnd: 10, boostF: 10, sagP75F: 8.1, sagP90F: 10.2, n: 37 };
+const flat = (f: number) => (startMs: number): ForecastHour[] => Array.from({ length: 24 }, (_, k) => ({ ts: new Date(startMs + k * 3600_000), outdoorF: f }));
+type ColdPlan = { cfg?: Record<string, number> | null; floor?: { tankTargetF: number; bindingZone: string; awtF: number } | null; prior?: ShadowOpts["priorExcursions"]; outdoorF?: number; preBoosts?: typeof opts.preBoosts; o?: Partial<ShadowOpts> };
+function coldPlanAt(d: number, h: number, p: ColdPlan = {}): ShadowBlock[] {
+  const forecast = flat(p.outdoorF ?? 32)(local(d, h));
+  const o: ShadowOpts = { ...opts, preBoosts: p.preBoosts ?? [earlyPeak], priorExcursions: p.prior ?? [], ...(p.o ?? {}) };
+  return computeShadowPlan(forecast, p.cfg === undefined ? coldCfg : p.cfg, o, p.floor ?? null, false);
+}
+const at = (plan: ShadowBlock[], h: number) => plan.find((b) => hourOf(b) === h)!;
+
+// (e) THE CURVE MIMIC NEVER CANCELS THE BOOST. No demand floor, the as-found curve at 135 °F: the 02:00 block is still
+//     the boost at 130 with its pre-boost reason, the auto-pilot classifies it as an excursion (a flat write, not the
+//     ~120 °F shaped curve the Nov 8–16 mornings got) and the identification driver keeps its distance. The hours
+//     around it are the guard's mimic blocks as before, and the boost records the 135 it declined (guard_f).
+if (run("e")) {
+  const plan = coldPlanAt(15, 0);
+  const b = at(plan, 2);
+  assert.equal(b.boost, true, "02:00 is still the boost under the winter guard");
+  assert.equal(b.tank_target_f, 130, "…at its own target, not the 135 °F curve");
+  assert.match(b.reason, /^pre-boost to 130°F for 03:00 window \(sag p90 10.2°F over 37 draws; hour before the bell, 32°F\)$/);
+  assert.equal(b.guard_f, 135, "the block records what the guard would have written");
+  assert.ok(b.hp1_setpoint_f >= b.tank_target_f + DEFAULT_OPTS.i1MarginF, "Phase B still leads the setpoint off the boost (I1)");
+  assert.equal(curveDecision(b).kind, "excursion", "the auto-pilot writes the boost flat, never the shaped curve through it");
+  assert.equal(planConflictAhead(plan, local(15, 1), 3), true, "the identification driver sees the boost and stands down");
+  assert.equal(plan.filter((x) => x.boost).length, 1, "one boost");
+  for (const h of [0, 1, 3, 4]) {
+    assert.equal(at(plan, h).tank_target_f, 135, `${h}:00 is the guard's mimic`);
+    assert.equal(at(plan, h).reason, "winter guard: mimic HBX curve");
+    assert.equal(at(plan, h).guard_f, undefined, "guard_f rides only on a boost block");
+  }
+  // a curve BELOW the boost records nothing (the guard would not have raised the block): 128 °F at 32 °F, so the
+  // band's curve + 3 ceiling (131) still admits the 130
+  const mild = at(coldPlanAt(15, 0, { cfg: { dot: 2, wwsd: 62, dbt: 143, mbt: 113 } }), 2);
+  assert.equal(mild.tank_target_f, 130); assert.equal(mild.guard_f, undefined);
+  console.log("preboost-timing.test.ts (e) the winter guard's curve mimic keeps the boost: ok");
+}
+
+// (f) A DEMAND FLOOR ABOVE THE BOOST raises the boost's target to the floor and says so; the block is still the boost.
+//     (The everyday band caps every non-soak block at strictCapF, so the 137 is observed with the cap at 140; with the
+//     default cap the same block is 135 — the floor clamped like its neighbours — and still the boost.)
+if (run("f")) {
+  const floor = { tankTargetF: 137, bindingZone: "Living Room Baseboard", awtF: 133 };
+  const b = at(coldPlanAt(15, 0, { floor, o: { strictCapF: 140 } }), 2);
+  assert.equal(b.boost, true, "02:00 is still the boost under the demand floor");
+  assert.equal(b.tank_target_f, 137, "max(boost 130, floor 137)");
+  assert.match(b.reason, /^pre-boost to 130°F for 03:00 window .* — raised to the demand floor 137°F \(binding zone: Living Room Baseboard needs 133°F/);
+  assert.equal(curveDecision(b).kind, "excursion");
+  const capped = at(coldPlanAt(15, 0, { floor }), 2);
+  assert.equal(capped.boost, true); assert.equal(capped.tank_target_f, DEFAULT_OPTS.strictCapF, "default cap: the floor is clamped to 135, the boost identity stays");
+  assert.match(capped.reason, /^pre-boost to 130°F .* — raised to the demand floor 137°F/);
+  console.log("preboost-timing.test.ts (f) demand floor above the boost: ok");
+}
+
+// (g) A DEMAND FLOOR BELOW THE BOOST leaves it alone: 130, boost, the plain pre-boost reason.
+if (run("g")) {
+  const plan = coldPlanAt(15, 0, { floor: { tankTargetF: 125, bindingZone: "Dining", awtF: 121 } });
+  const b = at(plan, 2);
+  assert.equal(b.boost, true); assert.equal(b.tank_target_f, 130);
+  assert.match(b.reason, /^pre-boost to 130°F for 03:00 window/); assert.doesNotMatch(b.reason, /raised to the demand floor/);
+  assert.equal(b.guard_f, undefined, "the floor branch raises the target itself; nothing to record");
+  assert.ok(plan.filter((x) => !x.boost).every((x) => x.tank_target_f === 125 && /^binding zone/.test(x.reason)), "every other block is the floor");
+  console.log("preboost-timing.test.ts (g) demand floor below the boost: ok");
+}
+
+// (h) A WINDOW SHIFT UNDER A RUNNING BOOST (Nov 13 2026): the 03:21 plan boosted 04:00 for a [5,10) window and the
+//     auto-pilot wrote 131 at 04:06; the 04:21 replan learned [3,10) — 04:00 now INSIDE the peak, a lead hour of
+//     nothing — and dropped the block to the 120 °F floor. The started boost is kept at its commanded 131.
+if (run("h")) {
+  const prior = [{ ts: new Date(local(13, 4)).toISOString(), boost: true, tank_target_f: 131 }];
+  const p = computeShadowPlan(forecastFrom(local(13, 4)), null, { ...opts, preBoosts: [earlyPeak], priorExcursions: prior }, null, false);
+  const b = p[0];
+  assert.equal(hourOf(b), 4, "the plan starts at the current (04:00) hour");
+  assert.equal(b.boost, true, "04:21: the boost written at 04:06 is kept");
+  assert.equal(b.tank_target_f, 131, "…at its commanded target");
+  assert.match(b.reason, /^pre-boost to 131°F \(kept from the previous plan/);
+  assert.equal(p.filter((x) => x.boost && new Date(x.ts).getDate() === 13 && hourOf(x) < 10).length, 1, "no second morning boost (02:00 is in the past, 03:00+ is the peak)");
+  const dropped = computeShadowPlan(forecastFrom(local(13, 4)), null, { ...opts, preBoosts: [earlyPeak] }, null, false)[0];
+  assert.equal(dropped.tank_target_f, DEFAULT_OPTS.dhwFloorF, "documents what the memory prevents: the floor at 04:21, showers an hour away");
+  // the kept boost also survives the winter guard (rule 1 holds for it too), and is capped at strictCapF
+  const cold = coldPlanAt(13, 4, { prior });
+  assert.equal(cold[0].boost, true); assert.equal(cold[0].tank_target_f, 131); assert.equal(cold[0].guard_f, 135);
+  assert.match(cold[0].reason, /^pre-boost to 131°F \(kept from the previous plan/);
+  const over = coldPlanAt(13, 4, { prior: [{ ...prior[0], tank_target_f: 150 }], cfg: null })[0];
+  assert.equal(over.tank_target_f, DEFAULT_OPTS.strictCapF, "a stored target above the cap is capped");
+  // a window still leading from the kept hour names itself, as in (c): peaks back at [5,10) → "for 05:00 window"
+  const same = computeShadowPlan(forecastFrom(local(13, 4)), null, { ...opts, preBoosts: [{ ...earlyPeak, windowStart: 5 }], priorExcursions: prior }, null, false)[0];
+  assert.equal(same.boost, true); assert.equal(same.tank_target_f, 131);
+  assert.match(same.reason, /^pre-boost to 131°F for 05:00 window \(sag p90 10.2°F over 37 draws; kept from the previous plan/);
+  // a soak on the hour keeps its own identity — a prior boost never relabels it
+  const soaked = computeShadowPlan(forecastFrom(local(13, 4)), null, { ...opts, preBoosts: [earlyPeak], priorExcursions: prior }, null, true, true)[0];
+  assert.equal(soaked.sani, true); assert.equal(soaked.boost, undefined);
+  console.log("preboost-timing.test.ts (h) window shift keeps the running boost: ok");
+}
+
+// (i) DEGRADED MODE (no shaped curve stamped → every block written flat): raiseBoostsToGuard lifts a boost block to
+//     its guard_f, re-leads the HP line, keeps the pre-boost identity, and returns every other block as the same object.
+if (run("i")) {
+  const plan = coldPlanAt(15, 0);
+  const held = raiseBoostsToGuard(plan, DEFAULT_OPTS);
+  const b = at(held, 2);
+  assert.equal(b.boost, true); assert.equal(b.tank_target_f, 135, "130 → the guard's 135");
+  assert.equal(b.hp1_setpoint_f, 135 + DEFAULT_OPTS.i1MarginF, "HP line re-led: target + margin, under strictCap + margin");
+  assert.match(b.reason, /^pre-boost to 130°F for 03:00 window .*; held at the winter guard's 135°F/);
+  assert.equal(curveDecision(b).kind, "excursion");
+  for (let i = 0; i < plan.length; i++) if (i !== plan.indexOf(at(plan, 2))) assert.equal(held[i], plan[i], `block ${i} is untouched (same object)`);
+  assert.deepEqual(plan.filter((x) => x.boost)[0].tank_target_f, 130, "pure: the input plan is not mutated");
+  // hand-built edge cases: no guard_f, guard_f at or below the target, a non-boost block with a stray guard_f
+  const mk = (x: Partial<ShadowBlock>): ShadowBlock => ({ ts: "2026-11-15T07:00:00.000Z", outdoor_f: 32, tank_target_f: 130, hp1_setpoint_f: 135, reason: "pre-boost to 130°F", boost: true, ...x });
+  const edge = [mk({}), mk({ guard_f: 130 }), mk({ guard_f: 128 }), mk({ boost: undefined, guard_f: 135, reason: "winter guard: mimic HBX curve" }), mk({ guard_f: 135, bank: true })];
+  const out = raiseBoostsToGuard(edge, DEFAULT_OPTS);
+  for (let i = 0; i < 4; i++) assert.equal(out[i], edge[i], `edge ${i} untouched`);
+  assert.equal(out[4].tank_target_f, 135);
+  // nothing to hold on a warm plan or a floor-raised plan (no guard_f anywhere)
+  assert.deepEqual(raiseBoostsToGuard(coldPlanAt(15, 0, { outdoorF: 55, cfg: { dot: 5, wwsd: 125, dbt: 165, mbt: 145 } }), DEFAULT_OPTS), coldPlanAt(15, 0, { outdoorF: 55, cfg: { dot: 5, wwsd: 125, dbt: 165, mbt: 145 } }));
+  console.log("preboost-timing.test.ts (i) degraded mode holds the boost at the guard: ok");
+}
+
+// (j) WARM CONTROL: at 55 °F the winter pass does not run — the plan with the as-found curve is byte-identical to the
+//     plan without it (the band's ceiling is strictCap either way), carries no guard_f, and boosts 02:00 at 130.
+if (run("j")) {
+  const asFound = { dot: 5, wwsd: 125, dbt: 165, mbt: 145 }; // the prod baseline: 156.7 °F at 55 °F → ceiling strictCap
+  const warm = coldPlanAt(15, 0, { outdoorF: 55, cfg: asFound });
+  assert.deepEqual(warm, coldPlanAt(15, 0, { outdoorF: 55, cfg: null }), "no cfg effect above the winter guard");
+  assert.ok(warm.every((b) => b.guard_f === undefined), "no guard_f anywhere");
+  const b = at(warm, 2);
+  assert.equal(b.boost, true); assert.equal(b.tank_target_f, 130);
+  assert.match(b.reason, /^pre-boost to 130°F for 03:00 window \(sag p90 10.2°F over 37 draws; hour before the bell, 55°F\)$/);
+  assert.ok(warm.filter((x) => !x.boost).every((x) => x.tank_target_f === DEFAULT_OPTS.dhwFloorF && x.reason === "DHW window floor"), "every other block is the floor, as before");
+  // the same with a demand floor below the guard threshold's reach: the winter pass is skipped at 55 °F regardless
+  assert.deepEqual(coldPlanAt(15, 0, { outdoorF: 55, cfg: asFound, floor: { tankTargetF: 137, bindingZone: "x", awtF: 133 } }), warm, "a demand floor is a winter-pass input only");
+  console.log("preboost-timing.test.ts (j) warm control unchanged: ok");
 }
 
 console.log("preboost-timing.test.ts: all assertions passed ✓");

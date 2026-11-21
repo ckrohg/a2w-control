@@ -21,7 +21,7 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { parseJsonObject, BODY_TOO_LARGE, MAX_BODY_BYTES } from "./httpbody";
 import { HubClient, type HubState } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans, raiseBoostsToGuard } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
@@ -1765,7 +1765,7 @@ async function shadowOnce(): Promise<void> {
   if (sanitizeDue.urgent) {
     console.warn("[I8] pasteurization window LAPSED — scheduling the soak at the earliest hour, not the warmest");
   }
-  const plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue.due, sanitizeDue.urgent);
+  let plan = computeShadowPlan(forecast, cfg, opts, demandFloor, sanitizeDue.due, sanitizeDue.urgent);
   if (!plan.length) throw new Error("empty forecast");
 
   // #59 winter DP — solve the cost-optimal trajectory over the SAME hard floors the plan
@@ -2003,6 +2003,18 @@ async function shadowOnce(): Promise<void> {
 
     console.warn("shaped curve not computed:", (e as Error).message);
 
+  }
+
+  // 2026-11 winter mornings lost the boost to the winter guard: the guard now leaves a pre-boost block at its own
+  // target. With no shaped curve stamped — or SHAPED_CURVE not live (off / shadow), where the stamp is reported but
+  // never written — the auto-pilot writes every block flat, so a 130 °F boost hour between the 135 °F curve-mimic
+  // hours would be a dip before the showers — hold it at what the guard would have written (block.guard_f). Never
+  // on the live curve path: there the mimic hours run the ~120 °F curve and the boost is the excursion above it.
+  if (!SHAPED_CURVE || !lastShapedCurve) {
+    const held = raiseBoostsToGuard(plan, opts);
+    const n = held.filter((b, i) => b !== plan[i]).length;
+    if (n) console.log(`[plan] no shaped curve: ${n} pre-boost block(s) held at the winter guard's target`);
+    plan = held;
   }
 
 
