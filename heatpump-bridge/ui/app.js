@@ -153,6 +153,8 @@ function renderCommBreakdown(c) {
   if (c.connect_failures) parts.push(`connect ${c.connect_failures}`);
   if (c.timeouts) parts.push(`timeout ${c.timeouts}`);
   if (c.io_errors) parts.push(`io ${c.io_errors}`);
+  if (c.crc_errors) parts.push(`crc ${c.crc_errors}`);  // of the timeouts/io above: garbled, not silent
+  if (c.slow_requests) parts.push(`slow ${c.slow_requests}`);
   if (c.exception_responses) parts.push(`nak ${c.exception_responses}`);
   if (c.reconnects) parts.push(`reconnects ${c.reconnects}`);
   if (c.consecutive_failures) parts.push(`${c.consecutive_failures} in a row`);

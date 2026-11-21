@@ -23,7 +23,7 @@ class CommStats:
     ok_polls: int = 0
     error_polls: int = 0
     timeouts: int = 0
-    io_errors: int = 0          # includes CRC/framing errors surfaced by pymodbus
+    io_errors: int = 0          # non-timeout transport errors + wrong-length replies
     exception_responses: int = 0  # Modbus exception PDUs from the pump
     connect_failures: int = 0   # TCP connect refused/unreachable (≠ timeout: see triage table)
     reconnects: int = 0
@@ -33,6 +33,19 @@ class CommStats:
     # W610 gateway is unreachable (TCP failed); timeout/io/exception = gateway answered
     # but the pump behind it didn't. Empty while healthy.
     last_error_category: str = ""
+    # #76 item 4 — additive. crc_errors is an "of which" count ALONGSIDE the counters
+    # above, never instead of them: a reply that arrived but was not a usable frame. Two
+    # sources: (a) reply bytes reached the socket yet pymodbus found no valid frame in
+    # them (bad CRC or a short frame — pymodbus drops those silently, so the request also
+    # counts in timeouts); (b) a valid frame of the wrong length (also counts in io_errors,
+    # as before). timeouts − (a) is therefore "true silence".
+    crc_errors: int = 0
+    # round trip of the most recent ANSWERED request (send → reply, monotonic clock), the
+    # worst one since these stats were created, and how many ran over the slow threshold:
+    # "slow with the link up". Unanswered requests are in timeouts, not here.
+    last_rtt_ms: float | None = None
+    max_rtt_ms: float | None = None
+    slow_requests: int = 0
 
     def as_dict(self) -> dict:
         total = self.ok_polls + self.error_polls
@@ -48,6 +61,10 @@ class CommStats:
             "last_ok_ts": self.last_ok_ts,
             "last_error_category": self.last_error_category,
             "error_rate": round(self.error_polls / total, 4) if total else 0.0,
+            "crc_errors": self.crc_errors,
+            "last_rtt_ms": self.last_rtt_ms,
+            "max_rtt_ms": self.max_rtt_ms,
+            "slow_requests": self.slow_requests,
         }
 
 
@@ -68,16 +85,25 @@ class ModbusError(Exception):
 # bridge-watchdog timer (deploy/bridge-watchdog.sh) escalates above it.
 REBUILD_AFTER_CONNECT_FAILURES = 30
 
+# An answered request slower than this counts in CommStats.slow_requests (#76 item 4). At
+# 2400 baud the largest poll block (51 registers = 107 reply bytes) is ~0.5 s of pure wire
+# time, so a healthy link sits well under 1 s; above it the WiFi leg is stalling.
+SLOW_RTT_MS = 1000.0
+
 
 class PumpClient:
     """One RTU-over-TCP connection to one heat pump. The bridge is the only Modbus
     master on each bus, so no cross-request locking beyond this client's own mutex."""
 
-    def __init__(self, host: str, port: int, device_id: int, timeout_s: float = 5.0):
+    def __init__(self, host: str, port: int, device_id: int, timeout_s: float = 5.0,
+                 *, slow_rtt_ms: float = SLOW_RTT_MS, clock=time.monotonic):
         self.host = host
         self.port = port
         self.device_id = device_id
         self._timeout_s = timeout_s
+        self._slow_rtt_ms = slow_rtt_ms
+        self._clock = clock   # injectable so tests can make a reply "slow" without sleeping
+        self._rx_bytes = 0    # reply bytes seen on the socket since the current request began
         self.stats = CommStats()
         # retries=0: NO pymodbus retransmits. RTU-over-TCP has no transaction IDs, so a
         # response that arrives after its timeout would be matched to whatever request is
@@ -92,8 +118,38 @@ class PumpClient:
     def _new_transport(self) -> AsyncModbusTcpClient:
         return AsyncModbusTcpClient(
             self.host, port=self.port, framer=FramerType.RTU,
-            timeout=self._timeout_s, retries=0,
+            timeout=self._timeout_s, retries=0, trace_packet=self._trace_packet,
         )
+
+    # @purpose: Passive byte counter on pymodbus's packet trace hook — the only place a
+    # reply that fails CRC is visible at all (the RTU framer discards it without raising).
+    # Returns the data untouched: it observes the stream, it never alters framing.
+    def _trace_packet(self, sending: bool, data: bytes) -> bytes:
+        if not sending:
+            self._rx_bytes += len(data)
+        return data
+
+    # @purpose: Mark the start of one request: zero the reply-byte counter and return the
+    # monotonic start time for _record_rtt.
+    def _begin_request(self) -> float:
+        self._rx_bytes = 0
+        return self._clock()
+
+    # @purpose: Record the round trip of a request that got a reply (good, exception or
+    # wrong-shape): last / max since these stats were created / count over the threshold.
+    def _record_rtt(self, started: float) -> None:
+        rtt_ms = round((self._clock() - started) * 1000.0, 1)
+        self.stats.last_rtt_ms = rtt_ms
+        if self.stats.max_rtt_ms is None or rtt_ms > self.stats.max_rtt_ms:
+            self.stats.max_rtt_ms = rtt_ms
+        if rtt_ms > self._slow_rtt_ms:
+            self.stats.slow_requests += 1
+
+    # @purpose: After a request timed out, tell "the pump said nothing" from "bytes came
+    # back but no valid frame was in them" (bad CRC / short frame) and count the latter.
+    def _note_garbled_reply(self, category: str) -> None:
+        if category == "timeout" and self._rx_bytes > 0:
+            self.stats.crc_errors += 1
 
     async def _ensure_connected(self) -> None:
         if self._client.connected:
@@ -143,6 +199,7 @@ class PumpClient:
         """Read one batched register block, returning {address: raw}."""
         async with self._lock:
             await self._ensure_connected()
+            started = self._begin_request()
             try:
                 resp = await self._client.read_holding_registers(
                     block.start, count=block.count, device_id=self.device_id,
@@ -152,8 +209,10 @@ class PumpClient:
                 # them as ModbusIOException — classify by message so stats.timeouts
                 # actually counts them
                 category = self._classify(exc)
+                self._note_garbled_reply(category)
                 self._flush_socket(category)
                 raise ModbusError(f"{category} reading {block.start}: {exc}", category) from exc
+            self._record_rtt(started)
             if resp.isError():
                 self.stats.exception_responses += 1
                 self.stats.last_error_category = "exception"
@@ -167,6 +226,7 @@ class PumpClient:
             regs = getattr(resp, "registers", None)
             if regs is None or len(regs) != block.count:
                 self.stats.io_errors += 1
+                self.stats.crc_errors += 1  # framing trouble; io_errors keeps its old total
                 self.stats.last_error_category = "io"
                 self._flush_socket("io")
                 got = "no registers" if regs is None else f"{len(regs)} registers"
@@ -184,12 +244,15 @@ class PumpClient:
         caller decides whether a mismatch is an error (it is, for setpoints)."""
         async with self._lock:
             await self._ensure_connected()
+            started = self._begin_request()
             try:
                 resp = await self._client.write_register(address, value, device_id=self.device_id)
             except ModbusException as exc:
                 category = self._classify(exc)
+                self._note_garbled_reply(category)
                 self._flush_socket(category)
                 raise ModbusError(f"{category} writing {address}: {exc}", category) from exc
+            self._record_rtt(started)
             if resp.isError():
                 self.stats.exception_responses += 1
                 self.stats.last_error_category = "exception"
