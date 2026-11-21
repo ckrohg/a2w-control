@@ -1,24 +1,38 @@
 # a2w-planner
 
-The planner service from `knowledge/reference/cross-system-optimization-plan.md`. This is
-**Phase A-2: the SensorLinx reader** — later phases add the shadow planner (A-5), the
-day-plan solver (§6.2), and the guarded HBX write adapter (Phase C, §5.2).
+The planner service from `knowledge/reference/cross-system-optimization-plan.md`, deployed on
+Railway as `a2w-planner` and **live in the control path**. Every `POLL_SECONDS` it reads the HBX
+ECO-0600 through `api.sensorlinx.co`, stores the reading and any configuration drift in the shared
+Railway Postgres, and pages on drift or on going offline (`index.ts`). It is also the **sole
+guarded writer** of the HBX reset curve (`writes.ts`, plan §5.2): a target is commanded by
+PATCHing a valid near-flat curve (or, with `SHAPED_CURVE=1`, the plan's demand-shaped curve), and
+every write passes the I4 envelope clamp, the I1 cross-check against the live pump setpoints, the
+15-minute rate limit, a response-echo verify, a self-recorded config version and an audit row —
+see [§Single-writer invariant](#single-writer-invariant). Two control loops ride on that: the
+**auto-pilot** (`autopilot.ts`) drives the HBX buffer target to the shadow plan's current block
+through the writer, and **Phase B** (`phaseb.ts`) drives both pumps' setpoints through the hub to
+lead the operative target on 90-minute leases, so a dead planner lapses back to the Pi's baseline
+rather than leaving a stale optimizer value — see [§Phase B](#phase-b--the-tracking-loop-live).
 
-What it does now (it both **reads** the HBX and — through one guarded path — is the **sole
-writer** of the reset curve; see [§Single-writer invariant](#single-writer-invariant) below):
+What the reader half does every poll:
 
 - Polls the HBX ECO-0600 through **`api.sensorlinx.co`** (the app's host — richer than
   the legacy `mobile.` host TempIQ uses) every `POLL_SECONDS` (default 300).
-- Stores a narrow reading per poll in **`slx_readings`** (Neon): tank temp, tank target,
-  outdoor, heat/cool demand, per-stage call flags, backup call flag, relay bitmask,
+- Stores a narrow reading per poll in **`slx_readings`** (Railway Postgres): tank temp, tank
+  target, outdoor, heat/cool demand, per-stage call flags, backup call flag, relay bitmask,
   connected.
 - Extracts the ~70 configuration parameters (curve, differentials, staging, backup
   triggers, demand modes, schedule) and maintains **`hbx_config_versions`** — an
   append-only history. Row 1 = first observation; every later row = a detected edit with
   `changed_fields` (old → new). This is the §6.6 curve-version/drift tracker.
-- **ntfy alerts** (optional): config drift (high priority), reader offline after 5
-  consecutive poll failures, and recovery. Same topic the Pi/hub use.
-- `GET /health` → `{ok, lastPollAt, lastDriftAt, consecutiveFailures}` (503 when failing).
+- **Alerts** (ntfy, Resend email and the 6bb phone push, chosen by tier — see
+  `alertpolicy.ts`): config drift, reader offline after 5 consecutive poll failures, and recovery.
+- `GET /health` (503 after 5 consecutive poll failures) emits these top-level keys:
+  `ok`, `lastPollAt`, `lastDriftAt`, `lastShadowAt`, `consecutiveFailures`, `unserved`, `span`,
+  `pump_health`, `backup_gate`, `pi`, `drift`, `forecast`, `instance`, `tz`, `writer_lease`, `i1`,
+  `tempiq_push`, `tempiq_read`, `tempiq_windows`, `identification`, `curve`, `phase_b`,
+  `demand_floor_cadence`, `winter_solver`, `winter_dp`, `demand_forecast`, `thermal`, `storm`,
+  `dhw`, `hygiene`. The sections below say what each one carries.
 
 ## Demand-floor cadence (#136)
 
@@ -255,8 +269,8 @@ GET  /api/hbx/target                          → writer.status()
   into `writes.ts` and its function lives in `autopilot.ts` + the API above. Re-running such a
   script bypasses every guardrail (it collided with a planner write 0.4 s apart on 2026-07-16).
 - **A second planner instance that writes.** Never run a local/parallel planner with
-  `AUTOPILOT_DRY_RUN=0` or `PHASE_B_DRY_RUN=0` against the shared Neon DB. Exactly one instance
-  writes; everything else must stay shadow/dry-run.
+  `AUTOPILOT_DRY_RUN=0` or `PHASE_B_DRY_RUN=0` against the shared Railway Postgres. Exactly one
+  instance writes; everything else must stay shadow/dry-run.
 
 **Detection.** A foreign write (any writer that isn't this planner) is caught two ways, because
 the planner records its *own* writes with a `_source` tag and therefore never self-alerts:
@@ -305,27 +319,182 @@ it deliberately (ideally at the #34 go-live) and confirm takeover works on the f
 
 ## Environment variables
 
-| Var | Required | Notes |
+Every variable the planner reads (`process.env` across `planner/src`, plus the rehearsal harness
+under `scripts/rehearsal`), grouped by subsystem. "Default" is what the code does when the
+variable is unset; it is not what production has set. Four flags only **seed** the
+`controller_flags` row on first boot (`AUTOPILOT_DRY_RUN`, `PHASE_B_DRY_RUN`,
+`AUTO_SANITIZE_ENABLED`, `IDENTIFICATION_MODE`): afterwards the dashboard's Optimize page owns
+them and a changed env value does not clobber the live choice. The dashboard's Off/Armed switch
+(`POST /api/autonomy`) is one switch for two loops: `off` sets `controller_flags.autopilot_dry_run`
+**and** `phaseb_dry_run`, `arm` clears both. The code's run-time truth is `/health`, never this
+table — with one exception: `/health.phase_b.mode` echoes the `PHASE_B_DRY_RUN` seed, not the
+switch, so it still reads `active` while the switch is Off. The live dry-run state is in the
+per-pump `/health.phase_b.lastResults` strings and in the `controller_status` row the planner
+heartbeats every poll (§Phase B).
+
+### Core — SensorLinx reader, database, process
+
+| Var | Default | Meaning |
 |---|---|---|
-| `SENSORLINX_EMAIL` / `SENSORLINX_PASSWORD` | yes | SensorLinx account login (JWT lives ~15 min; the client re-logs-in on 401). |
-| `DATABASE_URL` | yes | The Neon Postgres (same DB as `analytics-mirror`; tables are additive). |
-| `SLX_BUILDING_ID` | no | default `673e25ab8db6198c521700ed` |
-| `SLX_SYNC_CODE` | no | default `AECO-2036` |
-| `POLL_SECONDS` | no | default `300` |
-| `NTFY_TOPIC` / `NTFY_SERVER` | no | alerts off when unset; server defaults to `https://ntfy.sh` |
-| `PLANNER_API_TOKEN` | for writes | bearer that gates `POST /api/hbx/*` (and `/api/storm/*`). The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
-| `PLANNER_READ_TOKEN` | no | READ-ONLY bearer for the 6bb home app (#190) — opens `GET /api/status` and nothing else; see §Read-only status. Unset = that route is a plain 404, as before. |
-| `STAGE_PUMP_MAP` | no | JSON map of HBX stage relay → hub pump id, default `{"1":"pump1","2":"pump2"}`. The PHYSICAL wiring the per-stage unserved alarm (#185) checks against — verify it at the panel (§Per-stage unserved alarm). |
-| `WRITER_LEASE_ENABLED` | no | `1` arms the blocking single-writer lease (default off) — see §Single-writer invariant. |
-| `TEMPIQ_WINDOWS_ENABLED` | no | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137; needs `TEMPIQ_SURFACE_TOKEN`). Default off. |
-| `TEMPIQ_WINDOWS_EVERY_MIN` | no | poster cadence, default `5` |
-| `COP_OVERLAP_DAYS` | no | how far behind the newest mirrored TempIQ COP point each hourly read re-reads (upsert), default `3` — see §TempIQ COP mirror. `0` is the pre-TempIQv2#2124 cursor and misses every completed row. |
-| `IDENTIFICATION_ENABLED` | no | `1` constructs the identification driver (needs autopilot, Phase B, the winter-solver feed, the hub and `TEMPIQ_SURFACE_TOKEN`). Default off. |
-| `IDENTIFICATION_MODE` | no | seeds `controller_flags.identification_mode`: `off` (default) \| `shadow` (decide + draw + log, write nothing) \| `armed`. Runtime switch: dashboard Optimize page or `POST /api/identification`. |
-| `SHAPED_CURVE` | no | `1` makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) so the HBX weather-compensates on its own between writes and after a planner death. `shadow` computes and stamps the curve and reports it at `/health.curve.plan_implies` (with `would_write`) but writes nothing — the step before `1` on a live auto-pilot. Default off = the flat per-hour target. |
-| `FLOOR_CADENCE` | no | `0` disables the per-poll demand-floor re-check (#136). Default on: every poll the floor is recomputed and, if it exceeds the plan's current block by ≥ 3 °F (below the winter guard, never over a soak, band-clamped), the block is raised in place so Phase B leads it and the auto-pilot writes it on the same poll. Raises only. Escalation is per elapsed HOUR of unbroken calling (was per cycle), so the cadence change does not steepen it. `/health.demand_floor_cadence`. |
-| *(forecast cache)* | — | The hourly plan reads open-meteo; on failure (HTTP 429 after a deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed) so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`; the plan's `meta.forecast_source` records which. No cache → the hour fails as before. |
-| `PORT` | no | Railway injects it; default 8080 |
+| `SENSORLINX_EMAIL` | **required** | SensorLinx account login (JWT lives ~15 min; the client re-logs-in on 401). |
+| `SENSORLINX_PASSWORD` | **required** | SensorLinx account password. |
+| `DATABASE_URL` | **required** | The Railway Postgres (same DB as `analytics-mirror`; tables are additive). |
+| `SLX_BASE_URL` | `https://api.sensorlinx.co` | SensorLinx host; the rehearsal points it at the fake. |
+| `SLX_BUILDING_ID` | `673e25ab8db6198c521700ed` | SensorLinx building id. |
+| `SLX_SYNC_CODE` | `AECO-2036` | The HBX device's sync code. |
+| `POLL_SECONDS` | `300` | Poll cadence; Phase B, stagewatch and the floor re-check run on it. |
+| `POLL_ONCE` | unset | `1` = one-shot run (poll, then the hourly chain: shadow → score → decay → realized, plus the side tasks), then exit; the rehearsal's mode. Fails fast on a broken DB. |
+| `PORT` | `8080` | HTTP port; Railway injects it. |
+| `TZ` | unset | Must be `America/New_York` in production: the DHW windows and storm parsing rely on local time. Reported at `/health.tz` and asserted by `scripts/drift-check.sh` [2c]. |
+| `LAT` | `42.63` | Forecast / NWS point latitude. |
+| `LON` | `-70.87` | Forecast / NWS point longitude. |
+
+### Alerts
+
+| Var | Default | Meaning |
+|---|---|---|
+| `NTFY_TOPIC` | unset | ntfy topic; unset = no ntfy. Priority only sets ntfy loudness — email and the phone push are chosen by tier (`alertpolicy.ts`). |
+| `NTFY_SERVER` | `https://ntfy.sh` | ntfy server. |
+| `RESEND_API_KEY` | empty | Resend key for email-tier alerts; empty = no email. |
+| `RESEND_TO` | empty | Email recipient. |
+| `RESEND_FROM` | `A2W Alerts <onboarding@resend.dev>` | Email sender. |
+| `SIXBB_ALERT_URL` | empty | The 6bb app's `/api/external/alert` for the owner's phone push (page-tier alerts + their all-clears). No-op unless both 6bb vars are set. |
+| `SIXBB_ALERT_KEY` | empty | Token for that endpoint. |
+
+### Hub, Pi and the HTTP API
+
+| Var | Default | Meaning |
+|---|---|---|
+| `HUB_URL` | unset | The Railway hub. Without both hub vars the I1 monitor, Phase B, pump health, the backup gate, the identification driver and the TempIQ pusher are disabled. |
+| `HUB_CLIENT_TOKEN` | unset | Bearer for the hub's planner-side API. |
+| `HUB_ARM_TOKEN` | empty | Bearer for hub breaker commands; required only for `BACKUP_GATE=live`. |
+| `PLANNER_API_TOKEN` | unset | Bearer that gates `POST /api/hbx/*`, `/api/storm/*`, `/api/autonomy`, `/api/identification`, `/api/sanitize` and `/api/tempiq/cop-refetch`. Unset = write API disabled. The ONLY sanctioned way to inject external write intent — see §Single-writer invariant. |
+| `PLANNER_READ_TOKEN` | unset | READ-ONLY bearer for the 6bb home app (#190) — opens `GET /api/status` and nothing else; see §Read-only status. Unset = that route is a plain 404, as before. Equal to another planner secret = the route stays 404 and an error is logged. |
+| `WRITER_LEASE_ENABLED` | off | `1` arms the blocking single-writer lease: `patch()` refuses (423) and Phase B skips unless this instance holds the fresh `hbx_writer_lease` row — see §Single-writer invariant. |
+
+### Phase B — pump setpoint tracking
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PHASE_B_ENABLED` | off | `1` constructs the tracking loop (needs the hub). Production runs with it on — see §Phase B. |
+| `PHASE_B_DRY_RUN` | off | `1` seeds the loop as compute-and-log, send nothing. Seed only: the dashboard Off/Armed switch owns `controller_flags.phaseb_dry_run` afterwards — and that switch is shared with the auto-pilot (Off sets `autopilot_dry_run` too). Also decides what `/health.phase_b.mode` reports, regardless of the switch. |
+| `PHASE_B_PUMPS` | `pump1,pump2` | Hub pump ids that are tracked. |
+| `PHASE_B_CAP_C` | `75` | Planner-side setpoint cap in °C (the bridge config clamp, not the reg-2027 factory 55; the Pi's live bounds stay authoritative). The floor, 45 °C, is a constant. |
+
+### Auto-pilot, plan and hygiene
+
+| Var | Default | Meaning |
+|---|---|---|
+| `AUTOPILOT_ENABLED` | off | `1` constructs the auto-pilot: drives the HBX target to the shadow plan's current block through the guarded writer. |
+| `AUTOPILOT_DRY_RUN` | off | `1` seeds the auto-pilot as log-only. Seed only, like `PHASE_B_DRY_RUN`; the same dashboard Off/Armed switch owns both afterwards. |
+| `SHAPED_CURVE` | off | `1` (or `live`) makes the auto-pilot command the plan's demand-shaped reset curve for non-excursion hours (#133 b) and Phase B lead its output. `shadow` computes, stamps and reports the curve at `/health.curve.plan_implies` (with `would_write`) but writes nothing. Off = the flat per-hour target. |
+| `AUTO_SANITIZE_ENABLED` | off | `1` seeds `controller_flags.auto_sanitize`: checkI8 fires one guarded `boost(131, 60)` per overdue soak. Seed only; `POST /api/sanitize` owns it afterwards. |
+| `HYGIENE_MAX_INTERVAL_H` | `26` | Rolling window in which the tank must have held a real pasteurizing dwell (I8). Hard-capped at 72 h in `hygiene.ts`. |
+| `HYGIENE_SUMMER_INTERVAL_H` | = the base interval | The I8 interval in the cool-tank regime (outdoor ≥ 55 °F). |
+| `BANK_F` | `0` | #58 afternoon bank: raise the day's warmest-hour block to `dhwFloor + BANK_F`. Clamped to 0–15; 0 = off. |
+| `DHW_FLOOR_F` | `120` | DHW-ready floor, which also sets the idle target. Clamped to 112–125; unparseable = 120. `/health.dhw.floor_f`. |
+| `DHW_SHOWER_WINDOWS` | unset | Owner-declared shower windows, `HH:MM-HH:MM,…` local time, merged into the learned pre-boost peaks. `/health.dhw.shower_windows`. |
+| `WINTER_DP_ENABLED` | off | `1` lets the winter DP solve raise commanded targets. The solve itself always runs in shadow when the forecast dips below 55 °F (`/health.winter_dp`). |
+| `FLOOR_CADENCE` | on | `0` disables the per-poll demand-floor re-check (#136). On: a floor ≥ 3 °F above the plan's current block raises that block in place, raises only. `/health.demand_floor_cadence`. |
+| `SHADOW_EVERY_MIN` | `60` | Shadow-plan cadence; also sets the demand feed's "healthy" window (cadence + 5 min, at least 35). |
+| `STAGE_PUMP_MAP` | `{"1":"pump1","2":"pump2"}` | JSON map of HBX stage relay → hub pump id. The PHYSICAL wiring the per-stage unserved alarm (#185) checks against — verify it at the panel (§Per-stage unserved alarm). |
+
+### TempIQ, demand and identification
+
+| Var | Default | Meaning |
+|---|---|---|
+| `TEMPIQ_BASE_URL` | `https://tempiq.vercel.app` | The TempIQ insights seam (push, read, windows, demand feed, forecast, identification plan). |
+| `TEMPIQ_SURFACE_TOKEN` | unset | Bearer for that seam; every TempIQ-facing feature below is disabled without it. |
+| `TEMPIQ_PUSH_ENABLED` | off | `1` pushes hub state to TempIQ (§A-7; needs the hub). |
+| `TEMPIQ_PUSH_EVERY_MIN` | `5` | Pusher cadence. |
+| `TEMPIQ_READ_ENABLED` | off | `1` reads TempIQ zone insights (§6.7). |
+| `TEMPIQ_READ_EVERY_MIN` | `60` | Reader cadence. |
+| `COP_OVERLAP_DAYS` | `3` | How far behind the newest mirrored TempIQ COP point each hourly read re-reads (upsert) — see §TempIQ COP mirror. `0` is the pre-TempIQv2#2124 cursor and misses every completed row. |
+| `TEMPIQ_WINDOWS_ENABLED` | off | `1` posts our commanded-target episodes to TempIQ as quarantine windows (a2w#137). |
+| `TEMPIQ_WINDOWS_EVERY_MIN` | `5` | Window-poster cadence. |
+| `WINTER_SOLVER_SHADOW` | off | `1` enables the demand feed + floor proposals (plan §6.9); off = the plan mimics the HBX curve. |
+| `DEMAND_FLOOR_POLICY` | `escalate` | `escalate` (local model is the floor, TempIQ only a ceiling) \| `learned` (consume TempIQ's number outright, pre-#90) \| `local` (ignore TempIQ's number). |
+| `FORECAST_FETCH_ENABLED` | off | `1` fetches TempIQ's required-supply forecast and records what it would do (#87). |
+| `FORECAST_PREHEAT_ENABLED` | off | `1` lets that forecast raise a commanded target; needs FETCH. |
+| `ADJACENCY_SETBACK_SHADOW` | off | `1` logs what the floor would be if warm-adjacent zones borrowed heat (#33). Shadow only. |
+| `ADJACENCY_CREDIT_F` | `3` | Credit per warm neighbour in that shadow. |
+| `ADJACENCY_MIN_CONF` | `0.7` | Minimum spatial-edge confidence in that shadow. |
+| `EMITTER_OVERRIDES` | `{}` | JSON zone name → deliveryType overrides for TempIQ's zone list. |
+| `EMITTER_SYNTHETIC_ZONES` | `[]` | JSON InsightZone[] added to TempIQ's zone list. |
+| `IDENTIFICATION_ENABLED` | off | `1` constructs the identification driver (needs the auto-pilot, Phase B, the demand feed, the hub and the token). |
+| `IDENTIFICATION_MODE` | `off` | Seeds `controller_flags.identification_mode`: `off` \| `shadow` \| `armed`. Runtime switch: dashboard Optimize page, `POST /api/identification` or `scripts/identification-mode.sh`. |
+
+### Weather and storm
+
+| Var | Default | Meaning |
+|---|---|---|
+| `OPEN_METEO_URL` | `https://api.open-meteo.com` | Forecast host (plan + storm heuristics); the rehearsal points it at the fake. |
+| `NWS_URL` | `https://api.weather.gov` | NWS active-alerts host. |
+| `OUTAGEWATCH_URL` | the Railway OutageWatch service | Outage status feed for storm mode and the generator-aware supply check (#241). |
+| `STORM_MODE_ENABLED` | off | `1` lets armed/active storm windows shape the plan; off = notify-only. |
+| `STORM_CAP_F` | `135` | Storm ceiling cap. |
+| `STORM_STEP_F` | `10` | Pre-charge step above the curve target (owner decision 2026-09-25; `3` restores the earlier behaviour). |
+
+### SPAN cloud watch and pump health
+
+| Var | Default | Meaning |
+|---|---|---|
+| `SPAN_USERNAME` | unset | SPAN app login; unset = the cloud backup-element alarm and pump-energy metering are off. |
+| `SPAN_PASSWORD` | empty | SPAN app password (SRP via Cognito). |
+| `SPAN_BACKUP_CIRCUIT` | `backup` | Case-insensitive name substring of the element's circuit. |
+| `SPAN_BACKUP_ALARM_KWH` | `0.3` | Trailing-60-min energy above which the element alarm pages. |
+| `SPAN_BUILDING_ID` | unset | Optional; auto-discovered from the account. |
+| `SPAN_POLL_SECONDS` | `60` | SPAN cloud poll cadence. |
+| `SPAN_PUMP_CIRCUITS` | `air-water` | Name substring of the compressor circuits summed into `span_energy` for realized savings. |
+| `PUMP_HEALTH_ENABLED` | on | `0` turns the pump-health checks and rollup off. |
+| `PUMP_HEALTH_LIVE` | empty | Comma list of pump-health checks promoted to paging. |
+| `PUMP_SPAN_CIRCUITS` | `{"pump1":"Air-Water 1","pump2":"Air-Water 2"}` | JSON pump → SPAN circuit name. |
+| `PUMP_HEALTH_DIGEST` | on | `0` turns the daily pump-health email off. |
+| `PUMP_HEALTH_DIGEST_HOUR` | `7` | America/New_York hour after which the digest is sent. |
+
+### Backup-element gate and generator mode (`backupgate.ts`, `generator.ts`)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `BACKUP_GATE` | `shadow` | `off` \| `shadow` (virtual breaker, logged) \| `live` (closes the Buffer Tank breaker through the hub; needs `HUB_ARM_TOKEN`). |
+| `BACKUP_GATE_REOPEN` | off | `1` lets a live gate re-open the breaker (also needs `span.backup_reopen` on the Pi). |
+| `BACKUP_GATE_FLOOR_F` | `100` | Tank floor below which the gate closes (90–115). |
+| `BACKUP_GATE_FLOOR_MIN` | `30` | Minutes the tank must sit under the floor (10–120). |
+| `BACKUP_GATE_DEFICIT_F` | `10` | Target − tank deficit for the failed-not-recovering rule (4–20). |
+| `BACKUP_GATE_FAIL_HOLD_MIN` | `90` | Minutes that deficit must hold (60–240). |
+| `GEN_CAP_KW` | `20` | Generator capacity for the whole house (15–40; #241 — the Kohler 20RESA, owner 2026-11-02). |
+| `GEN_MARGIN_KW` | `2.4` | Headroom kept under that cap (0–8). |
+| `COMFORT_EXCLUDE_ZONES` | `Barn - Tack,Barn Basement` | Comma list of TempIQ zones left out of the 60 °F comfort check; replaces the default list. |
+
+### Realized savings
+
+| Var | Default | Meaning |
+|---|---|---|
+| `ELECTRIC_RATE_USD_KWH` | `0.30` | Tariff for the measured per-day ledger. |
+| `DAILY_KWH_BASELINE` | `11.8` | Daily kWh fallback when SPAN metering is absent. |
+| `STANDBY_UA_BTU` | `25` | Tank standing-loss UA (BTU/h·°F). |
+| `REALIZED_LOOKBACK_DAYS` | `45` | Local days recomputed every hour (capped at the 2026-07-16 cutover). |
+
+### Rehearsal harness only (`scripts/rehearsal/*.ts`)
+
+`inject-boost.ts` also reads the planner's own `DATABASE_URL`, `SLX_BASE_URL` and `HUB_URL` (each
+must be local), plus `SENSORLINX_*`, `HUB_CLIENT_TOKEN` and `SLX_BUILDING_ID` with rehearsal defaults.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `LOCAL_DATABASE_URL` | empty | The local rehearsal DB `assert.ts` checks; must be loopback. |
+| `REHEARSAL_OUT` | — | Output directory for a run's artefacts (set by `run.sh`). |
+| `REHEARSAL_SCENARIO` | `scenarios/cold-morning.json` | Scenario file for the fake upstreams and the assertions. |
+| `REHEARSAL_SHAPED_CURVE_MODE` | unset | The run's `SHAPED_CURVE` mode for `assert.ts` (set by `run.sh`); `live` selects the shaped-curve assertions. |
+| `REHEARSAL_PORT` | `9101` | Port of the fake-upstream server. |
+| `REHEARSAL_LOG` | `out/requests.jsonl` | The fake's request log. |
+| `SLX_SYNC_CODE` | `FAKE-0001` | The fake device's sync code (the planner side above uses the same name). |
+| `TZ` | `America/New_York` | The house zone the fake formats forecast hours in; `UTC` is treated as unset. |
+
+**Forecast cache (no variable).** The hourly plan reads open-meteo; on failure (HTTP 429 after a
+deploy burst) it reuses the last good forecast (`forecast_cache`, ≤ 6 h old, past hours trimmed)
+so the plan and the demand floor still refresh. `/health.forecast.source` = `live` \| `cached`;
+the plan's `meta.forecast_source` records which. No cache → the hour fails as before.
 
 ## Read-only status for the 6bb app (#190, `readstatus.ts`)
 
@@ -362,8 +531,13 @@ the house. The token is trimmed at startup, before the clash check and matching.
 1. In the existing Railway project, **New Service → this repo**, set
    **Root Directory = `planner`** (same pattern as `hub/`).
 2. Set service variables: `SENSORLINX_EMAIL`, `SENSORLINX_PASSWORD`, `DATABASE_URL`
-   (copy the `POSTGRES_URL` from the Vercel/Neon project), optional `NTFY_TOPIC`.
-3. Deploy; check `https://<service>/health`.
+   (reference the Railway Postgres service in the same project), `TZ=America/New_York`,
+   `HUB_URL` / `HUB_CLIENT_TOKEN`, `PLANNER_API_TOKEN`, and the alert channels.
+   *Historical note:* until 2026-08-23 the planner and the mirror shared a Neon Postgres
+   (`DATABASE_URL` was the Vercel project's `POSTGRES_URL`); the migration to Railway Postgres
+   was #79.
+3. Deploy; check `https://<service>/health`. A deploying change goes through
+   `scripts/deploy-gate.sh` (root README) — one at a time, verified.
 
 ## Local dev
 
@@ -402,22 +576,77 @@ Git-linked (2026-07-14): pushes to `main` touching `planner/**` auto-deploy this
 on Railway. The hub only redeploys on `hub/**` changes; the Vercel mirror only rebuilds
 when `analytics-mirror/` changes. The Pi keeps its deliberate `release-*` tag flow.
 
-## Phase B — the tracking loop (FLAG-OFF)
+## Phase B — the tracking loop (LIVE)
 
-Built 2026-07-14, dry-run-verified against live data. Every poll cycle, each enrolled
-pump's setpoint is driven to (live HBX tank target + 5°F I1 margin), rounded to whole °C,
-**leased 90 min** through the hub — a dead planner lapses to the Pi's baseline within the
-lease, never a stale value. Renewals are free on the Pi (renew-without-rewrite).
+**Phase B is ACTIVE on both pumps** (root `CLAUDE.md`, reconciled against the running system
+2026-09-16). `/health.phase_b.mode` reads `active` whenever `PHASE_B_DRY_RUN` is unset in the
+environment — it is the env seed, not the live switch, and stays `active` after the dashboard's
+Off switch has put Phase B in shadow. Whether a pump is actually being written is told by its
+`/health.phase_b.lastResults` entry (`ok … (lease …m armed)` versus `DRY-RUN would send …`) and
+by the `controller_status` heartbeat row the dashboard reads. Built 2026-07-14 and
+dry-run-verified first.
+Every poll (`POLL_SECONDS`, 300 s) `phaseb.ts runOnce` drives each pump in `PHASE_B_PUMPS`:
 
-| Env | Meaning |
-|---|---|
-| `PHASE_B_ENABLED=1` | turn tracking on (default off) |
-| `PHASE_B_DRY_RUN=1` | compute + log, send nothing |
-| `PHASE_B_PUMPS` | default `pump1,pump2` |
-| `PHASE_B_CAP_C` | planner-side cap, default 75 (bridge config clamp — NOT the reg-2027 factory 55; the Pi's live bounds stay authoritative) |
+1. **Requires a fresh SensorLinx reading** (≤ 15 min, with a target) — otherwise it skips the
+   cycle (`lastResults._skip`) rather than track stale data.
+2. **Lead** = the max of: the *operative* target (the SensorLinx report, or the curve in force's
+   output when `stale-target.ts` proves the report frozen after a lowering, #215); the plan's
+   command for the block in force and the next block's curve output (`planLeadF`, #220); an
+   identification probe target; a pending dashboard boost (#231, for at most 20 min); and, with
+   `SHAPED_CURVE=1`, the device curve's output now and at the next hour's forecast outdoor
+   (`curveLeadF`). Every term is shown at `/health.phase_b.lead`.
+3. **Setpoint** = lead + 5 °F I1 margin, rounded up to whole °C (natural hysteresis), clamped to
+   [45 °C, `PHASE_B_CAP_C`]. Above the cap it sends the cap and the standing I1 monitor alarms.
+4. **Send** through the hub (`POST /api/command`, source `phase-b`) with `lease_minutes` = **90**
+   — the `LEASE_MINUTES` constant in `phaseb.ts`, not an env variable. Renewals are free on the
+   Pi (same value = lease refresh only, no EEPROM write). Before every send it re-checks, fresh
+   from the DB row, that this instance holds the writer lease (when `WRITER_LEASE_ENABLED`) and
+   is not shutting down; otherwise the result is `skipped … writer lease not held / handing over`.
+5. **Verify what the Pi did, not what was asked** (FINDING-1b): after the sends it reads the hub
+   state and rewrites each result to `ok 63°C (lease 62m armed)` from `remote_lease_until`, or to
+   `— ⚠ NO LEASE ARMED`. The Pi arms a lease only when its `baseline_setpoint_c` is set
+   (FINDING-1, closed 2026-10-18: baseline 52 °C, `lease_max_minutes` 180).
 
-Rollback = unset `PHASE_B_ENABLED` → leases lapse → Pi reverts to `baseline_setpoint_c`.
-Gate for enabling (plan §7): two-week telemetry window (~Jul 27) + clean shadow record.
+Engineer alerts, all edge-triggered and record-tier (owner 2026-10-21): "Phase B tracking
+failing" after 3 consecutive write failures per pump (the lease lapses to baseline on its own —
+house safe, savings paused) and "Phase B recovered" on the next accepted write; "Phase B: no
+lease armed" after 3 consecutive verifies without a lease (one is usually the hub's pre-write
+snapshot). Two sustained conditions also page the owner (`owneralerts.ts`, owner 2026-10-29):
+"Heat-pump safety net is off" after > 30 min of accepted writes with no lease armed, and "A2W
+can't control the heat pumps" after 7 failed cycles in a row, not counting a person's choice or
+an unreachable Pi. Every attempt is logged in `phase_b_log`; `/health.phase_b` = `{mode, pumps,
+lastRunAt, lastResults, fail_streak, lead, owner_alerts}`.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PHASE_B_ENABLED` | off | `1` constructs the loop (needs `HUB_URL` / `HUB_CLIENT_TOKEN`). Set in production. |
+| `PHASE_B_DRY_RUN` | off | Seeds `controller_flags.phaseb_dry_run` on first boot only; the dashboard Off/Armed switch owns it afterwards, and that switch sets the auto-pilot's `autopilot_dry_run` at the same time (there is no Phase-B-only switch). Dry-run computes, logs `DRY-RUN would send …` and sends nothing. `/health.phase_b.mode` reports this seed (`dry-run` / `active`), not the switch. |
+| `PHASE_B_PUMPS` | `pump1,pump2` | Hub pump ids tracked. |
+| `PHASE_B_CAP_C` | `75` | Planner-side cap (bridge config clamp — NOT the reg-2027 factory 55; the Pi's live bounds stay authoritative). |
+
+**Rollback.** Either path stops the sends; the Pi then does the revert — the lease lapses within
+its remaining minutes and `check_lease()` restores `baseline_setpoint_c` (52 °C). Nothing may hold,
+queue or rate-limit that revert (#208).
+
+- *Without a deploy:* flip the dashboard's Off/Armed switch to Off (`POST /api/autonomy` with
+  `mode=off`). This is **not Phase-B-only**: it sets both `controller_flags.autopilot_dry_run` and
+  `phaseb_dry_run`, so the auto-pilot also goes shadow and stops writing the HBX curve; the
+  in-memory controllers are switched at once and the row is re-read every poll. No no-deploy switch
+  stops Phase B alone — only unsetting `PHASE_B_ENABLED` does that. Setting `PHASE_B_DRY_RUN=1` on
+  Railway does **not** do this on an already-seeded database (it only changes what
+  `/health.phase_b.mode` reports).
+- *With a deploy:* unset `PHASE_B_ENABLED` on the Railway service — a variable change redeploys
+  the planner, so treat it as a deploying change (one at a time, verified, root `CLAUDE.md`). This
+  is the only path that stops Phase B and leaves the auto-pilot live; `/health.phase_b` then reads
+  `disabled`.
+- *Confirm* by the per-pump results, not the mode field. After the Off path `/health.phase_b.mode`
+  **still reads `active`** (it comes from the `PHASE_B_DRY_RUN` env seed, index.ts), so judge by
+  `/health.phase_b.lastResults` showing `DRY-RUN would send …` for every pump, by the dashboard's
+  controller status, and by the Pi's setpoints back at `baseline_setpoint_c` once the leases lapse.
+  `scripts/drift-check.sh` does **not** confirm this rollback: its [2a] skips only on the dry-run
+  result strings, and its [2b] lease check (with `HUB_CLIENT_TOKEN` set) keys on the `active` mode
+  field and will report a false `phase_b is ACTIVE but … hold NO lease … baseline_setpoint_c is
+  unset` failure once the leases have lapsed. That is the rollback working, not FINDING-1 re-opened.
 
 ## SPAN backup-element power alarm (`spanwatch.ts`, FLAG-OFF)
 
