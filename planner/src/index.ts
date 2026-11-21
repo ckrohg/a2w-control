@@ -44,6 +44,7 @@ import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
 import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
+import { UnverifiedBindingWatch, roomDeficitF, describeEvent as describeUnverifiedBinding } from "./unverified-binding";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
 import { StageWatch, annotateFaultCodes, liveCodes, parseStagePumpMap, partitionRestore, stopOf, type StagePump } from "./stagewatch";
 import { BackupGate, BG, parseGateConfig, type GatePump } from "./backupgate";
@@ -177,6 +178,11 @@ const capWatchStreaks = new Map<string, number>();
 // #136: unbroken calling MINUTES per zone (was cycles) — advanced on every sample from the elapsed time.
 const zoneCallMinutes = new Map<string, number>();
 let lastCallSampleAt: number | null = null;
+// #170 (surface for #134): the cost-first escalation above is INERT on a binding zone whose delivery type is not
+// verified in TempIQ (no requiredSupplyF → no ceiling → costFirstAwtF never runs). This names the hourly cycles where
+// such a zone shows the evidence the escalation would have acted on. Edge-triggered: one log line per open/clear,
+// the open episode on /health.winter_solver.unverified_binding. Observation only — no target, no write, no page.
+const unverifiedBinding = new UnverifiedBindingWatch();
 /** zone_call_samples' 60-day prune rides the insert once an hour (same shape as the Pi-clock prune). */
 let zoneCallPrunedAt = 0;
 /** #136: the demand floor is re-checked every poll and the current plan block raised in place when it lags. */
@@ -1763,6 +1769,17 @@ async function shadowOnce(): Promise<void> {
         }
       }
     }
+    // #170 (surface for #134): is the binding zone one the escalation CANNOT help? The deficit is read from the same
+    // roomF/setpointF costFirstAwtF uses — bindingZf.deficitF is always 0 here, because an unverified zone never reaches
+    // costFirstAwtF; that is the very gap being surfaced. No binding zone (null floor / nobody calling) steps the watch
+    // with null so an open episode clears. One line per transition, nothing per cycle.
+    {
+      const bz = floor?.bindingZone != null ? floor.perZone.find((z) => z.name === floor.bindingZone) : undefined;
+      const facts = floor?.bindingZone != null
+        ? { zone: floor.bindingZone, verified: floor.bindingVerified, deficitF: roomDeficitF(bz?.roomF, bz?.setpointF) }
+        : null;
+      for (const ev of unverifiedBinding.step(facts)) console.warn(describeUnverifiedBinding(ev));
+    }
   }
 
   // INTERLOCK: hand the shadow planner the actuator state so its calendar sanitize boost stands down
@@ -2701,7 +2718,10 @@ async function main(): Promise<void> {
               return { enabled: FLOOR_CADENCE_ENABLED && !!demandFeed, poll_seconds: POLL_SECONDS, min_raise_f: FLOOR_RAISE_MIN_F, ...floorCadence, raises, raises_24h: raises.length, raises_source: "shadow_plans.meta.floor_raises (persisted, rolling 24 h)" };
             })(),
             winter_solver: demandFeed
-              ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status() }
+              ? { mode: demandFeed.isHealthy() ? "shadow" : "degraded", ...demandFeed.status(),
+                  // #170: the binding zone whose escalation is inert (#134), while the episode is open; null otherwise.
+                  // unverified_binding_7d is the week's episodes for a future digest line — in memory, lost on redeploy.
+                  unverified_binding: unverifiedBinding.current(), unverified_binding_7d: unverifiedBinding.week() }
               : "off",
             // #59: last DP solve (null until the forecast first dips below the compute threshold)
             winter_dp: winterDpState ?? { mode: "idle", enabled: WINTER_DP_ENABLED },
