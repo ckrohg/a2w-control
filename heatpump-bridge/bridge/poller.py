@@ -81,6 +81,22 @@ RECONNECT_HOLD_MIN_SPACING_S = 600.0
 # Powering a pump ON is exempt too (write_power).
 RECONNECT_HOLD_EXEMPT_SOURCES = frozenset(
     {"baseline-revert", "ui", "hub:dashboard", "hub:armed-dashboard"})
+# Offline attribution (#76): how long the one TCP connect to the pump's gateway may take at
+# a comm/offline edge, and the slack on top before the whole probe is abandoned (None).
+GATEWAY_PROBE_TIMEOUT_S = 1.0
+GATEWAY_PROBE_GRACE_S = 0.2
+
+
+# @purpose: One bare TCP connect to a W610 gateway, sending nothing: True if it accepted,
+# False if it refused, was unreachable, or did not answer within timeout_s. The socket is
+# aborted at once so the gateway's single client slot is free for the next poll.
+async def probe_gateway(host: str, port: int, timeout_s: float) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout_s)
+    except (OSError, TimeoutError):
+        return False
+    writer.transport.abort()
+    return True
 
 
 class PumpPoller:
@@ -109,6 +125,12 @@ class PumpPoller:
         # #212: callable () -> dict | None, set by main.py (deliberate_stop.DeliberateStops) — a pump whose
         # breaker a PERSON switched off answers no polls, and that is expected, not an outage to escalate
         self.deliberate_stop = None
+        # #76 offline attribution, all set by main.py and all optional (None = unknown):
+        # hub_link_up is a callable () -> bool | None reading the hub client's link state,
+        # peers the {pump_id: PumpPoller} map this poller is part of.
+        self.hub_link_up = None
+        self.peers: dict[str, PumpPoller] | None = None
+        self._gateway_probe = probe_gateway  # injectable for tests
         # _write_lock makes guardrail check-then-act atomic under concurrent requests
         # (rate limit was bypassable by requests arriving during a slow 2400-baud write);
         # _poll_lock stops interleaved polls double-emitting edge events / mixing reads
@@ -446,7 +468,8 @@ class PumpPoller:
                        f"{self.cfg.name} unreachable for {failures} consecutive polls")
             await self.store.add_event(
                 self.cfg.id, "comm", code="offline", severity="high",
-                message=message, detail={"category": exc.category})
+                message=message,
+                detail={"category": exc.category, **await self._offline_attribution()})
             if never_online and not stopped:
                 # Bench-day miswire: nothing to flap against, page immediately — a pump
                 # that has never answered is a provisioning failure needing a human.
@@ -502,6 +525,55 @@ class PumpPoller:
             self.snapshot["link"] = link
             self.snapshot["link_detail"] = detail
         await self._maybe_comm_row(force=True)
+
+    # @purpose: #76 item 3 — what the Pi could see at the moment a pump was declared offline,
+    # recorded on the comm/offline event so "Pi-side or gateway-side?" is not reconstructed
+    # later: hub link, the other pump, a TCP connect to this pump's gateway, and the client's
+    # last error category. Best-effort: every field is None when unknown; never raises.
+    async def _offline_attribution(self) -> dict:
+        out: dict = {"hub_link_up": None, "peer_pump_online": None,
+                     "gateway_reachable": None, "last_error_category": None}
+        try:
+            if self.hub_link_up is not None:
+                up = self.hub_link_up()
+                out["hub_link_up"] = None if up is None else bool(up)
+        except Exception as exc:  # noqa: BLE001 — attribution must never cost the offline event
+            log.warning("[%s] hub link state unreadable: %s", self.cfg.id, exc)
+        try:
+            others = [p for pid, p in (self.peers or {}).items() if pid != self.cfg.id]
+            if others:
+                out["peer_pump_online"] = any(p.online for p in others)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] peer pump state unreadable: %s", self.cfg.id, exc)
+        out["gateway_reachable"] = await self._probe_gateway()
+        try:
+            out["last_error_category"] = self.client.stats.last_error_category
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("[%s] offline attribution: hub_link_up=%s peer_pump_online=%s "
+                    "gateway_reachable=%s last_error_category=%s", self.cfg.id,
+                    out["hub_link_up"], out["peer_pump_online"], out["gateway_reachable"],
+                    out["last_error_category"])
+        return out
+
+    # @purpose: gateway_reachable for _offline_attribution. A session this client still holds
+    # open IS the answer (True) and is never probed: the W610 accepts one client, so a second
+    # connect would kick our own socket. Otherwise one bounded connect, awaited (the event
+    # loop and the other pump's poller keep running); None if the address is unknown or the
+    # probe hangs or fails.
+    async def _probe_gateway(self) -> bool | None:
+        try:
+            if getattr(self.client, "connected", False):
+                return True
+            host, port = self.cfg.host, self.cfg.port
+            if not host or not port:
+                return None
+            return bool(await asyncio.wait_for(
+                self._gateway_probe(host, port, GATEWAY_PROBE_TIMEOUT_S),
+                GATEWAY_PROBE_TIMEOUT_S + GATEWAY_PROBE_GRACE_S))
+        except Exception as exc:  # noqa: BLE001 — includes the timeout; best-effort only
+            log.info("[%s] gateway probe gave no answer: %r", self.cfg.id, exc)
+            return None
 
     def _deliberately_stopped(self) -> bool:
         if self.deliberate_stop is None:

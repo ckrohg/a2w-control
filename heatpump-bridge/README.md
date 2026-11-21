@@ -329,6 +329,16 @@ There are no config keys. The watch runs whenever breaker control is configured 
 `span.passphrase`), uses the `self_heal.circuits` map, and its timings are module constants. Status
 appears in `/api/health.deliberate_stops`.
 
+## Comm events
+
+Each `comm`/`offline` event's `detail` records what the Pi could see at that moment (#76):
+`hub_link_up` (the hub WebSocket was connected), `peer_pump_online` (the other pump was still
+online) and `gateway_reachable` (this pump's W610 accepted a TCP connect within 1 s, or the
+bridge still held its session open), each `null` when unknown, next to `category` and
+`last_error_category`. Read them together: both pumps offline with `hub_link_up` false is the
+Pi's own network; one pump offline with `gateway_reachable` false and the hub up is that
+gateway's Wi-Fi; a reachable gateway whose polls still fail is the serial side or the pump.
+
 ## Hub link
 
 `bridge/hub_client.py`. The Pi dials OUT to the Railway hub over WebSocket and holds the
