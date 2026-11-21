@@ -86,7 +86,8 @@ bridge/
                     self-heal and offline escalation stand down, flagged per pump to the hub
   backup_fallback.py  #210 Pi-local backup-element gate: CLOSE "Buffer Tank" when every pump
                     has been down for hold_min; close-only, shadow by default
-  sysstat.py        stdlib-only Pi health sampler (CPU, load, RAM, disk, SoC temp, uptime)
+  sysstat.py        stdlib-only Pi health sampler (CPU, load, RAM, disk, SoC temp, uptime, and
+                    the Pi's own Wi-Fi link, see "System stats")
   discovery.py      LAN discovery of W610 gateways (USR UDP broadcast + TCP sweep); MAC helpers
                     for the poller's identity check
   w610_config.py    EXPERIMENTAL remote W610 serial-side configuration over the vendor UDP channel
@@ -329,6 +330,23 @@ The phone push (#211/#237) POSTs to 6bb's token-protected `/api/external/alert`.
 sent with it. If either is unset, pages arrive by email only. Each push carries a per-incident tag, so the
 all-clear replaces the page on the phone. Email needs `resend_api_key` + `resend_to`. Keep the keys
 out of the repo like the other tokens.
+
+## System stats
+
+`bridge/sysstat.py`. The scheduler records one Pi health row a minute in `system_stats` (kept 90 days).
+The latest row is served at `/api/system`, the series at `/api/system/history`, and the latest row rides
+the analytics push as `system`.
+
+**The Pi's own Wi-Fi** (#76). Each row also carries `wifi_signal_dbm` and `wifi_link_quality` (the level
+and "link" columns of the `wlan0` row in `/proc/net/wireless`), `wifi_bssid` and `wifi_freq_mhz` (the
+in-use row of `nmcli dev wifi list`, read without a rescan), and `wifi_bssid_changes`, the number of
+times this bridge process has seen the Pi move to a different access point. The Pi's dropouts were
+diagnosed as roaming between weak 2.4 GHz mesh nodes, so the next comm flap can be laid against these
+columns: a weak signal or a roam at that minute points at the Pi's radio, a steady link points at the
+W610 gateways. The counter restarts at 0 with the bridge, so read it together with `uptime_s`. A source
+that cannot be read (no `/proc/net/wireless`, nmcli missing, failing or slower than 1 s) leaves its
+fields null; it never fails the sample. The keys are additive: the mirror stores only the columns it
+knows, so the Wi-Fi columns are in the Pi's DB and `/api/system` until the mirror adds them.
 
 ## Phases
 

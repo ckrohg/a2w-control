@@ -77,16 +77,25 @@ CREATE TABLE IF NOT EXISTS system_stats (
     cpu_pct REAL, load1 REAL, load5 REAL, load15 REAL, ncpu INTEGER,
     mem_used_pct REAL, mem_total_mb INTEGER, mem_avail_mb INTEGER,
     disk_used_pct REAL, disk_free_gb REAL, disk_total_gb REAL,
-    cpu_temp_c REAL, uptime_s REAL   -- all Optional: a missing /proc metric stores NULL
+    cpu_temp_c REAL, uptime_s REAL,  -- all Optional: a missing /proc metric stores NULL
+    wifi_signal_dbm INTEGER, wifi_link_quality INTEGER, wifi_bssid TEXT,
+    wifi_freq_mhz INTEGER, wifi_bssid_changes INTEGER   -- #76: the Pi's own Wi-Fi link
 );
 CREATE INDEX IF NOT EXISTS idx_system_ts ON system_stats(ts);
 """
+
+# system_stats columns added after the table first shipped (#76). CREATE TABLE IF NOT EXISTS
+# leaves an existing table alone, so open() adds whichever of these the Pi's DB still lacks.
+_SYSTEM_ADDED_COLS = (("wifi_signal_dbm", "INTEGER"), ("wifi_link_quality", "INTEGER"),
+                      ("wifi_bssid", "TEXT"), ("wifi_freq_mhz", "INTEGER"),
+                      ("wifi_bssid_changes", "INTEGER"))
 
 # system_stats columns in insert/select order — one list keeps the writer, the latest read,
 # and the tests from drifting apart.
 _SYSTEM_COLS = ("ts", "cpu_pct", "load1", "load5", "load15", "ncpu", "mem_used_pct",
                 "mem_total_mb", "mem_avail_mb", "disk_used_pct", "disk_free_gb",
-                "disk_total_gb", "cpu_temp_c", "uptime_s")
+                "disk_total_gb", "cpu_temp_c", "uptime_s",
+                *(name for name, _ in _SYSTEM_ADDED_COLS))
 
 
 class Store:
@@ -111,6 +120,11 @@ class Store:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            have = {row[1] for row in conn.execute("PRAGMA table_info(system_stats)")}
+            for name, sql_type in _SYSTEM_ADDED_COLS:
+                if name not in have:
+                    conn.execute(f"ALTER TABLE system_stats ADD COLUMN {name} {sql_type}")
+            conn.commit()
             return conn
         self._conn = await asyncio.to_thread(_open)
 
@@ -230,12 +244,15 @@ class Store:
         if hours <= 48:
             return await self._query(
                 "SELECT ts, cpu_pct, load1, mem_used_pct, disk_used_pct, disk_free_gb,"
-                " cpu_temp_c FROM system_stats WHERE ts>=? ORDER BY ts", (since,))
+                " cpu_temp_c, wifi_signal_dbm, wifi_bssid_changes"
+                " FROM system_stats WHERE ts>=? ORDER BY ts", (since,))
         return await self._query(
             "SELECT CAST(ts/300 AS INTEGER)*300 AS ts, AVG(cpu_pct) AS cpu_pct,"
             " AVG(load1) AS load1, AVG(mem_used_pct) AS mem_used_pct,"
             " AVG(disk_used_pct) AS disk_used_pct, AVG(disk_free_gb) AS disk_free_gb,"
-            " AVG(cpu_temp_c) AS cpu_temp_c FROM system_stats WHERE ts>=? GROUP BY 1"
+            " AVG(cpu_temp_c) AS cpu_temp_c, AVG(wifi_signal_dbm) AS wifi_signal_dbm,"
+            " MAX(wifi_bssid_changes) AS wifi_bssid_changes"
+            " FROM system_stats WHERE ts>=? GROUP BY 1"
             " ORDER BY 1", (since,))
 
     # --- reads ----------------------------------------------------------------
