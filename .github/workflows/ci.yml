@@ -109,10 +109,22 @@ jobs:
 
   # The ops scripts' own offline tests (no network, no live system): drift-check's classifier of
   # phase_b results (a string phaseb.ts writes must never read as STALE drift) and deploy-gate's
-  # #113 replay. Both need only bash, jq and curl, which the runner image has.
+  # #113 replay. Both need only bash, jq and curl, which the runner image has. The local-restore analysis scripts'
+  # pure logic (scripts/element-calibration.test.ts, #301; scripts/dhw-morning.test.ts) are node:assert scripts under
+  # tsx: they run on the hub's locked tsx (a hub devDependency, so `npm ci` there is enough). element-calibration.ts
+  # imports nothing; dhw-morning.ts imports only planner/src/dhw.ts, which imports nothing.
   script-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/drift-check.test.sh
       - run: bash scripts/deploy-gate.test.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm ci
+        working-directory: hub
+      - run: node --import ./hub/node_modules/tsx/dist/loader.mjs scripts/element-calibration.test.ts
+      - run: node --import ./hub/node_modules/tsx/dist/loader.mjs scripts/dhw-morning.test.ts
