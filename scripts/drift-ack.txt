@@ -19,7 +19,3 @@
 # baseline_setpoint_c on the Pi and the ack becomes moot.
 2026-11-15 #117 NO lease|baseline_setpoint_c is unset|finding1-arm-baseline-runbook
 # (2026-10-29) The OutageWatch ack is gone: storm mode reads 6bb's National Grid email feed now (#194), and [5] asserts it.
-# (2026-11-15) #180: the repo declares `node dist/index.js` as the start command; the live services still run `npm start`
-# until the owner runs `railway config apply` (an owner-applied service setting; it redeploys both services). Matches
-# only a build whose sole non-watch difference is the old start command. Short expiry on purpose: apply, then delete.
-2026-11-30 #180 ran with watch \[[^]]*\], NIXPACKS\|npm install && npm run build\|npm start\|ON_FAILURE\|10 \(from
