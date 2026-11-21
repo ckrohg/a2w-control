@@ -41,6 +41,13 @@
 import { defineRailway, github, postgres, project, service, volume } from "railway/iac";
 
 // Both services build and run the same way. Only the root directory and watch patterns differ.
+// Start command (#180): `node dist/index.js`, NOT `npm start`. With `npm start` the container's PID 1 was npm and node
+// its child; Railway's SIGTERM went to npm, and whether node ever heard it depended on npm's own signal handler (older
+// @npmcli/run-script versions swallow it: a no-op handler that waits for the child). Every planner deploy from #163 on
+// showed exactly that — no `[shutdown]` line at all, the lease never released, the successor waiting out the full
+// 600–700 s staleness window with no writer. node as PID 1 receives the signal itself. `npm start` runs the same
+// command (package.json), so nothing else changes. Both services, because an apply redeploys both anyway and the hub
+// has its own SIGTERM handler.
 const nodeService = (name: string, rootDirectory: string, watchPatterns: string[]) =>
   service(name, {
     source: github("ckrohg/a2w-control", { branch: "main", checkSuites: false, rootDirectory }),
@@ -50,7 +57,7 @@ const nodeService = (name: string, rootDirectory: string, watchPatterns: string[
       watchPatterns,
     },
     deploy: {
-      startCommand: "npm start",
+      startCommand: "node dist/index.js",
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
     },

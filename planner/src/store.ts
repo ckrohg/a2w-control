@@ -16,6 +16,7 @@ import { ADOPTION_TOLERANCE_F, STALE_REPORT_MIN_POLLS, STALE_TANK_MARGIN_DEFAULT
 import type { IdentWindow } from "./identify";
 import type { HbxConfig, FieldChange, PlannerWrite, CurveDiagnosis, ConfigVersionRecord } from "./drift";
 import type { PiLinkInputs } from "./pilink";
+import type { PredecessorRow } from "./shutdown";
 import type { PumpReading, SpanSample, TankReading, CurveVersion, DayMetrics, DayRow, EpisodeLine } from "./pumphealth";
 
 export interface SlxReading {
@@ -327,6 +328,13 @@ export class Store {
         instance_id  text PRIMARY KEY,
         heartbeat_at timestamptz NOT NULL DEFAULT now()
       );
+      -- #180: a clean exit MARKS its row instead of deleting it, so the successor can log what happened to the
+      -- instance it replaced (shutdown.ts describePredecessors). A row with shutdown_at NULL and a stale heartbeat is
+      -- a container killed before its SIGTERM handler ran. Marked rows are ignored by the peer check and pruned
+      -- with the rest after an hour.
+      ALTER TABLE planner_instances ADD COLUMN IF NOT EXISTS shutdown_at    timestamptz;
+      ALTER TABLE planner_instances ADD COLUMN IF NOT EXISTS lease_released boolean;
+      ALTER TABLE planner_instances ADD COLUMN IF NOT EXISTS shutdown_note  text;
       -- Singleton single-writer LEASE (flag-gated by WRITER_LEASE_ENABLED). When enabled, only
       -- the instance holding a FRESH lease may write the HBX; a second instance is refused in
       -- writes.ts patch(). Takeover-on-stale lets a redeployed planner reclaim it. #36.
@@ -1994,10 +2002,11 @@ export class Store {
       [instanceId],
     );
     await this.pool.query(`DELETE FROM planner_instances WHERE heartbeat_at < now() - interval '1 hour'`);
+    // a row that recorded its shutdown is a departed instance, never a peer (#180)
     const res = await this.pool.query(
       `SELECT instance_id, EXTRACT(EPOCH FROM (now() - heartbeat_at)) * 1000 AS age_ms,
               EXTRACT(EPOCH FROM heartbeat_at) * 1000 AS heartbeat_at_ms
-       FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2`,
+       FROM planner_instances WHERE instance_id <> $1 AND heartbeat_at > $2 AND shutdown_at IS NULL`,
       [instanceId, new Date(Date.now() - freshMs)],
     );
     return res.rows.map((r) => ({ instanceId: r.instance_id as string, ageMs: Number(r.age_ms), heartbeatAtMs: Number(r.heartbeat_at_ms) }));
@@ -2037,9 +2046,41 @@ export class Store {
     return (r.rowCount ?? 0) > 0;
   }
 
-  /** Forget this instance's heartbeat row on a clean exit so the successor's peer check is not fooled for an hour. */
-  async dropInstance(instanceId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM planner_instances WHERE instance_id = $1`, [instanceId]);
+  /**
+   * Mark this instance's heartbeat row as shut down (#180; replaces the DELETE that used to hide a clean exit from the
+   * successor). Called twice by shutdown.ts: once right after the barrier with no outcome yet (so the peer check stops
+   * counting this instance even if the hard exit beats the rest), once at the end with the lease outcome. shutdown_at
+   * keeps the FIRST mark; a heartbeat racing the mark only moves heartbeat_at. The row is pruned with the rest after
+   * an hour (heartbeatInstance), which is long enough for the successor to read it at startup.
+   */
+  async recordShutdown(instanceId: string, outcome: { leaseReleased: boolean | null; note: string }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO planner_instances (instance_id, heartbeat_at, shutdown_at, lease_released, shutdown_note)
+       VALUES ($1, now(), now(), $2, $3)
+       ON CONFLICT (instance_id) DO UPDATE
+         SET shutdown_at = COALESCE(planner_instances.shutdown_at, now()), lease_released = excluded.lease_released,
+             shutdown_note = excluded.shutdown_note`,
+      [instanceId, outcome.leaseReleased, outcome.note],
+    );
+  }
+
+  /**
+   * Every other instance's row (newest heartbeat first, at most 5): the ones that recorded a shutdown and their lease
+   * outcome, and the ones that never did — a predecessor killed before its handler ran, or a live peer. The successor
+   * logs them once at startup (shutdown.ts describePredecessors); ages are DB-clock.
+   */
+  async predecessors(instanceId: string): Promise<PredecessorRow[]> {
+    const res = await this.pool.query(
+      `SELECT instance_id, EXTRACT(EPOCH FROM (now() - heartbeat_at)) * 1000 AS age_ms, shutdown_at, lease_released, shutdown_note
+       FROM planner_instances WHERE instance_id <> $1 ORDER BY heartbeat_at DESC LIMIT 5`,
+      [instanceId],
+    );
+    return res.rows.map((r: any) => ({
+      instanceId: String(r.instance_id), heartbeatAgeMs: Number(r.age_ms),
+      shutdownAt: r.shutdown_at == null ? null : new Date(r.shutdown_at),
+      leaseReleased: r.lease_released == null ? null : Boolean(r.lease_released),
+      note: r.shutdown_note == null ? null : String(r.shutdown_note),
+    }));
   }
 
   /** True iff this instance currently holds a FRESH single-writer lease (the write-path gate). */
