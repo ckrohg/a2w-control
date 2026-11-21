@@ -18,6 +18,9 @@
  * blind for 25 minutes with nothing but /health to show it). Energy that arrives across a blind spell LONGER than the
  * alarm window is not stamped on the last 60 min (a run that ended hours ago must not page as "in the last 60 min"):
  * it is reported apart as lastBlindSpell, emailed once if it is an element run, and stays in the day total.
+ * The decision itself is split from the fetch: evaluateHourEnergy (pure — walks the panels, normalizes, picks the
+ * backup circuit, sums the pumps, and names a second backup match instead of letting it silently win) feeds
+ * applyHourEnergy (state: window, page, span_energy), which spanwatch.test.ts drives without Cognito or the network.
  */
 import { AuthenticationDetails, CognitoUser, CognitoUserPool, type CognitoUserSession } from "amazon-cognito-identity-js";
 import type { Notify } from "./alertpolicy";
@@ -48,6 +51,71 @@ export function energyKwh(m: { value?: unknown; unit?: unknown } | null | undefi
   }
 }
 
+/** One SPAN circuit/space as returned by HOUR_ENERGY_Q (only the fields we read). */
+export interface SpanSpace {
+  spaceId?: string | null;
+  name?: string | null;
+  state?: string | null;
+  currentHour?: { value?: unknown; unit?: unknown } | null;
+}
+export interface SpanPanel {
+  panelId?: string | null;
+  spaces?: SpanSpace[] | null;
+}
+
+/** The backup circuit's reading: `e` is its energy in kWh or why it cannot be read (energyKwh); `raw` is what SPAN sent. */
+export interface BackupHit {
+  name: string;
+  e: ReturnType<typeof energyKwh>;
+  raw: string;
+}
+
+export interface HourEnergyResult {
+  /** the circuit matching circuitMatch — null when nothing matched */
+  hit: BackupHit | null;
+  /** sum of the READABLE pump circuits' day-cumulative energy in kWh (0 when none matched); an unreadable one is
+   *  left out, never added under a guessed unit, and named in `warnings` */
+  pumpKwh: number;
+  /** conditions the caller logs once: a pump circuit left out, several circuits matching circuitMatch */
+  warnings: string[];
+  /** every circuit name seen, for the no-match message */
+  names: string[];
+}
+
+/**
+ * Pure: walk `multiPanels[].spaces[]`, normalize each reading to kWh (energyKwh), pick the backup circuit (substring
+ * match on circuitMatch, case-insensitive) and sum the pump circuits (pumpMatch). The last backup match wins, as it
+ * always has, but a second match is reported in `warnings` instead of silently replacing the first.
+ */
+export function evaluateHourEnergy(panels: SpanPanel[] | null | undefined, circuitMatch: string, pumpMatch?: string): HourEnergyResult {
+  const circuitNeedle = circuitMatch.toLowerCase();
+  const pumpNeedle = pumpMatch ? pumpMatch.toLowerCase() : null;
+  const warnings: string[] = [];
+  const names: string[] = [];
+  const backupMatches: BackupHit[] = [];
+  let pumpKwh = 0;
+
+  for (const p of panels ?? []) for (const s of p?.spaces ?? []) {
+    const label = s?.name ?? "";
+    if (label) names.push(label);
+    const name = label.toLowerCase();
+    if (name.includes(circuitNeedle)) {
+      backupMatches.push({ name: label || circuitMatch, e: energyKwh(s?.currentHour), raw: `${s?.currentHour?.value ?? "?"} ${s?.currentHour?.unit ?? "?"}` });
+    }
+    if (pumpNeedle && name.includes(pumpNeedle)) {
+      // an unreadable pump circuit is left out, as a non-numeric value always was — never added under a guessed unit
+      const e = energyKwh(s?.currentHour);
+      if ("kwh" in e) pumpKwh += e.kwh;
+      else warnings.push(`pump circuit "${label}": ${e.error} — left out of span_energy`);
+    }
+  }
+
+  if (backupMatches.length > 1) {
+    warnings.push(`${backupMatches.length} circuits match "${circuitMatch}" (${backupMatches.map((m) => `"${m.name}"`).join(", ")}) — using the last, "${backupMatches[backupMatches.length - 1].name}"; tighten SPAN_BACKUP_CIRCUIT`);
+  }
+  return { hit: backupMatches.length ? backupMatches[backupMatches.length - 1] : null, pumpKwh, warnings, names };
+}
+
 const BUILDINGS_Q = `query { data: currentUser { buildings { name buildingId accepted } } }`;
 // `currentHour` is a historical alias: with duration: DAY / calendarWindows: true the value is the circuit's
 // energy so far TODAY (local calendar day), not the current hour's. Kept as-is so the field name in stored
@@ -72,8 +140,9 @@ export class SpanWatch {
   private tokenExpMs = 0;
   private buildingId: string | null = null;
   private loggedOk = false;
-  /** #124: the unreadable-energy reasons already logged (each once; cleared when the reading is readable again) */
-  private loggedBlind = new Set<string>();
+  /** messages already logged once — #124's unreadable-energy reasons (the backup circuit's are cleared when the
+   *  reading is readable again, so a recurrence logs again) and the several-circuits-match warning */
+  private readonly warnedOnce = new Set<string>();
   /** edge state: a page is open until the trailing hour is back under alarmKwh (/health.span.cloud.backup_alarmed) */
   public alarmed = false;
   /** kWh the backup circuit drew in the trailing BACKUP_WINDOW_MS — what the alarm compares to alarmKwh */
@@ -210,10 +279,10 @@ export class SpanWatch {
     return { hourKwh: this.increments.reduce((s, x) => s + x.kwh, 0), blind };
   }
 
-  /** #124: warn about an unreadable energy reading the first time it is seen, not every poll. */
-  private logBlindOnce(msg: string): void {
-    if (this.loggedBlind.has(msg)) return;
-    this.loggedBlind.add(msg);
+  /** Warn the first time a message is seen, not every poll (#124's unreadable readings, a second backup match). */
+  private warnOnce(msg: string): void {
+    if (this.warnedOnce.has(msg)) return;
+    this.warnedOnce.add(msg);
     console.warn(`[spanwatch] ${msg}`);
   }
 
@@ -223,96 +292,92 @@ export class SpanWatch {
     try {
       const buildingId = await this.findBuilding();
       const d = await this.gql(HOUR_ENERGY_Q, { buildingId });
-      const now = this.now();
-      const panels: any[] = d?.data?.building?.multiPanels ?? [];
-      let hit: { name: string; e: ReturnType<typeof energyKwh>; raw: string } | null = null;
-      let pumpKwh = 0; // sum of the pump (Air-Water) circuits' day-to-date energy (see below)
-      for (const p of panels) for (const s of p.spaces ?? []) {
-        const name = (s.name ?? "").toLowerCase();
-        if (name.includes(this.circuitMatch.toLowerCase())) {
-          hit = { name: s.name ?? this.circuitMatch, e: energyKwh(s.currentHour), raw: `${s.currentHour?.value ?? "?"} ${s.currentHour?.unit ?? "?"}` };
-        }
-        if (this.pumpMatch && name.includes(this.pumpMatch.toLowerCase())) {
-          // an unreadable pump circuit is left out, as a non-numeric value always was — never added under a guessed unit
-          const e = energyKwh(s.currentHour);
-          if ("kwh" in e) pumpKwh += e.kwh;
-          else this.logBlindOnce(`pump circuit "${s.name}": ${e.error} — left out of span_energy`);
-        }
-      }
-      // Record the pumps' metered energy. HOUR_ENERGY_Q asks for duration: DAY / calendarWindows: true,
-      // so the value is SPAN's DAY-cumulative kWh (0 at local midnight, the day's total at 23:00), not
-      // the hour's energy: each span_energy row is a running total and upsertSpanEnergyHour keeps the
-      // MAX seen within the hour. Readers take a day's MAX row, never a sum (store.getRealizedDayInputs;
-      // deep dive 2026-10-19 §4.1). Stored RAW on purpose — the alarm's differencing below is not applied
-      // here. Never fails the alarm path.
-      if (this.store && this.pumpMatch) {
-        await this.store.upsertSpanEnergyHour(now, pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
-      }
-      if (!hit) {
-        const names = panels.flatMap((p) => (p.spaces ?? []).map((s: any) => s.name)).filter(Boolean);
-        this.lastError = `no circuit matching "${this.circuitMatch}" — available: ${names.join(" | ")}`;
-        this.failStreak++;
-        console.warn(`[spanwatch] ${this.lastError}`);
-        return;
-      }
-      if ("error" in hit.e) {
-        // #124: blind, like a failed read — no page, no clear, no baseline moved; the next readable poll differences
-        // against the last readable one
-        this.lastError = `${BACKUP_BLIND}circuit "${hit.name}": ${hit.e.error}`; // no live value in it: logged once per reason
-        this.failStreak++;
-        this.logBlindOnce(this.lastError);
-        return;
-      }
-      const dayKwh = hit.e.kwh;
-      for (const k of this.loggedBlind) if (k.startsWith(BACKUP_BLIND)) this.loggedBlind.delete(k); // a recurrence logs again
-      this.lastError = null;
-      const { hourKwh, blind } = this.accrue(dayKwh, now.getTime());
-      this.lastDayKwh = dayKwh;
-      this.lastHourKwh = hourKwh;
-      this.lastOkAt = now.toISOString();
-      this.failStreak = 0;
-      if (!this.loggedOk) {
-        this.loggedOk = true;
-        console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${dayKwh} kWh (SPAN: ${hit.raw}) so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
-      }
-      if (blind) {
-        // energy from a blind spell longer than the window: said once, apart from the trailing-hour alarm (whose edge
-        // state is untouched), at the alarm's own tier when it is an element run — never as "in the last 60 min"
-        const when = `between ${blind.from.slice(11, 16)}Z and ${blind.to.slice(11, 16)}Z (${blind.minutes} min with no reading)`;
-        console.warn(`[spanwatch] "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when}: when inside that spell is unknown, so it is not counted toward the last 60 min; today's total is ${dayKwh.toFixed(2)} kWh`);
-        if (blind.kwh > this.alarmKwh) {
-          await this.notify(
-            "16.5 kW backup element drew power while the alarm was blind",
-            `SPAN "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when} — the resistive element ran at some point in that spell, which the alarm could not see at the time ` +
-              `(${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}). Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
-            "default",
-            { tier: "attention",
-              action: "If it wasn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
-              facts: [["Blind spell", when], ["Drew", `${blind.kwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
-          );
-        }
-      }
-      if (hourKwh > this.alarmKwh && !this.alarmed) {
-        this.alarmed = true;
-        await this.notify(
-          "16.5 kW backup element DREW POWER",
-          `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
-          "high",
-          // costs money, never endangers the house (the element IS the heat): worth a look, at most daily
-          { tier: "attention", key: "backup-element-power",
-            action: "If it isn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
-            facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
-        );
-      } else if (hourKwh <= this.alarmKwh && this.alarmed) {
-        this.alarmed = false;
-        await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today).`, "default",
-          { tier: "attention", resolved: true, key: "backup-element-power" });
-      }
+      await this.applyHourEnergy(d?.data?.building?.multiPanels, buildingId);
     } catch (e) {
       // Never alarm on a read/auth failure (transient) — backup_called is the redundant net. Just log.
       this.lastError = (e as Error).message;
       this.failStreak++;
       console.warn(`[spanwatch] tick failed: ${this.lastError}`);
+    }
+  }
+
+  /**
+   * The alarm decision for one poll's panels (public so spanwatch.test.ts can drive it without tick()'s fetch).
+   * Everything the trailing-hour window, the threshold and the span_energy accumulator see has been normalized to
+   * kWh by evaluateHourEnergy. The clock is read here (this.now) so a scripted test can walk the window.
+   */
+  async applyHourEnergy(panels: SpanPanel[] | null | undefined, buildingId: string): Promise<void> {
+    const now = this.now();
+    const r = evaluateHourEnergy(panels, this.circuitMatch, this.pumpMatch);
+    for (const w of r.warnings) this.warnOnce(w);
+    // Record the pumps' metered energy. HOUR_ENERGY_Q asks for duration: DAY / calendarWindows: true,
+    // so the value is SPAN's DAY-cumulative kWh (0 at local midnight, the day's total at 23:00), not
+    // the hour's energy: each span_energy row is a running total and upsertSpanEnergyHour keeps the
+    // MAX seen within the hour. Readers take a day's MAX row, never a sum (store.getRealizedDayInputs;
+    // deep dive 2026-10-19 §4.1). Stored RAW on purpose — the alarm's differencing below is not applied
+    // here. Never fails the alarm path.
+    if (this.store && this.pumpMatch) {
+      await this.store.upsertSpanEnergyHour(now, r.pumpKwh).catch((e) => console.error("span_energy upsert failed:", (e as Error).message));
+    }
+    if (!r.hit) {
+      this.lastError = `no circuit matching "${this.circuitMatch}" — available: ${r.names.join(" | ")}`;
+      this.failStreak++;
+      console.warn(`[spanwatch] ${this.lastError}`);
+      return;
+    }
+    if ("error" in r.hit.e) {
+      // #124: blind, like a failed read — no page, no clear, no baseline moved; the next readable poll differences
+      // against the last readable one
+      this.lastError = `${BACKUP_BLIND}circuit "${r.hit.name}": ${r.hit.e.error}`; // no live value in it: logged once per reason
+      this.failStreak++;
+      this.warnOnce(this.lastError);
+      return;
+    }
+    const dayKwh = r.hit.e.kwh;
+    const hit = r.hit; // name and raw for the log and page texts
+    for (const k of this.warnedOnce) if (k.startsWith(BACKUP_BLIND)) this.warnedOnce.delete(k); // a recurrence logs again
+    this.lastError = null;
+    const { hourKwh, blind } = this.accrue(dayKwh, now.getTime());
+    this.lastDayKwh = dayKwh;
+    this.lastHourKwh = hourKwh;
+    this.lastOkAt = now.toISOString();
+    this.failStreak = 0;
+    if (!this.loggedOk) {
+      this.loggedOk = true;
+      console.log(`[spanwatch] OK — building ${buildingId}, circuit "${hit.name}" = ${dayKwh} kWh (SPAN: ${hit.raw}) so far today (alarm when > ${this.alarmKwh} kWh in 60 min)`);
+    }
+    if (blind) {
+      // energy from a blind spell longer than the window: said once, apart from the trailing-hour alarm (whose edge
+      // state is untouched), at the alarm's own tier when it is an element run — never as "in the last 60 min"
+      const when = `between ${blind.from.slice(11, 16)}Z and ${blind.to.slice(11, 16)}Z (${blind.minutes} min with no reading)`;
+      console.warn(`[spanwatch] "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when}: when inside that spell is unknown, so it is not counted toward the last 60 min; today's total is ${dayKwh.toFixed(2)} kWh`);
+      if (blind.kwh > this.alarmKwh) {
+        await this.notify(
+          "16.5 kW backup element drew power while the alarm was blind",
+          `SPAN "${hit.name}" drew ${blind.kwh.toFixed(2)} kWh ${when} — the resistive element ran at some point in that spell, which the alarm could not see at the time ` +
+            `(${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}). Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
+          "default",
+          { tier: "attention",
+            action: "If it wasn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
+            facts: [["Blind spell", when], ["Drew", `${blind.kwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
+        );
+      }
+    }
+    if (hourKwh > this.alarmKwh && !this.alarmed) {
+      this.alarmed = true;
+      await this.notify(
+        "16.5 kW backup element DREW POWER",
+        `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today, ≈$${(dayKwh * 0.3).toFixed(2)}) — the resistive element actually ran. Legitimate only on a design-cold day; otherwise the HPs aren't keeping up — investigate.`,
+        "high",
+        // costs money, never endangers the house (the element IS the heat): worth a look, at most daily
+        { tier: "attention", key: "backup-element-power",
+          action: "If it isn't bitterly cold, check both heat pumps are running; the element should only help on the coldest days.",
+          facts: [["Last hour", `${hourKwh.toFixed(2)} kWh`], ["Today", `${dayKwh.toFixed(2)} kWh ≈ $${(dayKwh * 0.3).toFixed(2)}`]] },
+      );
+    } else if (hourKwh <= this.alarmKwh && this.alarmed) {
+      this.alarmed = false;
+      await this.notify("Backup element power cleared", `SPAN "${hit.name}" drew ${hourKwh.toFixed(2)} kWh in the last 60 min (${dayKwh.toFixed(2)} kWh so far today).`, "default",
+        { tier: "attention", resolved: true, key: "backup-element-power" });
     }
   }
 }
