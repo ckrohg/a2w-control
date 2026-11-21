@@ -148,6 +148,7 @@ Config keys (`span:`): `host`, `ip_fallback`, `passphrase`, `circuits`, `poll_in
 `down_alert_after_s`, `arm_circuit`, `arm`, `arm_live`, `arm_cooldown_s`. The poller is
 enabled only when both `host` and `passphrase` are set. Inject the passphrase via the
 bootstrap environment like the hub/analytics tokens; never commit it.
+Transport cutover (`transport`, `v2_soak`, #199): runbook in `../knowledge/reference/span-v2-cutover.md`.
 
 ## Breaker control
 
