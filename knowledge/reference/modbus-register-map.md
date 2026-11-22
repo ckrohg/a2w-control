@@ -82,7 +82,7 @@
 | 2060 | Sys1 inverter cooling coil temp | |
 | 2061 | Sys1 inverter bus voltage | actual = value × 10 |
 | 2062 | Sys1 inverter IPM module temp | |
-| **2063** | **Sys1 inverter real power** | units unconfirmed (W?) — verify |
+| **2063** | **Sys1 inverter real power** | NOT watts, and not the unit's power — see "Power: what the registers are not" below |
 | 2064 | Sys1 inverter fan motor speed | |
 | 2065 | Sys1 inverter high pressure | |
 | 2066 | Sys1 inverter low pressure | |
@@ -95,6 +95,31 @@
 | 2078/2079 | Fixed-freq EE high/low | |
 | 2080–2095 | Sys2 inverter block, same layout as Sys1: 2080 discharge, 2081 coil, 2082 suction, 2083 AC current, 2084 main EEV (×2), 2085 cooling coil, 2086 bus voltage, 2087 IPM temp, **2088 = Sys2 inverter actual power**, 2089 fan speed, 2090 high pressure, 2091 low pressure, 2092 AC current(sic — doc says current; Sys1 equivalent is AC voltage), 2093 compressor frequency, 2094/2095 EE | |
 | 2096–2100 | Sys2 fixed-freq: discharge, coil, suction, current, EEV (×2) | |
+
+### Power: what the registers are not (measured 2026-11-22)
+
+2063 + 2088 were published as `power_w` on every surface (hub `/api/state`, the mirror's `readings.power_w`,
+both dashboards, 6bb's Heating card). Compared minute by minute with the pump's SPAN circuit over
+2026-10-12..11-16 (94,030 paired readings, restored backup):
+
+| SPAN circuit draw | pump-minutes | register sum (avg, min–max) |
+|---|---|---|
+| under 1 kW | 88,043 | 0.0 (0–32) |
+| 1–2 kW | 363 | 8 (0–33) |
+| 2–3 kW | 334 | 10 (0–34) |
+| 3–4 kW | 824 | 14 (0–35) |
+| 4–5 kW | 2,277 | 22 (0–32) |
+| 5–6 kW | 2,026 | 27 (21–34) |
+| over 6 kW | 163 | 32 (28–35) |
+
+Of 5,987 pump-minutes above 1 kW at the panel, none read above 35. Correlation with the circuit is 0.98, at
+roughly 200 W per count at full load and 180–280 W per count below it: a real signal for the two inverter
+stages, in an unconfirmed unit (about 0.1 kW per count would fit), and it leaves out the fixed-speed
+compressors, fans and circulator. It cannot be scaled into the unit's power.
+
+So since the release after `release-20261102-1`, `power_w` everywhere is the pump's SPAN circuit
+(`bridge/pump_power.py`), `None` when the panel reading is missing, and the register sum travels as
+`inverter_power_raw`. Mirror rows in `readings.power_w` from before that release are raw counts, not watts.
 
 **Resolves handoff §4 open item:** 2063 vs 2088 are not two candidates for one value —
 **2063 = System 1 (R410A stage) inverter power, 2088 = System 2 (R134a stage) inverter power.**

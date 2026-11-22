@@ -285,7 +285,9 @@ function renderDashboard() {
     const shown = pending ?? actual;
     const dirty = pending !== undefined && pending !== actual;
     const writing = state.writing[p.id];
-    const power = (s.power_sys1 || 0) + (s.power_sys2 || 0);
+    // power_w = the pump's SPAN circuit, metered at the panel (null when the panel reading is missing). The
+    // registers behind power_sys1/2 are the inverter stages only, in an unconfirmed unit: shown as raw counts.
+    const power = s.power_w;
     const modeLabel = MODE_LABELS[s.mode_kind] || (s.mode_name || "—");
     const bounds = s.setpoint_bounds_c;
     const faults = (s.active_faults || []).map(f => `
@@ -324,8 +326,8 @@ function renderDashboard() {
         <div class="temp"><div class="v">${temp(s.inlet_c)}°</div><div class="l">Inlet</div></div>
         <div class="temp"><div class="v">${temp(s.ambient_c)}°</div><div class="l">Outdoor</div></div>
       </div>
-      <div class="powerline">Power <b>${num(power, 0)} W</b>
-        &nbsp;·&nbsp; stage 1: ${num(s.power_sys1, 0)} · stage 2: ${num(s.power_sys2, 0)}</div>
+      <div class="powerline">Power <b>${power == null ? "—" : num(power, 0) + " W"}</b> <span title="Metered at the SPAN panel circuit">(panel)</span>
+        &nbsp;·&nbsp; inverter raw: ${num(s.power_sys1, 0)} · ${num(s.power_sys2, 0)}</div>
       <div class="setpoint">
         <div>
           <div class="label">Setpoint · ${esc(modeLabel)}</div>

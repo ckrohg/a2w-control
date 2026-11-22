@@ -24,6 +24,7 @@ from websockets.exceptions import ConnectionClosed
 from .config import HubConfig
 from .guardrails import GuardrailError
 from .poller import PumpPoller
+from .pump_power import power_fields
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class HubClient:
         self.span = None   # span_control.BreakerController when SPAN local is configured
         self.backup_fallback = None   # backup_fallback.BackupFallback — its status rides frame["span"]
         self.stops = None             # deliberate_stop.DeliberateStops — per pump "deliberate_stop" (#212)
+        self.pump_power = None        # pump_power.PumpPower — power_w is the SPAN circuit's draw, never the registers
         self._task: asyncio.Task | None = None
         self._breaker_tasks: set[asyncio.Task] = set()
 
@@ -279,7 +281,9 @@ class HubClient:
                 "inlet_c": s.get("inlet_c"),
                 "outlet_c": s.get("outlet_c"),
                 "ambient_c": s.get("ambient_c"),
-                "power_w": (s.get("power_sys1") or 0) + (s.get("power_sys2") or 0),
+                # power_w = metered watts at the pump's SPAN circuit, None when unknown; the register sum rides as
+                # inverter_power_raw (pump_power.py says why it was never watts).
+                **power_fields(self.pump_power, p.cfg.id, s),
                 "active_faults": wire_faults(s.get("active_faults")),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
                 "remote_lease_until": s.get("remote_lease_until"),

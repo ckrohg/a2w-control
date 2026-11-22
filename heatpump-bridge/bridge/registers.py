@@ -137,7 +137,8 @@ ALL_BLOCKS = all_blocks()  # snapshot at import for callers that don't need the 
 
 # --- Scaling (commissioning items — verify against wall controller / clamp meter) ----
 TEMP_SCALE = 1.0    # doc quotes whole degC ranges; Macon boards sometimes use x0.1
-POWER_SCALE = 1.0   # units of 2063/2088 unconfirmed
+POWER_SCALE = 1.0   # 2063/2088: inverter stages only, unit unconfirmed (~0.1 kW/count fits) — raw counts, never
+                    # published as watts: power_w on every surface is the SPAN circuit (pump_power.py)
 CURRENT_SCALE = 1.0
 
 
