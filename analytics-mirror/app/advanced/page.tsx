@@ -237,7 +237,7 @@ export default async function AdvancedPage({ searchParams }: { searchParams: { e
                   cool {fmt(f(s.setpoint_cooling_c), 0)}°F / DHW {fmt(f(s.setpoint_hot_water_c), 0)}°F ·
                   max water (reg 2027) {fmt(f(s.max_water_temp_c), 0)}°F ·
                   inlet {fmt(f(s.inlet_c))}°F / outlet {fmt(f(s.outlet_c))}°F / ambient {fmt(f(s.ambient_c))}°F ·
-                  power S1 {fmt(s.power_sys1, 0)} + S2 {fmt(s.power_sys2, 0)} ·
+                  inverter raw (not W) S1 {fmt(s.power_sys1, 0)} + S2 {fmt(s.power_sys2, 0)} ·
                   freq {fmt(s.freq_sys1_hz, 0)}/{fmt(s.freq_sys2_hz, 0)} Hz ·
                   {s.defrosting ? " DEFROSTING · " : " "}fan {s.fan_speed ?? "—"} ·
                   emergency {s.emergency_override ?? "—"}

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .config import AnalyticsConfig
 from .poller import PumpPoller
+from .pump_power import power_fields
 from .span_local import read_arm_intent, write_arm_intent
 from .store import Store
 
@@ -42,6 +43,7 @@ class Exporter:
         self.pollers = pollers
         self.store = store
         self._task: asyncio.Task | None = None
+        self.pump_power = None   # pump_power.PumpPower, set by main.py once the SPAN poller exists
         self._last_full = 0.0
         # Durable "max event id pushed" cursor — a small file next to the DB (same dir as
         # gateway-overrides.json) so events aren't re-shipped from id 0 after a restart.
@@ -110,7 +112,7 @@ class Exporter:
                 "inlet_c": s.get("inlet_c"),
                 "outlet_c": s.get("outlet_c"),
                 "ambient_c": s.get("ambient_c"),
-                "power_w": (s.get("power_sys1") or 0) + (s.get("power_sys2") or 0),
+                **power_fields(self.pump_power, p.cfg.id, s),   # metered SPAN watts or None — see pump_power.py
                 "active_faults": len(s.get("active_faults", [])),
                 "error_rate": p.client.stats.as_dict()["error_rate"],
             }

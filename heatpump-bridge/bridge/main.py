@@ -76,6 +76,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             arm_state_path=str(Path(cfg.db_path).resolve().parent / "span-arm.json"))
         span_poller.start()
         app.state.span_poller = span_poller
+        # One definition of a pump's power_w for every publisher: the SPAN circuit's metered draw (pump_power.py).
+        from .pump_power import PumpPower
+        pump_power = PumpPower(span_poller, cfg.self_heal.circuits)
+        app.state.pump_power = pump_power
+        exporter.pump_power = pump_power
+        hub_client.pump_power = pump_power
         span_breakers = None
         if cfg.span.host and cfg.span.passphrase:
             from .span_control import BreakerController

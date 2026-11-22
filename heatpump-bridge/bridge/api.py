@@ -204,7 +204,12 @@ async def remove_pump(request: Request, pump_id: str,
 
 @router.get("/pumps/{pump_id}/status")
 async def pump_status(request: Request, pump_id: str, _p: Principal = Depends(read)):
-    return _pump(request, pump_id).snapshot
+    poller = _pump(request, pump_id)
+    # The cached register snapshot plus power_w = the SPAN circuit's metered watts (None when unknown) and
+    # inverter_power_raw = registers 2063 + 2088 as read. The local UI shows the first as power (pump_power.py).
+    from .pump_power import power_fields
+    return {**poller.snapshot,
+            **power_fields(getattr(request.app.state, "pump_power", None), pump_id, poller.snapshot)}
 
 
 @router.get("/pumps/{pump_id}/history")
