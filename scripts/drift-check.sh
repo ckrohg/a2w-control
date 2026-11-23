@@ -85,6 +85,21 @@ iac_watch() { grep -A1 "nodeService(\"$2\"" "$1" 2>/dev/null | tail -n +2 | grep
 # toml_watch <file>: the `watchPatterns = [ ... ]` block of a railway.toml
 toml_watch() { sed -n '/^watchPatterns *= *\[/,/^\]/p' "$1" 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' | LC_ALL=C sort | paste -sd' ' -; }
 
+# [4]'s reader for FORECAST_FETCH_ENABLED. The planner's demand_forecast block has two shapes
+# (planner/src/index.ts): until the first fetch {mode:"idle", fetch_enabled, preheat_enabled}; after it the feed's own
+# status (healthy, lastSuccessAt, ...) with NO fetch_enabled key. Reading .fetch_enabled alone printed "live=null" for
+# a gate that had just been switched on (2026-11-23). $1 = planner /health json. Prints one of:
+#   off | pending | on <seconds since the last good fetch, or "never"> | unknown
+forecast_fetch_state() {
+  jq -r '(.demand_forecast // {}) as $d
+    | if ($d | has("lastSuccessAt") or has("healthy")) then
+        "on " + (($d.lastSuccessAt // "") | if . == "" then "never"
+                 else (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | now - . | floor | tostring) end)
+      elif $d.fetch_enabled == true then "pending"
+      elif $d.fetch_enabled == false then "off"
+      else "unknown" end' <<<"$1" 2>/dev/null || echo unknown
+}
+
 # scripts/drift-check.test.sh sources the helpers above and stops here.
 [ -n "${DRIFT_CHECK_LIB_ONLY:-}" ] && return 0
 
@@ -216,12 +231,19 @@ echo "[4] declared gate flags vs live"
 # Docs that claim a gate is on/off must match /health. Winter-DP go-live flips these; this
 # catches a doc that says "shadow" after the gate went live, or vice versa.
 if [ -n "$HEALTH" ]; then
-  for pair in "demand_forecast.fetch_enabled:FORECAST_FETCH_ENABLED" \
-              "demand_forecast.preheat_enabled:FORECAST_PREHEAT_ENABLED"; do
-    path="${pair%%:*}"; name="${pair##*:}"
-    live="$(jq -r ".${path}" <<<"$HEALTH")"
-    pass "${name} live=${live}"
-  done
+  # A fetch gate that is on but has not fetched for 2 h is recording nothing: the shadow weeks it is meant to collect
+  # (winter-dp-commissioning.md, A-8 step 1) would pass empty, and nothing else would say so.
+  FETCH_STATE="$(forecast_fetch_state "$HEALTH")"
+  case "$FETCH_STATE" in
+    off)        pass "FORECAST_FETCH_ENABLED live=false" ;;
+    pending)    pass "FORECAST_FETCH_ENABLED live=true (no fetch yet since the planner started)" ;;
+    "on never") fail "FORECAST_FETCH_ENABLED is on but the forecast has never been fetched (demand_forecast.lastSuccessAt null)" ;;
+    "on "*)     FETCH_AGE="${FETCH_STATE#on }"
+                if [ "$FETCH_AGE" -le 7200 ]; then pass "FORECAST_FETCH_ENABLED live=true (last good fetch $((FETCH_AGE / 60)) min ago)"
+                else fail "FORECAST_FETCH_ENABLED is on but the last good fetch was $((FETCH_AGE / 60)) min ago (> 120 min) — the shadow is recording nothing"; fi ;;
+    *)          fail "FORECAST_FETCH_ENABLED: /health.demand_forecast has neither shape the planner writes" ;;
+  esac
+  pass "FORECAST_PREHEAT_ENABLED live=$(jq -r '.demand_forecast.preheat_enabled' <<<"$HEALTH")"
   ws="$(jq -r '.winter_solver.mode' <<<"$HEALTH")"
   [ "$ws" = "shadow" ] || [ "$ws" = "active" ] \
     && pass "winter_solver mode=${ws}" || fail "winter_solver mode unexpected: ${ws}"
