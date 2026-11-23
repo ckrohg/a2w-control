@@ -10,13 +10,17 @@ during a Wi-Fi blind spell, see §2). The owner has approved the flip to `auto`.
 
 ## 1. What the settings do
 
-Both keys are in the `span:` section (`config.py:SpanConfig`): `transport: Literal["v1","auto","v2"]`, default `"v1"`,
-and `v2_soak: bool`, default `False`. `span_local.py:SpanClient.__init__` builds a v2 session only when
+Both keys are in the `span:` section (`config.py:SpanConfig`): `transport: Literal["v1","auto","v2"]`, default `"v2"`
+since the v2-default release (#199; `span_local.py:DEFAULT_TRANSPORT`), and `v2_soak: bool`, default `False`.
+**An absent `transport` key means `v2` on that release and later, and `v1` on every release before it.** `v1` is
+selectable only explicitly and is deprecated: every bridge start on it logs a warning that v1 dies 2026-12-31, and
+`/api/health.span.deprecated` says so. `span_local.py:SpanClient.__init__` builds a v2 session only when
 `transport != "v1"`, and a soak session only when `transport == "v1" and v2_soak`: `v2_soak` is ignored in `auto` and `v2`,
 and `/api/health.span.soak` is `null` there.
 
 | Setting | Reads | Relay writes |
 |---|---|---|
+| absent | as `v2` from the v2-default release; as `v1` before it | as `v2` / as `v1` |
 | `v1` | v1 REST only (`SpanClient._fetch_sync` → `_v1_circuits`). No v2 connection exists. | v1 only (`_v1_set_relay_sync`). |
 | `v1` + `v2_soak: true` | v1 decides. After each good v1 read, `SpanClient._soak_compare` reads the v2 tree and compares `name`, `relayState`, `isUserControllable` per circuit. It never waits, never raises, never writes. **Power is not compared.** | v1 only. |
 | `auto` | v2 first, v1 fallback, then v2 again with a wait (`_fetch_sync`). | v2 first, fallback rules below (`_set_relay_sync`). |
@@ -98,7 +102,8 @@ cp -p /home/admin/bridge-data/config.yaml /home/admin/bridge-data/config.yaml.ba
 grep -n -A12 '^span:' /home/admin/bridge-data/config.yaml     # find transport / v2_soak
 ```
 
-Change only these lines (whether a `transport:` line exists today is not determined from the repo; absent = `v1`):
+Change only these lines (whether a `transport:` line exists today is not determined from the repo; on the release
+running at the flip an absent key is `v1`, from the v2-default release on it is `v2`):
 
 ```yaml
 span:
@@ -134,6 +139,13 @@ wrote beside the v1 token (`SpanV2._ensure_creds`, `_ensure_ca`; state dir from 
 **If `span.read` is `"v1"`:** v2 did not come up and the fallback is working. Nothing is broken today. Read
 `span.v2_error`, wait a few polls (the session keeps retrying in the background), and if it does not turn to `"v2"`
 roll back (§5) and journal the error. drift-check `[10]` fails while a read in `auto` is answered by v1.
+
+**After the flip: the v2-default release, then remove the key.** Once `auto` has run clean for about a week, the owner
+ships the v2-default bridge in its own release tag. `auto` keeps working unchanged on it. Then, **once that release
+is on the Pi and by 2026-12-31**, remove the `span.transport` line from `config.yaml` (or set `transport: v2`) and
+restart; expect `span.mode: "v2"`, `span.read: "v2"`, `span.deprecated: null`. Not before the release: an older bridge
+reads an absent key as `v1`. Do not stay on `auto` past 2026-12-31: with v1 gone, every fallback attempt is only
+latency and log noise, and drift-check `[10]` fails mode `auto` from that date.
 
 ## 4. Verifying the write path over v2
 
@@ -183,7 +195,10 @@ cp -p /home/admin/bridge-data/config.yaml /home/admin/bridge-data/config.yaml.ba
 sudo systemctl restart heatpump-bridge
 ```
 
-Or restore the pre-flip backup, if nothing else in the file changed since. Expect `span.mode: "v1"`, `span.read: "v1"`,
+**Set `span.transport: v1` explicitly; an absent key is v2, so restoring an old config.yaml without the key is NOT a
+rollback** once the v2-default release is on the Pi. Restore the pre-flip backup only if it has an explicit
+`transport: v1` line and nothing else in the file changed since. Expect the v1 deprecation warning in the bridge log
+at start and `span.deprecated` set. Expect `span.mode: "v1"`, `span.read: "v1"`,
 `span.v2: null`, and `span.soak` back (counters from zero) if `v2_soak` is on. Possible only while the panel serves v1.
 
 **The v1 token.** It is persisted as `span-local-token` next to the DB (`main.py`, `SpanClient._persist_token`) and
@@ -215,8 +230,10 @@ How `/api/health` shows it:
   the code.
 - Top-level `healthy` stays `true`: it looks only at the pumps (`api.py:health`).
 
-Before that date: drift-check `[10]` fails a pinned `v1` from 2026-12-15. In `auto`, removal needs no action: reads
-and CLOSEs wait for v2 when v1 cannot answer (`_fetch_sync`, `_set_relay_sync`).
+Before that date: drift-check `[10]` fails a pinned `v1` from 2026-12-15. In `auto`, removal breaks nothing: reads
+and CLOSEs wait for v2 when v1 cannot answer (`_fetch_sync`, `_set_relay_sync`). It still leaves v1 attempts running
+with their latency and noise, so remove the `span.transport` key (or set `v2`) by 2026-12-31 (§3); drift-check `[10]`
+fails mode `auto` from that date.
 
 ## 7. Known quirks
 

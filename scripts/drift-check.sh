@@ -355,6 +355,8 @@ echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199
 # shipped pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
 # fallback). Cutover: once the auto soak is clean the bridge default becomes v2 (mode v2) and v1 is a deprecated,
 # explicit fallback. In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
+# Mode auto passes until 2026-12-31, then it is drift too: with v1 gone every fallback attempt is latency and noise, so
+# the key comes out (or is set to v2) once the v2-default release is on the Pi.
 if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
   skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
 else
@@ -376,7 +378,12 @@ else
       fi ;;
     auto|v2)
       case "$SPANTX" in
-        v2) pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE" ;;
+        v2)
+          if [ "$SPANMODE" = auto ] && [[ ! "$TODAY" < "2026-12-31" ]]; then
+            fail "SPAN still on transport auto on $TODAY — v1 is gone; remove span.transport on the Pi (or set v2)"
+          else
+            pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE"
+          fi ;;
         v1) fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
         *)  fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
       esac ;;

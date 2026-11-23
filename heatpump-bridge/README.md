@@ -98,8 +98,9 @@ sim/fake_span_v2.py the v2 side of the same fake: a minimal MQTT broker over rea
                     the eBus tree recorded from the house panel (sim/span_v2_capture.json)
 ui/                 static mobile-first SPA (no build step), served at /
 tests/              unit + integration (integration runs a real in-process sim pump; SPAN suites
-                    run twice against sim/fake_span.py: a v2-only panel on the default transport,
-                    and the v1 fake on the deprecated v1 fallback — tests/conftest.py)
+                    run three times against sim/fake_span.py: a v2-only panel on the default
+                    transport and on `auto`, and the v1 fake on the deprecated v1 fallback —
+                    tests/conftest.py)
 deploy/             Pi systemd units (bridge, auto-update timer, watchdog timer), production
                     config template, bootstrap/update scripts, W610 / Tailscale / cloudflared /
                     Railway-hub guides
@@ -160,9 +161,15 @@ and the bridge are unaffected.
   1. **Auto soak** — the Pi runs `transport: auto` (release tag around 2026-11-24): v2 answers
      every read and write, v1 only if v2 cannot. Watch `/api/health.span.read`/`write` and
      drift-check `[10]`: a `v1` answer means v2 is failing.
-  2. **This change** — once the soak is clean the owner merges it: the default becomes `v2`
-     (drop the `transport` key on the Pi, or leave `auto`), `v1` warns on every start.
-  3. **Remove v1 after 2026-12-31** — delete the v1 code paths (`_v1_*`, the REST register,
+  2. **This change** — once the soak is clean the owner merges it and ships it in its own
+     release tag: the default becomes `v2` (an absent key is now v2), `v1` warns on every start.
+     `auto` keeps working unchanged until the panel drops v1.
+  3. **By 2026-12-31, once this release is on the Pi: remove the `span.transport` key (or set
+     `v2`).** Not before: an older bridge reads an absent key as v1. Do not stay on
+     `auto` past that date: with v1 gone every v1 fallback attempt only adds latency and log
+     noise (drift-check `[10]` fails mode `auto` from 2026-12-31). To roll back to v1 before then,
+     set `span.transport: v1` explicitly — an absent key is v2.
+  4. **Remove v1 after 2026-12-31** — delete the v1 code paths (`_v1_*`, the REST register,
      `v2_soak`), the `v1`/`auto` values and the v1 run of the test suites.
 
 Config keys (`span:`): `host`, `ip_fallback`, `passphrase`, `circuits`, `poll_interval_s`,
