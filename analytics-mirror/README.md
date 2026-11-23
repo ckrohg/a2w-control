@@ -6,10 +6,29 @@ planner uses) and renders history charts, status, the control page and the optim
 
 ## Where it sits in the control path
 
-The **telemetry path is non-critical**: the Pi pushes to `/api/ingest`; if this app or its
-database is down, the Pi, the hub and the planner keep running and you lose the hosted view
-and the dashboard's buttons. Nothing here writes on its own schedule — the only cron is the
-weekly digest email; every control request starts with a logged-in person.
+The **telemetry path is non-critical**, but the two things that can fail here are not alike:
+
+- **This Vercel app is down.** The Pi's pushes to `/api/ingest` fail and the bridge keeps the
+  last backup-arm value it stored; the Pi, the hub and the planner keep running. You lose the
+  hosted view and the dashboard's buttons, and nothing else.
+- **The Railway Postgres is down.** That is not a mirror-only outage: the planner stores every
+  poll in the same database (`DATABASE_URL`, required) and its single-writer lease
+  (`hbx_writer_lease`) lives there. The planner process stays up — at boot it retries the schema
+  check forever instead of crashing, the lesson of the 2026-08-19 outage recorded in
+  `planner/src/store.ts` — but each poll fails at the reading insert, before Phase B, the
+  auto-pilot and the backup-element gate run (`planner/src/index.ts`, `pollOnce`). So the planner
+  stops optimizing, `/health` turns 503 and it pages "SensorLinx reader offline" after 5 failed
+  polls (that alert fires for any poll failure, the reader is not the cause). With
+  `WRITER_LEASE_ENABLED=1` the fresh-lease check that precedes every device write fails too, so
+  boost/target/restore requests die before they reach the HBX. The pumps lapse to the Pi's
+  `baseline_setpoint_c` when their 90-minute leases expire and the HBX keeps heating on its own
+  curve; the Pi's guardrails and the hub are untouched. Here, history pages and ingest fail while
+  the session cookie (not database-backed) and the hub proxies keep working. See
+  `planner/README.md` (§Single-writer invariant, §Phase B).
+
+Nothing here writes on its own schedule — the only cron is the weekly digest email. Every control
+request a person can make starts from a logged-in session; the one automatic feedback is the
+ingest echo described below.
 
 Two things do flow back, and an operator should know about both:
 

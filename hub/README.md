@@ -79,7 +79,7 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | ------------------ | ------- |
 | `HUB_PI_TOKEN`     | Bearer token the Pi presents on its WS handshake. Wrong/absent → WS close `4401`. |
 | `HUB_CLIENT_TOKEN` | Bearer token the optimizer + dashboard present on HTTP. |
-| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both off). Held only by the dashboard's server, released only after a fresh password re-entry. |
+| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both answer 503). Two holders: the dashboard's server, which sends it only after a fresh password re-entry; and the planner when its backup-element gate is live (`BACKUP_GATE=live`), which uses it for `/api/breaker` on the backup element only. |
 | `HUB_READONLY_TOKEN` | Optional. Read-only bearer for the 6bb home app (#190) — see below. Unset = off, nothing changes. |
 | `PORT`             | HTTP + WS port. Railway injects this automatically; defaults to `8080`. |
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
@@ -212,4 +212,5 @@ HUB_ARM_TOKEN=<HUB_ARM_TOKEN>         # must match the hub's HUB_ARM_TOKEN; serv
 The dashboard's server routes read `GET /api/state`, post setpoints to `POST /api/command`
 with `Authorization: Bearer <HUB_CLIENT_TOKEN>`, and add `X-Arm-Token` for
 `/api/write-enable` and `/api/breaker` only after the owner has re-entered the password. The
-optimizer uses the same base URL + client token.
+optimizer uses the same base URL + client token, and adds `X-Arm-Token` only for `/api/breaker` on
+the backup element when `BACKUP_GATE=live` (it needs none otherwise).
