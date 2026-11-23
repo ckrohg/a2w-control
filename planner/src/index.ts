@@ -53,6 +53,7 @@ import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
+import { BACKUP_INITIAL, evalBackupCalled, type BackupState } from "./housealarms";
 import { HousePages, R02_HISTORY_DAYS, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
@@ -1282,18 +1283,18 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
 /** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
  *  page — legitimate on a design-cold day, a planner bug or config drift any other time.
  *  Edge-triggered; the element's actual runtime (breaker permitting) lives in SPAN. */
-let backupWasCalled = false;
+let backupState: BackupState = BACKUP_INITIAL;
 async function checkBackupCalled(called: boolean | null): Promise<void> {
-  if (called === true && !backupWasCalled) {
-    backupWasCalled = true;
+  const { state, action } = evalBackupCalled(backupState, called);
+  backupState = state;
+  if (action === "open") {
     await ntfy(
       "16.5 kW backup element CALLED",
       "HBX has called the backup element (≈$5/hour if its breaker is on). Legitimate in design-cold; otherwise investigate.",
       "high",
       { tier: "record" }, // a call is not a draw: the SPAN power alarm (spanwatch) is the one that emails
     );
-  } else if (called === false && backupWasCalled) {
-    backupWasCalled = false;
+  } else if (action === "clear") {
     await ntfy("Backup element call ended", "HBX released the backup element.", "default", { tier: "record", resolved: true });
   }
 }
