@@ -40,7 +40,8 @@ write-enabled now. The cloud side is live: Railway hub + Railway Postgres (migra
 reaches the services only through an owner-run `railway config apply`. **Phase B is ACTIVE** — the planner drives both
 pumps' setpoints to track the HBX tank target (the curve in force is `/health.curve.in_force`) on 90-minute leases.
 The winter DP solver runs in SHADOW; `demand_forecast` has both gates (`FORECAST_FETCH_ENABLED`,
-`FORECAST_PREHEAT_ENABLED`) off by default and drift-check [4] reports their live values. TempIQ push/read are
+`FORECAST_PREHEAT_ENABLED`) off by default and drift-check [4] reports their live values; the fetch gate has been ON
+since 2026-11-23 (shadow: it records what a forecast would have done and actuates nothing). TempIQ push/read are
 live (18 zones, 38 spatial edges). Winnie's thread CLOSED 2026-07-14 — nothing is owed either
 direction. Dev quickstart in `heatpump-bridge/README.md`.
 
@@ -87,8 +88,9 @@ lease in about 20–50 s (was 600 s+). #300 names the hours an unverified bindin
 mesh node, no roaming, since 2026-11-13. Tue 2026-11-24: the Pi gets Ethernet and one release tag, after which
 `span.transport: auto` goes live (#199; runbook `reference/span-v2-cutover.md`); v2 becomes the default in its own
 December tag. Then the winter backlog: #89 TempIQ/local required-supply divergence, #87 winter DP v2, #76 comm
-degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
-`FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated.
+degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1`, done 2026-11-23 → ≥2 weeks of real cold →
+review → `FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated;
+the pre-heat gate is not to be flipped as built (#89).
 
 **Working rules (added 2026-09-16 after the Pi went offline mid-session — see
 `knowledge/reference/incident-20260916-pi-offline.md`):**
