@@ -21,6 +21,8 @@
 # the session time to come up, outside the client lock; every later (re)start runs in the background. When v1 cannot
 # answer (removed, on cooldown, unreachable) a read or a CLOSE does wait for v2: a safety write is never refused when it
 # could wait (#239 review). Under v2 every read and write waits for the session: there is nothing else to send on.
+# Unlike auto, that wait (first bring-up included) runs inline under the client lock, so during a panel outage a CLOSE
+# queues behind a read's CONNECT_WAIT_S (15 s); acceptable, since the CLOSE needs the same session (#199 review).
 from __future__ import annotations
 
 import asyncio

@@ -68,7 +68,10 @@ drift-check `[10]` passes a pinned v1 until 2026-12-15 and fails after that; a s
   (removed, on cooldown, unreachable) the CLOSE then waits for v2, because a safety write is never refused when it could
   wait. Reads behave the same, and also wait during a process's first bring-up, outside the client lock, so a bridge
   restart doesn't land on v1. An OPEN always waits (it is not a safety write), and so does everything under
-  `transport: v2` — the default since the cutover, where there is nothing else to send on.
+  `transport: v2` — the default since the cutover, where there is nothing else to send on. Under v2 the #239 point
+  above (a restart's CLOSE never queues behind the first-bring-up wait) does not hold: the wait runs inline under the
+  client lock, so during a panel outage a CLOSE queues behind a read's `CONNECT_WAIT_S` (15 s). That is acceptable,
+  because the CLOSE needs the same session.
 - **Registration backs off.** A broker that refuses what the panel just issued used to mean a new panel client every
   10 minutes. Re-registering now waits 10 min, then 20, 40 … capped at 6 h. The state is persisted in
   `span-v2-register.json`, so a restart doesn't reset it. After 3 registrations in a row without a session,
