@@ -747,6 +747,286 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     assert len(fired) == 1
 
 
+def _count_maintenance(sched):
+    """Wrap run_maintenance so tests can assert exactly how many times the gate fired
+    (the real backup still runs, so the file-name seeding is exercised too)."""
+    calls = []
+    orig = sched.run_maintenance
+
+    async def counting(now):
+        calls.append(now)
+        await orig(now)
+
+    sched.run_maintenance = counting
+    return calls
+
+
+async def test_scheduler_maintenance_runs_late_when_0330_was_missed(rig, caplog):
+    # (a) first tick lands at 03:31 (restart, or a tick held past 60 s by lease reverts over
+    # 2400-baud Modbus): the backup must still run — once — and say it ran late.
+    import logging
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+    backups = Path(store.path).parent / "backups"
+    assert not (backups / "bridge-20260705.db").exists()
+
+    with caplog.at_level(logging.INFO, logger="bridge.scheduler"):
+        await sched.check_once(datetime(2026, 7, 5, 3, 31))
+    assert len(calls) == 1
+    assert (backups / "bridge-20260705.db").exists()
+    late = [r for r in caplog.records if "running late" in r.getMessage()]
+    assert len(late) == 1
+    assert "03:31" in late[0].getMessage()
+
+
+async def test_scheduler_maintenance_runs_once_per_day(rig):
+    # (b) after the late run, later ticks the same day must not run it again
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+
+    await sched.check_once(datetime(2026, 7, 5, 3, 31))
+    assert len(calls) == 1
+    await sched.check_once(datetime(2026, 7, 5, 3, 32))
+    await sched.check_once(datetime(2026, 7, 5, 14, 0))
+    assert len(calls) == 1
+    # ...but the next day is due again
+    await sched.check_once(datetime(2026, 7, 6, 3, 30))
+    assert len(calls) == 2
+
+
+async def test_scheduler_maintenance_restart_does_not_rerun_todays_backup(rig):
+    # (c) a fresh Scheduler (bridge restart at 14:00) sees today's backup file already on
+    # disk and must not re-run the backup — the ">= 03:30" catch-up gate would otherwise
+    # fire on the first tick after every daytime restart.
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    first = Scheduler(store, {"p1": poller})
+    await first.check_once(datetime(2026, 7, 5, 3, 30))
+    backups = Path(store.path).parent / "backups"
+    assert (backups / "bridge-20260705.db").exists()
+    stamp = (backups / "bridge-20260705.db").stat().st_mtime_ns
+
+    fresh = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(fresh)
+    assert fresh._last_maintenance_date == "2026-07-05"
+    await fresh.check_once(datetime(2026, 7, 5, 14, 0))
+    assert calls == []
+    assert (backups / "bridge-20260705.db").stat().st_mtime_ns == stamp
+
+    # a restart the NEXT day (newest backup is yesterday's) does run it
+    await fresh.check_once(datetime(2026, 7, 6, 9, 15))
+    assert len(calls) == 1
+    assert (backups / "bridge-20260706.db").exists()
+
+
+async def test_scheduler_maintenance_not_before_0330(rig):
+    # (d) a tick before the scheduled minute must not run maintenance
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+
+    await sched.check_once(datetime(2026, 7, 5, 3, 29))
+    assert calls == []
+    assert not list((Path(store.path).parent / "backups").glob("bridge-*.db"))
+    await sched.check_once(datetime(2026, 7, 5, 3, 30))  # the exact minute still works
+    assert len(calls) == 1
+
+
+async def test_scheduler_maintenance_restart_just_before_0330_runs_once(rig):
+    # (e) restart at 03:29:50 (yesterday's backup on disk), first tick 03:30:10, next 03:30:30:
+    # exactly one run — the old == gate and the new >= gate must not both fire it.
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    await Scheduler(store, {"p1": poller}).run_maintenance(datetime(2026, 7, 4, 3, 30))
+
+    sched = Scheduler(store, {"p1": poller})      # constructed at 03:29:50
+    assert sched._last_maintenance_date == "2026-07-04"
+    calls = _count_maintenance(sched)
+    await sched.check_once(datetime(2026, 7, 5, 3, 29, 50))
+    assert calls == []
+    await sched.check_once(datetime(2026, 7, 5, 3, 30, 10))
+    await sched.check_once(datetime(2026, 7, 5, 3, 30, 30))
+    await sched.check_once(datetime(2026, 7, 5, 3, 31, 0))
+    assert len(calls) == 1
+    assert (Path(store.path).parent / "backups" / "bridge-20260705.db").stat().st_size > 0
+
+
+async def test_scheduler_maintenance_failed_backup_retries_hourly(rig, monkeypatch, caplog):
+    # (f) a backup that fails partway leaves no file behind and retries once an hour — not
+    # every 20 s tick (SD-card wear), and not never (the day's backup silently lost).
+    import logging
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+    dest = Path(store.path).parent / "backups" / "bridge-20260705.db"
+
+    real_backup = store.backup
+    failing = {"on": True}
+
+    async def flaky_backup(path):
+        if failing["on"]:
+            Path(path).write_bytes(b"partial")      # half-written file, then the I/O error
+            raise OSError("I/O error")
+        await real_backup(path)
+
+    monkeypatch.setattr(store, "backup", flaky_backup)
+
+    with caplog.at_level(logging.WARNING, logger="bridge.scheduler"):
+        await sched.check_once(datetime(2026, 7, 5, 3, 30))
+    assert len(calls) == 1
+    assert not dest.exists()                       # partial file removed
+    assert any("retrying at 04:30" in r.getMessage() for r in caplog.records)
+    # a restart now must not read the (removed) partial file as "ran today"
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date is None
+
+    for minute in (30, 31, 45, 59):                 # every tick inside the hour: no retry
+        await sched.check_once(datetime(2026, 7, 5, 3, minute, 20))
+    await sched.check_once(datetime(2026, 7, 5, 4, 29, 40))
+    assert len(calls) == 1
+    await sched.check_once(datetime(2026, 7, 5, 4, 30))   # an hour later: one retry, fails
+    assert len(calls) == 2
+    await sched.check_once(datetime(2026, 7, 5, 4, 30, 20))
+    assert len(calls) == 2
+
+    failing["on"] = False
+    await sched.check_once(datetime(2026, 7, 5, 5, 30))   # next hourly retry succeeds
+    assert len(calls) == 3
+    assert dest.stat().st_size > 0
+    await sched.check_once(datetime(2026, 7, 5, 6, 30))
+    await sched.check_once(datetime(2026, 7, 5, 23, 59))
+    assert len(calls) == 3                          # done for the day
+
+
+async def test_scheduler_maintenance_empty_backup_file_counts_as_failed(rig, monkeypatch):
+    # (g) a backup call that "succeeds" but leaves a zero-byte file is a failure: retried
+    # hourly, and a restart doesn't seed "ran today" from the empty file.
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+
+    async def empty_backup(path):
+        Path(path).touch()
+
+    monkeypatch.setattr(store, "backup", empty_backup)
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+    await sched.check_once(datetime(2026, 7, 5, 3, 30))
+    await sched.check_once(datetime(2026, 7, 5, 3, 31))
+    assert len(calls) == 1
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date is None
+    await sched.check_once(datetime(2026, 7, 5, 4, 30))
+    assert len(calls) == 2
+
+
+async def test_scheduler_maintenance_retry_survives_clock_step_back(rig, monkeypatch):
+    # (h) a failure stamped while the clock was wrong (hours ahead) must not hold the retry
+    # off for those hours once the clock is corrected.
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+
+    async def broken_backup(path):
+        raise OSError("I/O error")
+
+    monkeypatch.setattr(store, "backup", broken_backup)
+    sched = Scheduler(store, {"p1": poller})
+    calls = _count_maintenance(sched)
+    await sched.check_once(datetime(2026, 7, 5, 18, 0))   # clock 10 h fast
+    assert len(calls) == 1
+    await sched.check_once(datetime(2026, 7, 5, 8, 0))    # NTP corrects it
+    assert len(calls) == 2
+
+
+async def test_scheduler_maintenance_unusable_backups_dir_does_not_break_the_tick(rig):
+    # (h2) backups dir can't be created (here: a plain file in its place; on the Pi, a card
+    # remounted read-only): logged, retried hourly, and check_once still runs the timers.
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    (Path(store.path).parent / "backups").write_bytes(b"not a dir")
+    sched = Scheduler(store, {"p1": poller})
+    assert sched._last_maintenance_date is None
+    calls = _count_maintenance(sched)
+    await sched.check_once(datetime(2026, 7, 5, 3, 30))   # must not raise
+    await sched.check_once(datetime(2026, 7, 5, 3, 31))
+    assert len(calls) == 1
+    await sched.check_once(datetime(2026, 7, 5, 4, 30))
+    assert len(calls) == 2
+
+
+async def test_scheduler_maintenance_seed_ignores_junk_and_handles_future(rig):
+    # (i) seeding: no backups dir, an empty dir, and non-matching names all seed None (so the
+    # day's backup runs); a future-dated name (clock jump) seeds a non-today date, so today's
+    # backup still runs.
+    from datetime import datetime
+    from pathlib import Path
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    await poller.poll_once()
+    backups = Path(store.path).parent / "backups"
+    assert not backups.exists()
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date is None
+
+    backups.mkdir()
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date is None
+
+    for name in ("bridge-latest.db", "bridge-2026070.db", "bridge-202607051.db",
+                 "bridge-2026-07-05.db", "bridge-20260705.db.bak", "notes.txt"):
+        (backups / name).write_bytes(b"x")
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date is None
+
+    (backups / "bridge-20260701.db").write_bytes(b"x")
+    assert Scheduler(store, {"p1": poller})._last_maintenance_date == "2026-07-01"
+
+    (backups / "bridge-20991231.db").write_bytes(b"x")   # clock once jumped to 2099
+    sched = Scheduler(store, {"p1": poller})
+    assert sched._last_maintenance_date == "2099-12-31"
+    calls = _count_maintenance(sched)
+    await sched.check_once(datetime(2026, 7, 5, 3, 30))
+    assert len(calls) == 1
+    assert (backups / "bridge-20260705.db").stat().st_size > 0
+    await sched.check_once(datetime(2026, 7, 5, 9, 0))
+    assert len(calls) == 1
+
+
 async def test_analytics_exporter_pushes_snapshot(rig):
     # read-only mirror: the Pi POSTs a compact snapshot to a cloud endpoint. Verify the
     # payload shape + that it's best-effort (a dead endpoint never raises into the bridge).

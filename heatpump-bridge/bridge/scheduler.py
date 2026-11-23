@@ -7,7 +7,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import notify
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 CHECK_INTERVAL_S = 20      # < 1 minute so no HH:MM slot is ever skipped
 MAINTENANCE_HHMM = "03:30"  # nightly backup + retention pruning
+MAINTENANCE_RETRY_S = 3600  # a failed backup retries at most hourly (SD-card wear)
 BACKUPS_KEEP = 7
 SYSTEM_SAMPLE_S = 60       # Pi health cadence — ~1 row/min, pruned to 90 days
 
@@ -42,7 +43,12 @@ class Scheduler:
         self.heartbeat_url = heartbeat_url
         self.notifications = notifications
         self._task: asyncio.Task | None = None
-        self._last_maintenance_date: str | None = None
+        # Restart-safe "already ran today": seeded from the newest backups/bridge-YYYYMMDD.db
+        # so repeated daytime restarts don't re-run the backup each time (the catch-up gate in
+        # check_once would otherwise fire on the first tick after every restart).
+        self._last_maintenance_date: str | None = self._last_backup_date()
+        # earliest wall-clock time a failed backup may be retried (None = no retry pending)
+        self._maintenance_retry_at: datetime | None = None
         # One sampler for the process lifetime (CPU% is a delta across reads); disk usage is
         # measured on the volume that holds the DB, which is what actually fills up.
         self._sysstat = SystemStats(str(Path(store.path).parent))
@@ -79,15 +85,40 @@ class Scheduler:
             await asyncio.sleep(CHECK_INTERVAL_S)
 
     async def check_once(self, now: datetime) -> None:
-        """Fire every enabled rule matching this minute (at most once per rule per day)."""
+        """Fire every enabled rule due by this minute (at most once per rule per day), and
+        run nightly maintenance once per day at-or-after MAINTENANCE_HHMM."""
         # optimizer-lease watchdog: revert to baseline if a remote setpoint lease lapses
         ts = now.timestamp()
         for poller in self.pollers.values():
             await poller.check_lease(ts)
-        if (now.strftime("%H:%M") == MAINTENANCE_HHMM
-                and self._last_maintenance_date != now.strftime("%Y-%m-%d")):
-            self._last_maintenance_date = now.strftime("%Y-%m-%d")
+        # maintenance gate is >= (not ==), like due_schedules: a restart or a tick held past
+        # 60 s (two lease reverts over 2400-baud Modbus) spanning 03:30 must still run that
+        # day's backup late rather than silently skip it — the backup is the only thing that
+        # survives an SD-card death. "Already ran today" is seeded from the backup files at
+        # construction, so a daytime restart does not re-run it. A backup that fails (or
+        # leaves no file / an empty one) retries once per MAINTENANCE_RETRY_S, not every tick.
+        hhmm = now.strftime("%H:%M")
+        today = now.strftime("%Y-%m-%d")
+        retry_at = self._maintenance_retry_at
+        if (hhmm >= MAINTENANCE_HHMM and self._last_maintenance_date != today
+                and (retry_at is None or now >= retry_at
+                     # wall clock stepped backwards: don't wait out the bogus gap
+                     or retry_at - now > timedelta(seconds=MAINTENANCE_RETRY_S))):
+            if retry_at is not None:
+                log.info("maintenance: retrying failed backup at %s", hhmm)
+            elif hhmm != MAINTENANCE_HHMM:
+                log.info("maintenance: running late at %s (scheduled %s)", hhmm, MAINTENANCE_HHMM)
+            # arm the retry first: even an exception escaping run_maintenance (e.g. mkdir on
+            # a read-only remounted card) must not retry every 20 s tick
+            self._maintenance_retry_at = now + timedelta(seconds=MAINTENANCE_RETRY_S)
             await self.run_maintenance(now)
+            dest = self._backups_dir() / f"bridge-{now.strftime('%Y%m%d')}.db"
+            if dest.is_file() and dest.stat().st_size > 0:
+                self._last_maintenance_date = today
+                self._maintenance_retry_at = None
+            else:
+                log.warning("maintenance: no backup written for %s — retrying at %s",
+                            today, self._maintenance_retry_at.strftime("%H:%M"))
         due = await self.store.due_schedules(now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
         # catch-up semantics: mark ALL due rules fired, but execute only the LATEST per
         # pump — after downtime spanning "on at 06:00, off at 09:00", the net state
@@ -190,14 +221,49 @@ class Scheduler:
             await poller.write_setpoint(g.setback_setpoint_c, source="schedule",
                                         unattended=True)
 
+    def _backups_dir(self) -> Path:
+        return Path(self.store.path).parent / "backups"
+
+    def _last_backup_date(self) -> str | None:
+        """YYYY-MM-DD of the newest non-empty backups/bridge-YYYYMMDD.db, or None if there
+        are none. Decided by file NAME (the date run_maintenance stamped it with), not mtime,
+        so a copied-in or clock-skewed file can't masquerade as today's run. An empty file is
+        a failed run and doesn't count. A future-dated name (clock jump) just seeds a date
+        that isn't today, so the gate still runs today's backup."""
+        backups = self._backups_dir()
+        dates = []
+        try:
+            if not backups.is_dir():
+                return None
+            for f in backups.glob("bridge-*.db"):
+                stamp = f.stem[len("bridge-"):]
+                if len(stamp) == 8 and stamp.isdigit() and f.stat().st_size > 0:
+                    dates.append(stamp)
+        except OSError:
+            # runs at construction: an unreadable dir must not stop the bridge starting;
+            # None just means "run today's backup"
+            log.exception("maintenance: could not read %s", backups)
+            return None
+        if not dates:
+            return None
+        newest = max(dates)
+        return f"{newest[:4]}-{newest[4:6]}-{newest[6:]}"
+
     async def run_maintenance(self, now: datetime) -> None:
         """Nightly: consistent DB backup (rotated) + retention pruning. A dead SD card
         costs at most a day of history plus a bootstrap re-run."""
-        backups = Path(self.store.path).parent / "backups"
-        backups.mkdir(exist_ok=True)
+        backups = self._backups_dir()
         dest = backups / f"bridge-{now.strftime('%Y%m%d')}.db"
         try:
+            backups.mkdir(exist_ok=True)
             await self.store.backup(str(dest))
+        except Exception:
+            log.exception("maintenance: backup %s failed", dest.name)
+            # a partial file must not read as "ran today" to the gate or after a restart
+            with contextlib.suppress(OSError):
+                dest.unlink()
+            return
+        try:
             for old in sorted(backups.glob("bridge-*.db"))[:-BACKUPS_KEEP]:
                 old.unlink()
             await self.store.prune()
