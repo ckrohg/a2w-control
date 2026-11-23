@@ -13,7 +13,7 @@
  * The two attention emails (outage feed silent, element alarm blind) and the R02 daily watch (owner's decision,
  * 2026-11-04: R02 three or more times on one pump in a local day → one email per pump per day) ride the same PageEdge.
  */
-import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
+import { RENOTIFY_MS, piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import { DHW_INITIAL, FREEZE_INITIAL, evalDhwShortfall, evalFreezeRisk, type DhwState, type FreezeState } from "./housealarms";
 import type { HubState } from "./hub";
 import { etDay, etDayStart } from "./pumphealth";
@@ -70,6 +70,9 @@ export class PageEdge {
   constructor(private readonly key: string, private readonly queue: SendQueue) {}
 
   get owesAllClear(): boolean { return this.owed; }
+
+  /** A page a previous process sent and someone heard (its DB latch): heard, and owed its all-clear. */
+  adoptHeard(): void { this.heard = true; this.owed = true; }
 
   private want(job: Job | null): void {
     const inLine = this.wanted != null;
@@ -170,6 +173,7 @@ export class HousePages {
   private unservedEpisodeOpen = false;
   private dhwState: DhwState = DHW_INITIAL;
   private freezeState: FreezeState = FREEZE_INITIAL;
+  private freezeAdopted = false;
   private piDisconnectedSince: number | null = null;
   private piQuietAlerted = false;
   private piPageDue = false;
@@ -178,7 +182,7 @@ export class HousePages {
 
   constructor(private readonly d: {
     send: SendPage;
-    store: Pick<Store, "openUnservedEpisode" | "closeUnservedEpisode">;
+    store: Pick<Store, "openUnservedEpisode" | "closeUnservedEpisode" | "getNotifyLatch">;
     stageMap: Record<string, string>;
     dhwFloorF: number;
   }) {}
@@ -370,6 +374,18 @@ export class HousePages {
    *  P17 anti-freeze is the hard device-side backstop; this is planner visibility so the owner knows to
    *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only). */
   async freezeRisk(reading: SlxReading): Promise<void> {
+    // A redeploy inside the hysteresis band would otherwise start closed with nothing sent: its clear would owe no
+    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a live latch reopens it as heard.
+    if (!this.freezeAdopted) {
+      this.freezeAdopted = true;
+      try {
+        const row = await this.d.store.getNotifyLatch("freeze-risk");
+        if (row?.tier === "page" && Date.now() - row.notifiedAt.getTime() < RENOTIFY_MS) {
+          this.freezeState = { open: true };
+          this.freeze.adoptHeard();
+        }
+      } catch (e) { console.error("[pages] freeze-risk latch read failed (nothing adopted):", (e as Error).message); }
+    }
     const { outdoorF, tankF } = reading;
     if (outdoorF == null || tankF == null) return;
     // open from the raise thresholds, closed only past the hysteresis band: a reading hovering at 5–6 °F holds it open

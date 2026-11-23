@@ -49,6 +49,7 @@ function rig() {
   const store = {
     openUnservedEpisode: async () => { episodes.opened++; },
     closeUnservedEpisode: async () => { episodes.closed++; },
+    getNotifyLatch: latchStore.getNotifyLatch,
   } as any;
   const fresh = () => new HousePages({ send, store, stageMap: { 1: "pump1", 2: "pump2" }, dhwFloorF: 116 });
   let pages = fresh();
@@ -510,14 +511,14 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
 
   // ── what #251 and the latch already gave: unchanged ───────────────────────────────────────────────────────────
   {
-    // a redeploy's re-fire of a heard page is suppressed, reads as heard, and its all-clear still goes
+    // a redeploy adopts a heard page from its latch: no re-page, reads as heard, and its all-clear still goes
     const r = rig();
     await r.freezing();
     r.redeploy();
     await r.freezing(2);
     assert.equal(r.tried.length, 1, "no re-page");
     assert.equal(r.heard.length, 1);
-    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 1, "the suppressed re-fire, once");
+    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 0, "adopted as heard: not even a suppressed re-fire");
     await r.backInRange();
     assert.equal(allClears(r).length, 1);
     assert.equal(allClears(r)[0].tier, "page");
@@ -531,6 +532,28 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     r.channels.up = true;
     await r.freezing();
     assert.equal(r.heard.length, 1);
+  }
+  {
+    // a redeploy INSIDE the hysteresis band (6 °F / 100 °F): the new process adopts the heard page from its latch, so the
+    // clear still sends the all-clear and releases the latch, and a real freeze ~17 h later pages again
+    const r = rig();
+    await r.freezing();
+    assert.equal(r.rows.get("freeze-risk")?.tier, "page");
+    r.redeploy();
+    const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
+    await r.cycles(3, inBand);
+    assert.equal(r.tried.length, 1, "inside the band after a restart: no re-page");
+    assert.equal(allClears(r).length, 0, "inside the band: no all-clear");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "the clear after a restart still sends the all-clear");
+    assert.equal(allClears(r)[0].tier, "page");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+    await r.backInRange(2);
+    assert.equal(allClears(r).length, 1, "once");
+    now += 17 * 3_600_000;
+    await r.freezing();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 2, "a real freeze 17 h later pages again");
+    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 0, "not swallowed as a duplicate");
   }
 
   // ── the outage feed's silence: one email, not a page; an email nobody got goes again ──────────
