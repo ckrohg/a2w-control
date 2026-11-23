@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Literal
@@ -95,7 +96,8 @@ class GuardrailConfig(BaseModel):
                 self.setpoint_min_c <= self.unattended_min_setpoint_c <= self.setpoint_max_c):
             raise ValueError("unattended_min_setpoint_c must be within the heating clamp")
         if self.baseline_setpoint_c is not None:
-            floor = self.unattended_min_setpoint_c or self.setback_setpoint_c
+            # "is a floor set" decided exactly as the poller does (is None, not truthiness)
+            floor = self.unattended_floor_c
             if not (floor <= self.baseline_setpoint_c <= self.setpoint_max_c):
                 raise ValueError("baseline_setpoint_c must be within [unattended floor, max] "
                                  "— it's the WARM default the house reverts to")
@@ -103,6 +105,57 @@ class GuardrailConfig(BaseModel):
                 self.setpoint_min_c <= self.comfort_setpoint_c <= self.setpoint_max_c):
             raise ValueError("comfort_setpoint_c must be within the heating clamp")
         return self
+
+    @property
+    def unattended_floor_c(self) -> float:
+        """The heating floor for unattended writes (PumpPoller.write_setpoint): the configured
+        unattended_min_setpoint_c, or the setback when it is unset."""
+        if self.unattended_min_setpoint_c is None:
+            return self.setback_setpoint_c
+        return self.unattended_min_setpoint_c
+
+    @property
+    def unattended_floor_whole_c(self) -> int:
+        """The floor as write_setpoint compares it. The pump register has 1°C resolution and
+        write_setpoint accepts whole degrees only, so a fractional floor (45.5) is enforced as the
+        next whole degree UP (46): every accepted write stays at or above the configured value. The
+        ceil is applied to the floor, never to a timer's target — a target below the floor is refused."""
+        return math.ceil(self.unattended_floor_c)
+
+
+def _is_whole(value: float) -> bool:
+    return float(value) == int(value)
+
+
+def guardrail_warnings(cfg: AppConfig) -> list[str]:
+    """Guardrail settings that load fine but make a scheduler timer unwritable. Logged at startup,
+    never raised: a raise would stop the Pi booting on a config it already runs. A timer below the
+    unattended floor (or not a whole degree) is REFUSED by write_setpoint on every fire, never
+    clamped — this is what makes that visible before the first fire."""
+    g = cfg.guardrails
+    floor = g.unattended_floor_c
+    whole_floor = g.unattended_floor_whole_c
+    out = []
+    if g.unattended_min_setpoint_c is not None and not _is_whole(g.unattended_min_setpoint_c):
+        out.append(f"guardrails.unattended_min_setpoint_c {floor:g}°C is not a whole degree: the pump "
+                   f"register has 1°C resolution, so unattended writes are held to {whole_floor:g}°C")
+    if g.unattended_min_setpoint_c is None:
+        floor_desc = f"{whole_floor:g}°C (the setback, as unattended_min_setpoint_c is unset)"
+    elif whole_floor != floor:
+        floor_desc = f"{whole_floor:g}°C (unattended_min_setpoint_c {floor:g} rounded up)"
+    else:
+        floor_desc = f"{whole_floor:g}°C (unattended_min_setpoint_c)"
+    for name, timer in (("setback_setpoint_c", "off"), ("comfort_setpoint_c", "on")):
+        value = getattr(g, name)
+        if value is None:
+            continue
+        if not _is_whole(value):
+            out.append(f"guardrails.{name} {value:g}°C is not a whole degree: the pump register has "
+                       f"1°C resolution, so scheduler '{timer}' timers are refused on every fire")
+        elif value < whole_floor:
+            out.append(f"guardrails.{name} {value:g}°C is below the unattended floor {floor_desc}: "
+                       f"scheduler '{timer}' timers are refused on every fire")
+    return out
 
 
 class ApiToken(BaseModel):

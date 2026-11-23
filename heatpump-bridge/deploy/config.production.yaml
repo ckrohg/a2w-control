@@ -54,8 +54,10 @@ guardrails:
   # can't leave a pump in a state the manual/HBX fallback can't undo.
   restrict_unattended_writes: true
   setback_setpoint_c: 40     # scheduler "off" timers lower to this instead of powering off
-  #   ^ Phase 2: raise to 46 when the floor below is activated — an unattended write is
-  #     clamped by unattended_min_setpoint_c (45), so 40 would just be silently clamped to 45.
+  #   ^ Phase 2: raise to >= 45 when the floor below is activated — an unattended write below
+  #     unattended_min_setpoint_c (45) is REFUSED, never clamped up, so with 40 every "off"
+  #     timer would fail on every fire. The bridge logs this contradiction at startup
+  #     (config.guardrail_warnings) but keeps booting. Whole degrees only (1°C register).
   # comfort_setpoint_c: 50   # optional: scheduler "on" timers restore to this
   # --- WINTER-SAFE FLOOR + LEASE (Phase 2 — uncomment when enabling writes) ---
   # Values VALIDATED 2026-07-07 from the house's TempIQ-learned thermal data + an adversarial
