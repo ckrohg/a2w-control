@@ -89,6 +89,8 @@ if [ "$_q" != "$DATABASE_URL" ] && [ -n "$_q" ]; then
     _p="${_rest%%&*}"
     case "$_p" in
       host=*) is_loopback "${_p#host=}" || { echo "error: DATABASE_URL query host=${_p#host=} is not loopback" >&2; exit 1; } ;;
+      hostaddr=*) is_loopback "${_p#hostaddr=}" || { echo "error: DATABASE_URL query hostaddr=${_p#hostaddr=} is not loopback" >&2; exit 1; } ;;
+      service=*) echo "error: service= is not allowed in DATABASE_URL; name localhost explicitly" >&2; exit 1 ;;
     esac
     [ "$_rest" = "$_p" ] && break
     _rest="${_rest#*&}"
@@ -374,8 +376,8 @@ SELECT verdict,
          || ' F, or < 2 room snapshots after the first 60 min. '
          || 'A2W ADEQUATE if room >= setpoint - ' || :hold_tol || ' F for >= 80% of evaluated minutes after the first 60 min of calling. '
          || 'A2W TOO COLD if the final hour sits >= 2 F below setpoint and the room is not rising (<= 0.5 F/h). '
-         || 'Otherwise inconclusive. Element ran = HBX backup_called or Buffer Tank >= ' || :element_w
-         || ' W; it does not change the verdict but means the supply was not heat-pump-only.'   AS rule
+         || 'Otherwise inconclusive. Element ran = Buffer Tank >= ' || :element_w
+         || ' W on SPAN (hbx_backup_called is shown separately); it does not change the verdict but means the supply was not heat-pump-only.'   AS rule
 FROM judged;
 \x off
 SQL

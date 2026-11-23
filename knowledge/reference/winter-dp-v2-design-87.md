@@ -21,8 +21,8 @@
    1 of 7 zones predictable, the wrong one). `p_call` is not coming.
 2. **So requirement 2 cannot read `p_call × confidence`.** The amendment replaced it with
    evidence: *only a zone that is CALLING NOW earns a forecast-driven raise, and only for its
-   own requirement.* v2 keeps that. `PREHEAT_CONFIDENCE` stays a reserved, documented knob
-   with no effect; if a predictability signal ever ships it plugs in there as a multiplier.
+   own requirement.* v2 keeps that. `PREHEAT_CONFIDENCE` is gone (`index.ts`, #87 rewire); if a
+   predictability signal ever ships it returns as a new multiplier.
 3. **#89 makes the shipped pre-heat unsafe to flip as-is.** `planPreheat` raises to TempIQ's
    raw number + 4.5 °F. TempIQ's anchor is now `demonstrated_max` (the plant's as-found p99,
    164.7 °F), and its ceiling sits above A2W's local model by:
@@ -31,9 +31,10 @@
    |---|---|---|---|---|---|
    | TempIQ ceiling − local | 12 | 18 | 26 | 31 | 32 |
 
-   The ceiling crosses the 135 °F pump cap below about 41 °F outdoor. Flipping
+   TempIQ's raw ceiling crosses the 135 °F pump cap below about 41 °F outdoor; with
+   `BUFFER_MARGIN_F` 4.5 the planned need crosses it below about 46 °F. Flipping
    `FORECAST_PREHEAT_ENABLED` today would pin the tank at 135 °F whenever a baseboard calls
-   on a sub-41 °F night. Both baseboard zones are comfort-only and normally OFF, so that is a
+   on a sub-46 °F night. Both baseboard zones are comfort-only and normally OFF, so that is a
    pure cost regression on the nights that matter. Verdict on which model is right: unknown
    until a ≤ 20 °F test night. **v2 is the redesign that makes the flip safe.**
 
@@ -74,7 +75,7 @@ two-week review can tell what the ceiling was made of.
 ## 2. The five requirements, v2 reading
 
 **R1 — DP future floors may only RAISE relative to today's baseline.**
-Today (`index.ts` ~1786): `floorF_h = min(strictCap, max(dhwFloor, allZonesLocal_h,
+Today (`index.ts` ~1817): `floorF_h = min(strictCap, max(dhwFloor, allZonesLocal_h,
 mimic_h, band.lo))`, with `proposeFloor(o, null)` = conservative all-zones LOCAL posture.
 v2: `floorF_h' = max(floorF_h, preheatRequirement_h)` for the hours that have a pre-heat
 requirement (the current block and the next, for calling zones only); every other hour is
@@ -96,7 +97,7 @@ the plan already sits at the as-found curve and `need ≤ target` yields nothing
 
 **R3 — predictive cap-watch (afternoon, email tier).**
 Today `predictedCapRisk` fires when TempIQ's raw number + margin > strictCap. With the #89
-ceiling that is every night below ~41 °F: a daily page all winter, for a model we do not yet
+ceiling (plus the 4.5 °F margin) that is every night below ~46 °F: a daily page all winter, for a model we do not yet
 trust. v2:
 - **attention tier (one email, key `cap-predicted`)** when the *cost-first* projected need
   exceeds strictCap: local model at forecast outdoor + the escalation a zone carries right
@@ -164,8 +165,7 @@ Waits for #2009:
   decision);
 - a `deliveryTypeVerified`-based hard gate (today the vouching signal is "TempIQ emitted a
   number"; keep that, plus `=== false` hard-blocks);
-- any confidence multiplier in the `PREHEAT_CONFIDENCE` slot (no predictability signal
-  exists).
+- any confidence multiplier (none exists; `PREHEAT_CONFIDENCE` was removed).
 
 Waits for weather: the ≤ 20 °F test night, which decides whether the 135 °F cap is a
 problem at all.

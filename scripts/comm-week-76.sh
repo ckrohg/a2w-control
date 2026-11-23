@@ -158,7 +158,7 @@ WITH win AS (
          COALESCE(max(c.still_open), 0) AS still_open
   FROM pumps p LEFT JOIN clipped c ON c.pump_id = p.pump_id
   GROUP BY p.pump_id
-), rd AS (           -- second opinion: the mirror's own online flag, one row per pump per ~60 s
+), rd AS (           -- second opinion: the mirror own online flag, one row per pump per ~60 s
   SELECT pump_id, count(*) AS samples, count(*) FILTER (WHERE online IS FALSE) AS off_samples
   FROM readings, win
   WHERE ts >= EXTRACT(EPOCH FROM win.s) AND ts < EXTRACT(EPOCH FROM win.e)
@@ -296,7 +296,7 @@ done <<< "$OUTAGES"
 # ---------------------------------------------------------------- the bar to beat
 cat <<'EOF'
 == September baseline (from #76, comment of 2026-09-30; before the Ethernet move) ==
-  phase_b failed results per pump per day, out of ~144 active rows/day
+  failed /health.phase_b samples per pump per day (1 per 10 min, ~144/day) — the table above counts phase_b_log rows (~288/day), so halve it before comparing
     day     pump1 failed   pump2 failed
     09-27              1              7
     09-28             25             12

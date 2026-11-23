@@ -32,7 +32,7 @@ Write journal entries AS YOU WORK, not at session end. Each entry needs:
 2. `knowledge/reference/modbus-register-map.md` — distilled register map (source of truth: `A2W Modbus.docx` same folder, from Winnie @ Guangdong Macon)
 3. `knowledge/PRODUCT_SPEC.md` + `knowledge/ROADMAP.md` — working summaries
 
-**Stage (reconciled 2026-11-20 against the repo and `knowledge/reference/`; the last live reconciliation is
+**Stage (reconciled 2026-11-23 against the repo and `knowledge/reference/`; the last live reconciliation is
 `knowledge/reference/live-state-20260916.md`):** Phases 0-2 are DONE. The bridge runs on the Pi
 against both real pumps; write_enabled was flipped on pump 1 on 2026-07-13 and both pumps are
 write-enabled now. The cloud side is live: Railway hub + Railway Postgres (migrated off Neon
@@ -54,7 +54,7 @@ declared-vs-live; run it before believing any stage claim, including this one.
 `lease Nm armed` per pump. Treat the revert as a SAFETY write: nothing may hold, queue or rate-limit it (see #208).
 The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; edit it on the Pi, back it up first.
 
-**Live safety layer (2026-11-20; verify with `scripts/drift-check.sh` and `/health`, not this list):**
+**Live safety layer (2026-11-23; verify with `scripts/drift-check.sh` and `/health`, not this list):**
 - **HBX `lagT` = 60** (drift-check [9]). At 180 the HBX never added the second pump or the backup, which was the
   Oct 14–16 incident's root cause (`incident-20261016-hp2-e21-investigation.md` §6). Never raise it to save
   element energy; the element is gated by its SPAN breaker ("Buffer Tank", kept OPEN) instead.
@@ -75,18 +75,19 @@ The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; ed
   The lease-revert "planner not commanding setpoints" alert stays record-tier (#191, owner 2026-11-11).
 - **SPAN local API v1 is removed 2026-12-31** (#199): the v2 transport (`bridge/span_v2.py`, MQTT eBus) shipped in
   release-20261102-1 pinned to `transport: v1`. The flip to `auto` is a Pi config change
-  (`reference/span-v2-local-api.md` step 3); drift-check [10] fails a pinned v1 from 2026-12-15.
+  (`reference/span-v2-cutover.md` (#299) and `span-v2-local-api.md` step 3); drift-check [10] fails a pinned v1 from 2026-12-15.
 - **DB backups** cover the live Railway Postgres 18 again (#203). Restore with `scripts/analyze-local.sh`; on the
   administrator Mac, put `~/micromamba/envs/pg/bin` on PATH first.
 
-**Next (owner plan 2026-11-20):** #294–#297 are on main; #298 (the DHW pre-boost survives the winter guard) landed
-2026-11-20 — verify its deploy on `/health`. PR #293 (#180, branch `owner/planner-handover-180`) is still open: it changes
-the Railway start command from `npm start` to `node dist/index.js` so the planner hears SIGTERM and releases the writer
-lease. It changes nothing until the owner runs `railway config apply` (planned Mon 2026-11-23; `.railway/railway.ts`);
-until then every planner deploy is a writer-lease handover of 600 s or more. Tue 2026-11-24: the Pi gets Ethernet (its
-Wi-Fi is −79 dBm, `incident-20261016-hp2-e21-investigation.md`) and one release tag, after which `span.transport: auto`
-goes live on the Pi (#199). Then the winter backlog: #89 TempIQ/local required-supply divergence, #87 winter DP v2,
-#76 comm degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
+**Next (owner plan, updated 2026-11-23):** #293–#302, #304, #306 and #311 are on main; #303 (freeze-risk page
+hysteresis) and #305 (spanwatch split) wait for the Monday element-night analysis. #180 is fixed and proven: #293 landed,
+the Railway start command `node dist/index.js` was applied 2026-11-21, and a planner deploy now hands over the writer
+lease in about 20–50 s (was 600 s+). #300 names the hours an unverified binding zone calls without an escalation ceiling
+(#134 is the follow-up). The Pi's Wi-Fi (−79 dBm, `incident-20261016-hp2-e21-investigation.md`) has been pinned to one
+mesh node, no roaming, since 2026-11-13. Tue 2026-11-24: the Pi gets Ethernet and one release tag, after which
+`span.transport: auto` goes live (#199; runbook `reference/span-v2-cutover.md`); v2 becomes the default in its own
+December tag. Then the winter backlog: #89 TempIQ/local required-supply divergence, #87 winter DP v2, #76 comm
+degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
 `FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated.
 
 **Working rules (added 2026-09-16 after the Pi went offline mid-session — see
