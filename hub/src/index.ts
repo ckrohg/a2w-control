@@ -29,6 +29,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import { createDropoutTracker } from "./dropouts";
 import { breakerAckTimeoutMs, bridgeSupportsBreaker, parseGraceMs, validateBreakerBody } from "./breaker";
+import { failPendingOnDisconnect, parseCommandBody, PI_DISCONNECTED_DETAIL, settlePending, type PendingEntry } from "./command";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -288,34 +289,32 @@ let piSilenceAlerted = false;
  * socket that is still `piSocket`, and the tracker ignores repeats in either direction. */
 const piDropouts = createDropoutTracker();
 
-/** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
- * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
- * the replacement check, and the eventual `close` event count at most once between them. */
-function markDisconnected(sock: WebSocket): void {
-  if (piSocket !== sock) return;
-  piSocket = null;
-  piDropouts.disconnected();
-  console.log("[hub] Pi disconnected");
-}
-
-interface PendingCommand {
-  resolve: (ack: AckMessage) => void;
-  timer: NodeJS.Timeout;
-}
-
 /** command_id -> pending command awaiting its ack. */
-const pending = new Map<string, PendingCommand>();
+const pending = new Map<string, PendingEntry<AckMessage>>();
 
 /**
  * Resolve a pending command exactly once. Clears its timeout and removes it from
  * the map so it can never be resolved twice.
  */
 function settleCommand(commandId: string, ack: AckMessage): void {
-  const entry = pending.get(commandId);
-  if (!entry) return; // already settled (timeout or duplicate ack)
-  pending.delete(commandId);
-  clearTimeout(entry.timer);
-  entry.resolve(ack);
+  settlePending(pending, commandId, ack); // false = already settled (timeout or duplicate ack)
+}
+
+/** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
+ * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
+ * the replacement check, and the eventual `close` event count at most once between them.
+ * Every /api/command setpoint still awaiting an ack is answered now (502 'Pi disconnected before
+ * ack'): the link it would arrive on is gone, so waiting out the ack timeout only turns a known
+ * cause into a misleading 504. A late ack on the dying socket is then a no-op (settled once).
+ * Breaker and write-enable commands are left to their own 504 (command.ts failOnDisconnect). */
+function markDisconnected(sock: WebSocket): void {
+  if (piSocket !== sock) return;
+  piSocket = null;
+  piDropouts.disconnected();
+  const failed = failPendingOnDisconnect(pending, (commandId): AckMessage => ({
+    type: "ack", command_id: commandId, ok: false, detail: PI_DISCONNECTED_DETAIL, setpoint_c: null, result: null,
+  }));
+  console.log(`[hub] Pi disconnected${failed ? ` — failed ${failed} pending command(s)` : ""}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,41 +392,17 @@ if (process.env.HUB_E2E_CLIENT_ONLY_GET === "1") {
  * POST /api/command — body {pump_id, value_c, lease_minutes?, source?}.
  * Assigns command_id, relays to the Pi, awaits the matching ack (10s timeout).
  *   200 {ok:true, setpoint_c}  on ack ok
- *   502 {ok:false, detail}     on nack
+ *   502 {ok:false, detail}     on nack, or the Pi dropped before acking
  *   504                        on ack timeout
  *   503                        if no Pi connected
  */
 app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as Record<string, unknown>;
-  const pumpId = body.pump_id;
-  const valueC = body.value_c;
-
-  if (typeof pumpId !== "string" || pumpId.length === 0) {
-    res.status(400).json({ ok: false, detail: "pump_id is required (string)" });
+  const parsed = parseCommandBody(req.body);
+  if (!parsed.ok) {
+    res.status(400).json({ ok: false, detail: parsed.detail });
     return;
   }
-  if (typeof valueC !== "number" || !Number.isFinite(valueC)) {
-    res.status(400).json({ ok: false, detail: "value_c is required (number)" });
-    return;
-  }
-
-  let leaseMinutes: number | null = null;
-  if (body.lease_minutes !== undefined && body.lease_minutes !== null) {
-    if (typeof body.lease_minutes !== "number" || !Number.isFinite(body.lease_minutes)) {
-      res.status(400).json({ ok: false, detail: "lease_minutes must be a number when provided" });
-      return;
-    }
-    leaseMinutes = body.lease_minutes;
-  }
-
-  let source = "optimizer";
-  if (body.source !== undefined && body.source !== null) {
-    if (typeof body.source !== "string") {
-      res.status(400).json({ ok: false, detail: "source must be a string when provided" });
-      return;
-    }
-    source = body.source;
-  }
+  const { pump_id: pumpId, value_c: valueC, lease_minutes: leaseMinutes, source } = parsed.cmd;
 
   const sock = piSocket;
   if (!sock || sock.readyState !== WebSocket.OPEN) {
@@ -455,6 +430,7 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
 
   pending.set(commandId, {
     timer,
+    failOnDisconnect: true,
     resolve: (ack: AckMessage) => {
       if (ack.ok) {
         res.status(200).json({ ok: true, setpoint_c: ack.setpoint_c });
