@@ -17,8 +17,14 @@ The **telemetry path is non-critical**, but the two things that can fail here ar
   check forever instead of crashing, the lesson of the 2026-08-19 outage recorded in
   `planner/src/store.ts` — but each poll fails at the reading insert, before Phase B, the
   auto-pilot and the backup-element gate run (`planner/src/index.ts`, `pollOnce`). So the planner
-  stops optimizing, `/health` turns 503 and it pages "SensorLinx reader offline" after 5 failed
-  polls (that alert fires for any poll failure, the reader is not the cause). With
+  stops optimizing and `/health` turns 503 after 5 failed polls. The planner's own "SensorLinx
+  reader offline" alert (it fires for any poll failure, the reader is not the cause) is
+  record-tier (log and a database row, which the outage also blocks; no push, no email), so it
+  reaches nobody.
+  The owner is paged by the hub's planner dead-man (`hub/src/index.ts`, `PLANNER_HEALTH_URL`),
+  which has no Postgres dependency: it checks `/health` every minute, counts a 503, `ok:false`
+  or a `lastPollAt` older than 20 min as down, and pages once the planner has been down for 2 h
+  since its last healthy check, so expect the page roughly two hours into the outage. With
   `WRITER_LEASE_ENABLED=1` the fresh-lease check that precedes every device write fails too, so
   boost/target/restore requests die before they reach the HBX. The pumps lapse to the Pi's
   `baseline_setpoint_c` when their 90-minute leases expire and the HBX keeps heating on its own
