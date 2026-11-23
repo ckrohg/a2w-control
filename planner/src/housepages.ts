@@ -13,7 +13,7 @@
  * The two attention emails (outage feed silent, element alarm blind) and the R02 daily watch (owner's decision,
  * 2026-11-04: R02 three or more times on one pump in a local day → one email per pump per day) ride the same PageEdge.
  */
-import { RENOTIFY_MS, piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
+import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import { DHW_INITIAL, FREEZE_INITIAL, evalDhwShortfall, evalFreezeRisk, type DhwState, type FreezeState } from "./housealarms";
 import type { HubState } from "./hub";
 import { etDay, etDayStart } from "./pumphealth";
@@ -375,16 +375,18 @@ export class HousePages {
    *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only). */
   async freezeRisk(reading: SlxReading): Promise<void> {
     // A redeploy inside the hysteresis band would otherwise start closed with nothing sent: its clear would owe no
-    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a live latch reopens it as heard.
+    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a latch reopens it as heard, at any
+    // age: the latch is only released by the all-clear, so an old one is a long incident, not a closed one. A failed read
+    // adopts nothing and is tried again next poll.
     if (!this.freezeAdopted) {
-      this.freezeAdopted = true;
       try {
         const row = await this.d.store.getNotifyLatch("freeze-risk");
-        if (row?.tier === "page" && Date.now() - row.notifiedAt.getTime() < RENOTIFY_MS) {
+        this.freezeAdopted = true;
+        if (row?.tier === "page") {
           this.freezeState = { open: true };
           this.freeze.adoptHeard();
         }
-      } catch (e) { console.error("[pages] freeze-risk latch read failed (nothing adopted):", (e as Error).message); }
+      } catch (e) { console.error("[pages] freeze-risk latch read failed (retrying next poll):", (e as Error).message); }
     }
     const { outdoorF, tankF } = reading;
     if (outdoorF == null || tankF == null) return;
