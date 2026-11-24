@@ -59,9 +59,10 @@ async def rig(tmp_path):
 
 
 async def _fire(store, poller, action: str, hhmm: str = "23:00"):
-    # store.add_schedule takes no `now` on this branch; when #315 lands, pass now=datetime(2026, 11, 4, h, m)
-    await store.add_schedule("p1", hhmm, action)
+    # added at midnight of the test day (#315: a rule added after its time waits until tomorrow), so the
+    # tick below is its first firing whatever the wall clock says
     h, m = map(int, hhmm.split(":"))
+    await store.add_schedule("p1", hhmm, action, now=datetime(2026, 11, 4, 0, 0))
     await Scheduler(store, {"p1": poller}).check_once(datetime(2026, 11, 4, h, m, 5))
 
 
