@@ -12,6 +12,8 @@ import {
   drawGapStats,
   largestSampleGapMin,
   HYGIENE_HARD_MAX_H,
+  soakDue,
+  SOAK_REST_H,
   type HygieneReading,
 } from "./hygiene";
 import { detectDrawTimes } from "./dhw";
@@ -175,6 +177,23 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
   // largestSampleGapMin edge cases
   assert.equal(largestSampleGapMin([]), 0, "empty ⇒ 0");
   assert.equal(largestSampleGapMin([cool(0)]), 0, "single reading ⇒ 0 (no gap measurable)");
+}
+
+// 8. soakDue: the 12 h rest period after a qualifying dwell (2026-11-24: 15 of 47 soaks ran within 12 h of the
+//    previous dwell under the old 3 h floor). Urgent is unchanged: no dwell at all, or the interval has lapsed.
+{
+  assert.equal(SOAK_REST_H, 12);
+  const d = (h: number | null, i: number) => soakDue(h, i);
+  assert.deepEqual(d(3, 26), { due: false, urgent: false }, "3 h after a dwell: resting (the old floor said due)");
+  assert.deepEqual(d(11.9, 26), { due: false, urgent: false }, "11.9 h: still resting");
+  assert.deepEqual(d(12, 26), { due: true, urgent: false }, "12 h: due");
+  assert.deepEqual(d(25.9, 26), { due: true, urgent: false }, "25.9 h: due, not urgent");
+  assert.deepEqual(d(26, 26), { due: true, urgent: true }, "26 h: the window lapsed");
+  assert.deepEqual(d(35.9, 60), { due: false, urgent: false }, "summer 60 h: a day before the lapse is 36 h");
+  assert.deepEqual(d(36, 60), { due: true, urgent: false });
+  assert.deepEqual(d(60, 60), { due: true, urgent: true });
+  assert.deepEqual(d(null, 26), { due: true, urgent: true }, "no qualifying dwell in the lookback: due and urgent");
+  assert.deepEqual(d(null, 60), { due: true, urgent: true });
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");
