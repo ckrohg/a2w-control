@@ -76,13 +76,21 @@ export interface LatchStore {
 }
 
 export class Latches {
+  /** Keys whose all-clear went out but whose latch delete failed: the row is a closed incident, not an open one. */
+  private readonly unreleased = new Set<string>();
   constructor(private readonly store: LatchStore, private readonly log: (m: string) => void = (m) => console.error(m)) {}
 
   /**
    * True when this open should reach the owner's channels. Writes nothing: record() latches it once someone has heard
-   * it. A DB failure fails OPEN: a duplicate beats a lost page.
+   * it. A DB failure fails OPEN: a duplicate beats a lost page. A key whose release failed (see release) is retried
+   * here first and is always due: its row belongs to an incident that already cleared, so it must never swallow the
+   * next one's page (#324 review).
    */
   async due(key: string, nowMs = Date.now()): Promise<boolean> {
+    if (this.unreleased.has(key)) {
+      await this.retryRelease(key);
+      return true;
+    }
     try {
       const row = await this.store.getNotifyLatch(key);
       return !(row && nowMs - row.notifiedAt.getTime() < RENOTIFY_MS);
@@ -99,6 +107,7 @@ export class Latches {
   async record(key: string, tier: Tier): Promise<void> {
     try {
       await this.store.upsertNotifyLatch(key, tier);
+      this.unreleased.delete(key);   // the row is this new, heard page's latch now, not the stale one
     } catch (e) {
       this.log(`notify latch write failed for ${key}: ${(e as Error).message}`);
     }
@@ -113,10 +122,31 @@ export class Latches {
   async release(key: string, fallback: Tier, heard = false): Promise<Tier | null> {
     try {
       const row = await this.store.deleteNotifyLatch(key);
+      this.unreleased.delete(key);
       return row ? (row.tier as Tier) : heard ? fallback : null;
     } catch (e) {
-      this.log(`notify latch release failed for ${key}: ${(e as Error).message}`);
+      // the all-clear still goes (fallback tier); the row stays behind, so remember it and delete it later: until then
+      // due() treats the key as clear, and retryReleases() keeps trying so the row rarely outlives a restart
+      this.unreleased.add(key);
+      this.log(`notify latch release failed for ${key} (will retry): ${(e as Error).message}`);
       return fallback;
+    }
+  }
+
+  /** Retry every failed release. Cheap when there are none; called once per planner poll. Never throws. */
+  async retryReleases(): Promise<void> {
+    for (const key of [...this.unreleased]) await this.retryRelease(key);
+  }
+
+  /** Keys still waiting for their latch delete, for /health and tests. */
+  pendingReleases(): string[] { return [...this.unreleased]; }
+
+  private async retryRelease(key: string): Promise<void> {
+    try {
+      await this.store.deleteNotifyLatch(key);
+      this.unreleased.delete(key);
+    } catch (e) {
+      this.log(`notify latch release retry failed for ${key}: ${(e as Error).message}`);
     }
   }
 }

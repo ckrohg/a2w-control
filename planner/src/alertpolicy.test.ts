@@ -49,6 +49,51 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, episodeTier, piU
   assert.equal(await latches.release("x", "page" as Tier), "page", "DB down: all-clear still sent at the caller's tier");
   down = false;
 
+  // #324 review: an all-clear whose latch DELETE fails must not leave a row that swallows the next incident's page
+  {
+    const rows2 = new Map<string, { tier: string; notifiedAt: Date }>();
+    let deleteFails = false;
+    const store2: LatchStore = {
+      getNotifyLatch: async (k) => rows2.get(k) ?? null,
+      upsertNotifyLatch: async (k, tier) => { rows2.set(k, { tier, notifiedAt: new Date(now) }); },
+      deleteNotifyLatch: async (k) => { if (deleteFails) throw new Error("db down"); const r = rows2.get(k); rows2.delete(k); return r ? { tier: r.tier } : null; },
+    };
+    let l = new Latches(store2, quiet);
+    await l.record("freeze-risk", "page");
+    deleteFails = true;
+    assert.equal(await l.release("freeze-risk", "page"), "page", "the all-clear still goes when the delete fails");
+    assert.ok(rows2.has("freeze-risk"), "the row was left behind");
+    assert.deepEqual(l.pendingReleases(), ["freeze-risk"]);
+    // a new freeze 2 h later, DB still failing deletes: the stale row (< 24 h) must not dedupe it
+    assert.equal(await l.due("freeze-risk", now + 2 * 3_600_000), true, "a new incident after a failed release is due");
+    deleteFails = false;
+    assert.equal(await l.due("freeze-risk", now + 2 * 3_600_000), true, "retried on the next due() and still due");
+    assert.equal(rows2.has("freeze-risk"), false, "the retry deleted the stale row");
+    assert.deepEqual(l.pendingReleases(), []);
+    assert.equal(await l.due("freeze-risk", now + 2 * 3_600_000), true, "no row: due as usual");
+
+    // the per-poll sweep deletes it before any new incident (and before a restart can adopt it)
+    await l.record("freeze-risk", "page");
+    deleteFails = true;
+    await l.release("freeze-risk", "page");
+    await l.retryReleases();
+    assert.ok(rows2.has("freeze-risk"), "a sweep while the DB still fails keeps it pending");
+    deleteFails = false;
+    await l.retryReleases();
+    assert.equal(rows2.has("freeze-risk"), false, "the sweep deleted it once the DB answered");
+    l = new Latches(store2, quiet); // a restart now finds no stale row to adopt
+    assert.equal(await l.due("freeze-risk", now + 3_600_000), true);
+
+    // a new heard page clears the pending mark: its row is a real latch again and dedupes as usual
+    await l.record("freeze-risk", "page");
+    deleteFails = true;
+    await l.release("freeze-risk", "page");
+    deleteFails = false;
+    await l.record("freeze-risk", "page");
+    assert.deepEqual(l.pendingReleases(), [], "record() supersedes the stale mark");
+    assert.equal(await l.due("freeze-risk", now + 60_000), false, "and the new latch dedupes a re-fire");
+  }
+
   // who heard it: a ntfy 200 proves nothing while nobody subscribes to the topic
   assert.equal(acknowledged({ ownerConfigured: true, ownerAcked: false, ntfyConfigured: true, ntfyAcked: true }), false, "ntfy alone is nobody");
   assert.equal(acknowledged({ ownerConfigured: true, ownerAcked: true, ntfyConfigured: true, ntfyAcked: false }), true);
