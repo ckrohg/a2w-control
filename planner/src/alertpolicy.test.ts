@@ -56,7 +56,12 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, episodeTier, piU
     const store2: LatchStore = {
       getNotifyLatch: async (k) => rows2.get(k) ?? null,
       upsertNotifyLatch: async (k, tier) => { rows2.set(k, { tier, notifiedAt: new Date(now) }); },
-      deleteNotifyLatch: async (k) => { if (deleteFails) throw new Error("db down"); const r = rows2.get(k); rows2.delete(k); return r ? { tier: r.tier } : null; },
+      deleteNotifyLatch: async (k, notNewerThan) => {
+        if (deleteFails) throw new Error("db down");
+        const r = rows2.get(k);
+        if (!r || (notNewerThan && r.notifiedAt.getTime() > notNewerThan.getTime())) return null;
+        rows2.delete(k); return { tier: r.tier };
+      },
     };
     let l = new Latches(store2, quiet);
     await l.record("freeze-risk", "page");
@@ -92,6 +97,40 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, episodeTier, piU
     await l.record("freeze-risk", "page");
     assert.deepEqual(l.pendingReleases(), [], "record() supersedes the stale mark");
     assert.equal(await l.due("freeze-risk", now + 60_000), false, "and the new latch dedupes a re-fire");
+
+    // the race (#328 review): a sweep's retry is in flight while a NEW page latches the same key. The new latch survives.
+    {
+      const rows3 = new Map<string, { tier: string; notifiedAt: Date }>();
+      let failDeletes = false;
+      let gate: (() => void) | null = null;   // holds the retry's DELETE in flight, as a slow DB would
+      const store3: LatchStore = {
+        getNotifyLatch: async (k) => rows3.get(k) ?? null,
+        upsertNotifyLatch: async (k, tier) => { rows3.set(k, { tier, notifiedAt: new Date(now) }); },
+        deleteNotifyLatch: async (k, notNewerThan) => {
+          if (failDeletes) throw new Error("db down");
+          if (pauseRead) { pauseRead = false; await new Promise<void>((res) => { gate = res; }); }
+          const r = rows3.get(k);
+          if (!r || (notNewerThan && r.notifiedAt.getTime() > notNewerThan.getTime())) return null;
+          rows3.delete(k); return { tier: r.tier };
+        },
+      };
+      let pauseRead = false;
+      const l3 = new Latches(store3, quiet);
+      await l3.record("freeze-risk", "page");
+      failDeletes = true;
+      await l3.release("freeze-risk", "page");          // stale row left, key marked
+      failDeletes = false;
+      pauseRead = true;
+      const sweep = l3.retryReleases();                  // reads the stale row; its DELETE is held at the gate
+      while (gate === null) await new Promise((r) => setImmediate(r));
+      now += 5_000;
+      await l3.record("freeze-risk", "page");            // a new, heard page latches meanwhile
+      (gate as unknown as () => void)();                 // the DELETE lands after the new upsert
+      await sweep;
+      assert.ok(rows3.has("freeze-risk"), "the in-flight retry did not delete the new page's latch");
+      assert.equal(rows3.get("freeze-risk")!.notifiedAt.getTime(), now, "and it is the new latch");
+      assert.equal(await l3.due("freeze-risk", now + 60_000), false, "which still dedupes a re-fire");
+    }
   }
 
   // who heard it: a ntfy 200 proves nothing while nobody subscribes to the topic

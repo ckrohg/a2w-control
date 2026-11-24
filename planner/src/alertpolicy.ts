@@ -72,12 +72,16 @@ export const PAGE_BUDGET_PER_WEEK = 3;
 export interface LatchStore {
   getNotifyLatch(key: string): Promise<{ tier: string; notifiedAt: Date } | null>;
   upsertNotifyLatch(key: string, tier: Tier): Promise<void>;
-  deleteNotifyLatch(key: string): Promise<{ tier: string } | null>;
+  /** With `notNewerThan`, deletes the row only if it was latched no later than that (a retry must never delete a newer,
+   *  heard page's latch). */
+  deleteNotifyLatch(key: string, notNewerThan?: Date): Promise<{ tier: string } | null>;
 }
 
 export class Latches {
   /** Keys whose all-clear went out but whose latch delete failed: the row is a closed incident, not an open one. */
   private readonly unreleased = new Set<string>();
+  /** Bumped by every record() before its write: a retry that sees it change between its read and its delete stands down. */
+  private readonly gen = new Map<string, number>();
   constructor(private readonly store: LatchStore, private readonly log: (m: string) => void = (m) => console.error(m)) {}
 
   /**
@@ -105,6 +109,7 @@ export class Latches {
    * again, must not read as open after a redeploy, and is owed no all-clear.
    */
   async record(key: string, tier: Tier): Promise<void> {
+    this.gen.set(key, (this.gen.get(key) ?? 0) + 1);
     try {
       await this.store.upsertNotifyLatch(key, tier);
       this.unreleased.delete(key);   // the row is this new, heard page's latch now, not the stale one
@@ -126,7 +131,9 @@ export class Latches {
       return row ? (row.tier as Tier) : heard ? fallback : null;
     } catch (e) {
       // the all-clear still goes (fallback tier); the row stays behind, so remember it and delete it later: until then
-      // due() treats the key as clear, and retryReleases() keeps trying so the row rarely outlives a restart
+      // due() treats the key as clear, and retryReleases() keeps trying so the row rarely outlives a restart. If the
+      // next page is heard but its record() also fails, the mark stays and that page can be re-sent once more: a
+      // duplicate, never a lost page (callers on a PageEdge are protected by `heard` anyway).
       this.unreleased.add(key);
       this.log(`notify latch release failed for ${key} (will retry): ${(e as Error).message}`);
       return fallback;
@@ -138,12 +145,21 @@ export class Latches {
     for (const key of [...this.unreleased]) await this.retryRelease(key);
   }
 
-  /** Keys still waiting for their latch delete, for /health and tests. */
+  /** Keys still waiting for their latch delete (tests and logs). */
   pendingReleases(): string[] { return [...this.unreleased]; }
 
+  /**
+   * Delete the stale row, and only it. A new page may be latching the same key concurrently (its send runs outside the
+   * poll): so read the row first, stand down if a record() started meanwhile, and delete only a row no newer than the
+   * one read. If the new upsert lands first the delete matches nothing; if the delete lands first the upsert re-creates
+   * the row. Either way the new page's latch survives (#328 review).
+   */
   private async retryRelease(key: string): Promise<void> {
+    const g = this.gen.get(key) ?? 0;
     try {
-      await this.store.deleteNotifyLatch(key);
+      const row = await this.store.getNotifyLatch(key);
+      if ((this.gen.get(key) ?? 0) !== g) return;           // a new page is latching: its record() clears the mark
+      if (row) await this.store.deleteNotifyLatch(key, row.notifiedAt);
       this.unreleased.delete(key);
     } catch (e) {
       this.log(`notify latch release retry failed for ${key}: ${(e as Error).message}`);

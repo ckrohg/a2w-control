@@ -1035,8 +1035,14 @@ export class Store {
        ON CONFLICT (key) DO UPDATE SET tier = EXCLUDED.tier, notified_at = now()`, [key, tier]);
   }
 
-  async deleteNotifyLatch(key: string): Promise<{ tier: string } | null> {
-    const r = await this.locked.query(`DELETE FROM notify_latches WHERE key = $1 RETURNING tier`, [key]);
+  async deleteNotifyLatch(key: string, notNewerThan?: Date): Promise<{ tier: string } | null> {
+    // notNewerThan comes from a JS Date (ms) of a timestamptz (µs): +1 ms keeps the row that was read, while a re-latch
+    // (now(), seconds or more later) is never matched
+    const r = notNewerThan
+      ? await this.locked.query(
+          `DELETE FROM notify_latches WHERE key = $1 AND notified_at < $2::timestamptz + interval '1 millisecond' RETURNING tier`,
+          [key, notNewerThan.toISOString()])
+      : await this.locked.query(`DELETE FROM notify_latches WHERE key = $1 RETURNING tier`, [key]);
     return r.rows[0] ? { tier: String(r.rows[0].tier) } : null;
   }
 
