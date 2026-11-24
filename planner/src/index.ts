@@ -21,6 +21,7 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { parseJsonObject, BODY_TOO_LARGE, MAX_BODY_BYTES } from "./httpbody";
 import { HubClient, type HubState, hubActuationsInFlight } from "./hub";
+import { piClockOffsetS as piClockOffset, i1Offenders } from "./i1";
 import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans, raiseBoostsToGuard } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
@@ -599,8 +600,7 @@ async function checkI1(op: OperativeLead | null): Promise<void> {
   lastPiConnected = state.pi_connected === true;
   // #165: the live Pi-clock offset (planner now − the frame's Pi time). The Pi pushes a frame every 15 s, so a
   // connected, fresh frame measures its clock to within ~15 s + latency; piHealth voids windows while it is off.
-  piClockOffsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
-    ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
+  piClockOffsetS = piClockOffset(state, Date.now());
   piClockOffsetAt = Date.now();
   // persisted — the planner-clock history /health.pi needs to trust a dropout verdict (pilink.ts) — OFF the control
   // path: not awaited, one write in flight at most, bounded pool, stamped with the measurement time (codex pass 19)
@@ -616,10 +616,7 @@ async function checkI1(op: OperativeLead | null): Promise<void> {
   lastThermal.setpoints_f = Object.fromEntries(
     state.pumps.map((p) => [p.id, p.setpoint_c != null ? Math.round(cToF(p.setpoint_c) * 10) / 10 : null]),
   );
-  const required = tankTargetF + DEFAULT_OPTS.i1MarginF;
-  const offenders = state.pumps
-    .filter((p) => p.online && p.setpoint_c != null && cToF(p.setpoint_c) < required)
-    .map((p) => `${p.id} setpoint ${cToF(p.setpoint_c as number).toFixed(1)}°F < required ${required.toFixed(1)}°F`);
+  const { offenders } = i1Offenders(state.pumps, tankTargetF, DEFAULT_OPTS.i1MarginF);
   if (offenders.length && !i1Violated) {
     i1Violated = true;
     i1Detail = offenders.join("; ");
@@ -992,9 +989,7 @@ async function checkPumpHealth(): Promise<void> {
   if (!healthHubState || Date.now() - healthHubState.atMs > 4 * 60_000) {
     try {
       const state = await hub.getState();
-      const offsetS = state.pi_connected && typeof state.ts === "number" && state.ts > 0
-        ? Date.now() / 1000 - (state.ts > 1e11 ? state.ts / 1000 : state.ts) : null;
-      healthHubState = { state, atMs: Date.now(), offsetS };
+      healthHubState = { state, atMs: Date.now(), offsetS: piClockOffset(state, Date.now()) };
     } catch (e) {
       pumpHealthGate = `hub unreachable: ${(e as Error).message}`;
       return;
