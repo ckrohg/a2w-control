@@ -566,6 +566,7 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
     await r.cycles(3, inBand);
     assert.equal(allClears(r).length, 0, "inside the band: no all-clear");
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 2, "past the 24 h window a freeze that still holds pages once more");
     await r.backInRange();
     assert.equal(allClears(r).length, 1, "a 30 h incident's clear after a restart still sends the all-clear");
     assert.equal(allClears(r)[0].tier, "page");
@@ -587,6 +588,30 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     assert.equal(allClears(r).length, 1, "the latch read retried after the DB recovered: the all-clear still goes");
     assert.equal(allClears(r)[0].tier, "page");
     assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+  }
+
+  {
+    // a stale latch: an old page whose release failed (row left behind), then a restart during a NEW freeze. It is
+    // adopted as owed, not heard, so the new freeze still pages (owner, 2026-11-23: never lose the page)
+    const r = rig();
+    r.rows.set("freeze-risk", { tier: "page", notifiedAt: new Date(now - 3 * 86_400_000) });
+    r.redeploy();
+    await r.freezing();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "the new freeze pages despite the stale latch");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "and its clear sends the all-clear");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+  }
+  {
+    // the same stale latch, restart in normal weather: one all-clear, then the row is gone (harmless, and it stops a
+    // later freeze being swallowed)
+    const r = rig();
+    r.rows.set("freeze-risk", { tier: "page", notifiedAt: new Date(now - 3 * 86_400_000) });
+    r.redeploy();
+    await r.backInRange();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 0, "no page in normal weather");
+    assert.equal(allClears(r).length, 1, "one all-clear for the stale latch");
+    assert.equal(r.rows.has("freeze-risk"), false, "and the latch is released");
   }
 
   // ── the outage feed's silence: one email, not a page; an email nobody got goes again ──────────

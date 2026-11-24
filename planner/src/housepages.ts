@@ -13,7 +13,7 @@
  * The two attention emails (outage feed silent, element alarm blind) and the R02 daily watch (owner's decision,
  * 2026-11-04: R02 three or more times on one pump in a local day → one email per pump per day) ride the same PageEdge.
  */
-import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
+import { RENOTIFY_MS, piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
 import { DHW_INITIAL, FREEZE_INITIAL, evalDhwShortfall, evalFreezeRisk, type DhwState, type FreezeState } from "./housealarms";
 import type { HubState } from "./hub";
 import { etDay, etDayStart } from "./pumphealth";
@@ -73,6 +73,10 @@ export class PageEdge {
 
   /** A page a previous process sent and someone heard (its DB latch): heard, and owed its all-clear. */
   adoptHeard(): void { this.heard = true; this.owed = true; }
+
+  /** A page a previous process sent longer ago than the re-notify window: owed its all-clear, but not heard, so a
+   *  condition that still holds pages again (as a long incident re-notifies) and a clear sends the all-clear. */
+  adoptOwed(): void { this.heard = false; this.owed = true; }
 
   private want(job: Job | null): void {
     const inLine = this.wanted != null;
@@ -375,16 +379,19 @@ export class HousePages {
    *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only). */
   async freezeRisk(reading: SlxReading): Promise<void> {
     // A redeploy inside the hysteresis band would otherwise start closed with nothing sent: its clear would owe no
-    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a latch reopens it as heard, at any
-    // age: the latch is only released by the all-clear, so an old one is a long incident, not a closed one. A failed read
-    // adopts nothing and is tried again next poll.
+    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a page latch reopens the alarm at
+    // any age, because only the all-clear releases it. Inside the re-notify window it is adopted as heard (no re-page).
+    // Older, it is adopted as owed but unheard, so a freeze that still holds pages again and a clear sends the
+    // all-clear. That also covers a stale latch whose release failed: a NEW freeze after the restart still pages
+    // (owner, 2026-11-23). A failed read adopts nothing and is tried again next poll.
     if (!this.freezeAdopted) {
       try {
         const row = await this.d.store.getNotifyLatch("freeze-risk");
         this.freezeAdopted = true;
         if (row?.tier === "page") {
           this.freezeState = { open: true };
-          this.freeze.adoptHeard();
+          if (Date.now() - row.notifiedAt.getTime() < RENOTIFY_MS) this.freeze.adoptHeard();
+          else this.freeze.adoptOwed();
         }
       } catch (e) { console.error("[pages] freeze-risk latch read failed (retrying next poll):", (e as Error).message); }
     }
