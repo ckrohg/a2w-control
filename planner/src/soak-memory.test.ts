@@ -217,6 +217,11 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
     }
   }
   assert.deepEqual(isSoak, [true, true, true, false, true, true, true, false]);
+  // The history's run (07, 08, 09) ends at the refused hour 10:00: it counts for no later block. The 10:42 plan still
+  // marks 11:00 and gives the 25th its one soak (a run counted for every block would refuse all of the 25th).
+  const last = history[history.length - 1];
+  assert.ok(last.plan[1].sani, "11:00 follows the rest hour: marked");
+  assert.equal(soaks(last).filter((x) => x.startsWith("25@")).length, 1, "the 25th gets its soak");
 
   // A kept soak: one or two soak hours before it → kept; three → not.
   const soakAt = (hs: number[]): Stored[] => [{ computedAt: new Date(at(-2)), plan: hs.map((h) => (
