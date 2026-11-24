@@ -45,8 +45,16 @@ tree, or has had no message for `STALE_AFTER_S` (10 s) is unusable: `fetch` rais
 - `v2`: the read fails. Breaker actions are refused 503 "SPAN panel unreachable on the LAN"
   (`span_control.py:BreakerController._run`), self-heal loses its panel read after `SPAN_FRESH_S` (120 s,
   `self_heal.py:_span`), and "SPAN local link down" goes out after `down_alert_after_s` (4 h,
-  `SpanLocalPoller._maybe_alert_down`).
+  `SpanLocalPoller._maybe_alert_down`) for a bridge that has read the panel since it started; at boot, see below.
 - `v1` + soak: `soak.unavailable` goes up by one and `soak.last_error` is set. Nothing else changes.
+
+**Pure v2, panel or broker unreachable at boot** (explicit `v2`, or the key absent on the v2-default release). With
+no good read since start, `_last_ok == 0`, so `_maybe_alert_down` takes the outage as infinitely long
+(`span_local.py:SpanLocalPoller._maybe_alert_down`): the first failed poll, about 15 s after start (`CONNECT_WAIT_S`),
+sends "SPAN local link down … since startup" — not after 4 h. `_down_alerted` lives in the process, so **every
+restart during the outage pages again**; do not restart in a loop to "fix" it. Meanwhile every breaker action is
+refused 503 (`span_control.py:BreakerController._run`), the backup-element close included, and self-heal and the
+backup fallback lose their panel evidence after `SPAN_FRESH_S` (120 s). Fix the panel or broker reachability first.
 
 ## 2. Pre-flip checklist
 
@@ -140,12 +148,15 @@ wrote beside the v1 token (`SpanV2._ensure_creds`, `_ensure_ca`; state dir from 
 `span.v2_error`, wait a few polls (the session keeps retrying in the background), and if it does not turn to `"v2"`
 roll back (§5) and journal the error. drift-check `[10]` fails while a read in `auto` is answered by v1.
 
-**After the flip: the v2-default release, then remove the key.** Once `auto` has run clean for about a week, the owner
-ships the v2-default bridge in its own release tag. `auto` keeps working unchanged on it. Then, **once that release
-is on the Pi and by 2026-12-31**, remove the `span.transport` line from `config.yaml` (or set `transport: v2`) and
-restart; expect `span.mode: "v2"`, `span.read: "v2"`, `span.deprecated: null`. Not before the release: an older bridge
-reads an absent key as `v1`. Do not stay on `auto` past 2026-12-31: with v1 gone, every fallback attempt is only
-latency and log noise, and drift-check `[10]` fails mode `auto` from that date.
+**After the flip: set `transport: v2` explicitly, by 2026-12-31.** Once `auto` has run clean for about a week, set
+`transport: v2` in `config.yaml` (back it up first, as above) and restart; expect `span.mode: "v2"`,
+`span.read: "v2"`, `span.deprecated: null`. An explicit `v2` works on every release since #239, whatever tag the Pi
+runs. **Do not just delete the `transport:` line**: on any release before the v2-default one (#313) an absent key
+means `v1`, so if the December tag slips or an older tag is running, the bridge cannot read or switch the panel from
+2026-12-31 (no self-heal, no element close). Do not stay on `auto` past 2026-12-31: with v1 gone, every fallback
+attempt is only latency and log noise, and drift-check `[10]` fails mode `auto` from that date. *Optional cleanup,
+later:* once the Pi is confirmed on a release that includes #313, the explicit `v2` line may be removed; it changes
+nothing there.
 
 ## 4. Verifying the write path over v2
 
@@ -167,8 +178,9 @@ latency and log noise, and drift-check `[10]` fails mode `auto` from that date.
   (`tests/conftest.py`): evidence about the bridge, not about the real panel.
 
 As far as the repo records, v2 has only ever been *read* on the real panel: the first real action is the first proof.
-**Owner decision, not made here:** `span-v2-local-api.md` ("Still to do") and #199's "Done when" list an Air-Water 2
-power-cycle test on v2, which conflicts with the standing rule above.
+**Owner decision (2026-11-23):** the Air-Water 2 power-cycle test on v2 (`span-v2-local-api.md` "Still to do", #199's
+"Done when") is triggered by the owner from the dashboard on Tue 2026-11-24 — the owner's call, not a test run from
+this runbook, so the standing rule above still holds. Ran: <date ran>.
 
 **How the first real action will look.** Writes come from self-heal (`self_heal.py` → `execute(circuit,
 "power_cycle", source="self-heal")`), the Pi's backup fallback (`execute("Buffer Tank", "close")`), the planner's
@@ -218,7 +230,9 @@ Every SPAN read fails, because every consumer goes through `SpanClient.fetch_cir
 - Self-heal, the backup fallback and the deliberate-stop watch lose their panel evidence after 120 s
   (`SPAN_FRESH_S`). If the pumps also go quiet, self-heal reads the silent panel as a blind Pi and holds back the
   both-down page (`self_heal.py:_pi_blind`).
-- One "SPAN local link down" alert after 4 h (`_maybe_alert_down`).
+- One "SPAN local link down" alert after 4 h (`_maybe_alert_down`) for a bridge that was running when v1 went away.
+  A bridge (re)started with no good read pages at its first failed poll, "since startup", and again on every
+  restart (§1, "unreachable at boot").
 
 How `/api/health` shows it:
 
@@ -232,8 +246,8 @@ How `/api/health` shows it:
 
 Before that date: drift-check `[10]` fails a pinned `v1` from 2026-12-15. In `auto`, removal breaks nothing: reads
 and CLOSEs wait for v2 when v1 cannot answer (`_fetch_sync`, `_set_relay_sync`). It still leaves v1 attempts running
-with their latency and noise, so remove the `span.transport` key (or set `v2`) by 2026-12-31 (§3); drift-check `[10]`
-fails mode `auto` from that date.
+with their latency and noise, so set `span.transport: v2` explicitly by 2026-12-31 (§3; not just removing the key,
+which is `v1` on releases before #313); drift-check `[10]` fails mode `auto` from that date.
 
 ## 7. Known quirks
 
@@ -262,4 +276,4 @@ fails mode `auto` from that date.
 - Any fallback to v1 (`read` or `write` showing `"v1"` in `auto`), with `v2_error` and the time.
 - The first real relay write over v2: time, circuit, source, `span.write`, the event codes, verified or not.
 - Any `v2_ca_changed` / `v2_register_backoff` event, and any rollback: why, when, the health fields afterwards.
-- The owner's decision on the Air-Water 2 power-cycle test (§4).
+- The Air-Water 2 power-cycle test (§4, owner decision 2026-11-23): the date it ran and its result.

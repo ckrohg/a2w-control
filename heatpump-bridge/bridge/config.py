@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Literal
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .discovery import normalize_mac   # stdlib + pymodbus only: no import cycle
 from .registers import COOLING_REGISTER_RANGE, HARD_MAX_SETPOINT_C, HARD_MIN_SETPOINT_C
+
+log = logging.getLogger(__name__)
 
 
 class PumpConfig(BaseModel):
@@ -251,9 +254,9 @@ class SpanConfig(BaseModel):
     # every start while it is set. Cutover: (1) soak on auto, (2) this default, (3) v1 removed after 2026-12-31.
     # See knowledge/reference/span-v2-local-api.md.
     transport: Literal["v1", "auto", "v2"] = "v2"
-    # Read-only v2 soak, for transport: v1 only (ignored otherwise). After every v1 read the bridge also reads the v2 tree
-    # and compares relay state + controllable per circuit (/api/health.span.soak). It never writes over v2, and a v2
-    # failure never touches the v1 read.
+    # Read-only v2 soak, for transport: v1 only (ignored otherwise; load_config warns). After every v1 read the bridge
+    # also reads the v2 tree and compares relay state + controllable per circuit (/api/health.span.soak). It never
+    # writes over v2, and a v2 failure never touches the v1 read.
     v2_soak: bool = False
     poll_interval_s: float = 25.0
     down_alert_after_s: float = 4 * 3600.0  # alert once if logging has been down this long
@@ -403,6 +406,8 @@ def load_config(path: str | os.PathLike | None = None) -> AppConfig:
     with open(cfg_path) as f:
         raw = yaml.safe_load(f)
     cfg = AppConfig.model_validate(raw)
+    if cfg.span.v2_soak and cfg.span.transport != "v1":
+        log.warning("config: span.v2_soak is ignored under span.transport %r (it applies to v1 only)", cfg.span.transport)
     apply_gateway_overrides(cfg)
     return cfg
 

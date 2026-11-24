@@ -44,7 +44,7 @@ TRANSPORTS = ("auto", "v2", "v1")   # v2 = the default and only transport; auto 
 DEFAULT_TRANSPORT = "v2"
 V1_REMOVED_ON = "2026-12-31"        # the panel's own OpenAPI: v1 REST is removed on this date
 V1_DEPRECATION = (f"SPAN transport v1 is DEPRECATED: the panel removes the v1 REST API on {V1_REMOVED_ON}. "
-                  f"span.transport: v1 is an explicit fallback only — drop the key (the default is v2) or set auto. "
+                  f"span.transport: v1 is an explicit fallback only — set span.transport: v2 (or auto). "
                   f"After {V1_REMOVED_ON} this bridge cannot read or switch the panel on v1.")
 
 # SPAN rejects a duplicate client name ("Name already exists"), so every registration uses a

@@ -18,9 +18,10 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from bridge import span_control, span_local, span_v2
-from bridge.config import BreakerCircuit, SelfHealConfig, SpanConfig
+from bridge.config import BreakerCircuit, SelfHealConfig, SpanConfig, load_config
 from bridge.self_heal import SelfHealer
 from bridge.span_control import BreakerController, BreakerRefused
 from bridge.span_local import OpenAborted, OpenPermit, SpanClient, SpanLocalPoller
@@ -207,6 +208,22 @@ def test_transport_v1_is_an_explicit_deprecated_fallback_that_warns_on_start(tmp
         SpanClient("h", "p").close()
         SpanClient("h", "p", transport="auto").close()
     assert [r.getMessage() for r in caplog.records if "DEPRECATED" in r.getMessage()] == [span_local.V1_DEPRECATION]
+
+
+@pytest.mark.parametrize("transport, warns", [(None, True), ("v2", True), ("auto", True), ("v1", False)])
+def test_load_config_warns_once_when_v2_soak_is_ignored(tmp_path, caplog, transport, warns):
+    """v2_soak only works on transport v1; anywhere else load_config says the key is ignored, once, instead of silence."""
+    span = {"v2_soak": True, **({"transport": transport} if transport else {})}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"pumps": [{"id": "p1", "name": "P1", "host": "127.0.0.1"}], "span": span,
+                                    "db_path": str(tmp_path / "bridge.db")}))
+    with caplog.at_level(logging.WARNING, logger="bridge.config"):
+        cfg = load_config(path)
+    assert cfg.span.v2_soak is True
+    ignored = [r.getMessage() for r in caplog.records if "span.v2_soak" in r.getMessage()]
+    assert len(ignored) == (1 if warns else 0)
+    if warns:
+        assert "ignored" in ignored[0] and repr(cfg.span.transport) in ignored[0]
 
 
 def test_auto_from_config_still_prefers_v2_and_falls_back_only_when_v2_cannot(tmp_path):

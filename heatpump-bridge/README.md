@@ -164,8 +164,10 @@ and the bridge are unaffected.
   2. **This change** — once the soak is clean the owner merges it and ships it in its own
      release tag: the default becomes `v2` (an absent key is now v2), `v1` warns on every start.
      `auto` keeps working unchanged until the panel drops v1.
-  3. **By 2026-12-31, once this release is on the Pi: remove the `span.transport` key (or set
-     `v2`).** Not before: an older bridge reads an absent key as v1. Do not stay on
+  3. **By 2026-12-31: set `span.transport: v2` explicitly** (works on every release since
+     #239). Do not just remove the key: an older bridge reads an absent key as v1, so a slipped
+     or older tag could not read or switch the panel from 2026-12-31. Removing the key is
+     optional cleanup once the Pi is confirmed on a release that includes #313. Do not stay on
      `auto` past that date: with v1 gone every v1 fallback attempt only adds latency and log
      noise (drift-check `[10]` fails mode `auto` from 2026-12-31). To roll back to v1 before then,
      set `span.transport: v1` explicitly — an absent key is v2.
