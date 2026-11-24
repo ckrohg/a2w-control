@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useModals } from "../ui/modal";
 import { SpanBreakerCard } from "./span-breaker-card";
 import type { SpanSnapshot } from "@/lib/breaker-state";
+import { commandMessage, type CommandBody } from "@/lib/command-message";
 
 type Pump = {
   id: string;
@@ -108,21 +109,8 @@ export default function ControlClient() {
         // °C the guard rejects (e.g. 70°F -> 21.11°C -> nack). Round-trips back as °F below.
         body: JSON.stringify({ pump_id: id, value_c: Math.round(fToC(targetF)) }),
       });
-      const body: { ok?: boolean; setpoint_c?: number; detail?: string; error?: string } =
-        await res.json().catch(() => ({}));
-      let msg: string;
-      if (res.ok && body.ok) {
-        const f = cToF(body.setpoint_c ?? null);
-        msg = `Set to ${f == null ? targetF : Math.round(f)}°F ✓`;
-      } else if (res.status === 503) {
-        msg = "Pi offline — command not sent.";
-      } else if (res.status === 504) {
-        msg = "Timed out waiting for the pump to acknowledge.";
-      } else if (res.status === 502) {
-        msg = `Rejected: ${body.detail || body.error || "guardrail nack"}`;
-      } else {
-        msg = body.detail || body.error || `Failed (${res.status}).`;
-      }
+      const body: CommandBody = await res.json().catch(() => ({}));
+      const msg = commandMessage(res.status, body ?? {}, targetF);
       setMsgs((m) => ({ ...m, [id]: msg }));
     } catch {
       setMsgs((m) => ({ ...m, [id]: "Network error — try again." }));

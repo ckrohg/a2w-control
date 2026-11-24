@@ -1,8 +1,10 @@
 // @purpose Server-side proxy to the Railway hub's POST /api/command. Cookie-gated by the
 // existing middleware; injects Bearer HUB_CLIENT_TOKEN (kept off the browser) and stamps
 // source:"dashboard". Forwards {pump_id, value_c, lease_minutes?} and relays the hub's
-// status + body back so the client can surface 503 (no Pi) / 504 (ack timeout) / 502 (nack
-// detail). setpoint is the ONLY action the hub relays — power/mode/params stay human-only.
+// status + body back so the client can surface 503 (no Pi, not sent) / 504 (no answer, outcome
+// unknown: an ack timeout, or the Pi link dropped or was replaced before the ack; reason in
+// detail) / 502 (refused by the Pi, nack detail). setpoint is the ONLY action the hub relays —
+// power/mode/params stay human-only.
 import { NextResponse } from "next/server";
 import { isAuthed } from "@/lib/auth";
 
