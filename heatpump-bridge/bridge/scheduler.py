@@ -150,7 +150,9 @@ class Scheduler:
             return
         self._last_sysstat = mono
         try:
-            sample = self._sysstat.read()
+            # off the event loop: the Wi-Fi part runs nmcli (bounded at 1 s), and the pump
+            # pollers share this loop
+            sample = await asyncio.to_thread(self._sysstat.read)
             await self.store.add_system_stat(sample)
             await self._evaluate_health_alerts(sample)
         except Exception:

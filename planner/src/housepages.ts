@@ -13,7 +13,8 @@
  * The two attention emails (outage feed silent, element alarm blind) and the R02 daily watch (owner's decision,
  * 2026-11-04: R02 three or more times on one pump in a local day → one email per pump per day) ride the same PageEdge.
  */
-import { piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
+import { RENOTIFY_MS, piUnreachablePageAfterS, type NotifyOpts, type Tier } from "./alertpolicy";
+import { DHW_INITIAL, FREEZE_INITIAL, evalDhwShortfall, evalFreezeRisk, type DhwState, type FreezeState } from "./housealarms";
 import type { HubState } from "./hub";
 import { etDay, etDayStart } from "./pumphealth";
 import { calledStagesAllStopped } from "./stagewatch";
@@ -70,6 +71,9 @@ export class PageEdge {
 
   get owesAllClear(): boolean { return this.owed; }
 
+  /** A page a previous process sent and someone heard (its DB latch): heard, and owed its all-clear. */
+  adoptHeard(): void { this.heard = true; this.owed = true; }
+
   private want(job: Job | null): void {
     const inLine = this.wanted != null;
     this.wanted = job;
@@ -103,11 +107,8 @@ export class PageEdge {
 
 // Owner alert policy: 29 of 36 unserved calls in Sept–Oct cleared within 15 min (start-up, defrost). The buffer tank
 // carries the house for hours, so only a call left unserved this long is a page.
+// The DHW-shortfall and freeze-risk thresholds and streak/hysteresis state live in housealarms.ts.
 const UNSERVED_PAGE_POLLS = 9; // ~45 min at the 5-min poll
-const DHW_SHORTFALL_F = 113;   // below the 45 °C unattended floor → clearly cold for delivery (normal cycle bottoms ~117°F)
-const DHW_SHORTFALL_POLLS = 12; // ~60 min sustained at the 5-min poll — a draw dip recovers well inside that (alert-policy.md)
-const FREEZE_OUTDOOR_F = 5;  // design-day outdoor
-const FREEZE_TANK_F = 105;   // buffer has fallen below the DHW-ready floor while it's this cold out
 const PI_QUIET_ALERT_S = 600;
 
 // ── R02 daily watch (owner's decision, 2026-11-04) ──────────────────────────────────────────────────────────────────
@@ -170,7 +171,9 @@ export class HousePages {
   private readonly elementWatch = new PageEdge("element-alarm-blind", this.queue);
   private unservedStreak = 0;
   private unservedEpisodeOpen = false;
-  private dhwShortfallStreak = 0;
+  private dhwState: DhwState = DHW_INITIAL;
+  private freezeState: FreezeState = FREEZE_INITIAL;
+  private freezeAdopted = false;
   private piDisconnectedSince: number | null = null;
   private piQuietAlerted = false;
   private piPageDue = false;
@@ -179,7 +182,7 @@ export class HousePages {
 
   constructor(private readonly d: {
     send: SendPage;
-    store: Pick<Store, "openUnservedEpisode" | "closeUnservedEpisode">;
+    store: Pick<Store, "openUnservedEpisode" | "closeUnservedEpisode" | "getNotifyLatch">;
     stageMap: Record<string, string>;
     dhwFloorF: number;
   }) {}
@@ -247,24 +250,23 @@ export class HousePages {
   async dhwShortfall(reading: SlxReading): Promise<void> {
     const tankF = reading.tankF;
     if (tankF == null) return;
-    if (tankF >= DHW_SHORTFALL_F) {
-      this.dhwShortfallStreak = 0;
+    this.dhwState = evalDhwShortfall(this.dhwState, tankF).state;
+    if (this.dhwState.streak === 0) {
       this.dhw.cleared((heard) => this.d.send("DHW shortfall cleared", `Buffer back to ${tankF.toFixed(0)}°F — hot water recovered.`, "default", { tier: "page", resolved: true, key: "dhw-shortfall", heard }));
       return;
     }
-    this.dhwShortfallStreak++;
-    if (this.dhwShortfallStreak < DHW_SHORTFALL_POLLS) return;
+    if (!this.dhwState.open) return;
     // one incident, one page: a cold tank while the "no heat" page is open is that incident's symptom (Oct 11 and
     // Oct 15 2026, HP2 E21: both fired for the same outage). Only a page someone HEARD covers it: if "no heat" failed on
     // every channel, this is another chance to reach them. Asked when the send runs, behind unservedCall's in the queue,
     // so a cycle that gets "no heat" through sends this as its record.
     this.dhw.holding((tier) => this.d.send(
       "⚠ DHW comfort shortfall — buffer running cold",
-      `Buffer ${tankF.toFixed(0)}°F, below the ${Math.round(this.d.dhwFloorF)}°F DHW-ready floor for ~${this.dhwShortfallStreak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
+      `Buffer ${tankF.toFixed(0)}°F, below the ${Math.round(this.d.dhwFloorF)}°F DHW-ready floor for ~${this.dhwState.streak * 5} min — the heat pumps aren't holding hot-water temp (big draw, capacity shortfall, or a stuck-low target). Showers may run lukewarm. If it persists: turn the SPAN breaker ON so the element can help, or raise the target on the Control page.`,
       "high",
       { tier, key: "dhw-shortfall",
         action: "Turn the backup element breaker ON at the SPAN panel so it can help, or raise the tank target on the Control page.",
-        facts: [["Tank", `${f0(tankF)} for ${this.dhwShortfallStreak * 5} min`], ["Hot-water floor", f0(this.d.dhwFloorF)]] },
+        facts: [["Tank", `${f0(tankF)} for ${this.dhwState.streak * 5} min`], ["Hot-water floor", f0(this.d.dhwFloorF)]] },
     ), () => (this.noHeat.heard ? "record" : "page"));
   }
 
@@ -372,9 +374,23 @@ export class HousePages {
    *  P17 anti-freeze is the hard device-side backstop; this is planner visibility so the owner knows to
    *  confirm the HPs are keeping up + the element breaker is on. Rare (design-cold only). */
   async freezeRisk(reading: SlxReading): Promise<void> {
+    // A redeploy inside the hysteresis band would otherwise start closed with nothing sent: its clear would owe no
+    // all-clear, and the heard page's 24 h latch would swallow the next real freeze. So a live latch reopens it as heard.
+    if (!this.freezeAdopted) {
+      this.freezeAdopted = true;
+      try {
+        const row = await this.d.store.getNotifyLatch("freeze-risk");
+        if (row?.tier === "page" && Date.now() - row.notifiedAt.getTime() < RENOTIFY_MS) {
+          this.freezeState = { open: true };
+          this.freeze.adoptHeard();
+        }
+      } catch (e) { console.error("[pages] freeze-risk latch read failed (nothing adopted):", (e as Error).message); }
+    }
     const { outdoorF, tankF } = reading;
     if (outdoorF == null || tankF == null) return;
-    if (outdoorF <= FREEZE_OUTDOOR_F && tankF < FREEZE_TANK_F) {
+    // open from the raise thresholds, closed only past the hysteresis band: a reading hovering at 5–6 °F holds it open
+    this.freezeState = evalFreezeRisk(this.freezeState, { outdoorF, tankF }).state;
+    if (this.freezeState.open) {
       this.freeze.holding(() => this.d.send(
         "⚠ Freeze-risk advisory",
         `Outdoor ${outdoorF.toFixed(0)}°F with the buffer only ${tankF.toFixed(0)}°F. The HBX P17 anti-freeze is the hard backstop, but confirm the HPs are keeping up and the SPAN breaker is on for the element.`,

@@ -85,4 +85,29 @@ ck "never answered: DRIFT"                  1 "$(grep -c 'DRIFT.*has not answere
 OUT="$(run_5 none)"
 ck "planner predates the feed: DRIFT"       1 "$(grep -c 'DRIFT.*has no backup_gate.generator.feed' <<<"$OUT")"
 
+# ---- 5. [4] FORECAST_FETCH_ENABLED over both shapes of /health.demand_forecast. With the gate on, the block loses its
+# fetch_enabled key after the first fetch, and [4] printed "live=null" (seen 2026-11-23, the day the gate went on).
+ck "idle shape, gate off"            off     "$(forecast_fetch_state '{"demand_forecast":{"mode":"idle","fetch_enabled":false,"preheat_enabled":false}}')"
+ck "idle shape, gate on, no fetch"   pending "$(forecast_fetch_state '{"demand_forecast":{"mode":"idle","fetch_enabled":true,"preheat_enabled":false}}')"
+ck "fetching shape, never succeeded" "on never" "$(forecast_fetch_state '{"demand_forecast":{"healthy":false,"lastSuccessAt":null,"preheat_enabled":false}}')"
+# (a variable first: macOS bash 3.2 brace-expands a JSON literal nested inside "$( ... )")
+FETCHING="{\"demand_forecast\":{\"healthy\":true,\"lastSuccessAt\":\"$FRESH\",\"preheat_enabled\":false}}"
+ck "fetching shape, fresh: on, with the age in seconds" 1 "$(forecast_fetch_state "$FETCHING" | grep -c '^on [0-9]\{1,3\}$')"
+ck "no demand_forecast block"        unknown "$(forecast_fetch_state '{"ok":true}')"
+ck "not JSON"                        unknown "$(forecast_fetch_state 'nope')"
+run_4() { # $1 = demand_forecast JSON; prints the [4] lines
+  printf '{"ok":true,"winter_solver":{"mode":"shadow"},"demand_forecast":%s}' "$1" > "$TMP/health"
+  PLANNER_URL="file://$TMP" HUB_URL="file://$TMP/nohub" HUB_CLIENT_TOKEN="" DRIFT_ACK_FILE=/dev/null \
+    bash scripts/drift-check.sh 2>/dev/null | awk '/^\[4\]/{on=1} /^\[5\]/{on=0} on'
+}
+OUT="$(run_4 "{\"healthy\":true,\"lastSuccessAt\":\"$FRESH\",\"zoneCount\":18,\"preheat_enabled\":false,\"applied_last_cycle\":0}")"
+ck "gate on and fetching: says true"         1 "$(grep -c 'FORECAST_FETCH_ENABLED live=true (last good fetch 0 min ago)' <<<"$OUT")"
+ck "gate on and fetching: never 'null'"      0 "$(grep -c 'live=null' <<<"$OUT")"
+ck "gate on and fetching: preheat still off" 1 "$(grep -c 'FORECAST_PREHEAT_ENABLED live=false' <<<"$OUT")"
+ck "gate on and fetching: no DRIFT in [4]"   0 "$(grep -c 'DRIFT' <<<"$OUT")"
+OUT="$(run_4 '{"healthy":false,"lastSuccessAt":"2026-11-01T00:00:00.000Z","degradeReason":"stale","preheat_enabled":false}')"
+ck "gate on, last fetch weeks ago: DRIFT"    1 "$(grep -c 'DRIFT.*FORECAST_FETCH_ENABLED is on but the last good fetch was [0-9]* min ago' <<<"$OUT")"
+OUT="$(run_4 '{"mode":"idle","fetch_enabled":false,"preheat_enabled":false}')"
+ck "gate off: says false, no DRIFT"          "1 0" "$(grep -c 'FORECAST_FETCH_ENABLED live=false' <<<"$OUT") $(grep -c 'DRIFT' <<<"$OUT")"
+
 [ "$fails" = 0 ] && echo "drift-check.test: all passed" || { echo "drift-check.test: FAILURES"; exit 1; }
