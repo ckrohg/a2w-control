@@ -21,11 +21,11 @@ import { IdentificationDriver, IDENT_MODES, type IdentMode } from "./identify";
 import { TempiqReader, parseCopRefetchRequest } from "./tempiq-read";
 import { parseJsonObject, BODY_TOO_LARGE, MAX_BODY_BYTES } from "./httpbody";
 import { HubClient, type HubState, hubActuationsInFlight } from "./hub";
-import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans, raiseBoostsToGuard } from "./shadow";
+import { computeShadowPlan, curveTargetF, fetchForecast, forecastWithFallback, bandFor, DEFAULT_OPTS, DemandFloor, MIN_PREBOOST_DRAWS, MIN_PREBOOST_F, MAX_PREBOOST_F, priorExcursionsFromPlans, raiseBoostsToGuard, SOAK_MAX_RUN_H } from "./shadow";
 import { shapeCurve, curveOutputF, canShapeFromFeed, parseShapedCurveMode, curveAlreadyInForce } from "./curve";
 import { solveWinterDp, DEFAULT_TANK_UA, type DpHour } from "./winterdp";
 import { aggregateTankUa } from "./tank-ua-push";
-import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats, soakDue, SOAK_REST_H } from "./hygiene";
+import { hygieneVerdict, hygieneIntervalH, lastDwellEnd, drawGapStats, soakDue, SOAK_REST_H, SOAK_LEAD_H } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 import { SpanWatch } from "./spanwatch";
 import {
@@ -655,12 +655,15 @@ const SANITIZE_DWELL_MIN = 30;
  *  enough that the hygiene window would lapse within a day, and never within SOAK_REST_H (12 h) of it
  *  (hygiene.ts soakDue) — so we soak at a warm (cheap) FUTURE hour BEFORE it expires, skip a redundant
  *  soak otherwise, and a soak whose dwell has qualified may end before its hour does. Errors ⇒ true
- *  (fail safe). `measured` = the dwell was actually read (auto-sanitize on, no error): when false the
- *  plan falls back on its own history so `due` (always true) does not re-soak a day that already had
- *  one. The soak runs on the plan→autopilot→Phase B path (setpoint-coordinated so it clears I1);
- *  checkI8 only alarms. */
-async function sanitizeDueNow(): Promise<{ due: boolean; urgent: boolean; measured: boolean }> {
-  if (!autoSanitizeLive) return { due: true, urgent: false, measured: false }; // OFF = conservative daily soak
+ *  (fail safe). `measured` = the dwell was actually read (auto-sanitize on, no error): only then (with a
+ *  readable plan history) does the plan use its memory mode; when false the soak is placed exactly as
+ *  before 2026-11-24. `limitMs` = the latest START of a new soak, SOAK_LEAD_H before the interval runs
+ *  out (null when not measured or no dwell is in the lookback). `rested` = no dwell within SOAK_REST_H: a
+ *  soak in progress keeps its hour while it is true, even if `due` turned off because the outdoor reading
+ *  crossed 55 °F and the interval became 60 h. The soak runs on the
+ *  plan→autopilot→Phase B path (setpoint-coordinated so it clears I1); checkI8 only alarms. */
+async function sanitizeDueNow(): Promise<{ due: boolean; urgent: boolean; rested: boolean; measured: boolean; limitMs: number | null }> {
+  if (!autoSanitizeLive) return { due: true, urgent: false, rested: true, measured: false, limitMs: null }; // OFF = conservative daily soak
   try {
     const intervalH = hygieneIntervalH(lastOutdoorF, HYGIENE_BASE_INTERVAL_H, HYGIENE_SUMMER_INTERVAL_H, HYGIENE_SUMMER_OUTDOOR_F);
     const series = await store.getRecentSeries(intervalH);
@@ -671,10 +674,12 @@ async function sanitizeDueNow(): Promise<{ due: boolean; urgent: boolean; measur
     // dwell anywhere in the lookback — which includes "telemetry was down so we can't prove one happened".
     // Treating that as urgent soaks redundantly at worst; the opposite error is the one that matters.
     const hoursSince = lastEnd ? (Date.now() - lastEnd.getTime()) / 3_600_000 : null;
-    return { ...soakDue(hoursSince, intervalH), measured: true };
+    // The 12 h rest can push "due" late in a day: the plan must not wait for a warm hour past the interval.
+    const limitMs = lastEnd ? lastEnd.getTime() + (intervalH - SOAK_LEAD_H) * 3_600_000 : null;
+    return { ...soakDue(hoursSince, intervalH), measured: true, limitMs };
   } catch (e) {
     console.error("sanitizeDue check failed — defaulting to soak:", (e as Error).message);
-    return { due: true, urgent: false, measured: false };
+    return { due: true, urgent: false, rested: true, measured: false, limitMs: null };
   }
 }
 
@@ -1708,9 +1713,10 @@ async function shadowOnce(): Promise<void> {
   // Rolling-horizon fix: the bank / soak blocks this plan's own history already placed at hours that have started,
   // so the bank is chosen once per local day (shadow.ts priorExcursionsFromPlans) instead of re-landing on the
   // current hour every recompute. A history read failure means no memory — the pre-fix plan — never a skipped plan.
-  // priorExcursionsKnown says the history was READ (even if empty): only then does the soak use it (a soak in
-  // progress keeps its full hour, a new soak never lands on the hour in progress) — an unreadable history must
-  // never drop a running soak mid-hour, so it leaves the soak exactly as before.
+  // priorExcursionsKnown says the history was READ (even if empty): only then, AND with a measured dwell
+  // (sanitizeDueNow().measured), does the soak use it (a soak in progress keeps its full hour, a new soak never lands
+  // on the hour in progress and starts by the interval's limit, at most SOAK_MAX_RUN_H soak hours in a row) — an
+  // unreadable history must never drop a running soak mid-hour, so it leaves the soak exactly as before.
   let priorExcursionsKnown = true;
   const priorExcursions = priorExcursionsFromPlans(await store.recentPlans(26).catch(() => { priorExcursionsKnown = false; return []; }), Date.now());
   const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F, priorExcursions, priorExcursionsKnown };
@@ -1799,7 +1805,7 @@ async function shadowOnce(): Promise<void> {
   if (sanitizeDue.urgent) {
     console.warn("[I8] pasteurization window LAPSED — scheduling the soak at the earliest hour, not the warmest");
   }
-  let plan = computeShadowPlan(forecast, cfg, { ...opts, sanitizeDueMeasured: sanitizeDue.measured }, demandFloor, sanitizeDue.due, sanitizeDue.urgent);
+  let plan = computeShadowPlan(forecast, cfg, { ...opts, sanitizeDueMeasured: sanitizeDue.measured, sanitizeLimitMs: sanitizeDue.limitMs, sanitizeRested: sanitizeDue.rested }, demandFloor, sanitizeDue.due, sanitizeDue.urgent);
   if (!plan.length) throw new Error("empty forecast");
 
   // #59 winter DP — solve the cost-optimal trajectory over the SAME hard floors the plan
@@ -2785,6 +2791,9 @@ async function main(): Promise<void> {
               sanitize_f: DEFAULT_OPTS.sanitizeF,
               // hours after a qualifying dwell before the soak is due again (hygiene.ts soakDue)
               rest_h: SOAK_REST_H,
+              // a new soak starts no later than lead_h before the interval runs out; at most max_run_h soak hours in a row
+              lead_h: SOAK_LEAD_H,
+              max_run_h: SOAK_MAX_RUN_H,
               // blind = monitor can't confirm a soak because telemetry has holes (distinct from
               // "overdue", which is a confident no). largest_gap_min is the evidence.
               blind: i8LastBlind,

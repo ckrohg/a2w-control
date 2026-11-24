@@ -14,6 +14,7 @@ import {
   HYGIENE_HARD_MAX_H,
   soakDue,
   SOAK_REST_H,
+  SOAK_LEAD_H,
   type HygieneReading,
 } from "./hygiene";
 import { detectDrawTimes } from "./dhw";
@@ -183,17 +184,21 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
 //    previous dwell under the old 3 h floor). Urgent is unchanged: no dwell at all, or the interval has lapsed.
 {
   assert.equal(SOAK_REST_H, 12);
+  assert.equal(SOAK_LEAD_H, 3.5, "a soak starts no later than 3.5 h before the interval runs out");
   const d = (h: number | null, i: number) => soakDue(h, i);
-  assert.deepEqual(d(3, 26), { due: false, urgent: false }, "3 h after a dwell: resting (the old floor said due)");
-  assert.deepEqual(d(11.9, 26), { due: false, urgent: false }, "11.9 h: still resting");
-  assert.deepEqual(d(12, 26), { due: true, urgent: false }, "12 h: due");
-  assert.deepEqual(d(25.9, 26), { due: true, urgent: false }, "25.9 h: due, not urgent");
-  assert.deepEqual(d(26, 26), { due: true, urgent: true }, "26 h: the window lapsed");
-  assert.deepEqual(d(35.9, 60), { due: false, urgent: false }, "summer 60 h: a day before the lapse is 36 h");
-  assert.deepEqual(d(36, 60), { due: true, urgent: false });
-  assert.deepEqual(d(60, 60), { due: true, urgent: true });
-  assert.deepEqual(d(null, 26), { due: true, urgent: true }, "no qualifying dwell in the lookback: due and urgent");
-  assert.deepEqual(d(null, 60), { due: true, urgent: true });
+  assert.deepEqual(d(3, 26), { due: false, urgent: false, rested: false }, "3 h after a dwell: resting (the old floor said due)");
+  assert.deepEqual(d(11.9, 26), { due: false, urgent: false, rested: false }, "11.9 h: still resting");
+  assert.deepEqual(d(12, 26), { due: true, urgent: false, rested: true }, "12 h: due");
+  assert.deepEqual(d(25.9, 26), { due: true, urgent: false, rested: true }, "25.9 h: due, not urgent");
+  assert.deepEqual(d(26, 26), { due: true, urgent: true, rested: true }, "26 h: the window lapsed");
+  assert.deepEqual(d(11.9, 60), { due: false, urgent: false, rested: false }, "summer 60 h: resting");
+  assert.deepEqual(d(24, 60), { due: false, urgent: false, rested: true }, "summer 60 h, 24 h after a dwell: rested but not due (a soak begun under the 26 h interval keeps its hour)");
+  assert.deepEqual(d(35.9, 60), { due: false, urgent: false, rested: true }, "summer 60 h: a day before the lapse is 36 h");
+  assert.deepEqual(d(36, 60), { due: true, urgent: false, rested: true });
+  assert.deepEqual(d(60, 60), { due: true, urgent: true, rested: true });
+  assert.deepEqual(d(null, 26), { due: true, urgent: true, rested: true }, "no qualifying dwell in the lookback: due and urgent");
+  assert.deepEqual(d(null, 60), { due: true, urgent: true, rested: true });
+  for (const i of [26, 60]) for (let h = 0; h <= 70; h += 0.5) { const v = d(h, i); assert.ok(!v.urgent || v.due, "urgent implies due"); assert.ok(!v.due || v.rested, "due implies rested"); }
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

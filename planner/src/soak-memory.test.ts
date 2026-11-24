@@ -2,13 +2,15 @@
  * @purpose A soak gets a full hour (2026-11-24). The plan is recomputed at :42 and the forecast starts at the hour in
  * progress, so a soak placed on that hour was written at ~:47 and replaced at ~:07 — ~15 min at 140 °F, never the 30-min
  * dwell (11 of 47 soaks over 8 weeks); and the old 3 h "due" floor re-soaked a cooling day within 12 h of a dwell (15 of
- * 47). Pins shadow.ts with ShadowOpts.priorExcursionsKnown (keep a soak in progress, never place a new one on the hour
- * in progress, a two-block overdue soak, one soak per day when the dwell is not measured) and that without the flag the
- * plan is exactly the old one. Plain node:assert script under tsx like the other planner suites:
+ * 47). Pins shadow.ts in memory mode, ShadowOpts.priorExcursionsKnown AND sanitizeDueMeasured (keep a soak in progress,
+ * never place a new one on the hour in progress, a two-block overdue soak, a new soak no later than sanitizeLimitMs, at
+ * most SOAK_MAX_RUN_H soak hours in a row) and that without either flag the plan is exactly the old one. Plain
+ * node:assert script under tsx like the other planner suites:
  * node --import ./hub/node_modules/tsx/dist/loader.mjs planner/src/soak-memory.test.ts.
  */
 import assert from "node:assert/strict";
-import { computeShadowPlan, priorExcursionsFromPlans, DEFAULT_OPTS, type DemandFloor, type ForecastHour, type ShadowBlock } from "./shadow";
+import { computeShadowPlan, priorExcursionsFromPlans, DEFAULT_OPTS, SOAK_MAX_RUN_H, type DemandFloor, type ForecastHour, type ShadowBlock } from "./shadow";
+import { soakDue, SOAK_LEAD_H } from "./hygiene";
 import { AutoPilot } from "./autopilot";
 
 // 2026-11-24's shape in LOCAL components (the TZ env makes the Date getters local, so day grouping and the warmest-hour
@@ -18,20 +20,23 @@ import { AutoPilot } from "./autopilot";
 const NOV24: number[] = [48, 46, 44, 42, 40, 38, 36, 35, 35, 36, 38, 40, 42, 43, 44, 43, 42, 41, 40, 38, 36, 34, 33, 32];
 const tempOf = (ts: Date) => ts.getDate() === 23 ? 46 : ts.getDate() === 24 ? NOV24[ts.getHours()] : 20 + ts.getHours();
 /** 24 forecast hours starting at the hour in progress (h may be -1 = 23:00 on the 23rd; Date normalises). */
-function forecastFrom(h: number): ForecastHour[] {
-  return Array.from({ length: 24 }, (_, k) => { const ts = new Date(2026, 10, 24, h + k); return { ts, outdoorF: tempOf(ts) }; });
+function forecastFrom(h: number, temp: (ts: Date) => number = tempOf): ForecastHour[] {
+  return Array.from({ length: 24 }, (_, k) => { const ts = new Date(2026, 10, 24, h + k); return { ts, outdoorF: temp(ts) }; });
 }
 const at = (h: number, m = 42) => new Date(2026, 10, 24, h, m).getTime();
 type Stored = { computedAt: Date; plan: ShadowBlock[] };
-/** known: undefined = true (the live default), null = the field omitted, else the value given. */
-type Opt = { due?: boolean; urgent?: boolean; known?: boolean | null; measured?: boolean; cfg?: Record<string, any> | null; floor?: DemandFloor | null };
+/** known / measured: undefined = true (the live default), null = the field omitted, else the value given. limit: the
+ *  key absent = sanitizeLimitMs omitted, else the value given. temp: the forecast's outdoor temperature (default NOV24). */
+type Opt = { due?: boolean; urgent?: boolean; known?: boolean | null; measured?: boolean | null; cfg?: Record<string, any> | null; floor?: DemandFloor | null;
+  limit?: number | null; temp?: (ts: Date) => number; rested?: boolean };
 /** The hourly recompute at h:42 with the stored history as the memory (known / measured default to true). */
 function planAt(h: number, history: Stored[], o: Opt = {}): Stored {
   const prior = priorExcursionsFromPlans(history, at(h));
   const opts = { ...DEFAULT_OPTS, priorExcursions: prior,
     ...(o.known === undefined ? { priorExcursionsKnown: true } : o.known === null ? {} : { priorExcursionsKnown: o.known }),
-    sanitizeDueMeasured: o.measured ?? true };
-  const plan = computeShadowPlan(forecastFrom(h), o.cfg ?? null, opts, o.floor ?? null, o.due ?? false, o.urgent ?? false);
+    ...(o.measured === null ? {} : { sanitizeDueMeasured: o.measured ?? true }),
+    ...("limit" in o ? { sanitizeLimitMs: o.limit } : {}), ...("rested" in o ? { sanitizeRested: o.rested } : {}) };
+  const plan = computeShadowPlan(forecastFrom(h, o.temp), o.cfg ?? null, opts, o.floor ?? null, o.due ?? false, o.urgent ?? false);
   return { computedAt: new Date(at(h)), plan };
 }
 /** The plan as computed before 2026-11-24: no memory at all. */
@@ -105,7 +110,8 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
   assert.ok(kept.plan[1].sani);
 }
 
-// 5. UNKNOWN HISTORY: without priorExcursionsKnown === true the plan is, block for block, the plan with no memory at all.
+// 5. NO MEMORY MODE: without priorExcursionsKnown === true, or (history readable) without sanitizeDueMeasured === true,
+//    the plan is, block for block, the plan with no memory at all — no per-day memory for the unmeasured mode.
 {
   for (const h of [-1, 0, 3, 9, 14, 17, 20]) {
     const t0 = new Date(2026, 10, 24, h);
@@ -116,36 +122,118 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
     for (const [due, urgent] of [[false, false], [true, false], [true, true]] as const) {
       for (const cfg of [null, { dot: 0, wwsd: 60, dbt: 180, mbt: 140 }]) {
         const ref = oldPlan(h, due, urgent, cfg);
-        for (const known of [KNOWN_ABSENT, false]) for (const measured of [true, false]) {
-          const p = planAt(h, hist, { due, urgent, known, measured, cfg });
-          assert.deepEqual(p.plan, ref, `h=${h} due=${due} urgent=${urgent} known=${known} measured=${measured} cfg=${!!cfg}`);
+        const cases: [boolean | null, boolean | null][] = [[KNOWN_ABSENT, true], [KNOWN_ABSENT, false], [false, true], [false, false],
+          [true, false], [true, null], [KNOWN_ABSENT, null]];
+        for (const [known, measured] of cases) for (const limit of [undefined, at(h) + 5 * 3600_000, at(h) - 3600_000]) {
+          const p = planAt(h, hist, { due, urgent, known, measured, cfg, ...(limit === undefined ? {} : { limit }) });
+          assert.deepEqual(p.plan, ref, `h=${h} due=${due} urgent=${urgent} known=${known} measured=${measured} limit=${limit} cfg=${!!cfg}`);
         }
       }
     }
   }
 }
 
-// 6. NOT MEASURED (auto-sanitize off: due is always true): one soak per day from the history; a soak in progress is kept.
+// 6. THE LIMIT (review fix 1): the 12 h rest can push "due" past the last warm hour before the interval runs out. Replay
+//    of the review's example: the last qualifying dwell ended 07:00 on the 24th, interval 26 h → lapses 09:00 on the
+//    25th, limit = 07:00 + (26 − SOAK_LEAD_H) h = 05:30 on the 25th. Every day's warmest hour is 14:00.
 {
-  const nm = { due: true, measured: false };
-  const p2342 = planAt(-1, [], nm);
-  assert.deepEqual(soaks(p2342), ["24@0"]);
-  const p0042 = planAt(0, [p2342], nm);
-  assert.ok(p0042.plan[0].sani && /kept from the previous plan/.test(p0042.plan[0].reason), "the soak in progress keeps its hour");
-  assert.deepEqual(soaks(p0042), ["24@0"]);
-  const p0142 = planAt(1, [p2342, p0042], nm);
-  assert.deepEqual(soaks(p0142), [], "01:42: the 24th had its soak — no second one");
-  assert.deepEqual(soaks(planAt(1, [p2342, p0042], { due: true, measured: true })), ["24@2"], "(measured and still due: a new FUTURE soak is allowed)");
-  assert.deepEqual(soaks(oldPlan(1, true)), ["24@1"], "documents the defect: the old plan re-soaked the hour in progress");
-  const p1742 = planAt(17, [p2342, p0042, p0142], nm);
-  assert.ok(!soaks(p1742).some((s) => s.startsWith("24@")), "17:42: still none on the 24th");
-  assert.deepEqual(soaks(p1742).filter((s) => s.startsWith("25@")), ["25@16"], "the next day still gets its own soak");
-  // measured absent (not exactly true) is "not measured"
-  const absent = computeShadowPlan(forecastFrom(1), null, { ...DEFAULT_OPTS, priorExcursions: priorExcursionsFromPlans([p2342, p0042], at(1)), priorExcursionsKnown: true }, null, true, false);
-  assert.deepEqual(soaks(absent), []);
+  const peak = (h0: number) => (ts: Date) => 40 - Math.abs(ts.getHours() - h0);
+  const dwellEnd = new Date(2026, 10, 24, 7).getTime();
+  const limit = dwellEnd + (26 - SOAK_LEAD_H) * 3600_000;
+  assert.equal(limit, new Date(2026, 10, 25, 5, 30).getTime());
+  const gate = (h: number) => soakDue((at(h) - dwellEnd) / 3600_000, 26);
+  const history: Stored[] = [];
+  const replay = (h: number) => { const p = planAt(h, history, { ...gate(h), limit, temp: peak(14) }); history.push(p); return p; };
+  for (let h = 8; h <= 17; h++) replay(h);
+  assert.ok(!history.some((p) => soaks(p).length), "08:42–17:42: resting, no soak");
+  const p1842 = replay(18);
+  assert.equal(gate(18).due, false, "18:42 is 11.7 h after the dwell");
+  assert.deepEqual(soaks(p1842), [], "18:42 (not due): no soak");
+  const p1942 = replay(19);
+  assert.equal(gate(19).due, true);
+  assert.ok(!soaks(p1942).some((s) => s.startsWith("24@")), "19:42: the 24th has 5 blocks left — no soak on it");
+  assert.deepEqual(soaks(p1942), ["25@5"], "the 25th's soak is on 05:00, the last hour that starts by 05:30 — not on 14:00");
+  const b = p1942.plan.find((x) => x.sani)!;
+  assert.equal(b.reason, "daily sanitize to 140°F = 60°C (I8 pasteurization, last hour before the interval runs out)");
+  assert.ok(b.tank_target_f >= 140);
+  assert.deepEqual(soaks(planAt(19, history.slice(0, -1), { due: true, temp: peak(14) })), ["25@14"],
+    "documents the defect: without the limit the soak waits for 14:00 on the 25th, 31 h after the dwell");
+  for (let h = 20; h <= 28; h++) assert.deepEqual(soaks(replay(h)), ["25@5"], `${h % 24}:42: the soak stays on 05:00`);
+  const p0542 = replay(29);
+  assert.ok(p0542.plan[0].sani && /kept from the previous plan/.test(p0542.plan[0].reason), "05:42 on the 25th: the soak keeps its hour");
+
+  // Not binding: the warmest future hour starts before the limit → the warmest hour, with the unchanged reason.
+  const free = planAt(9, [], { due: true, limit: new Date(2026, 10, 24, 20, 30).getTime() });
+  assert.deepEqual(soaks(free), ["24@14"]);
+  assert.equal(free.plan.find((x) => x.sani)!.reason, "daily sanitize to 140°F = 60°C (I8 pasteurization, warmest hour)");
+  // null, undefined (key present or absent) and NaN: the plan without a limit.
+  for (const h of [-1, 1, 9, 14, 17]) for (const [due, urgent] of [[false, false], [true, false], [true, true]] as const) {
+    const ref = planAt(h, [], { due, urgent });
+    for (const l of [null, undefined, NaN, Infinity]) assert.deepEqual(planAt(h, [], { due, urgent, limit: l }).plan, ref.plan, `h=${h} limit=${l}`);
+  }
+  assert.deepEqual(soaks(planAt(1, [], { due: true })), ["24@2"], "(still due at 01:42: a new FUTURE soak, never the hour in progress)");
+
+  // The limit has already passed (before every future hour): do not wait for the lapse — the soak takes the next hour.
+  const early = planAt(9, [], { due: true, limit: new Date(2026, 10, 24, 9, 30).getTime() });
+  assert.deepEqual(soaks(early), ["24@10"]);
+  assert.equal(early.plan.find((x) => x.sani)!.reason, "daily sanitize to 140°F = 60°C (I8 pasteurization, the interval is about to run out)");
+  // The limit falls this evening and the day has fewer than 6 blocks left (the day-skip): the last hour that starts by it.
+  const evening = planAt(19, [], { due: true, limit: new Date(2026, 10, 24, 21, 30).getTime(), temp: peak(14) });
+  assert.deepEqual(soaks(evening), ["24@21"]);
+  assert.match(evening.plan.find((x) => x.sani)!.reason, /last hour before the interval runs out/);
+  assert.ok(!evening.plan[0].sani, "never the hour in progress");
+  // …and with the limit beyond the horizon nothing is forced: the day-skip stands, tomorrow's warmest hour is planned.
+  const far = planAt(19, [], { due: true, limit: new Date(2026, 10, 26, 12).getTime(), temp: peak(14) });
+  assert.deepEqual(soaks(far), ["25@14"]);
+  // A short forecast (5 blocks: every day is skipped). The limit beyond it forces nothing; the limit inside it does.
+  const short = (limit: number) => computeShadowPlan(forecastFrom(19, peak(14)).slice(0, 5), null,
+    { ...DEFAULT_OPTS, priorExcursions: [], priorExcursionsKnown: true, sanitizeDueMeasured: true, sanitizeLimitMs: limit }, null, true, false);
+  assert.deepEqual(soaks(short(new Date(2026, 10, 25, 12).getTime())), [], "limit beyond the forecast: the next plan covers it");
+  assert.deepEqual(soaks(short(new Date(2026, 10, 24, 21, 30).getTime())), ["24@21"]);
+
+  // Afternoon: the day's warmest hour is 16:00, the limit 15:30 → 15:00.
+  const pm = planAt(9, [], { due: true, limit: new Date(2026, 10, 24, 15, 30).getTime(), temp: peak(16) });
+  assert.deepEqual(soaks(pm), ["24@15"]);
+  assert.match(pm.plan.find((x) => x.sani)!.reason, /last hour before the interval runs out/);
+  assert.deepEqual(soaks(planAt(9, [], { due: true, temp: peak(16) })).filter((s) => s.startsWith("24@")), ["24@16"], "(without the limit: 16:00)");
 }
 
-// 7. A KEPT SOAK IN A COLD HOUR flows through the winter guard like a freshly placed soak: never below the kept target.
+// 7. THE CAP (review fix 2): at most SOAK_MAX_RUN_H consecutive soak hours.
+{
+  assert.equal(SOAK_MAX_RUN_H, 3);
+  // Overdue for good, hourly recomputes from 03:42: the hour in force from :07 (the previous plan's [1]) and from :47
+  // (this plan's [0]) is a soak at 03, 04, 05; not 06; 07, 08, 09; not 10.
+  const history: Stored[] = [];
+  const isSoak: boolean[] = [];
+  for (let h = 3; h <= 10; h++) {
+    const prev = history[history.length - 1];
+    const p = planAt(h, history, { due: true, urgent: true });
+    history.push(p);
+    if (prev) assert.equal(prev.plan[1].sani === true, p.plan[0].sani === true, `${h}:00 is the same soak/not before and after :42`);
+    isSoak.push(p.plan[0].sani === true);
+    if (!p.plan[0].sani) {
+      assert.equal(p.plan[0].tank_target_f, DEFAULT_OPTS.dhwFloorF, `${h}:00 refused: its normal target`);
+      assert.doesNotMatch(p.plan[0].reason, /sanitize/, `${h}:00 refused: its normal reason`);
+    }
+  }
+  assert.deepEqual(isSoak, [true, true, true, false, true, true, true, false]);
+
+  // A kept soak: one or two soak hours before it → kept; three → not.
+  const soakAt = (hs: number[]): Stored[] => [{ computedAt: new Date(at(-2)), plan: hs.map((h) => (
+    { ts: new Date(2026, 10, 24, h).toISOString(), outdoor_f: 40, tank_target_f: 140, hp1_setpoint_f: 145, reason: "daily sanitize", sani: true })) }];
+  assert.ok(/kept from the previous plan/.test(planAt(12, soakAt([12]), { due: true }).plan[0].reason), "an ordinary kept soak: one hour, unaffected");
+  assert.ok(planAt(12, soakAt([10, 11, 12]), { due: true }).plan[0].sani, "third consecutive hour: kept");
+  const fourth = planAt(12, soakAt([9, 10, 11, 12]), { due: true });
+  assert.ok(!fourth.plan[0].sani && fourth.plan[0].tank_target_f === DEFAULT_OPTS.dhwFloorF, "fourth consecutive hour: not kept");
+  assert.ok(planAt(12, soakAt([8, 10, 11, 12]), { due: true }).plan[0].sani, "a gap breaks the run");
+
+  // A NEW soak on draft[1] as the 4th consecutive hour: 23:00 kept after 21:00 and 22:00, the 25th warmest at 00:00.
+  const cool25 = (ts: Date) => ts.getDate() === 25 ? 50 - ts.getHours() : 30;
+  assert.deepEqual(soaks(planAt(23, soakAt([23]), { due: true, temp: cool25 })), ["24@23", "25@0"], "(no run: the 25th's warmest, 00:00)");
+  assert.deepEqual(soaks(planAt(23, soakAt([21, 22, 23]), { due: true, temp: cool25 })), ["24@23", "25@1"], "00:00 would be the 4th: next-warmest");
+}
+
+// 8. A KEPT SOAK IN A COLD HOUR flows through the winter guard like a freshly placed soak: never below the kept target.
 {
   const hist = (t: number): Stored[] => [{ computedAt: new Date(at(-1)), plan: [{ ts: new Date(2026, 10, 24, 0).toISOString(), outdoor_f: 48, tank_target_f: t, hp1_setpoint_f: t + 5, reason: "daily sanitize", sani: true }] }];
   const hot = { dot: 0, wwsd: 60, dbt: 180, mbt: 140 }; // 148 °F at 48 °F outdoor: the guard acts
@@ -162,7 +250,31 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
   }
 }
 
-// 8. END TO END — the real AutoPilot (flat-target mode) over the cooling day: plans land at :42, the auto-pilot polls at
+// 8b. THE INTERVAL LENGTHENS MID-SOAK (found replaying 8 weeks: Oct 14 and Nov 11): the soak was planned under the 26 h
+//     interval, then the outdoor reading crossed 55 °F, the interval became 60 h and "due" turned off with no dwell
+//     behind it. The soak in progress keeps its hour while no dwell has qualified (sanitizeRested); nothing new is planned.
+{
+  const p0842 = planAt(8, [], { due: true, limit: new Date(2026, 10, 24, 9, 30).getTime() });
+  assert.deepEqual(soaks(p0842), ["24@9"], "08:42, limit 09:30: the soak is planned on 09:00");
+  const flip = planAt(9, [p0842], { due: false, rested: true });
+  assert.ok(flip.plan[0].sani && flip.plan[0].tank_target_f >= 140, "09:42, not due but no dwell yet: the soak keeps its hour");
+  assert.match(flip.plan[0].reason, /^daily sanitize.*kept from the previous plan/);
+  assert.deepEqual(soaks(flip), ["24@9"], "and nothing else is planned while not due");
+  assert.deepEqual(soaks(planAt(9, [p0842], { due: false, rested: false })), [], "its dwell has qualified: the soak may end before its hour does");
+  assert.deepEqual(soaks(planAt(9, [p0842], { due: false })), [], "sanitizeRested absent: kept only while due (as before)");
+  assert.deepEqual(soaks(planAt(9, [p0842], { due: false, rested: true, measured: false })), [], "outside memory mode nothing is kept");
+  assert.deepEqual(soaks(planAt(9, [p0842], { due: false, rested: true, known: KNOWN_ABSENT })), []);
+  // The hour after: the kept soak is not carried into the next hour.
+  assert.deepEqual(soaks(planAt(10, [p0842, flip], { due: false, rested: true })), [], "10:42: the soak had its hour; nothing is kept beyond it");
+  // The cap still binds: a block that would be the 4th consecutive soak hour is not kept.
+  const run: Stored[] = []; let prev = planAt(5, [], { due: true, urgent: true });
+  run.push(prev);
+  for (const h of [6, 7]) { prev = planAt(h, run, { due: true, urgent: true }); run.push(prev); }
+  assert.ok(run.every((r) => r.plan[0].sani), "three overdue soak hours in a row (05, 06, 07)");
+  assert.deepEqual(soaks(planAt(8, run, { due: false, rested: true })), [], `the ${SOAK_MAX_RUN_H + 1}th hour is not kept`);
+}
+
+// 9. END TO END — the real AutoPilot (flat-target mode) over the cooling day: plans land at :42, the auto-pilot polls at
 //    :07 (rollover, previous plan) and :47 (the new plan). With the memory the soak is written ONCE per soak hour, at :07
 //    of that hour, and never on an hour already in progress; without it the 17:00 and 18:00 soaks land at :47.
 (async () => {

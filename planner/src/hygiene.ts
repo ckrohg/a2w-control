@@ -105,14 +105,23 @@ export function hygieneIntervalH(
  *  (on a cooling day the warmest hour left is always the current one, so a soak repeated). */
 export const SOAK_REST_H = 12;
 
+/** Lead (hours): the latest a soak may START is SOAK_LEAD_H hours before the interval runs out — the planner's
+ *  look-back loses the last dwell 30 minutes early, a soak needs about 40 minutes to reach 134 °F after a possible
+ *  5-minute refusal, then 30 minutes of dwell, plus a margin. If that soak fails, the overdue backstop is the
+ *  second try. */
+export const SOAK_LEAD_H = 3.5;
+
 /** Demand-aware soak gate (pure). `hoursSince` = hours since the last qualifying dwell ended, null = no
  *  qualifying dwell in the lookback (which includes "telemetry was down, cannot prove one happened").
  *  URGENT = the window has lapsed (the plan stops shopping for the warmest hour). DUE = soak ~a day before
- *  the window lapses, but never within SOAK_REST_H of the last dwell; urgent always implies due. */
-export function soakDue(hoursSince: number | null, intervalH: number): { due: boolean; urgent: boolean } {
+ *  the window lapses, but never within SOAK_REST_H of the last dwell; urgent always implies due. RESTED = no
+ *  dwell within SOAK_REST_H (or none known), so a soak in progress has not qualified yet; due always implies
+ *  rested, but not the reverse: with the 60 h interval a soak is due only from 36 h. */
+export function soakDue(hoursSince: number | null, intervalH: number): { due: boolean; urgent: boolean; rested: boolean } {
   const urgent = hoursSince == null || hoursSince >= intervalH;
-  const due = urgent || hoursSince >= Math.max(intervalH - 24, SOAK_REST_H);
-  return { due, urgent };
+  const rested = hoursSince == null || hoursSince >= SOAK_REST_H;
+  const due = urgent || (rested && hoursSince >= intervalH - 24);
+  return { due, urgent, rested };
 }
 
 /** Draw-gap stats over an ASCENDING list of DHW draw times (from `detectDrawTimes` in dhw.ts) — the
