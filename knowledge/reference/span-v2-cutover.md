@@ -154,9 +154,13 @@ roll back (§5) and journal the error. drift-check `[10]` fails while a read in 
 - `deploy/span-v2-probe.py` publishes nothing. The tests run every breaker path against a v2-only fake
   (`tests/conftest.py`): evidence about the bridge, not about the real panel.
 
-As far as the repo records, v2 has only ever been *read* on the real panel: the first real action is the first proof.
-**Owner decision, not made here:** `span-v2-local-api.md` ("Still to do") and #199's "Done when" list an Air-Water 2
-power-cycle test on v2, which conflicts with the standing rule above.
+**Done 2026-11-24 11:30 ET (owner decision 2026-11-23, executed on the owner's go):** after the flip to `auto`
+(11:28:19 ET, reads over v2 at t+10 s), a 60 s `power_cycle` of Air-Water 2 was sent from the Pi through a bridge UI
+session (`/api/span/breaker` is `require("human")`: API tokens are refused, only the `a2w_ui` cookie from
+`POST /api/session` works). Events: `cycle_opened` "OFF (verified); holding 60 s" 11:30:20, `cycle_done` "OFF 61 s,
+back ON (verified)" 11:31:21, `relay_state CLOSED`, `close_attempts 1`; `span.write` = `v2`. Pump 2 (idle) was
+comm-offline for 3 polls while powered off and back at 11:31:41. The v2 write path is proven on the real panel; the
+paragraph below describes how such an action looks and what the failure shapes mean.
 
 **How the first real action will look.** Writes come from self-heal (`self_heal.py` → `execute(circuit,
 "power_cycle", source="self-heal")`), the Pi's backup fallback (`execute("Buffer Tank", "close")`), the planner's

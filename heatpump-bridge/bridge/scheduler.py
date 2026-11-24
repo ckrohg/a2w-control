@@ -144,7 +144,9 @@ class Scheduler:
                 log.info("schedule %s: %s -> %s (%s)", rule["id"], rule["pump_id"],
                          rule["action"], rule["time_hhmm"])
             except GuardrailError as exc:
-                # already audited by the write path; nothing else to do
+                # already audited by the write path (a setback/comfort below the unattended
+                # floor is refused here on every fire, never clamped up — config.guardrail_warnings
+                # reports that misconfiguration at boot); nothing else to do
                 log.warning("schedule %s failed: %s", rule["id"], exc)
 
     async def _sample_system(self) -> None:
@@ -215,7 +217,10 @@ class Scheduler:
         """Execute a timer. Under unattended-write restriction (default), the scheduler
         NEVER powers a pump off — an "off" timer sets a setback setpoint (unit keeps
         running, can't latch a cold state if connectivity then drops); "on" powers on and
-        optionally sets a comfort setpoint. Powering ON is always safe (toward heat)."""
+        optionally sets a comfort setpoint. Powering ON is always safe (toward heat).
+        The targets are written exactly as configured: write_setpoint holds them to the
+        unattended floor (GuardrailConfig.unattended_floor_whole_c) and refuses anything below
+        it — never clamped up (owner audit 2026-11-23)."""
         g = poller.app_cfg.guardrails
         if not g.restrict_unattended_writes:
             await poller.write_power(action == "on", source="schedule")
@@ -223,11 +228,9 @@ class Scheduler:
         if action == "on":
             await poller.write_power(True, source="schedule")
             if g.comfort_setpoint_c is not None:
-                await poller.write_setpoint(g.comfort_setpoint_c, source="schedule",
-                                            unattended=True)
+                await poller.write_setpoint(g.comfort_setpoint_c, source="schedule", unattended=True)
         else:  # "off" becomes a setback, never a shutdown
-            await poller.write_setpoint(g.setback_setpoint_c, source="schedule",
-                                        unattended=True)
+            await poller.write_setpoint(g.setback_setpoint_c, source="schedule", unattended=True)
 
     def _backups_dir(self) -> Path:
         return Path(self.store.path).parent / "backups"
