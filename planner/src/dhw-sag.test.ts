@@ -87,43 +87,52 @@ assert.deepEqual(peakWindows(Array(24).fill(0)), []);
   assert.deepEqual(mergeWindows([[8, 10]], [[19, 21]]), [[8, 10], [19, 21]], "a separate declared window stays separate");
   assert.deepEqual(mergeWindows([], []), []);
 }
-// boostWindows (2026-11-23): every declared start opens a window, and the hour before it is in no window.
+// boostWindows (2026-11-23): every declared start opens a window, the hour before it is in no window, and a learned
+// peak that ends before the first declared start is dropped (owner: no night boost).
 {
   // 1. nothing declared: the learned peaks exactly, as before
   for (const peaks of [[], [[8, 10]], [[2, 13], [18, 21]], [[0, 24]]] as [number, number][][]) {
     assert.deepEqual(boostWindows(peaks, []), mergeWindows(peaks, []));
     assert.deepEqual(boostWindows(peaks, []), peaks);
   }
-  // 2. a declared window away from every peak is its own window; a declared window that starts before a peak and
+  // 2. a declared window away from every later peak is its own window; a declared window that starts before a peak and
   //    touches or overlaps it is the plain union, as before
-  assert.deepEqual(boostWindows([[8, 10]], [[19, 21]]), [[8, 10], [19, 21]]);
+  assert.deepEqual(boostWindows([[19, 21]], [[8, 10]]), [[8, 10], [19, 21]]);
   assert.deepEqual(boostWindows([], [[6, 10]]), [[6, 10]]);
   assert.deepEqual(boostWindows([[8, 10]], [[6, 8]]), [[6, 10]]);
   assert.deepEqual(boostWindows([[8, 10]], [[6, 10]]), [[6, 10]]);
   assert.deepEqual(boostWindows([[8, 10]], [[7, 9]]), [[7, 10]]);
   // 3. PRODUCTION on 2026-11-23: the learned night peak ends where the declared window starts. The plain union was
-  //    [2,13] (boost at 01:00); now 05:00 is free and the 06:00 start opens its own window.
+  //    [2,13] (boost at 01:00); now the 06:00 start opens its own window, 05:00 is free, and the night hours are gone.
   const live: [number, number][] = [[2, 6], [7, 13], [16, 17], [18, 19], [20, 23]];
   assert.deepEqual(mergeWindows(live, [[6, 10]]), [[2, 13], [16, 17], [18, 19], [20, 23]], "what the planner did before");
-  assert.deepEqual(boostWindows(live, [[6, 10]]), [[2, 5], [6, 13], [16, 17], [18, 19], [20, 23]]);
+  assert.deepEqual(boostWindows(live, [[6, 10]]), [[6, 13], [16, 17], [18, 19], [20, 23]]);
   // 4. a learned peak that runs over the declared start: same result
-  assert.deepEqual(boostWindows([[2, 13]], [[6, 10]]), [[2, 5], [6, 13]]);
-  assert.deepEqual(boostWindows([[2, 14]], [[6, 10]]), [[2, 5], [6, 14]]);
-  assert.deepEqual(boostWindows([[2, 13], [18, 21]], [[6, 10]]), [[2, 5], [6, 13], [18, 21]], "other peaks untouched");
+  assert.deepEqual(boostWindows([[2, 13]], [[6, 10]]), [[6, 13]]);
+  assert.deepEqual(boostWindows([[2, 14]], [[6, 10]]), [[6, 14]]);
+  assert.deepEqual(boostWindows([[2, 13], [18, 21]], [[6, 10]]), [[6, 13], [18, 21]], "later peaks untouched");
   // 5. a learned peak that is only the hour before the declared start is the boost hour itself, and disappears
   assert.deepEqual(boostWindows([[5, 6]], [[6, 10]]), [[6, 10]]);
   assert.deepEqual(boostWindows([[5, 8]], [[6, 10]]), [[6, 10]]);
-  // 6. two declared windows inside one long peak: each gets its start and its free hour
-  assert.deepEqual(boostWindows([[2, 22]], [[6, 8], [18, 20]]), [[2, 5], [6, 17], [18, 22]]);
+  // 6. two declared windows inside one long peak: each gets its start and its free hour; only what lies before the
+  //    FIRST declared start is dropped
+  assert.deepEqual(boostWindows([[2, 22]], [[6, 8], [18, 20]]), [[6, 17], [18, 22]]);
   assert.deepEqual(boostWindows([[8, 20]], [[6, 10], [15, 17]]), [[6, 14], [15, 20]]);
   // 7. declared windows that touch or overlap count as one; one declared from midnight has no earlier hour to free
-  assert.deepEqual(boostWindows([[2, 13]], [[6, 8], [8, 10]]), [[2, 5], [6, 13]]);
+  assert.deepEqual(boostWindows([[2, 13]], [[6, 8], [8, 10]]), [[6, 13]]);
   assert.deepEqual(boostWindows([[0, 9]], [[0, 2]]), [[0, 9]]);
   // 8. inputs not mutated; junk declared windows ignored
   const peaks: [number, number][] = [[18, 21], [2, 13]], declared: [number, number][] = [[6, 10], [4, 4], [9, 7]];
-  assert.deepEqual(boostWindows(peaks, declared), [[2, 5], [6, 13], [18, 21]]);
+  assert.deepEqual(boostWindows(peaks, declared), [[6, 13], [18, 21]]);
   assert.deepEqual(peaks, [[18, 21], [2, 13]]); assert.deepEqual(declared, [[6, 10], [4, 4], [9, 7]]);
-  // 9. the two guarantees, and a well-formed result, over a grid of inputs
+  // 9. NO NIGHT BOOST: a learned peak that ends before the first declared start is dropped whether or not it touches
+  //    the declared window. (Dropping only the piece cut off a merged window would bring the 01:00 boost back on the
+  //    day hour 05:00 fell under the peak threshold and the night peak shrank to [2,5].)
+  assert.deepEqual(boostWindows([[2, 5], [7, 13]], [[6, 10]]), [[6, 13]]);
+  assert.deepEqual(boostWindows([[1, 3], [20, 23]], [[6, 10]]), [[6, 10], [20, 23]]);
+  assert.deepEqual(boostWindows([[2, 4], [12, 14]], [[6, 8], [18, 20]]), [[6, 8], [12, 14], [18, 20]], "a peak between two declared windows stays");
+  assert.deepEqual(boostWindows([[8, 10]], [[19, 21]]), [[19, 21]], "the documented edge: declare the EARLIEST showers, or a learned morning peak gets no boost");
+  // 10. the three guarantees, and a well-formed result, over a grid of inputs
   for (const ps of [[[2, 22]], [[2, 6], [7, 13]], [[2, 13], [14, 16]], [[0, 24]], [[5, 9], [10, 23]], []] as [number, number][][]) {
     for (const ds of [[[6, 8], [18, 20]], [[5, 7], [6, 12]], [[1, 2], [23, 24]], [[9, 10]], [[6, 10]]] as [number, number][][]) {
       const w = boostWindows(ps, ds);
@@ -131,12 +140,14 @@ assert.deepEqual(peakWindows(Array(24).fill(0)), []);
         assert.ok(a < b, `non-empty ${JSON.stringify(w)}`);
         if (i) assert.ok(w[i - 1][1] <= a, `sorted, no overlap ${JSON.stringify(w)}`);
       });
+      const first = mergeWindows(ds)[0][0];
+      assert.ok(w.every(([, b]) => b > first), `nothing ends before the first declared start ${first} in ${JSON.stringify(w)}`);
       for (const [s] of mergeWindows(ds)) {
         assert.ok(w.some(([a]) => a === s), `declared start ${s} opens a window in ${JSON.stringify(w)}`);
         assert.ok(!w.some(([a, b]) => a <= s - 1 && s - 1 < b), `hour ${s - 1} is free in ${JSON.stringify(w)}`);
       }
     }
   }
-  console.log("boostWindows: declared starts open a window with a free hour before — all assertions passed");
+  console.log("boostWindows: declared starts open a window with a free hour before, nothing before the first — all assertions passed");
 }
 console.log("dhw-sag.test.ts: all assertions passed");

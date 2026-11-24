@@ -307,7 +307,8 @@ if (run("j")) {
 // (k) THE DECLARED SHOWER WINDOW GETS ITS OWN BOOST HOUR (2026-11-23). Heating-season zone load reads as draws, so the
 //     learned peaks were [2,6) and [7,13); with 06:00–10:00 declared the plain union was one window [2,13) and the only
 //     morning boost was the 01:00 block, five hours before the showers. boostWindows keeps 05:00 out of every window, so
-//     the 06:00 window is boosted there. Sags are fixed here: this pins where the boosts land, not their size.
+//     the 06:00 window is boosted there, and drops the learned hours before the first declared start, so nothing is
+//     boosted at night (owner 2026-11-23). Sags are fixed here: this pins where the boosts land, not their size.
 if (run("k")) {
   const learnedPeaks: [number, number][] = [[2, 6], [7, 13], [16, 17], [18, 19], [20, 23]];
   const asBoosts = (ws: [number, number][]) => ws.map(([a, b]) => ({ windowStart: a, windowEnd: b, boostF: 10, sagP75F: 7, sagP90F: 9.7, n: 40 }));
@@ -315,7 +316,7 @@ if (run("k")) {
   const before = planAt(24, 0, 19, [], { preBoosts: asBoosts(mergeWindows(learnedPeaks, [[6, 10]])) });
   assert.deepEqual(boostHours(before), [1], "the plain union: one boost at 01:00, none before the 06:00 showers");
   const after = planAt(24, 0, 19, [], { preBoosts: asBoosts(boostWindows(learnedPeaks, [[6, 10]])) });
-  assert.deepEqual(boostHours(after), [1, 5], "the night peak keeps its 01:00 boost and the declared window gets 05:00");
+  assert.deepEqual(boostHours(after), [5], "one morning boost, at 05:00 for the declared window; none at night");
   const b5 = after.plan.find((b) => new Date(b.ts).getDate() === 24 && hourOf(b) === 5)!;
   assert.equal(b5.tank_target_f, 130);
   assert.match(b5.reason, /^pre-boost to 130°F for 06:00 window /);

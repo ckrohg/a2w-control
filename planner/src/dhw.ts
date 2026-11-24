@@ -177,9 +177,10 @@ export const PEAK_THRESHOLD = 0.5;
  * outside the [8,10] morning peak and gets no pre-boost (measured Oct 1–29: deep draws, sag ≥ 8 °F, cluster 07–11).
  * Hour granularity, because plan blocks are hourly: the start rounds DOWN (06:30 → 6, so the boost is in force by the
  * 06:00 block) and the end rounds UP. An entry that does not parse, or is empty or inverted, is skipped with a warning.
- * A declared START always opens a boost window and the hour before it is kept free for the boost (boostWindows):
- * heating-season zone calls read as draws and stretched the learned morning peak back to 02:00, which swallowed
- * 06:00–10:00 and landed the pre-boost at 01:00 (seen 2026-11-23).
+ * A declared START always opens a boost window, the hour before it is kept free for the boost, and learned peaks that
+ * end before the first declared start get no boost (boostWindows): heating-season zone calls read as draws and
+ * stretched the learned morning peak back to 02:00, which swallowed 06:00–10:00 and landed the pre-boost at 01:00
+ * (seen 2026-11-23). So the list must name the EARLIEST showers of the day.
  */
 export function parseShowerWindows(raw: string | undefined): [number, number][] {
   if (!raw || !raw.trim()) return [];
@@ -208,15 +209,22 @@ export function mergeWindows(...lists: [number, number][][]): [number, number][]
 }
 
 /**
- * The windows the pre-boost precedes: the union of the learned peaks and the owner-declared shower windows, with two
- * guarantees for every declared window: its START opens a window, and the hour before it belongs to no window.
- * shadow.ts boosts on the latest hour before a window that lies outside EVERY window, so without the second guarantee a
- * learned peak that runs up to (or over) a declared start pushes the boost hours early. Production, 2026-11-23: learned
- * [2,6] and [7,13] (heating-season zone load reads as draws) + declared [6,10] was the plain union [2,13], and the boost
- * landed at 01:00 for showers that start at 06:00. Now → [2,5], [6,13]: 05:00 is free, so the 06:00 window is boosted
- * there. A learned peak that is only the hour before a declared start disappears. Overlapping or touching declared
- * windows count as one; a window declared from midnight has no earlier hour to keep free. No declared windows =
- * mergeWindows(learnedPeaks, []) exactly. Inputs are not mutated.
+ * The windows the pre-boost precedes: the union of the learned peaks and the owner-declared shower windows. Once the
+ * owner has declared windows, three rules hold:
+ *   1. every declared window's START opens a window;
+ *   2. the hour before a declared start belongs to no window. shadow.ts boosts on the latest hour before a window that
+ *      lies outside EVERY window, so a learned peak that ran up to (or over) a declared start pushed the boost early;
+ *   3. a learned peak that ends before the FIRST declared start earns no pre-boost (owner 2026-11-23: nobody showers
+ *      then). In the heating season zone load reads as draws all night, and those hours were boosted at 01:00.
+ * Production, 2026-11-23: learned [2,6] and [7,13] + declared [6,10] was the plain union [2,13], and the only morning
+ * boost landed at 01:00 for showers that start at 06:00. Now → [6,13]: one boost, at 05:00. Peaks after the first
+ * declared start (afternoon, evening) keep theirs. Rule 3 means the declared list must name the EARLIEST showers: with
+ * only an evening window declared, a learned morning peak is not boosted. Rule 3 looks at where a peak ENDS, not at
+ * whether it touches the declared window, so the night boost does not come back on the day hour 05:00 drops under the
+ * peak threshold. Draws that begin outside every window are not measured by measureWindowSags; the tank floor for those
+ * hours comes from learned.windows and is not affected. Overlapping or touching declared windows count as one; a window
+ * declared from midnight has no earlier hour to keep free. No declared windows = mergeWindows(learnedPeaks, []) exactly.
+ * Inputs are not mutated.
  */
 export function boostWindows(learnedPeaks: [number, number][], declared: [number, number][]): [number, number][] {
   const valid = (w: [number, number]) => w[0] < w[1];
@@ -227,7 +235,8 @@ export function boostWindows(learnedPeaks: [number, number][], declared: [number
     out = out.flatMap(([a, b]): [number, number][] =>
       a < s && s < b ? ([[a, s - 1], [s, b]] as [number, number][]).filter(valid) : [[a, b]]);
   }
-  return out;
+  // decl is sorted, so decl[0][0] is the first declared start: what ends before it is the night, not the showers
+  return decl.length ? out.filter(([, b]) => b > decl[0][0]) : out;
 }
 export function peakWindows(hourScores: number[], threshold = PEAK_THRESHOLD): [number, number][] {
   const out: [number, number][] = [];
