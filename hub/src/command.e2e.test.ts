@@ -5,8 +5,8 @@
  * in-flight /api/command the moment the link goes with a 504 PI_DISCONNECTED_DETAIL ("no Pi
  * connected: …" — outcome unknown, the Pi may have applied it) in well under
  * COMMAND_ACK_TIMEOUT_MS (10 s, not configurable), while a real nack from the Pi stays a 502 with
- * the Pi's detail. A second Pi socket replacing a still-OPEN one answers the same 504 at once
- * without recording a dropout. It also proves what neither must do: /api/write-enable and
+ * the Pi's detail. A second Pi socket replacing a still-OPEN one answers a 504 at once too, with
+ * PI_REPLACED_DETAIL (not "no Pi connected": the Pi is there) and without recording a dropout. It also proves what neither must do: /api/write-enable and
  * /api/breaker share the same `pending` map but set no onLinkLost, so they wait out their own
  * timers and answer 504 (a breaker action carries on on the Pi, and its 504 tells the dashboard
  * not to retry yet). The breaker's grace is 4 s here: longer than "at once", shorter than the 10 s
@@ -18,7 +18,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import path from "node:path";
 import WebSocket from "ws";
-import { PI_DISCONNECTED_DETAIL } from "./command";
+import { PI_DISCONNECTED_DETAIL, PI_REPLACED_DETAIL } from "./command";
 
 const HUB_DIR = path.resolve(__dirname, "..");
 const PI = "e2e-pi-token";
@@ -243,7 +243,8 @@ async function test(name: string, fn: () => Promise<void>) {
       const [cmd, arm, brk] = await Promise.all(answers);
 
       assert.equal(cmd.status, 504);
-      assert.deepEqual(cmd.body, { ok: false, detail: PI_DISCONNECTED_DETAIL });
+      assert.deepEqual(cmd.body, { ok: false, detail: PI_REPLACED_DETAIL });
+      assert.ok(!/no Pi connected/i.test(cmd.body.detail!), "a replacement is not a missing Pi");
       assert.ok(cmd.ms < PROMPT_MS, `the setpoint command was answered in ${cmd.ms} ms`);
       assert.equal(hub.count("[hub] Pi socket replaced — failed 1 pending command(s)"), 1, "the hub logged the one command it failed");
 

@@ -29,7 +29,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import { createDropoutTracker } from "./dropouts";
 import { breakerAckTimeoutMs, bridgeSupportsBreaker, parseGraceMs, validateBreakerBody } from "./breaker";
-import { failPendingOnDisconnect, parseCommandBody, PI_DISCONNECTED_DETAIL, settlePending, type PendingEntry } from "./command";
+import { failPendingOnDisconnect, parseCommandBody, PI_DISCONNECTED_DETAIL, PI_REPLACED_DETAIL, settlePending, type PendingEntry } from "./command";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -312,7 +312,7 @@ function markDisconnected(sock: WebSocket): void {
   if (piSocket !== sock) return;
   piSocket = null;
   piDropouts.disconnected();
-  const failed = failPendingOnDisconnect(pending);
+  const failed = failPendingOnDisconnect(pending, "dropped");
   console.log(`[hub] Pi disconnected${failed ? ` — failed ${failed} pending command(s)` : ""}`);
 }
 
@@ -392,9 +392,10 @@ if (process.env.HUB_E2E_CLIENT_ONLY_GET === "1") {
  * Assigns command_id, relays to the Pi, awaits the matching ack (10s timeout).
  *   200 {ok:true, setpoint_c}  on ack ok
  *   502 {ok:false, detail}     on nack (the Pi refused)
- *   504 {ok:false, detail}     on ack timeout ("ack timeout"), or at once when the Pi link drops or
- *                              its socket is replaced before the ack (PI_DISCONNECTED_DETAIL; the
- *                              write may or may not have been applied)
+ *   504 {ok:false, detail}     on ack timeout ("ack timeout"), or at once when the Pi link drops
+ *                              (PI_DISCONNECTED_DETAIL) or its socket is replaced by a new Pi
+ *                              connection (PI_REPLACED_DETAIL) before the ack; in both the write
+ *                              may or may not have been applied
  *   503                        if no Pi connected
  */
 app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
@@ -431,8 +432,8 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
 
   pending.set(commandId, {
     timer,
-    onLinkLost: () => {
-      res.status(504).json({ ok: false, detail: PI_DISCONNECTED_DETAIL });
+    onLinkLost: (why) => {
+      res.status(504).json({ ok: false, detail: why === "replaced" ? PI_REPLACED_DETAIL : PI_DISCONNECTED_DETAIL });
     },
     resolve: (ack: AckMessage) => {
       if (ack.ok) {
@@ -784,9 +785,10 @@ wss.on("connection", (ws: WebSocket) => {
     if (old.readyState !== WebSocket.OPEN) markDisconnected(old);
     else {
       // Still OPEN, so no dropout — but the Pi acks only on the socket a command came in on, and
-      // this one is about to be closed: answer its pending setpoints now (504, as on a drop) rather
-      // than at the 10 s ack timeout. Done before `piSocket = ws`, so no new command is swept.
-      const failed = failPendingOnDisconnect(pending);
+      // this one is about to be closed: answer its pending setpoints now (504 PI_REPLACED_DETAIL,
+      // which does not say "no Pi connected": the Pi is here) rather than at the 10 s ack timeout.
+      // Done before `piSocket = ws`, so no new command is swept.
+      const failed = failPendingOnDisconnect(pending, "replaced");
       if (failed) console.log(`[hub] Pi socket replaced — failed ${failed} pending command(s)`);
     }
     try {
