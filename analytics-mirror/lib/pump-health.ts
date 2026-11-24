@@ -27,7 +27,7 @@ export const CHECK_LABELS: Record<string, string> = {
   idle_draw: "idle, drawing power",
   defrost_overlong: "stuck in defrost",
   called_tank_flat: "called, tank flat",
-  stage_never_called: "Tank low, stage 2 never called",
+  stage_never_called: "Tank low, never called", // per pump: either stage can be the one left out (HBX rotation)
 };
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);

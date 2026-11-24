@@ -56,7 +56,7 @@ import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_
 import { BACKUP_INITIAL, evalBackupCalled, type BackupState } from "./housealarms";
 import { HousePages, R02_HISTORY_DAYS, f0 } from "./housepages";
 import {
-  PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
+  PH, TREND, evaluatePump, evaluateTankFlat, stageNeverCalledVerdicts, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
   digest, etDay, etHour, etDayStart, evaluatedChecks, pumpRetryAllowed, type Verdict, type DayRow, type TrendOut, type StoppedPump, type CheckKind,
 } from "./pumphealth";
 import { PhaseB, operativeLeadF, staleProofApplicable, staleProofNote, type OperativeLead } from "./phaseb";
@@ -1023,17 +1023,17 @@ async function checkPumpHealth(): Promise<void> {
     if (!PUMP_SPAN_CIRCUITS[id]) continue;
     verdicts.push(evaluateTankFlat(stage, id, readings[id] ?? [], span[PUMP_SPAN_CIRCUITS[id]] ?? [], tank, nowPi, ua));
   }
-  // #172 stage_never_called: stage 2 (the lag stage in the Oct incident) — planner clock, the HBX series and config
-  // versions as stored. Either mapped pump switched off by a person (#212) → not judged.
-  const stage2Pump = STAGE_MAP.map["2"];
-  if (stage2Pump) {
+  // #172 stage_never_called: every mapped stage, one verdict per stage's pump (HBX rotation: either stage can lead, so
+  // either can be the one never added) — planner clock, the HBX series and config versions as stored. Either mapped
+  // pump switched off by a person (#212) → not judged.
+  if (Object.keys(STAGE_MAP.map).length) {
     const curves = await store.curveVersionsSince(new Date((nowS - PH.STAGE_IDLE_WINDOW_S - PH.MAX_SLX_GAP_S) * 1000));
     const stopped: StoppedPump[] = Object.values(STAGE_MAP.map).flatMap((id) => {
       const p = state.pumps.find((x) => x.id === id);
       const s = stopOf(p);
       return s ? [{ pumpId: id, label: pumpNames[id] ?? id, since: s.since }] : [];
     });
-    verdicts.push(evaluateStageNeverCalled("2", stage2Pump, hbx, curves, stopped, nowS));
+    verdicts.push(...stageNeverCalledVerdicts(STAGE_MAP.map, hbx, curves, stopped, nowS));
   }
   pumpHealthGate = null;
   pumpHealthAt = new Date().toISOString();

@@ -5,11 +5,13 @@
  * data is "unknown" and moves nothing. The target is the curve, never a frozen SensorLinx report. #257 review: a window
  * without heat demand, or at/above the WWSD of the curve in force, is "not judged" — the HBX calls nothing then and a
  * coasting tank proves nothing — and only a verdict that judged ITS OWN data releases a re-adopted pump_* row for re-send.
+ * HBX rotation: stageNeverCalledVerdicts judges every mapped stage (stage 1 never added while stage 2 leads too), one
+ * verdict and one episode per pump.
  * Run with: npx tsx planner/src/pumphealth-stage2.test.ts
  */
 import assert from "node:assert/strict";
 import {
-  PH, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, evaluatedChecks, pumpRetryAllowed,
+  PH, evaluateStageNeverCalled, stageNeverCalledVerdicts, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, evaluatedChecks, pumpRetryAllowed,
   type TankReading, type CurveVersion, type StoppedPump, type Verdict, type CheckKind,
 } from "./pumphealth";
 
@@ -246,6 +248,76 @@ async function main(): Promise<void> {
     assert.equal(pumpRetryAllowed("pump_idle_draw", evaluatedChecks(mirrorBlind)), false);
     assert.equal(pumpRetryAllowed("pump_retired_check", new Set()), false);
     assert.equal(pumpRetryAllowed("pump_retired_check", since), true);
+  }
+
+  // ── 12. HBX rotation: every mapped stage is judged, one verdict per stage's pump, episodes keyed by (check, pump) ─────
+  // Either stage can lead, so the stage never added can be stage 1 (stage 2 leading) as well as stage 2.
+  {
+    const MAP = { "1": "pump1", "2": "pump2" };
+    const both = (hbx: TankReading[], stopped: StoppedPump[] = []) => {
+      const vs = stageNeverCalledVerdicts(MAP, hbx, curves, stopped, NOW);
+      assert.deepEqual(vs.map((x) => [x.kind, x.pumpId]), [["stage_never_called", "pump1"], ["stage_never_called", "pump2"]], "one verdict per stage, in stage order");
+      return { p1: vs[0], p2: vs[1], vs };
+    };
+    // (a) stage 2 leads in every poll, stage 1 never added, tank 9.3 °F under the curve, demand on → pump1 trips, pump2 ok
+    const lead2 = series(() => 110, () => [false, true]);
+    {
+      const { p1, p2 } = both(lead2);
+      assert.equal(p1.state, "tripped", p1.reason);
+      assert.match(p1.reason, /never called stage 1, while another stage was called 100 % .*one pump carried the recovery alone/);
+      assert.equal(p1.metrics.other_stage_called_pct, 100);
+      assert.equal(p2.state, "ok", p2.reason); assert.match(p2.reason, /^stage 2 was called at /);
+    }
+    // (b) the mirror: stage 1 leads, stage 2 never added → pump2 trips, pump1 ok
+    {
+      const { p1, p2 } = both(low);
+      assert.equal(p2.state, "tripped", p2.reason);
+      assert.match(p2.reason, /never called stage 2, while another stage was called 100 %/);
+      assert.equal(p1.state, "ok", p1.reason); assert.match(p1.reason, /^stage 1 was called at /);
+    }
+    // (c) both called → both ok
+    {
+      const { p1, p2 } = both(series(() => 110, () => [true, true]));
+      assert.equal(p1.state, "ok", p1.reason); assert.equal(p2.state, "ok", p2.reason);
+    }
+    // (d) a deliberate stop on EITHER pump → neither stage is judged, whichever one was idle
+    for (const id of ["pump1", "pump2"]) {
+      const stop: StoppedPump[] = [{ pumpId: id, label: id, since: NOW - 3 * 3600 }];
+      for (const hbx of [lead2, low]) {
+        const { vs } = both(hbx, stop);
+        for (const x of vs) { assert.equal(x.state, "ok", x.reason); assert.match(x.reason, /^not judged: .* deliberate stop \(#212\)/); }
+      }
+    }
+    // (e) through PumpHealthWatch: pump1's episode neither opens, closes nor blocks pump2's
+    {
+      const w = new PumpHealthWatch({ pump1: "Heat Pump 1", pump2: "Heat Pump 2" });
+      const e1 = w.step(both(lead2).vs);
+      assert.deepEqual(e1.map((e) => [e.kind, e.pumpId]), [["open", "pump1"]], "only pump1 opens");
+      assert.equal(e1[0].title, "Heat Pump 1: tank below target for 2 h but never called");
+      assert.match(e1[0].body, /^Heat Pump 1 was never called: .*never called stage 1/);
+      assert.equal(w.isOpen("stage_never_called", "pump2"), false);
+      const p1Tripped = both(lead2).p1, p2Tripped = both(low).p2, p2Ok = both(lead2).p2;
+      assert.deepEqual(w.step([p1Tripped, p2Tripped]).map((e) => [e.kind, e.pumpId]), [["open", "pump2"]], "pump1 open does not block pump2 opening");
+      assert.deepEqual(w.step([p1Tripped, p2Ok]).map((e) => [e.kind, e.pumpId]), [["close", "pump2"]], "pump2 closing leaves pump1 open");
+      assert.equal(w.isOpen("stage_never_called", "pump1"), true);
+      const st = w.status();
+      assert.equal(st.pump1.stage_never_called.open, true); assert.equal(st.pump2.stage_never_called.open, false);
+      assert.equal(st.pump2.stage_never_called.state, "ok", "/health.pump_health.checks keeps one entry per pump");
+      // restore: a re-adopted pump1 row closes on pump1's ok and never on pump2's
+      const r = new PumpHealthWatch();
+      r.restore([{ check: "stage_never_called", pumpId: "pump1" }]);
+      assert.deepEqual(r.step([p1Tripped, p2Ok]), [], "pump2 ok does not close pump1's re-adopted episode");
+      assert.deepEqual(r.step([p1Tripped, p2Tripped]).map((e) => [e.kind, e.pumpId]), [["open", "pump2"]]);
+      assert.deepEqual(r.step(both(series(() => 110, () => [true, true])).vs).map((e) => [e.kind, e.pumpId]), [["close", "pump1"], ["close", "pump2"]]);
+      // the two verdicts are one check for the restore gate
+      assert.deepEqual([...evaluatedChecks(both(lead2).vs)], ["stage_never_called"]);
+    }
+    // (f) a one-stage map → one verdict; an empty map → none
+    {
+      const one = stageNeverCalledVerdicts({ "2": "pump2" }, low, curves, [], NOW);
+      assert.equal(one.length, 1); assert.equal(one[0].pumpId, "pump2"); assert.equal(one[0].state, "tripped");
+      assert.deepEqual(stageNeverCalledVerdicts({}, low, curves, [], NOW), []);
+    }
   }
 
   console.log("pumphealth-stage2.test.ts: all assertions passed");
