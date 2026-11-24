@@ -5,9 +5,10 @@
  * TempIQ's requiredSupplyWaterTempF, which acts as the ceiling (demand.ts costFirstAwtF). TempIQ emits that ceiling
  * only for zones whose delivery type the owner has VERIFIED (deliveryTypeVerified). For an unverified zone
  * requiredSupplyF is null, computeFloors never calls costFirstAwtF, and the zone gets awtF = localF with zero
- * escalation at any room deficit and for any number of calling cycles (#134). Three hydronic zones are still
- * unverified (Master Bathroom at 60 % duty last winter, Upstairs Bathroom, Kitchen Radiant), and index.ts only
- * logged a generic "UNVERIFIED delivery_type" warning every cycle.
+ * escalation at any room deficit and for any number of calling cycles (#134). The three hydronic zones this was
+ * written for (Master Bathroom, Upstairs Bathroom, Kitchen Radiant) were verified on 2026-10-29, so this watch stays
+ * quiet unless a zone becomes unverified again. Their verified ceiling sits below the local model, though, so radiant
+ * zones still cannot escalate (#134 re-scoped, knowledge/reference/escalation-unverified-zones-134.md).
  *
  * This is OPTION (a) of #170 — surface only. It changes no target and writes nothing: it names the cycles where
  * the binding zone is unverified AND is showing the very evidence the escalation would have acted on (room deficit
