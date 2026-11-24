@@ -101,6 +101,11 @@ class GuardrailConfig(BaseModel):
             if not (floor <= self.baseline_setpoint_c <= self.setpoint_max_c):
                 raise ValueError("baseline_setpoint_c must be within [unattended floor, max] "
                                  "— it's the WARM default the house reverts to")
+            # the lease revert writes it via write_setpoint, which refuses non-whole degrees:
+            # a fractional baseline would be refused on every tick and never revert the house
+            if not _is_whole(self.baseline_setpoint_c):
+                raise ValueError("baseline_setpoint_c must be a whole degree — the lease revert "
+                                 "writes it as-is and the pump accepts whole degrees only")
         if self.comfort_setpoint_c is not None and not (
                 self.setpoint_min_c <= self.comfort_setpoint_c <= self.setpoint_max_c):
             raise ValueError("comfort_setpoint_c must be within the heating clamp")
@@ -131,7 +136,9 @@ def guardrail_warnings(cfg: AppConfig) -> list[str]:
     """Guardrail settings that load fine but make a scheduler timer unwritable. Logged at startup,
     never raised: a raise would stop the Pi booting on a config it already runs. A timer below the
     unattended floor (or not a whole degree) is REFUSED by write_setpoint on every fire, never
-    clamped — this is what makes that visible before the first fire."""
+    clamped — this is what makes that visible before the first fire. Timers write setpoints only
+    under restrict_unattended_writes; without it they just power the pump on/off, so only the
+    fractional-floor warning (which still governs machine-token writes) applies."""
     g = cfg.guardrails
     floor = g.unattended_floor_c
     whole_floor = g.unattended_floor_whole_c
@@ -139,6 +146,8 @@ def guardrail_warnings(cfg: AppConfig) -> list[str]:
     if g.unattended_min_setpoint_c is not None and not _is_whole(g.unattended_min_setpoint_c):
         out.append(f"guardrails.unattended_min_setpoint_c {floor:g}°C is not a whole degree: the pump "
                    f"register has 1°C resolution, so unattended writes are held to {whole_floor:g}°C")
+    if not g.restrict_unattended_writes:
+        return out
     if g.unattended_min_setpoint_c is None:
         floor_desc = f"{whole_floor:g}°C (the setback, as unattended_min_setpoint_c is unset)"
     elif whole_floor != floor:

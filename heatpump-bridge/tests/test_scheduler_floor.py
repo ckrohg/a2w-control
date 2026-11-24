@@ -5,16 +5,18 @@
 # A fractional floor (45.5) is compared rounded UP to the whole degree (46), never the timer.
 from __future__ import annotations
 
-import asyncio
 import logging
+import pathlib
 import socket
 from datetime import datetime
 
 import pytest
+import yaml
 
 from bridge import registers as R
 from bridge.config import AppConfig, GuardrailConfig, PumpConfig, guardrail_warnings
 from bridge.guardrails import SetpointGuard
+from bridge.main import create_app
 from bridge.poller import PumpPoller
 from bridge.scheduler import Scheduler
 from bridge.store import Store
@@ -57,6 +59,7 @@ async def rig(tmp_path):
 
 
 async def _fire(store, poller, action: str, hhmm: str = "23:00"):
+    # store.add_schedule takes no `now` on this branch; when #315 lands, pass now=datetime(2026, 11, 4, h, m)
     await store.add_schedule("p1", hhmm, action)
     h, m = map(int, hhmm.split(":"))
     await Scheduler(store, {"p1": poller}).check_once(datetime(2026, 11, 4, h, m, 5))
@@ -126,7 +129,8 @@ async def test_fractional_floor_is_compared_rounded_up(rig):
     assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 46
     assert await _rejected(store) == []
 
-    await asyncio.sleep(0.15)                                            # rate-limit lane
+    clock = poller.guard._clock()
+    poller.guard._clock = lambda: clock + 3600                           # step past the rate limit
     g.setback_setpoint_c = 45
     await _fire(store, poller, "off", "23:00")
     assert await pump.get_reg(R.REG_SETPOINT_HEATING) == 46                 # untouched
@@ -190,3 +194,38 @@ def test_guardrail_warnings_flags_fractional_setpoints():
     assert len(targets) == 2
     assert "setback_setpoint_c 40.5" in targets[0] and "'off' timers are refused" in targets[0]
     assert "comfort_setpoint_c 50.5" in targets[1] and "'on' timers are refused" in targets[1]
+
+
+def test_guardrail_warnings_skip_timers_when_unattended_writes_are_unrestricted():
+    # unrestricted, a timer only powers the pump on/off — it never writes the setback or comfort
+    assert guardrail_warnings(_cfg(restrict_unattended_writes=False, setback_setpoint_c=40,
+                                   unattended_min_setpoint_c=45, comfort_setpoint_c=42)) == []
+    # the floor still governs machine-token writes, so a fractional one is still reported
+    fractional = guardrail_warnings(_cfg(restrict_unattended_writes=False, setback_setpoint_c=40,
+                                         unattended_min_setpoint_c=45.5))
+    assert len(fractional) == 1 and "unattended_min_setpoint_c 45.5" in fractional[0]
+
+
+def test_baseline_must_be_a_whole_degree():
+    # check_lease reverts via write_setpoint, which refuses non-whole degrees: a 45.5 baseline
+    # would be refused on every tick and the house would never revert
+    with pytest.raises(ValueError, match="baseline_setpoint_c must be a whole degree"):
+        GuardrailConfig(setback_setpoint_c=40, unattended_min_setpoint_c=45, baseline_setpoint_c=45.5)
+    # the safety values that ship still validate: the default (unset), the live Pi's 52, a whole
+    # float, and the production template
+    assert GuardrailConfig().baseline_setpoint_c is None
+    assert GuardrailConfig(unattended_min_setpoint_c=45, baseline_setpoint_c=52).baseline_setpoint_c == 52
+    assert GuardrailConfig(baseline_setpoint_c=48.0).baseline_setpoint_c == 48
+    template = pathlib.Path(__file__).resolve().parents[1] / "deploy" / "config.production.yaml"
+    g = yaml.safe_load(template.read_text())["guardrails"]
+    GuardrailConfig(**{k: v for k, v in g.items() if k in GuardrailConfig.model_fields})
+
+
+def test_create_app_logs_guardrail_warnings_at_boot(caplog, tmp_path):
+    # create_app alone, no lifespan: the warning is logged before anything starts
+    cfg = _cfg(setback_setpoint_c=40, unattended_min_setpoint_c=45)
+    cfg.db_path = str(tmp_path / "test.db")   # create_app keeps its UI secret beside the db
+    with caplog.at_level(logging.WARNING, logger="bridge.main"):
+        create_app(cfg)
+    messages = [r.getMessage() for r in caplog.records if r.name == "bridge.main"]
+    assert any("setback_setpoint_c 40" in m and "floor 45" in m and "refused" in m for m in messages)
