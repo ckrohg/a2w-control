@@ -40,7 +40,8 @@ write-enabled now. The cloud side is live: Railway hub + Railway Postgres (migra
 reaches the services only through an owner-run `railway config apply`. **Phase B is ACTIVE** — the planner drives both
 pumps' setpoints to track the HBX tank target (the curve in force is `/health.curve.in_force`) on 90-minute leases.
 The winter DP solver runs in SHADOW; `demand_forecast` has both gates (`FORECAST_FETCH_ENABLED`,
-`FORECAST_PREHEAT_ENABLED`) off by default and drift-check [4] reports their live values. TempIQ push/read are
+`FORECAST_PREHEAT_ENABLED`) off by default and drift-check [4] reports their live values; the fetch gate has been ON
+since 2026-11-23 (shadow: it records what a forecast would have done and actuates nothing). TempIQ push/read are
 live (18 zones, 38 spatial edges). Winnie's thread CLOSED 2026-07-14 — nothing is owed either
 direction. Dev quickstart in `heatpump-bridge/README.md`.
 
@@ -74,8 +75,11 @@ The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; ed
   (`SIXBB_ALERT_*`; Pi `notifications.sixbb_alert_*`). Email is unchanged. Nobody subscribes to the ntfy topic.
   The lease-revert "planner not commanding setpoints" alert stays record-tier (#191, owner 2026-11-11).
 - **SPAN local API v1 is removed 2026-12-31** (#199): the v2 transport (`bridge/span_v2.py`, MQTT eBus) shipped in
-  release-20261102-1 pinned to `transport: v1`. The flip to `auto` is a Pi config change
-  (`reference/span-v2-cutover.md` (#299) and `span-v2-local-api.md` step 3); drift-check [10] fails a pinned v1 from 2026-12-15.
+  release-20261102-1 pinned to `transport: v1`. **`transport: auto` is live on the Pi since 2026-11-24 11:28 ET** (explicit
+  key in `~/bridge-data/config.yaml`; backup `config.yaml.bak-20261124-v2auto`): reads over v2, and the first real v2 write was
+  proven the same day with a verified 60 s power-cycle of Air-Water 2 (owner-instructed; `reference/span-v2-cutover.md` §3–§4,
+  #199 comment 2026-11-24). Next: #313 makes v2 the code default in the December tag, then explicit `transport: v2`; never
+  rely on the absent-key default. drift-check [10] fails a pinned v1 from 2026-12-15.
 - **DB backups** cover the live Railway Postgres 18 again (#203). Restore with `scripts/analyze-local.sh`; on the
   administrator Mac, put `~/micromamba/envs/pg/bin` on PATH first.
 
@@ -87,8 +91,9 @@ lease in about 20–50 s (was 600 s+). #300 names the hours an unverified bindin
 mesh node, no roaming, since 2026-11-13. Tue 2026-11-24: the Pi gets Ethernet and one release tag, after which
 `span.transport: auto` goes live (#199; runbook `reference/span-v2-cutover.md`); v2 becomes the default in its own
 December tag. Then the winter backlog: #89 TempIQ/local required-supply divergence, #87 winter DP v2, #76 comm
-degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1` → ≥2 weeks of real cold →
-`FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated.
+degradation. The forecast shadow sequence (`FORECAST_FETCH_ENABLED=1`, done 2026-11-23 → ≥2 weeks of real cold →
+review → `FORECAST_PREHEAT_ENABLED=1`, per `reference/winter-dp-commissioning.md`) is WEATHER-gated, not work-gated;
+the pre-heat gate is not to be flipped as built (#89).
 
 **Working rules (added 2026-09-16 after the Pi went offline mid-session — see
 `knowledge/reference/incident-20260916-pi-offline.md`):**

@@ -342,10 +342,12 @@ judged AS (
            WHEN s.min_outdoor_f IS NULL                 THEN 'inconclusive: no slx_readings in the window'
            WHEN s.min_outdoor_f > :max_out              THEN 'inconclusive: outdoor never below ' || :max_out || ' F (min ' || round(s.min_outdoor_f::numeric, 1) || ')'
            WHEN r.snapshots < 2 OR s.eval_min = 0       THEN 'inconclusive: fewer than 2 room/setpoint snapshots after the first 60 min of calling'
-           WHEN s.held_min::numeric / s.eval_min >= 0.8 THEN 'A2W adequate'
-           WHEN s.final_worst_deficit_f <= -2 AND coalesce(r.rise_f_per_h, 0) <= 0.5
+           -- verdicts follow the merged protocol, knowledge/reference/cold-snap-baseboard-test.md (PASS/FAIL, #104)
+           WHEN s.final_eval_min < 60                   THEN 'inconclusive: the final hour of calling lacks a room/setpoint reading in every 10-min bucket'
+           WHEN s.final_held_min = s.final_eval_min     THEN 'A2W adequate'
+           WHEN s.final_worst_deficit_f < -2 AND coalesce(r.rise_f_per_h, 0) < 0
                                                         THEN 'A2W too cold'
-           ELSE 'inconclusive: room below setpoint but still rising (near the crossover, or coasting on thermal mass)'
+           ELSE 'inconclusive: room drifted below setpoint but is not still falling (near the crossover) -- repeat colder'
          END AS verdict
   FROM stats s, rise r
 )
@@ -374,8 +376,9 @@ SELECT verdict,
        round(mean_hp1_w::numeric) || ' / ' || round(mean_hp2_w::numeric)             AS mean_hp1_hp2_w_while_calling,
        'INCONCLUSIVE if the zone called < ' || :min_call || ' min, outdoor never fell below ' || :max_out
          || ' F, or < 2 room snapshots after the first 60 min. '
-         || 'A2W ADEQUATE if room >= setpoint - ' || :hold_tol || ' F for >= 80% of evaluated minutes after the first 60 min of calling. '
-         || 'A2W TOO COLD if the final hour sits >= 2 F below setpoint and the room is not rising (<= 0.5 F/h). '
+         || 'A2W ADEQUATE (guide PASS) if the room holds within ' || :hold_tol || ' F of setpoint for the whole final hour of calling. '
+         || 'A2W TOO COLD (guide FAIL) if the final hour drifts more than 2 F below setpoint and the room keeps falling. '
+         || 'held_share (minutes held after the first 60 min) is shown for context only. '
          || 'Otherwise inconclusive. Element ran = Buffer Tank >= ' || :element_w
          || ' W on SPAN (hbx_backup_called is shown separately); it does not change the verdict but means the supply was not heat-pump-only.'   AS rule
 FROM judged;

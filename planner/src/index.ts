@@ -42,7 +42,7 @@ import {
 import { DemandFeed, requiredAwtF, type FloorPolicy } from "./demand";
 import { ForecastFeed, planPreheat, predictedCapRisk } from "./forecast";
 import { logAdjacencyShadowFloor } from "./spatial";
-import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, mergeWindows, parseShowerWindows, type WindowSag } from "./dhw";
+import { learnDhwWindows, detectDrawTimes, measureWindowSags, peakWindows, boostWindows, parseShowerWindows, type WindowSag } from "./dhw";
 import { advanceCallMinutes, decideFloorRaise, FLOOR_RAISE_MIN_F } from "./floor-cadence";
 import { UnverifiedBindingWatch, roomDeficitF, describeEvent as describeUnverifiedBinding } from "./unverified-binding";
 import { HbxWriter, WriteError, curveOverridden, raiseWriteBarrier, deviceWritesInFlight, withDeviceLock, piStateUnverifiable } from "./writes";
@@ -53,6 +53,7 @@ import { spanHealth, SpanLocalAlarm, type SpanHealth } from "./spanlocal";
 import { AlertOutbox } from "./alerts";
 import { renderAlertEmail } from "./alertemail";
 import { route, tierSubject, acknowledged, Latches, PageBudget, PAGE_BUDGET_PER_WEEK, episodeTier, type Tier, type NotifyOpts } from "./alertpolicy";
+import { BACKUP_INITIAL, evalBackupCalled, type BackupState } from "./housealarms";
 import { HousePages, R02_HISTORY_DAYS, f0 } from "./housepages";
 import {
   PH, TREND, evaluatePump, evaluateTankFlat, evaluateStageNeverCalled, PumpHealthWatch, parseLiveChecks, episodeKind, parseEpisodeKind, rollupDay, trend,
@@ -150,8 +151,10 @@ const AUTOPILOT_DRY_RUN = process.env.AUTOPILOT_DRY_RUN === "1";
 // so the day's charge is bought at the best outdoor COP. 0 (default) = off — plans identical
 // to before. Only ever ADDS heat above the DHW floor; clamped to a sane 0–15 °F.
 const BANK_F = Math.min(Math.max(Number(process.env.BANK_F ?? "0") || 0, 0), 15);
-// Owner-declared shower windows (2026-10-30), e.g. "06:30-10:00": merged into the learned DHW peaks so the pre-boost
-// lands before them (dhw.ts parseShowerWindows). Unset = learned peaks only, the previous behaviour.
+// Owner-declared shower windows (2026-10-30), e.g. "06:30-10:00": added to the learned DHW peaks so the pre-boost
+// lands before them; a declared start always opens a window, with the hour before it kept free for the boost, and
+// learned peaks that end before the first declared start get no boost (dhw.ts boostWindows). Unset = learned peaks
+// only, the previous behaviour.
 const DHW_SHOWER_WINDOWS = parseShowerWindows(process.env.DHW_SHOWER_WINDOWS);
 console.log(`DHW shower windows: ${DHW_SHOWER_WINDOWS.length ? DHW_SHOWER_WINDOWS.map(([a, b]) => `${a}–${b}h`).join(", ") : "none declared (learned peaks only)"}`);
 console.log(`DHW-ready floor ${DEFAULT_OPTS.dhwFloorF} °F (idle ${DEFAULT_OPTS.idleF} °F)${process.env.DHW_FLOOR_F ? ` — from DHW_FLOOR_F=${process.env.DHW_FLOOR_F}` : " — default"}`);
@@ -1282,18 +1285,18 @@ async function checkUnservedCall(reading: SlxReading): Promise<void> {
 /** R3 element accounting (plan §5.5): the 16.5 kW element being CALLED is always worth a
  *  page — legitimate on a design-cold day, a planner bug or config drift any other time.
  *  Edge-triggered; the element's actual runtime (breaker permitting) lives in SPAN. */
-let backupWasCalled = false;
+let backupState: BackupState = BACKUP_INITIAL;
 async function checkBackupCalled(called: boolean | null): Promise<void> {
-  if (called === true && !backupWasCalled) {
-    backupWasCalled = true;
+  const { state, action } = evalBackupCalled(backupState, called);
+  backupState = state;
+  if (action === "open") {
     await ntfy(
       "16.5 kW backup element CALLED",
       "HBX has called the backup element (≈$5/hour if its breaker is on). Legitimate in design-cold; otherwise investigate.",
       "high",
       { tier: "record" }, // a call is not a draw: the SPAN power alarm (spanwatch) is the one that emails
     );
-  } else if (called === false && backupWasCalled) {
-    backupWasCalled = false;
+  } else if (action === "clear") {
     await ntfy("Backup element call ended", "HBX released the backup element.", "default", { tier: "record", resolved: true });
   }
 }
@@ -1688,9 +1691,12 @@ async function shadowOnce(): Promise<void> {
     // Same rows, no extra query: the draw-gap picture for /health (see dhwDraws) and, per learned
     // window, how deep the draws sag the tank — the #135 pre-boost is sized from that.
     dhwDraws = drawGapStats(detectDrawTimes(tankHistory), Date.now());
-    // Owner-declared shower windows (DHW_SHOWER_WINDOWS) merge into the learned peaks before the sag is measured, so a
-    // regular 07:00 shower extends the [8,10] morning peak to [6,10] and is boosted for (dhw.ts parseShowerWindows).
-    if (learned) sags = measureWindowSags(tankHistory, mergeWindows(peakWindows(learned.hourScores), DHW_SHOWER_WINDOWS));
+    // Owner-declared shower windows (DHW_SHOWER_WINDOWS) join the learned peaks before the sag is measured (dhw.ts
+    // boostWindows): a declared start always opens a window, the hour before it is kept out of every window, and a
+    // learned peak that ends before the first declared start is dropped. Winter's learned [2,6] + [7,13] with
+    // 06:00–10:00 declared → [6,13]: one morning boost, at 05:00, where the plain union [2,13] put it at 01:00 (owner
+    // 2026-11-23: no night boost). The floor windows (learned.windows) are untouched.
+    if (learned) sags = measureWindowSags(tankHistory, boostWindows(peakWindows(learned.hourScores), DHW_SHOWER_WINDOWS));
   } catch (e) {
     console.warn("dhw learner failed, using default windows:", (e as Error).message);
   }
@@ -2751,7 +2757,8 @@ async function main(): Promise<void> {
               min_draws: MIN_PREBOOST_DRAWS, min_boost_f: MIN_PREBOOST_F, max_boost_f: MAX_PREBOOST_F,
               // peaks = hours where ≥ 50 % of observed days had a draw (unpadded); the floor windows are the padded 25 % ones
               peak_threshold: 0.5, floor_windows: learnedWindowsForHealth,
-              // owner-declared shower windows (env DHW_SHOWER_WINDOWS), merged into the peaks above; [] when unset
+              // owner-declared shower windows (env DHW_SHOWER_WINDOWS), combined with the peaks above by dhw.ts
+              // boostWindows; [] when unset
               shower_windows: DHW_SHOWER_WINDOWS,
               // eval 2026-09-30 F6: did the boost actually fire? The last pre-boost block the auto-pilot acted on and how
               // (set | would-set | rate-limited | rejected: …); null until the first boost hour is reached.

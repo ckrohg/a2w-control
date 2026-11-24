@@ -19,7 +19,7 @@ type Note = { title: string; body: string; tier: Tier; resolved: boolean; key?: 
 
 function rig() {
   /** the 6bb push and the email; ntfy.sh always answers 200 here, as it does for a topic nobody subscribes to */
-  const channels = { up: true, refuse: (_key?: string) => false, hung: null as Promise<void> | null, latchWriteFails: false, throws: false };
+  const channels = { up: true, refuse: (_key?: string) => false, hung: null as Promise<void> | null, latchWriteFails: false, latchReadFails: false, throws: false };
   const rows = new Map<string, { tier: string; notifiedAt: Date }>();
   const latchStore: LatchStore = {
     getNotifyLatch: async (k) => rows.get(k) ?? null,
@@ -49,6 +49,8 @@ function rig() {
   const store = {
     openUnservedEpisode: async () => { episodes.opened++; },
     closeUnservedEpisode: async () => { episodes.closed++; },
+    // HousePages' own adoption read; the send path's latch reads above are unaffected
+    getNotifyLatch: async (k: string) => { if (channels.latchReadFails) throw new Error("db down"); return latchStore.getNotifyLatch(k); },
   } as any;
   const fresh = () => new HousePages({ send, store, stageMap: { 1: "pump1", 2: "pump2" }, dhwFloorF: 116 });
   let pages = fresh();
@@ -329,6 +331,17 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: null })));
     assert.equal(r.tried.length, 1);
   }
+  {
+    // outdoor hovering 5 ↔ 6 °F on a design-cold night: one page, no all-clear inside the hysteresis band
+    const r = rig();
+    for (const outdoorF of [5, 6, 5, 6, 5]) await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF, tankF: 100 })));
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "paged once");
+    assert.equal(allClears(r).length, 0, "no all-clear while it hovers");
+    await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 108 })));
+    assert.equal(allClears(r).length, 0, "a 108 °F tank is still inside the band");
+    await r.cycles(1, () => r.pages.freezeRisk(r.slx({ outdoorF: 9, tankF: 100 })));
+    assert.equal(allClears(r).length, 1, "past 8 °F out it clears");
+  }
 
   // ── Pi unreachable ───────────────────────────────────────────────────────────────────────────────────────────
   {
@@ -499,14 +512,14 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
 
   // ── what #251 and the latch already gave: unchanged ───────────────────────────────────────────────────────────
   {
-    // a redeploy's re-fire of a heard page is suppressed, reads as heard, and its all-clear still goes
+    // a redeploy adopts a heard page from its latch: no re-page, reads as heard, and its all-clear still goes
     const r = rig();
     await r.freezing();
     r.redeploy();
     await r.freezing(2);
     assert.equal(r.tried.length, 1, "no re-page");
     assert.equal(r.heard.length, 1);
-    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 1, "the suppressed re-fire, once");
+    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 0, "adopted as heard: not even a suppressed re-fire");
     await r.backInRange();
     assert.equal(allClears(r).length, 1);
     assert.equal(allClears(r)[0].tier, "page");
@@ -520,6 +533,88 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     r.channels.up = true;
     await r.freezing();
     assert.equal(r.heard.length, 1);
+  }
+  {
+    // a redeploy INSIDE the hysteresis band (6 °F / 100 °F): the new process adopts the heard page from its latch, so the
+    // clear still sends the all-clear and releases the latch, and a real freeze ~17 h later pages again
+    const r = rig();
+    await r.freezing();
+    assert.equal(r.rows.get("freeze-risk")?.tier, "page");
+    r.redeploy();
+    const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
+    await r.cycles(3, inBand);
+    assert.equal(r.tried.length, 1, "inside the band after a restart: no re-page");
+    assert.equal(allClears(r).length, 0, "inside the band: no all-clear");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "the clear after a restart still sends the all-clear");
+    assert.equal(allClears(r)[0].tier, "page");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+    await r.backInRange(2);
+    assert.equal(allClears(r).length, 1, "once");
+    now += 17 * 3_600_000;
+    await r.freezing();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 2, "a real freeze 17 h later pages again");
+    assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 0, "not swallowed as a duplicate");
+  }
+  {
+    // an incident older than the 24 h latch window, then a redeploy inside the band: the old latch is adopted as OWED
+    // but unheard, so the freeze that still holds pages once more and the clear still sends the all-clear
+    const r = rig();
+    await r.freezing();
+    now += 30 * 3_600_000;
+    r.redeploy();
+    // the first poll after the restart has no reading: adoption happens, nothing is sent (#324 review)
+    await r.pages.freezeRisk(r.slx({ outdoorF: null as unknown as number }));
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "a null first reading sends nothing");
+    const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
+    await r.cycles(3, inBand);
+    assert.equal(allClears(r).length, 0, "inside the band: no all-clear");
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 2, "past the 24 h window a freeze that still holds pages once more");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "a 30 h incident's clear after a restart still sends the all-clear");
+    assert.equal(allClears(r)[0].tier, "page");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+  }
+  {
+    // the adoption read fails on the first poll after a redeploy: the next poll reads it again and adopts the heard
+    // page, so the clear still sends the all-clear
+    const r = rig();
+    await r.freezing();
+    r.redeploy();
+    r.channels.latchReadFails = true;
+    const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
+    await r.cycles(1, inBand);
+    r.channels.latchReadFails = false;
+    await r.cycles(2, inBand);
+    assert.equal(r.tried.length, 1, "no re-page");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "the latch read retried after the DB recovered: the all-clear still goes");
+    assert.equal(allClears(r)[0].tier, "page");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+  }
+
+  {
+    // a stale latch: an old page whose release failed (row left behind), then a restart during a NEW freeze. It is
+    // adopted as owed, not heard, so the new freeze still pages (owner, 2026-11-23: never lose the page)
+    const r = rig();
+    r.rows.set("freeze-risk", { tier: "page", notifiedAt: new Date(now - 3 * 86_400_000) });
+    r.redeploy();
+    await r.freezing();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "the new freeze pages despite the stale latch");
+    await r.backInRange();
+    assert.equal(allClears(r).length, 1, "and its clear sends the all-clear");
+    assert.equal(r.rows.has("freeze-risk"), false, "and releases the latch");
+  }
+  {
+    // the same stale latch, restart in normal weather: one all-clear, then the row is gone (harmless, and it stops a
+    // later freeze being swallowed)
+    const r = rig();
+    r.rows.set("freeze-risk", { tier: "page", notifiedAt: new Date(now - 3 * 86_400_000) });
+    r.redeploy();
+    await r.backInRange();
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 0, "no page in normal weather");
+    assert.equal(allClears(r).length, 1, "one all-clear for the stale latch");
+    assert.equal(r.rows.has("freeze-risk"), false, "and the latch is released");
   }
 
   // ── the outage feed's silence: one email, not a page; an email nobody got goes again ──────────

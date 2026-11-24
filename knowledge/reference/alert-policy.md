@@ -71,7 +71,7 @@ These rules apply to every tier:
 
 | Incident | Source | Threshold |
 |---|---|---|
-| Freeze risk | planner `housepages.ts` | Outdoor ≤ 5 °F and tank < 105 °F |
+| Freeze risk | planner `housepages.ts` | Outdoor ≤ 5 °F and tank < 105 °F; clears only at outdoor > 8 °F or tank ≥ 110 °F (hysteresis band, `housealarms.ts`; a restart inside the band adopts a heard page from its latch, so the all-clear still goes) |
 | No heat being made | planner `housepages.ts` | A stage called with no pump heating for 45 min (9 polls) |
 | Tank cold | planner `housepages.ts` | Tank < 113 °F for 60 min, unless a no-heat page has been heard |
 | Pump fault that sticks | bridge `poller._check_sustained_faults` | Any non-INFO fault except PC (weather) still set after 30 min |
