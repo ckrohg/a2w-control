@@ -62,7 +62,11 @@ Responses:
 
 - `200 {"ok":true,"setpoint_c":<number>}` — Pi acked ok
 - `502 {"ok":false,"detail":"<string>"}` — Pi nacked (guardrail: clamp/rate-limit/floor/offline/write_enabled)
-- `504` — ack timeout (10s)
+- `504 {"ok":false,"detail":"ack timeout"}` — no ack within 10s
+- `504 {"ok":false,"detail":"no Pi connected: the link dropped before the ack, …"}` — at once, when the
+  Pi link drops (or a new Pi connection replaces the socket) before the ack. The Pi may have applied
+  the write, so this is "outcome unknown", not a refusal. The text starts with "no Pi connected" so the
+  planner classifies it as Pi unreachable.
 - `503` — no Pi connected
 
 A nack is a **normal** outcome (guardrails still apply on the Pi).

@@ -1,8 +1,9 @@
 /**
  * @purpose node:assert suite for src/command.ts — the hub-side rules of POST /api/command: body
  * validation (every 400 message verbatim), the lease/source defaults, and settling the pending
- * map exactly once (one ack, or every setpoint entry when the Pi drops mid-command, whichever
- * comes first; breaker / write-enable entries are left to their own timeout).
+ * map exactly once (one ack, or every setpoint entry's onLinkLost — the route's 504 — when the Pi
+ * drops or is replaced mid-command, whichever comes first; a nack stays on the resolve/502 path;
+ * breaker / write-enable entries are left to their own timeout).
  * Run: npx tsx src/command.test.ts
  */
 import assert from "node:assert/strict";
@@ -66,22 +67,37 @@ t("a valid body round-trips; unknown fields are dropped", () => {
 });
 
 type Ack = { id: string; ok: boolean; detail: string };
+/** What the /api/command route answers from onLinkLost: never the resolve (nack → 502) path. */
+type Lost = { status: 504; detail: string };
+const LOST: Lost = { status: 504, detail: PI_DISCONNECTED_DETAIL };
 
-/** `ids` are /api/command setpoints (failOnDisconnect); `others` stand for breaker / write-enable entries. */
+/** `ids` are /api/command setpoints (onLinkLost); `others` stand for breaker / write-enable entries. */
 function makePending(ids: string[], others: string[] = []) {
   const pending = new Map<string, PendingEntry<Ack>>();
-  const got: Record<string, Ack[]> = {};
+  const got: Record<string, (Ack | Lost)[]> = {};
   const timedOut: string[] = [];
   for (const id of [...ids, ...others]) {
     got[id] = [];
     // a real timer, so the test also proves settling clears it (a leak would fire and record)
     const timer = setTimeout(() => { if (pending.delete(id)) timedOut.push(id); }, 50);
-    pending.set(id, { timer, resolve: (ack) => { got[id].push(ack); }, ...(ids.includes(id) ? { failOnDisconnect: true } : {}) });
+    pending.set(id, { timer, resolve: (ack) => { got[id].push(ack); },
+                      ...(ids.includes(id) ? { onLinkLost: () => { got[id].push(LOST); } } : {}) });
   }
   return { pending, got, timedOut };
 }
 
-const drop = (id: string): Ack => ({ id, ok: false, detail: PI_DISCONNECTED_DETAIL });
+t("the disconnect detail begins with 'no Pi connected' (planner/src/owneralerts.ts classifies on it)", () => {
+  assert.match(PI_DISCONNECTED_DETAIL, /^no Pi connected/);
+  assert.ok(/no Pi connected/i.test(PI_DISCONNECTED_DETAIL));
+  assert.equal(PI_DISCONNECTED_DETAIL, "no Pi connected: the link dropped before the ack, so the write may or may not have been applied");
+});
+
+t("a real nack from the Pi goes through resolve (→ 502), never onLinkLost (→ 504)", () => {
+  const { pending, got } = makePending(["a"]);
+  assert.equal(settlePending(pending, "a", { id: "a", ok: false, detail: "rate limited" }), true);
+  assert.equal(failPendingOnDisconnect(pending), 0);
+  assert.deepEqual(got.a, [{ id: "a", ok: false, detail: "rate limited" }]);
+});
 
 t("settlePending resolves once; a duplicate ack is a no-op", () => {
   const { pending, got } = makePending(["a"]);
@@ -95,51 +111,51 @@ t("settlePending resolves once; a duplicate ack is a no-op", () => {
 t("ack then disconnect: the ack wins, the disconnect sweep does not touch it", () => {
   const { pending, got } = makePending(["a"]);
   assert.equal(settlePending(pending, "a", { id: "a", ok: true, detail: "ok" }), true);
-  assert.equal(failPendingOnDisconnect(pending, drop), 0);
+  assert.equal(failPendingOnDisconnect(pending), 0);
   assert.deepEqual(got.a, [{ id: "a", ok: true, detail: "ok" }]);
 });
 
-t("disconnect then late ack: the 502 wins, the late ack is a no-op", () => {
+t("disconnect then late ack: the 504 wins, the late ack is a no-op", () => {
   const { pending, got } = makePending(["a"]);
-  assert.equal(failPendingOnDisconnect(pending, drop), 1);
+  assert.equal(failPendingOnDisconnect(pending), 1);
   assert.equal(settlePending(pending, "a", { id: "a", ok: true, detail: "late" }), false);
-  assert.deepEqual(got.a, [{ id: "a", ok: false, detail: "Pi disconnected before ack" }]);
+  assert.deepEqual(got.a, [LOST]);
 });
 
-t("failPendingOnDisconnect fails every pending setpoint exactly once, then is a no-op", () => {
+t("failPendingOnDisconnect fails every pending setpoint exactly once with the 504, then is a no-op", () => {
   const { pending, got } = makePending(["a", "b", "c"]);
   settlePending(pending, "b", { id: "b", ok: true, detail: "acked" }); // b acked before the drop
-  assert.equal(failPendingOnDisconnect(pending, drop), 2);
-  assert.equal(failPendingOnDisconnect(pending, drop), 0);
+  assert.equal(failPendingOnDisconnect(pending), 2);
+  assert.equal(failPendingOnDisconnect(pending), 0);
   assert.equal(pending.size, 0);
-  assert.deepEqual(got.a, [{ id: "a", ok: false, detail: "Pi disconnected before ack" }]);
+  assert.deepEqual(got.a, [LOST]);
   assert.deepEqual(got.b, [{ id: "b", ok: true, detail: "acked" }]);
-  assert.deepEqual(got.c, [{ id: "c", ok: false, detail: "Pi disconnected before ack" }]);
+  assert.deepEqual(got.c, [LOST]);
 });
 
-t("breaker / write-enable entries (no failOnDisconnect) stay pending for their own ack or timeout", () => {
+t("breaker / write-enable entries (no onLinkLost) stay pending for their own ack or timeout", () => {
   const { pending, got } = makePending(["set"], ["brk"]);
-  assert.equal(failPendingOnDisconnect(pending, drop), 1);
+  assert.equal(failPendingOnDisconnect(pending), 1);
   assert.deepEqual([...pending.keys()], ["brk"]);
   assert.deepEqual(got.brk, []);
   assert.equal(settlePending(pending, "brk", { id: "brk", ok: true, detail: "verified" }), true);
   assert.deepEqual(got.brk, [{ id: "brk", ok: true, detail: "verified" }]);
 });
 
-t("failPendingOnDisconnect survives a resolver that mutates the map mid-sweep", () => {
+t("failPendingOnDisconnect survives an onLinkLost that mutates the map mid-sweep", () => {
   const { pending, got } = makePending(["a", "b"]);
-  // a's resolver settles b itself (as a racing ack would); b must still be resolved only once
+  // a's callback settles b itself (as a racing ack would); b must still be settled only once
   const aEntry = pending.get("a")!;
-  pending.set("a", { ...aEntry, resolve: (ack) => { aEntry.resolve(ack); settlePending(pending, "b", { id: "b", ok: true, detail: "race" }); } });
-  assert.equal(failPendingOnDisconnect(pending, drop), 1);
-  assert.equal(got.a.length, 1);
+  pending.set("a", { ...aEntry, onLinkLost: () => { aEntry.onLinkLost!(); settlePending(pending, "b", { id: "b", ok: true, detail: "race" }); } });
+  assert.equal(failPendingOnDisconnect(pending), 1);
+  assert.deepEqual(got.a, [LOST]);
   assert.deepEqual(got.b, [{ id: "b", ok: true, detail: "race" }]);
 });
 
 // settled entries' timers must have been cleared, and an unswept entry's must still run:
 // wait past their 50 ms and check that only the breaker-like one fired
 const probe = makePending(["x"], ["y"]);
-failPendingOnDisconnect(probe.pending, drop);
+failPendingOnDisconnect(probe.pending);
 setTimeout(() => {
   assert.deepEqual(probe.timedOut, ["y"], "a settled entry's timeout fired, or an unswept one's did not");
   n++; console.log("  ok   settling clears the ack timeout; unswept entries still time out");

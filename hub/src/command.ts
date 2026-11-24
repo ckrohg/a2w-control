@@ -1,15 +1,18 @@
 /**
  * @purpose Pure pieces of the hub's POST /api/command relay (Phase B leased setpoints): body
  * validation, and settling the pending-ack map exactly once — one entry on its ack, or every
- * setpoint entry when the Pi link drops. Kept out of index.ts (which starts a server on import) so the
+ * setpoint entry when the Pi link drops or is replaced. Kept out of index.ts (which starts a server on import) so the
  * rules have unit tests (command.test.ts).
  */
 
 export const DEFAULT_COMMAND_SOURCE = "optimizer";
 
-/** Ack detail for commands still in flight when the Pi link goes down (502, not a 10 s stall
- *  misreported as a 504 'ack timeout'). */
-export const PI_DISCONNECTED_DETAIL = "Pi disconnected before ack";
+/** Detail of the 504 for a setpoint still in flight when the Pi link goes down (or its socket is
+ *  replaced). 504, not 502: the Pi may have applied the write and only the ack was lost, so the
+ *  outcome is unknown — a 502 would make the dashboard say "Rejected". The text MUST begin with
+ *  "no Pi connected": planner/src/owneralerts.ts matches /no Pi connected/i to classify the failure
+ *  as "Pi unreachable", even when the Pi has reconnected by the time it re-reads the hub state. */
+export const PI_DISCONNECTED_DETAIL = "no Pi connected: the link dropped before the ack, so the write may or may not have been applied";
 
 export interface SetpointCommand {
   pump_id: string;
@@ -55,10 +58,21 @@ export function parseCommandBody(body: unknown): ParsedCommand {
 export interface PendingEntry<A> {
   resolve: (ack: A) => void;
   timer: ReturnType<typeof setTimeout>;
-  /** Fail at once when the Pi link drops. Set only by POST /api/command: a breaker action carries on
-   *  on the Pi after the link drops, and its 504 tells the dashboard not to retry until it settles,
-   *  so /api/breaker and /api/write-enable keep waiting out their own timeouts as before. */
-  failOnDisconnect?: boolean;
+  /** Called instead of `resolve` when the Pi link drops (or its socket is replaced) before the ack:
+   *  a separate path from `resolve`, so a lost link can never be mistaken for the Pi's nack. Set
+   *  only by POST /api/command: a breaker action carries on on the Pi after the link drops, and its
+   *  504 tells the dashboard not to retry until it settles, so /api/breaker and /api/write-enable
+   *  leave this unset and keep waiting out their own timeouts as before. */
+  onLinkLost?: () => void;
+}
+
+/** Remove an entry and clear its timer; undefined when it was already settled. */
+function take<A>(pending: Map<string, PendingEntry<A>>, commandId: string): PendingEntry<A> | undefined {
+  const entry = pending.get(commandId);
+  if (!entry) return undefined;
+  pending.delete(commandId);
+  clearTimeout(entry.timer);
+  return entry;
 }
 
 /**
@@ -66,23 +80,22 @@ export interface PendingEntry<A> {
  * can never be resolved twice. Returns false when it was already settled (timeout, duplicate ack).
  */
 export function settlePending<A>(pending: Map<string, PendingEntry<A>>, commandId: string, ack: A): boolean {
-  const entry = pending.get(commandId);
+  const entry = take(pending, commandId);
   if (!entry) return false;
-  pending.delete(commandId);
-  clearTimeout(entry.timer);
   entry.resolve(ack);
   return true;
 }
 
-/** The Pi link dropped: settle every entry pending right now that asked for it (failOnDisconnect),
- *  each exactly once, with the ack `makeAck` builds for its id. The Pi acks only on the socket the
- *  command came in on (hub_client.py), so such an ack can never arrive. Iterates a snapshot of the
- *  ids, so a resolver that touches the map cannot skip or repeat one. Returns how many were settled. */
-export function failPendingOnDisconnect<A>(pending: Map<string, PendingEntry<A>>, makeAck: (commandId: string) => A): number {
+/** The Pi link dropped or was replaced: settle every entry pending right now that has an
+ *  `onLinkLost`, each exactly once, by calling it. The Pi acks only on the socket the command came
+ *  in on (hub_client.py), so such an ack can never arrive. Iterates a snapshot of the ids, so a
+ *  callback that touches the map cannot skip or repeat one. Returns how many were settled. */
+export function failPendingOnDisconnect<A>(pending: Map<string, PendingEntry<A>>): number {
   let n = 0;
   for (const id of [...pending.keys()]) {
-    if (pending.get(id)?.failOnDisconnect !== true) continue;
-    if (settlePending(pending, id, makeAck(id))) n++;
+    if (!pending.get(id)?.onLinkLost) continue;
+    const entry = take(pending, id);
+    if (entry) { entry.onLinkLost!(); n++; }
   }
   return n;
 }

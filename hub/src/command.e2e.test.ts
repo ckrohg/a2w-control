@@ -2,14 +2,16 @@
  * @purpose End-to-end coverage of the Pi-dropout path on the real hub spawned as a child (like
  * link.e2e.test.ts) with a fake Pi on a real WebSocket. The unit tests in command.test.ts prove
  * failPendingOnDisconnect; this file proves the wiring in index.ts: markDisconnected answers an
- * in-flight /api/command the moment the link goes, so the planner gets a 502 'Pi disconnected
- * before ack' in well under COMMAND_ACK_TIMEOUT_MS (10 s, not configurable) instead of a 504 'ack
- * timeout'. It also proves what the drop must NOT do: /api/write-enable and /api/breaker share the
- * same `pending` map but do not set failOnDisconnect, so they wait out their own timers and answer
- * 504 (a breaker action carries on on the Pi, and its 504 tells the dashboard not to retry yet).
- * The breaker's grace is 4 s here: longer than "at once", shorter than the 10 s ack timeout. Also:
- * the map is clean afterwards (a reconnected Pi's ack lands), and a late ack for a command the
- * drop already answered is a no-op. Run: npx tsx src/command.e2e.test.ts
+ * in-flight /api/command the moment the link goes with a 504 PI_DISCONNECTED_DETAIL ("no Pi
+ * connected: …" — outcome unknown, the Pi may have applied it) in well under
+ * COMMAND_ACK_TIMEOUT_MS (10 s, not configurable), while a real nack from the Pi stays a 502 with
+ * the Pi's detail. A second Pi socket replacing a still-OPEN one answers the same 504 at once
+ * without recording a dropout. It also proves what neither must do: /api/write-enable and
+ * /api/breaker share the same `pending` map but set no onLinkLost, so they wait out their own
+ * timers and answer 504 (a breaker action carries on on the Pi, and its 504 tells the dashboard
+ * not to retry yet). The breaker's grace is 4 s here: longer than "at once", shorter than the 10 s
+ * ack timeout. Also: the map is clean afterwards (a reconnected Pi's ack lands), and a late ack for
+ * a command the drop already answered is a no-op. Run: npx tsx src/command.e2e.test.ts
  */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -140,7 +142,19 @@ async function test(name: string, fn: () => Promise<void>) {
     const hub = await Hub.start();
     hubs.push(hub);
 
-    await test("/api/command: the Pi takes the command and closes without acking → 502 'Pi disconnected before ack' at once", async () => {
+    await test("/api/command: a real nack from the Pi → 502 with the Pi's detail (even one worded like the drop's)", async () => {
+      const details = ["rate limited: 1 change per 5 min", PI_DISCONNECTED_DETAIL];
+      const pi = await fakePi(hub, () => ({ ok: false, detail: details[pi.commands.length - 1] }));
+      for (const detail of details) {
+        const a = await timed(hub.post("/api/command", SETPOINT));
+        assert.equal(a.status, 502);
+        assert.deepEqual(a.body, { ok: false, detail });
+      }
+      pi.ws.close();
+      assert.ok(await waitFor(async () => !((await (await fetch(`http://127.0.0.1:${hub.port}/health`)).json()) as { pi_connected: boolean }).pi_connected));
+    });
+
+    await test("/api/command: the Pi takes the command and closes without acking → 504 'no Pi connected: …' at once", async () => {
       const pi = await fakePi(hub);
       const dc = hub.count("[hub] Pi disconnected");
       const answer = timed(hub.post("/api/command", SETPOINT));
@@ -148,15 +162,15 @@ async function test(name: string, fn: () => Promise<void>) {
       assert.equal(pi.commands[0].action, "setpoint");
       pi.ws.close();                                   // a plain close frame, as a rebooting bridge sends
       const a = await answer;
-      assert.equal(a.status, 502);
+      assert.equal(a.status, 504);
       assert.deepEqual(a.body, { ok: false, detail: PI_DISCONNECTED_DETAIL });
-      assert.equal(a.body.detail, "Pi disconnected before ack");
+      assert.match(a.body.detail!, /^no Pi connected: the link dropped before the ack/);
       assert.ok(a.ms < PROMPT_MS, `answered in ${a.ms} ms, not the ${COMMAND_ACK_TIMEOUT_MS} ms ack timeout`);
       assert.ok(await waitFor(() => hub.count("[hub] Pi disconnected — failed 1 pending command(s)") === 1), "the hub logged the one command it failed");
       assert.equal(hub.count("[hub] Pi disconnected"), dc + 1);
     });
 
-    await test("three in flight across /api/command, /api/write-enable and /api/breaker; the Pi is terminated → only the setpoint command 502s at once, the other two wait out their own 504", async () => {
+    await test("three in flight across /api/command, /api/write-enable and /api/breaker; the Pi is terminated → only the setpoint command gets the drop's 504 at once, the other two wait out their own 504", async () => {
       const pi = await fakePi(hub);
       const failedBefore = hub.count("failed 1 pending command(s)");
       const answers = [
@@ -168,7 +182,7 @@ async function test(name: string, fn: () => Promise<void>) {
       pi.ws.terminate();                               // TCP torn down without a close frame: a Wi-Fi drop
       const [cmd, arm, brk] = await Promise.all(answers);
 
-      assert.equal(cmd.status, 502);
+      assert.equal(cmd.status, 504);
       assert.deepEqual(cmd.body, { ok: false, detail: PI_DISCONNECTED_DETAIL });
       assert.ok(cmd.ms < PROMPT_MS, `the setpoint command was answered in ${cmd.ms} ms`);
 
@@ -194,7 +208,7 @@ async function test(name: string, fn: () => Promise<void>) {
       const droppedId = silent.commands[0].command_id as string;
       silent.ws.terminate();
       const d = await dropped;
-      assert.equal(d.status, 502);
+      assert.equal(d.status, 504);
       assert.equal(d.body.detail, PI_DISCONNECTED_DETAIL);
 
       const back = await fakePi(hub, () => ({ ok: true, detail: "applied", setpoint_c: 41 }));
@@ -206,6 +220,52 @@ async function test(name: string, fn: () => Promise<void>) {
       assert.equal(back.commands.length, 1, "only the fresh command reached the reconnected Pi");
       assert.ok((await (await fetch(`http://127.0.0.1:${hub.port}/health`)).json() as { pi_connected: boolean }).pi_connected);
       back.ws.close();
+      await sleep(100);
+    });
+
+    await test("a second Pi socket replaces a still-OPEN one with three in flight → the setpoint gets the 504 at once and no dropout is recorded; write-enable and breaker wait out their own 504; the new socket's command is acked 200", async () => {
+      const health = async () => (await (await fetch(`http://127.0.0.1:${hub.port}/health`)).json()) as
+        { pi_connected: boolean; pi_dropouts_24h: number; current_dropout_min: number | null };
+      const first = await fakePi(hub);                 // never acks
+      const firstClosed = new Promise<number>((r) => first.ws.on("close", (code) => r(code)));
+      const before = await health();
+      assert.equal(before.current_dropout_min, null, "no dropout open before the replacement");
+      const dc = hub.count("[hub] Pi disconnected");
+      const answers = [
+        timed(hub.post("/api/command", SETPOINT)),
+        timed(hub.post("/api/write-enable", { pump_id: "aw1", enabled: true }, ARMED)),
+        timed(hub.post("/api/breaker", { circuit: "Air-Water 2", action: "close" }, ARMED)),
+      ];
+      assert.ok(await waitFor(() => first.commands.length === 3), "the first socket received all three commands");
+      assert.equal(first.ws.readyState, WebSocket.OPEN);
+
+      const second = await fakePi(hub, () => ({ ok: true, detail: "applied", setpoint_c: 42 }));
+      const [cmd, arm, brk] = await Promise.all(answers);
+
+      assert.equal(cmd.status, 504);
+      assert.deepEqual(cmd.body, { ok: false, detail: PI_DISCONNECTED_DETAIL });
+      assert.ok(cmd.ms < PROMPT_MS, `the setpoint command was answered in ${cmd.ms} ms`);
+      assert.equal(hub.count("[hub] Pi socket replaced — failed 1 pending command(s)"), 1, "the hub logged the one command it failed");
+
+      assert.equal(brk.status, 504);
+      assert.match(brk.body.detail!, /no answer from the bridge in time — the action may still complete/);
+      assert.ok(brk.ms >= BREAKER_GRACE_MS - TIMER_SLACK_MS, `the breaker waited out its grace (${brk.ms} ms)`);
+      assert.equal(arm.status, 504);
+      assert.deepEqual(arm.body, { ok: false, detail: "ack timeout" });
+      assert.ok(arm.ms >= COMMAND_ACK_TIMEOUT_MS - TIMER_SLACK_MS, `write-enable waited out the ack timeout (${arm.ms} ms)`);
+
+      assert.equal(await firstClosed, 4000, "the old socket was closed as replaced");
+      const after = await health();
+      assert.ok(after.pi_connected);
+      assert.equal(after.pi_dropouts_24h, before.pi_dropouts_24h, "replacing a live socket is not a dropout");
+      assert.equal(after.current_dropout_min, null);
+      assert.equal(hub.count("[hub] Pi disconnected"), dc, "the replacement did not take the link down");
+
+      const fresh = await timed(hub.post("/api/command", { ...SETPOINT, value_c: 42 }));
+      assert.equal(fresh.status, 200);
+      assert.deepEqual(fresh.body, { ok: true, setpoint_c: 42 });
+      assert.equal(second.commands.length, 1, "only the fresh command reached the new socket");
+      second.ws.close();
       await sleep(100);
     });
   } finally {

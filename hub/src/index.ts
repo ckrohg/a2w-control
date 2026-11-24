@@ -303,17 +303,16 @@ function settleCommand(commandId: string, ack: AckMessage): void {
 /** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
  * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
  * the replacement check, and the eventual `close` event count at most once between them.
- * Every /api/command setpoint still awaiting an ack is answered now (502 'Pi disconnected before
- * ack'): the link it would arrive on is gone, so waiting out the ack timeout only turns a known
- * cause into a misleading 504. A late ack on the dying socket is then a no-op (settled once).
- * Breaker and write-enable commands are left to their own 504 (command.ts failOnDisconnect). */
+ * Every /api/command setpoint still awaiting an ack is answered now (504 PI_DISCONNECTED_DETAIL,
+ * "no Pi connected: …"): the link it would arrive on is gone, so there is nothing to wait 10 s
+ * for — but the Pi may have applied the write, so it is a 504 (outcome unknown), never a 502
+ * (refused). A late ack on the dying socket is then a no-op (settled once). Breaker and
+ * write-enable commands are left to their own 504 (command.ts onLinkLost). */
 function markDisconnected(sock: WebSocket): void {
   if (piSocket !== sock) return;
   piSocket = null;
   piDropouts.disconnected();
-  const failed = failPendingOnDisconnect(pending, (commandId): AckMessage => ({
-    type: "ack", command_id: commandId, ok: false, detail: PI_DISCONNECTED_DETAIL, setpoint_c: null, result: null,
-  }));
+  const failed = failPendingOnDisconnect(pending);
   console.log(`[hub] Pi disconnected${failed ? ` — failed ${failed} pending command(s)` : ""}`);
 }
 
@@ -392,8 +391,10 @@ if (process.env.HUB_E2E_CLIENT_ONLY_GET === "1") {
  * POST /api/command — body {pump_id, value_c, lease_minutes?, source?}.
  * Assigns command_id, relays to the Pi, awaits the matching ack (10s timeout).
  *   200 {ok:true, setpoint_c}  on ack ok
- *   502 {ok:false, detail}     on nack, or the Pi dropped before acking
- *   504                        on ack timeout
+ *   502 {ok:false, detail}     on nack (the Pi refused)
+ *   504 {ok:false, detail}     on ack timeout ("ack timeout"), or at once when the Pi link drops or
+ *                              its socket is replaced before the ack (PI_DISCONNECTED_DETAIL; the
+ *                              write may or may not have been applied)
  *   503                        if no Pi connected
  */
 app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
@@ -430,7 +431,9 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
 
   pending.set(commandId, {
     timer,
-    failOnDisconnect: true,
+    onLinkLost: () => {
+      res.status(504).json({ ok: false, detail: PI_DISCONNECTED_DETAIL });
+    },
     resolve: (ack: AckMessage) => {
       if (ack.ok) {
         res.status(200).json({ ok: true, setpoint_c: ack.setpoint_c });
@@ -458,8 +461,9 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
  * only after a fresh password re-entry — a stolen session or the ordinary client token
  * alone can never arm. Relays the write_enable action to the Pi (which applies its own
  * loud ceremony: audit event + high-priority push on enable) and awaits the ack.
- * 503 if HUB_ARM_TOKEN is unset (feature off), 401 on a bad arm token. A Pi link drop before
- * the ack is not answered early: the request waits out the 10 s ack timeout (504).
+ * 503 if HUB_ARM_TOKEN is unset (feature off), 401 on a bad arm token. A Pi link drop or socket
+ * replacement before the ack is not answered early: the request waits out the 10 s ack timeout
+ * (504 "ack timeout").
  */
 app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) => {
   const armToken = process.env.HUB_ARM_TOKEN ?? "";
@@ -532,7 +536,8 @@ app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) =
  *   501                             the connected bridge predates breaker control
  *   503 no Pi / arming not configured · 504 no ack in time (the action may still complete:
  *                                    the dashboard reads the live relay state from /api/state)
- * A Pi link drop does NOT answer this route early (unlike /api/command): the bridge finishes a
+ * A Pi link drop or socket replacement does NOT answer this route early (unlike /api/command's
+ * immediate 504): the bridge finishes a
  * breaker action on its own once it has it, so the request waits out off_s + grace and gets the
  * 504 above. command.e2e.test.ts pins this.
  */
@@ -777,6 +782,13 @@ wss.on("connection", (ws: WebSocket) => {
     // registered yet — and once this socket takes over, the old one's late `close` would be
     // ignored. Register it now so this connect closes it as a short episode (Codex, PR #178).
     if (old.readyState !== WebSocket.OPEN) markDisconnected(old);
+    else {
+      // Still OPEN, so no dropout — but the Pi acks only on the socket a command came in on, and
+      // this one is about to be closed: answer its pending setpoints now (504, as on a drop) rather
+      // than at the 10 s ack timeout. Done before `piSocket = ws`, so no new command is swept.
+      const failed = failPendingOnDisconnect(pending);
+      if (failed) console.log(`[hub] Pi socket replaced — failed ${failed} pending command(s)`);
+    }
     try {
       old.close(4000, "replaced by new Pi connection");
     } catch {
