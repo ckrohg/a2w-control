@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import sqlite3
 import threading
 import time
@@ -87,6 +88,19 @@ CREATE INDEX IF NOT EXISTS idx_system_ts ON system_stats(ts);
 _SYSTEM_COLS = ("ts", "cpu_pct", "load1", "load5", "load15", "ncpu", "mem_used_pct",
                 "mem_total_mb", "mem_avail_mb", "disk_used_pct", "disk_free_gb",
                 "disk_total_gb", "cpu_temp_c", "uptime_s")
+
+# busy timeout of backup()'s own read-only connection: a brief lock (WAL recovery after a
+# crash) waits instead of failing the night's backup
+BACKUP_BUSY_TIMEOUT_S = 10.0
+
+
+def _backup_into(src: sqlite3.Connection, dest: str) -> None:
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
 
 
 class Store:
@@ -317,17 +331,40 @@ class Store:
     # --- maintenance (run nightly by the scheduler) -----------------------------
     async def backup(self, dest: str) -> None:
         """Consistent online backup via SQLite's backup API — survives SD card death
-        as long as yesterday's copy does. Under the connection lock (touches _conn)."""
-        async with self._conn_lock:
-            def _run():
-                with self._thread_lock:      # see _thread_lock (#94)
-                    dst = sqlite3.connect(dest)
-                    try:
-                        with dst:
-                            self._conn.backup(dst)
-                    finally:
-                        dst.close()
-            await asyncio.to_thread(_run)
+        as long as yesterday's copy does.
+
+        Takes NEITHER _conn_lock nor _thread_lock and never touches self._conn, so no other
+        store call (polls, lease reverts, a breaker cycle's audit write) queues behind the copy
+        (#319 lets it run in the daytime). It reads from its OWN read-only connection to the file,
+        opened, used and closed inside this one worker thread and never stored on self — so
+        no second thread ever shares a connection, which is what #94 was about. In WAL mode
+        that reader blocks no writer.
+
+        Consistency: backup() with the default pages=-1 copies everything in ONE step under
+        one read transaction, so the file is the database as of that step's start. Commits by
+        self._conn during the copy go to the WAL past that snapshot and are not in the copy;
+        nothing restarts (SQLite restarts a backup only BETWEEN steps, and there is just one).
+        The bridge only ever auto-checkpoints (PASSIVE), which stops short of a live reader's
+        snapshot rather than failing or waiting; the WAL drains on a later checkpoint.
+
+        In-memory store (":memory:" or ""; tests only): a second connection cannot see it,
+        so that case alone still copies from self._conn under both locks."""
+        if self.path in ("", ":memory:"):
+            async with self._conn_lock:
+                def _run():
+                    with self._thread_lock:      # see _thread_lock (#94)
+                        _backup_into(self._conn, dest)
+                await asyncio.to_thread(_run)
+            return
+        src_uri = pathlib.Path(self.path).absolute().as_uri() + "?mode=ro"
+        def _run():
+            # private to this worker thread: opened here, closed here even on error
+            src = sqlite3.connect(src_uri, uri=True, timeout=BACKUP_BUSY_TIMEOUT_S)
+            try:
+                _backup_into(src, dest)
+            finally:
+                src.close()
+        await asyncio.to_thread(_run)
 
     async def prune(self, *, samples_days: float = 365, comm_days: float = 90,
                     system_days: float = 90) -> None:
