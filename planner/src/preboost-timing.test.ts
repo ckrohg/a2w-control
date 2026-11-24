@@ -25,6 +25,7 @@ import assert from "node:assert/strict";
 import { computeShadowPlan, priorExcursionsFromPlans, raiseBoostsToGuard, DEFAULT_OPTS, MAX_PREBOOST_F, type ForecastHour, type ShadowBlock, type ShadowOpts } from "./shadow";
 import { AutoPilot, curveDecision } from "./autopilot";
 import { planConflictAhead } from "./identify";
+import { boostWindows, mergeWindows } from "./dhw";
 
 // A November night like Nov 2 2026: falling overnight, 03:00 the warmest lead hour of [3, 4, 5]. Below the winter
 // guard, but with no demand floor and cfg = null the winter pass changes nothing (as bank-memory.test.ts).
@@ -301,6 +302,28 @@ if (run("j")) {
   // the same with a demand floor below the guard threshold's reach: the winter pass is skipped at 55 °F regardless
   assert.deepEqual(coldPlanAt(15, 0, { outdoorF: 55, cfg: asFound, floor: { tankTargetF: 137, bindingZone: "x", awtF: 133 } }), warm, "a demand floor is a winter-pass input only");
   console.log("preboost-timing.test.ts (j) warm control unchanged: ok");
+}
+
+// (k) THE DECLARED SHOWER WINDOW GETS ITS OWN BOOST HOUR (2026-11-23). Heating-season zone load reads as draws, so the
+//     learned peaks were [2,6) and [7,13); with 06:00–10:00 declared the plain union was one window [2,13) and the only
+//     morning boost was the 01:00 block, five hours before the showers. boostWindows keeps 05:00 out of every window, so
+//     the 06:00 window is boosted there, and drops the learned hours before the first declared start, so nothing is
+//     boosted at night (owner 2026-11-23). Sags are fixed here: this pins where the boosts land, not their size.
+if (run("k")) {
+  const learnedPeaks: [number, number][] = [[2, 6], [7, 13], [16, 17], [18, 19], [20, 23]];
+  const asBoosts = (ws: [number, number][]) => ws.map(([a, b]) => ({ windowStart: a, windowEnd: b, boostF: 10, sagP75F: 7, sagP90F: 9.7, n: 40 }));
+  const boostHours = (p: Stored) => p.plan.filter((b) => b.boost && new Date(b.ts).getDate() === 24 && hourOf(b) < 13).map(hourOf);
+  const before = planAt(24, 0, 19, [], { preBoosts: asBoosts(mergeWindows(learnedPeaks, [[6, 10]])) });
+  assert.deepEqual(boostHours(before), [1], "the plain union: one boost at 01:00, none before the 06:00 showers");
+  const after = planAt(24, 0, 19, [], { preBoosts: asBoosts(boostWindows(learnedPeaks, [[6, 10]])) });
+  assert.deepEqual(boostHours(after), [5], "one morning boost, at 05:00 for the declared window; none at night");
+  const b5 = after.plan.find((b) => new Date(b.ts).getDate() === 24 && hourOf(b) === 5)!;
+  assert.equal(b5.tank_target_f, 130);
+  assert.match(b5.reason, /^pre-boost to 130°F for 06:00 window /);
+  // nothing else moves: every block from 13:00 on is identical under both rules
+  const tail = (p: Stored) => p.plan.filter((b) => new Date(b.ts).getDate() === 24 && hourOf(b) >= 13);
+  assert.deepEqual(tail(after), tail(before), "afternoon and evening blocks are unchanged");
+  console.log("preboost-timing.test.ts (k) the declared window gets its own boost hour: ok");
 }
 
 console.log("preboost-timing.test.ts: all assertions passed ✓");
