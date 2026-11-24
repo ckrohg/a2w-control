@@ -16,7 +16,7 @@ import time
 
 WIFI_IFACE = "wlan0"                    # the Pi's only radio; SystemStats(wifi_iface=) overrides
 PROC_WIRELESS = "/proc/net/wireless"    # absent on the Mac dev box and on a wired-only host
-NMCLI_TIMEOUT_S = 1.0                   # the sampler must never hold its caller longer than this
+NMCLI_TIMEOUT_S = 1.0                   # bounds nmcli at ~1 s (plus kill/wait); read() runs off the event loop
 
 _UNESCAPED_COLON = re.compile(r"(?<!\\):")
 

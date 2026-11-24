@@ -165,8 +165,37 @@ async def test_store_keeps_wifi_fields_and_migrates_an_old_table(monkeypatch, tm
 
         row = (await store.get_system_history(1))[-1]
         assert row["wifi_signal_dbm"] == -65 and row["wifi_bssid_changes"] == 0
+        # beyond 48 h the 5-min rollup AVG/MAX runs over the migrated Wi-Fi columns too
+        bucket = (await store.get_system_history(72))[-1]
+        assert bucket["wifi_signal_dbm"] == -65 and bucket["wifi_bssid_changes"] == 0
     finally:
         await store.close()
+
+
+async def test_a_failed_wifi_migration_does_not_stop_the_store_opening(monkeypatch, tmp_path):
+    """#308 review: an ALTER that raises (a locked DB at restart) is logged and skipped, never fatal to the bridge."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE system_stats (id INTEGER PRIMARY KEY, ts REAL NOT NULL, cpu_pct REAL)")
+    conn.commit()
+    conn.close()
+    real_connect = sqlite3.connect
+
+    class LockedAlter:
+        def __init__(self, inner): self._inner = inner
+        def execute(self, sql, *a):
+            if sql.startswith("ALTER TABLE system_stats"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._inner.execute(sql, *a)
+        def __getattr__(self, name): return getattr(self._inner, name)
+        def __setattr__(self, name, value):
+            if name == "_inner": object.__setattr__(self, name, value)
+            else: setattr(self._inner, name, value)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: LockedAlter(real_connect(*a, **kw)))
+    store = Store(str(db))
+    await store.open()   # must not raise
+    await store.close()
 
     # reopening an already-migrated DB is a no-op
     again = Store(str(db))

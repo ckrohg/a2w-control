@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -123,7 +124,15 @@ class Store:
             have = {row[1] for row in conn.execute("PRAGMA table_info(system_stats)")}
             for name, sql_type in _SYSTEM_ADDED_COLS:
                 if name not in have:
-                    conn.execute(f"ALTER TABLE system_stats ADD COLUMN {name} {sql_type}")
+                    # A failed migration (e.g. "database is locked" by a sqlite3 shell during the restart) must not
+                    # stop the bridge: pump control matters more than a stats column. Without the column the stats
+                    # insert/read fail and are already caught by their callers; the next start retries (#308 review).
+                    try:
+                        conn.execute(f"ALTER TABLE system_stats ADD COLUMN {name} {sql_type}")
+                    except sqlite3.OperationalError as exc:
+                        logging.getLogger(__name__).warning(
+                            "system_stats migration: could not add %s (%s); Wi-Fi stats off until the next start",
+                            name, exc)
             conn.commit()
             return conn
         self._conn = await asyncio.to_thread(_open)
