@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
+import socket
+import struct
 import time
 from collections import deque
 
@@ -87,16 +90,28 @@ GATEWAY_PROBE_TIMEOUT_S = 1.0
 GATEWAY_PROBE_GRACE_S = 0.2
 
 
-# @purpose: One bare TCP connect to a W610 gateway, sending nothing: True if it accepted,
-# False if it refused, was unreachable, or did not answer within timeout_s. The socket is
-# aborted at once so the gateway's single client slot is free for the next poll.
-async def probe_gateway(host: str, port: int, timeout_s: float) -> bool:
+# @purpose: One bare TCP connect to a W610 gateway, sending nothing. Returns why it ended:
+# "ok" (accepted), "refused", "timeout" (no answer within timeout_s) or "unreachable" (any
+# other OS error: no route, no network). The socket is reset (SO_LINGER 0, as
+# PumpClient._hard_close does) and aborted at once, so the gateway's single client slot
+# is free for the next poll without a FIN handshake.
+async def probe_gateway(host: str, port: int, timeout_s: float) -> str:
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout_s)
-    except (OSError, TimeoutError):
-        return False
+    except ConnectionRefusedError:
+        return "refused"
+    except TimeoutError:
+        return "timeout"
+    except OSError as exc:
+        return "timeout" if exc.errno == errno.ETIMEDOUT else "unreachable"
+    sock = writer.transport.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        except OSError:
+            pass  # already dead — the abort below is all that's left to do
     writer.transport.abort()
-    return True
+    return "ok"
 
 
 class PumpPoller:
@@ -466,6 +481,9 @@ class PumpPoller:
                        f"first-hour triage table in deploy/HARDWARE-DAY.md"
                        if never_online else
                        f"{self.cfg.name} unreachable for {failures} consecutive polls")
+            # Runs under _poll_lock: the gateway probe adds at most GATEWAY_PROBE_TIMEOUT_S +
+            # GATEWAY_PROBE_GRACE_S (~1.2 s), once per offline edge, so a write queued behind
+            # this poll (e.g. a baseline revert) waits at most ~1.2 s longer, once per outage.
             await self.store.add_event(
                 self.cfg.id, "comm", code="offline", severity="high",
                 message=message,
@@ -528,11 +546,13 @@ class PumpPoller:
 
     # @purpose: #76 item 3 — what the Pi could see at the moment a pump was declared offline,
     # recorded on the comm/offline event so "Pi-side or gateway-side?" is not reconstructed
-    # later: hub link, the other pump, a TCP connect to this pump's gateway, and the client's
-    # last error category. Best-effort: every field is None when unknown; never raises.
+    # later: hub link, the other pump, a TCP connect to this pump's gateway (and why it
+    # failed), and the client's last error category. Best-effort: every field is None when
+    # unknown; never raises.
     async def _offline_attribution(self) -> dict:
         out: dict = {"hub_link_up": None, "peer_pump_online": None,
-                     "gateway_reachable": None, "last_error_category": None}
+                     "gateway_reachable": None, "gateway_probe_result": None,
+                     "last_error_category": None}
         try:
             if self.hub_link_up is not None:
                 up = self.hub_link_up()
@@ -545,35 +565,45 @@ class PumpPoller:
                 out["peer_pump_online"] = any(p.online for p in others)
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] peer pump state unreadable: %s", self.cfg.id, exc)
-        out["gateway_reachable"] = await self._probe_gateway()
+        out["gateway_reachable"], out["gateway_probe_result"] = await self._probe_gateway()
         try:
-            out["last_error_category"] = self.client.stats.last_error_category
+            # "" after a rediscovery rebuilt the client: unknown, not a category
+            out["last_error_category"] = self.client.stats.last_error_category or None
         except Exception:  # noqa: BLE001
             pass
         log.warning("[%s] offline attribution: hub_link_up=%s peer_pump_online=%s "
-                    "gateway_reachable=%s last_error_category=%s", self.cfg.id,
-                    out["hub_link_up"], out["peer_pump_online"], out["gateway_reachable"],
+                    "gateway_reachable=%s gateway_probe_result=%s last_error_category=%s",
+                    self.cfg.id, out["hub_link_up"], out["peer_pump_online"],
+                    out["gateway_reachable"], out["gateway_probe_result"],
                     out["last_error_category"])
         return out
 
-    # @purpose: gateway_reachable for _offline_attribution. A session this client still holds
-    # open IS the answer (True) and is never probed: the W610 accepts one client, so a second
-    # connect would kick our own socket. Otherwise one bounded connect, awaited (the event
-    # loop and the other pump's poller keep running); None if the address is unknown or the
-    # probe hangs or fails.
-    async def _probe_gateway(self) -> bool | None:
+    # @purpose: (gateway_reachable, gateway_probe_result) for _offline_attribution. A session
+    # this client still holds open IS the answer (True, "ok") and is never probed: the W610
+    # accepts one client, so a second connect would kick our own socket. Otherwise one
+    # bounded connect, awaited (the event loop and the other pump's poller keep running).
+    # (None, None) if the address is unknown; (None, "timeout") if the probe itself hangs
+    # past its grace; (None, "error") if it raises.
+    async def _probe_gateway(self) -> tuple[bool | None, str | None]:
         try:
             if getattr(self.client, "connected", False):
-                return True
+                return True, "ok"
             host, port = self.cfg.host, self.cfg.port
             if not host or not port:
-                return None
-            return bool(await asyncio.wait_for(
+                return None, None
+            result = await asyncio.wait_for(
                 self._gateway_probe(host, port, GATEWAY_PROBE_TIMEOUT_S),
-                GATEWAY_PROBE_TIMEOUT_S + GATEWAY_PROBE_GRACE_S))
-        except Exception as exc:  # noqa: BLE001 — includes the timeout; best-effort only
+                GATEWAY_PROBE_TIMEOUT_S + GATEWAY_PROBE_GRACE_S)
+        except TimeoutError:
+            log.info("[%s] gateway probe hung past its bound", self.cfg.id)
+            return None, "timeout"
+        except Exception as exc:  # noqa: BLE001 — best-effort only
             log.info("[%s] gateway probe gave no answer: %r", self.cfg.id, exc)
-            return None
+            return None, "error"
+        if result not in ("ok", "refused", "timeout", "unreachable"):
+            log.info("[%s] gateway probe returned %r", self.cfg.id, result)
+            return None, "error"
+        return result == "ok", result
 
     def _deliberately_stopped(self) -> bool:
         if self.deliberate_stop is None:
