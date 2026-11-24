@@ -24,6 +24,8 @@ ACKED=0; ACKED_BY=""
 # DRIFT_ACK_FILE=/dev/null disables acks (then this script behaves exactly as before);
 # DRIFT_ACK_TODAY=YYYY-MM-DD overrides "today" so expiry can be tested.
 ACK_FILE="${DRIFT_ACK_FILE:-$(dirname "${BASH_SOURCE[0]}")/drift-ack.txt}"
+# TODAY is a UTC date, so every dated gate below (acks, [10]'s 2026-12-15 / 2026-12-31) turns red at 19:00 ET
+# (20:00 EDT) the evening before the date it names.
 TODAY="${DRIFT_ACK_TODAY:-$(date -u +%Y-%m-%d)}"
 # prints "<issue> <expires>" if $1 matches a LIVE ack, "EXPIRED <issue> <expires>" if it matches
 # only an expired one, nothing otherwise.
@@ -374,8 +376,12 @@ fi
 echo
 echo "[10] SPAN transport — v1 REST is removed from the panel 2026-12-31 (#199)"
 # The Pi reports its SPAN transport in the hub state frame (span.transport). Rollout (owner 2026-10-29): the release
-# ships pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
-# fallback). In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
+# shipped pinned to v1 (mode v1), then a read-only v2 soak (span.v2_soak), then — owner's OK — mode auto (v2 first, v1
+# fallback). Cutover: once the auto soak is clean the bridge default becomes v2 (mode v2) and v1 is a deprecated,
+# explicit fallback. In auto/v2 a "v1" read means v2 is failing. Pinned v1 passes until 2026-12-15, then it is drift.
+# Mode auto passes until 2026-12-31, then it is drift too: with v1 gone every fallback attempt is latency and noise, so
+# the fix is an explicit span.transport: v2 (works on every release since #239). Do NOT just remove the key: on a
+# release older than #313 an absent key means v1. Removing it is optional cleanup once the Pi runs a #313+ release.
 if [ -z "${HUB_CLIENT_TOKEN:-}" ]; then
   skip "set HUB_CLIENT_TOKEN to assert which SPAN transport the Pi uses"
 else
@@ -387,17 +393,22 @@ else
   case "$SPANMODE" in
     v1)
       if [[ ! "$TODAY" < "2026-12-15" ]]; then
-        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; set span.transport: auto on the Pi"
+        fail "SPAN still pinned to v1 REST on $TODAY — v1 is removed 2026-12-31; set span.transport: v2 on the Pi (not just removing the key: an absent key is v1 on releases before #313)"
       elif [ -n "$SOAK" ] && [ "$(cut -d' ' -f2 <<<"$SOAK")" -gt 0 ]; then
         fail "SPAN v2 soak: v2 disagreed with v1 on $(cut -d' ' -f2 <<<"$SOAK") of $(cut -d' ' -f1 <<<"$SOAK") reads — see /api/health.span.soak.last_disagreement"
       elif [ -n "$SOAK" ]; then
         pass "SPAN pinned to v1 (rollout); v2 soak agrees on $(cut -d' ' -f1 <<<"$SOAK") reads ($(cut -d' ' -f3 <<<"$SOAK") with v2 unavailable)"
       else
-        pass "SPAN pinned to v1 by config (rollout step 1; next: span.v2_soak: true)"
+        pass "SPAN pinned to v1 by config (deprecated fallback — next: span.v2_soak: true, then auto, then span.transport: v2)"
       fi ;;
     auto|v2)
       case "$SPANTX" in
-        v2) pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE" ;;
+        v2)
+          if [ "$SPANMODE" = auto ] && [[ ! "$TODAY" < "2026-12-31" ]]; then
+            fail "SPAN still on transport auto on $TODAY — v1 is gone; set span.transport: v2 on the Pi (not just removing the key: an absent key is v1 on releases before #313)"
+          else
+            pass "SPAN local reads come over v2 (MQTT eBus), mode $SPANMODE"
+          fi ;;
         v1) fail "SPAN local reads fell back to v1 REST — v2 is failing${SPANV2ERR:+ ($SPANV2ERR)}; v1 is removed 2026-12-31" ;;
         *)  fail "the Pi has not read the SPAN panel on any transport${SPANV2ERR:+ (v2: $SPANV2ERR)}" ;;
       esac ;;

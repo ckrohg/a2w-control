@@ -1,21 +1,28 @@
-# @purpose: The SPAN v2 transport and the v2-first / v1-fallback client (#199) against the fake panel
+# @purpose: The SPAN v2 transport and the SpanClient that serves it (#199) against the fake panel
 # (sim/fake_span.py + sim/fake_span_v2.py: real HTTP, real MQTT-over-TLS, real paho). The breaker/self-heal/backup/
 # deliberate-stop suites already run end to end on a v2-only panel (tests/conftest.py span_transport); this file
 # covers what only the transport layer can get wrong: which transport answers, never a second OPEN on v1 after a
-# possibly-delivered v2 OPEN, QoS 0 writes, stale or not-ready data reading as unknown, re-registration, TLS.
+# possibly-delivered v2 OPEN, QoS 0 writes, stale or not-ready data reading as unknown, re-registration, TLS — and the
+# cutover: v2 is the shipped default, v1 only an explicit, deprecated fallback that warns on every start, auto still
+# prefers v2, and every relay-write path (dashboard breaker control, backup-element arm, self-heal power cycle) lands on
+# v2 while a v1 that is still being served is never asked.
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import ssl
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from bridge import span_control, span_local, span_v2
-from bridge.config import BreakerCircuit, SpanConfig
+from bridge.config import BreakerCircuit, SelfHealConfig, SpanConfig, load_config
+from bridge.self_heal import SelfHealer
 from bridge.span_control import BreakerController, BreakerRefused
 from bridge.span_local import OpenAborted, OpenPermit, SpanClient, SpanLocalPoller
 from bridge.store import Store
@@ -141,9 +148,20 @@ def test_v2_only_panel_down_is_an_error_not_a_v1_answer(make):
         c._fetch_locked()
 
 
-def test_the_release_default_is_v1_and_touches_no_v2(make, tmp_path):
-    """Owner rollout 2026-10-29: the release ships pinned to v1 (no behaviour change); v2 is a later config flip."""
-    assert SpanConfig().transport == "v1" and SpanConfig().v2_soak is False
+def v1_relay_posts(panel):
+    return [r for r in panel.v1_requests if r[1].startswith("/api/v1/circuits/")]
+
+
+def test_the_default_is_v2_and_touches_no_v1(tmp_path):
+    """Cutover (#199, after the auto soak): a config without span.transport runs v2 only. A panel that STILL serves v1
+    (before 2026-12-31) never sees a request — not a register, not a read, not a relay write."""
+    assert SpanConfig().transport == "v2" and SpanConfig().v2_soak is False
+    assert span_local.DEFAULT_TRANSPORT == "v2"
+    bare = SpanClient("h", "p")
+    try:
+        assert bare.transport == "v2" and bare.v2 is not None and bare._soak is None
+    finally:
+        bare.close()
     panel = FakeSpan(v1=True, v2=True)
     addr = panel.start()
     poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw"), None, token_path=str(tmp_path / "tok"))
@@ -151,8 +169,81 @@ def test_the_release_default_is_v1_and_touches_no_v2(make, tmp_path):
         poller.client._fetch_locked()
         poller.client._set_relay_sync(cid(poller.client, "Kitchen"), "CLOSED")
         st = poller.client.transport_status()
+        assert st["mode"] == "v2" and st["read"] == st["write"] == "v2" and st["soak"] is None
+        assert st["deprecated"] is None and st["v2"]["connected"]
+        # the relay already read CLOSED, so the echo needs no wait; the broker may still be taking the /set
+        assert wait_for(lambda: [s[1:] for s in panel.ebus.sets] == [("CLOSED", 0)])
+        assert panel.v1_requests == []
+        assert not (tmp_path / "tok").exists()                 # no v1 token was ever minted
+    finally:
+        poller.client.close()
+        panel.stop()
+
+
+def test_transport_v1_is_an_explicit_deprecated_fallback_that_warns_on_start(tmp_path, caplog):
+    """v1 stays in the code for a few weeks (a firmware surprise may need it) but only by explicit config, and every
+    bridge start on it says so: v1 REST is removed from the panel on 2026-12-31."""
+    panel = FakeSpan(v1=True, v2=True)
+    addr = panel.start()
+    with caplog.at_level(logging.WARNING, logger="bridge.span_local"):
+        poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", transport="v1"), None,
+                                 token_path=str(tmp_path / "tok"))
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and "DEPRECATED" in r.getMessage()]
+    try:
+        assert len(warned) == 1 and "2026-12-31" in warned[0] and "span.transport: v1" in warned[0]
+        poller.client._fetch_locked()
+        poller.client._set_relay_sync(cid(poller.client, "Kitchen"), "CLOSED")
+        st = poller.client.transport_status()
         assert st["mode"] == "v1" and st["read"] == st["write"] == "v1" and st["v2"] is None and st["soak"] is None
+        assert st["deprecated"] and "2026-12-31" in st["deprecated"]      # /api/health + the hub frame carry it
         assert panel.v2_registrations == [] and panel.ebus.connects == [] and panel.ebus.sets == []
+        assert v1_relay_posts(panel) == [("POST", "/api/v1/circuits/c-k")]
+    finally:
+        poller.client.close()
+        panel.stop()
+    # a second start warns again (once per process, not once ever); the default and auto never do
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="bridge.span_local"):
+        SpanClient("h", "p", transport="v1").close()
+        SpanClient("h", "p").close()
+        SpanClient("h", "p", transport="auto").close()
+    assert [r.getMessage() for r in caplog.records if "DEPRECATED" in r.getMessage()] == [span_local.V1_DEPRECATION]
+
+
+@pytest.mark.parametrize("transport, warns", [(None, True), ("v2", True), ("auto", True), ("v1", False)])
+def test_load_config_warns_once_when_v2_soak_is_ignored(tmp_path, caplog, transport, warns):
+    """v2_soak only works on transport v1; anywhere else load_config says the key is ignored, once, instead of silence."""
+    span = {"v2_soak": True, **({"transport": transport} if transport else {})}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"pumps": [{"id": "p1", "name": "P1", "host": "127.0.0.1"}], "span": span,
+                                    "db_path": str(tmp_path / "bridge.db")}))
+    with caplog.at_level(logging.WARNING, logger="bridge.config"):
+        cfg = load_config(path)
+    assert cfg.span.v2_soak is True
+    ignored = [r.getMessage() for r in caplog.records if "span.v2_soak" in r.getMessage()]
+    assert len(ignored) == (1 if warns else 0)
+    if warns:
+        assert "ignored" in ignored[0] and repr(cfg.span.transport) in ignored[0]
+
+
+def test_auto_from_config_still_prefers_v2_and_falls_back_only_when_v2_cannot(tmp_path):
+    """The owner's Pi runs `auto` through the soak: v2 for every read and write while it answers; v1 only when it
+    cannot. Switching the default to v2 changes nothing for a config that still says auto."""
+    panel = FakeSpan(v1=True, v2=True)
+    addr = panel.start()
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", transport="auto"), None,
+                             token_path=str(tmp_path / "tok"))
+    try:
+        poller.client._fetch_locked()
+        poller.client._set_relay_sync(cid(poller.client, "Kitchen"), "CLOSED")
+        st = poller.client.transport_status()
+        assert st["mode"] == "auto" and st["read"] == st["write"] == "v2" and st["deprecated"] is None
+        assert wait_for(lambda: [s[1:] for s in panel.ebus.sets] == [("CLOSED", 0)])
+        assert panel.v1_requests == []
+        panel.ebus.stop()                                   # the broker is gone; v1 REST still answers
+        assert wait_for(lambda: not poller.client.v2._connected)
+        assert cid(poller.client, "Air-Water 1")
+        assert poller.client.transport_status()["read"] == "v1"
     finally:
         poller.client.close()
         panel.stop()
@@ -540,8 +631,9 @@ async def test_a_broker_that_keeps_refusing_backs_off_alarms_once_and_cleans_up(
 
     async def notify(title, message, priority="default", *, tier, resolved=False, action=None):
         sent.append((tier, title))
-    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", v2_soak=True), store, notify=notify,
-                             token_path=str(tmp_path / "span-local-token"))
+    # the soak shadows a v1-pinned client (transport v1 + v2_soak); since the cutover v1 is explicit, never the default
+    poller = SpanLocalPoller(SpanConfig(host=addr, passphrase="pw", transport="v1", v2_soak=True), store,
+                             notify=notify, token_path=str(tmp_path / "span-local-token"))
     try:
         for _ in range(40):                                  # ~4 s of polls (v1 answers every one)
             await poller.poll_once()
@@ -873,3 +965,160 @@ async def test_the_element_open_refuses_a_frozen_tree_at_dispatch(tmp_path, monk
         await poller.stop()
         await store.close()
         panel.stop()
+
+
+# --- the cutover (#199): on the default transport every relay-write path lands on v2 ------------------------------------
+# The strongest form of "goes through v2" is a panel that STILL serves v1 (today, before 2026-12-31) and is never asked:
+# not a register, not a read, not a relay POST. The three paths that can write a relay are the dashboard's breaker
+# control (BreakerController.execute, which /api/span/breaker and the hub `breaker` command call), the backup-element
+# arm (SpanLocalPoller._evaluate_arm, the one write that path can make: a CLOSE) and the self-heal power cycle
+# (SelfHealer → BreakerController.execute power_cycle). The safety invariants sit below all three in
+# SpanClient._set_relay_sync and are asserted here on the same client.
+class _Time:
+    """Injected clock + sleep for the controller and the self-heal: a 60 s hold costs nothing."""
+
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+    def clock(self) -> float:
+        return self.t
+
+    async def sleep(self, s: float) -> None:
+        self.t += s
+        await asyncio.sleep(0)
+
+
+class _Pump:
+    """A pump poller as the self-heal sees it: a snapshot with fresh stamps, optionally in an E21 fault."""
+
+    def __init__(self, pid, name, ft):
+        self.cfg = SimpleNamespace(id=pid, name=name)
+        self.ft = ft
+        self.snapshot = {"online": True, "last_poll_ts": ft.clock(), "last_poll_mono": ft.clock(), "running": False,
+                         "defrosting": False, "state": "idle", "active_faults": [], "identity_ok": True}
+
+    def fresh(self):
+        self.snapshot.update(last_poll_ts=self.ft.clock(), last_poll_mono=self.ft.clock())
+
+    def fault(self, code="E21", age_min=12.0):
+        self.snapshot["active_faults"] = [{"key": "2111.13", "code": code, "severity": "warning",
+                                           "since": self.ft.clock() - age_min * 60, "message": "x"}]
+        self.snapshot["state"] = "fault"
+
+
+@pytest.fixture
+def flush_v2(monkeypatch):
+    """The fake publishes FakeSpan's dict every 20 ms; a controller read-back right after a write must not race it."""
+    real_fetch = span_v2.SpanV2.fetch
+
+    def fetch(self, wait=True):
+        for ebus in list(fake_span_v2.LIVE):
+            if self.broker and self.broker.endswith(f":{ebus.port}"):
+                ebus.flush(self)
+        return real_fetch(self, wait)
+    monkeypatch.setattr(span_v2.SpanV2, "fetch", fetch)
+
+
+@pytest.fixture
+async def cutover(tmp_path, flush_v2):
+    """A bridge on the release default (no span.transport key) against a panel that serves BOTH v1 and v2."""
+    made = []
+
+    async def _make(**span_kw):
+        panel = FakeSpan(v1=True, v2=True)
+        panel.set("Air-Water 2", instantPowerW=-15.0)        # the faulted pump's circuit, idle
+        addr = panel.start()
+        store = Store(str(tmp_path / f"b{len(made)}.db"))
+        await store.open()
+        cfg = SpanConfig(host=addr, passphrase="pw", close_retry_delay_s=1.0, **span_kw)
+        assert cfg.transport == "v2"                          # nothing here sets it: the default
+        ft = _Time()
+        poller = SpanLocalPoller(cfg, store, token_path=str(tmp_path / f"tok{len(made)}"),
+                                 arm_state_path=str(tmp_path / f"span-arm{len(made)}.json"))
+        ctl = BreakerController(cfg, poller.client, store, cache=poller, state_dir=str(tmp_path),
+                                sleep=ft.sleep, clock=ft.clock, mono=ft.clock)
+        rig = SimpleNamespace(panel=panel, store=store, cfg=cfg, ft=ft, poller=poller, ctl=ctl, tmp_path=tmp_path)
+        made.append(rig)
+        return rig
+    yield _make
+    for rig in made:
+        await rig.ctl.stop()
+        await rig.poller.stop()
+        await rig.store.close()
+        rig.panel.stop()
+        assert rig.panel.rejected == [] and rig.panel.ebus.rejected == [], "a write the panel's own schema refuses"
+
+
+def _sets(panel):
+    return [s[1:] for s in panel.ebus.sets]
+
+
+async def test_dashboard_breaker_control_goes_through_v2(cutover):
+    """hub → Pi → BreakerController.execute (what /api/span/breaker and the hub `breaker` command call)."""
+    r = await cutover()
+    res = await r.ctl.execute("Air-Water 2", "power_cycle", source="ui")
+    assert res["ok"] and res["verified"] and res["relay_state"] == "CLOSED" and res["off_s"] >= 60
+    assert r.panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
+    assert _sets(r.panel) == [("OPEN", 0), ("CLOSED", 0)]                   # the writes, on v2, QoS 0
+    res = await r.ctl.execute("Buffer Tank", "close", source="ui")           # the element: close-only, also on v2
+    assert res["ok"] and r.panel.relay("Buffer Tank") == "CLOSED"
+    # it already read CLOSED, so the echo needed no wait and the broker may still be taking the /set
+    assert wait_for(lambda: _sets(r.panel) == [("OPEN", 0), ("CLOSED", 0), ("CLOSED", 0)])
+    assert r.panel.v1_requests == []                                         # v1 is served and was never asked
+    tx = r.ctl.snapshot()["transport"]
+    assert tx["mode"] == "v2" and tx["read"] == "v2" and tx["write"] == "v2" and tx["deprecated"] is None
+    # the choke point below every path is unchanged: without a permit an OPEN is refused before any transport
+    with pytest.raises(ValueError, match="CLOSE-ONLY"):
+        await r.poller.client.set_relay(cid(r.poller.client, "Air-Water 2"), "OPEN")
+    with pytest.raises(BreakerRefused, match="close-only"):
+        await r.ctl.execute("Buffer Tank", "open")
+    assert len(r.panel.ebus.sets) == 3 and r.panel.v1_requests == []
+
+
+async def test_backup_element_arm_goes_through_v2(cutover):
+    """The arm path (owner intent ARMED, arm_live): the element reads OPEN, so the poll CLOSEs it — over v2, with no
+    permit (it never holds one: close-only by construction)."""
+    r = await cutover(arm=True, arm_live=True)
+    r.panel.set("Buffer Tank", relayState="OPEN", instantPowerW=0.0)
+    rows = await r.poller.poll_once()
+    assert {x["name"] for x in rows} == {"Buffer Tank", "Air-Water 1", "Air-Water 2"}
+    assert r.panel.relay("Buffer Tank") == "CLOSED"
+    assert r.panel.writes == [("Buffer Tank", "CLOSED")] and _sets(r.panel) == [("CLOSED", 0)]
+    assert r.panel.v1_requests == []
+    st = r.poller.status()
+    assert st["mode"] == "v2" and st["read"] == "v2" and st["write"] == "v2" and st["last_ok_ts"]
+    assert r.poller.latest_arm["armed"] and r.poller.latest_arm["live"]
+    # a second poll finds the element available and writes nothing more (and still asks v1 nothing)
+    await r.poller.poll_once()
+    assert _sets(r.panel) == [("CLOSED", 0)] and r.panel.v1_requests == []
+
+
+async def test_self_heal_power_cycle_goes_through_v2(cutover):
+    """SelfHealer (live, map verified) → BreakerController power_cycle, with its precheck re-run at v2's dispatch
+    boundary — the whole OPEN / hold / CLOSE over v2."""
+    r = await cutover()
+    p1, p2 = _Pump("pump1", "Heat Pump 1", r.ft), _Pump("pump2", "Heat Pump 2", r.ft)
+    heal = SelfHealer(SelfHealConfig(live=True, circuits_verified=True), {"pump1": p1, "pump2": p2}, r.ctl, r.store,
+                      state_dir=str(r.tmp_path), clock=r.ft.clock, mono=r.ft.clock, boot_id="boot-A")
+
+    async def prime():   # one panel read, as the SPAN poll loop does every ~25 s
+        r.poller.note_circuits(await r.poller.client.fetch_circuits(), r.ft.clock(), r.ft.clock())
+    try:
+        await prime()
+        assert heal.status()["mode"] == "live" and heal.config_errors == {}
+        p2.fault(age_min=12)
+        await heal.tick()                        # first sight of the fault: the in-process grace starts
+        r.ft.t += 601
+        p1.fresh()
+        p2.fresh()
+        await prime()
+        await heal.tick()                        # the grace has passed on both clocks: the live cycle runs
+        assert r.panel.writes == [("Air-Water 2", "OPEN"), ("Air-Water 2", "CLOSED")]
+        assert _sets(r.panel) == [("OPEN", 0), ("CLOSED", 0)]
+        assert r.panel.v1_requests == []
+        assert r.panel.relay("Air-Water 2") == "CLOSED"
+        assert [e["code"] for e in await r.store.get_events("pump2", 1) if e["type"] == "self_heal"] == ["cycle_start"]
+        assert heal.status()["pumps"]["pump2"]["phase"] == "verifying"
+        assert r.ctl.snapshot()["transport"]["write"] == "v2"
+    finally:
+        await heal.stop()
