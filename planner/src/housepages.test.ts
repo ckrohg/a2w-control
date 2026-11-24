@@ -557,12 +557,15 @@ process.on("exit", () => { if (!finished) { console.error("housepages.test.ts: s
     assert.equal(titled(r.logged, /Freeze-risk advisory/).length, 0, "not swallowed as a duplicate");
   }
   {
-    // an incident older than the 24 h latch window, then a redeploy inside the band: the old latch is still adopted, so
-    // the clear still sends the all-clear (age limits re-paging, it never closes the incident)
+    // an incident older than the 24 h latch window, then a redeploy inside the band: the old latch is adopted as OWED
+    // but unheard, so the freeze that still holds pages once more and the clear still sends the all-clear
     const r = rig();
     await r.freezing();
     now += 30 * 3_600_000;
     r.redeploy();
+    // the first poll after the restart has no reading: adoption happens, nothing is sent (#324 review)
+    await r.pages.freezeRisk(r.slx({ outdoorF: null as unknown as number }));
+    assert.equal(titled(r.heard, /Freeze-risk advisory/).length, 1, "a null first reading sends nothing");
     const inBand = () => r.pages.freezeRisk(r.slx({ outdoorF: 6, tankF: 100 }));
     await r.cycles(3, inBand);
     assert.equal(allClears(r).length, 0, "inside the band: no all-clear");
