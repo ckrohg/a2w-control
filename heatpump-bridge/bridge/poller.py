@@ -829,14 +829,12 @@ class PumpPoller:
         target_register = R.SETPOINT_REGISTER_FOR_KIND[kind]
 
         # unattended actors (scheduler / machine token) can't drop below the winter-safe
-        # floor even within the mode's clamp (re-audit: setpoint-only is still heat-removing)
+        # floor even within the mode's clamp (re-audit: setpoint-only is still heat-removing).
+        # A fractional floor is compared rounded UP to the whole degree (45.5 -> 46): the value
+        # was already required to be whole, so the write is never dropped below the config.
         eff_min = bounds[0]
         if unattended and kind == "heating":
-            g = self.app_cfg.guardrails
-            floor = g.unattended_min_setpoint_c
-            if floor is None:
-                floor = g.setback_setpoint_c
-            eff_min = max(eff_min, floor)
+            eff_min = max(eff_min, self.app_cfg.guardrails.unattended_floor_whole_c)
         try:
             context = f"{kind} mode" + (f", unit max {unit_max:g}°C" if kind == "heating" else "")
             if unattended and eff_min > bounds[0]:
