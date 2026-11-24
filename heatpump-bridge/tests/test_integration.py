@@ -729,8 +729,9 @@ async def test_scheduler_catchup_after_downtime_collapses_to_latest(rig):
     poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
     await poller.poll_once()
     assert poller.snapshot["on"] is True
-    await store.add_schedule("p1", "06:00", "on")
-    await store.add_schedule("p1", "09:00", "off")
+    # added the evening before (pinned: add_schedule stamps a rule already past "now")
+    await store.add_schedule("p1", "06:00", "on", now=datetime(2026, 7, 3, 21, 0))
+    await store.add_schedule("p1", "09:00", "off", now=datetime(2026, 7, 3, 21, 0))
     sched = Scheduler(store, {"p1": poller})
 
     # bridge was down all morning; first tick at 14:23 — net intended state is OFF,
@@ -890,7 +891,7 @@ async def test_scheduler_off_becomes_setback_not_shutdown(rig):
     poller.app_cfg.guardrails.setback_setpoint_c = 38
     await poller.poll_once()
 
-    await store.add_schedule("p1", "23:00", "off")
+    await store.add_schedule("p1", "23:00", "off", now=datetime(2026, 7, 4, 22, 0))
     sched = Scheduler(store, {"p1": poller})
     await sched.check_once(datetime(2026, 7, 4, 23, 0, 5))
 
@@ -907,7 +908,7 @@ async def test_scheduler_fires_once_per_day(rig):
     await poller.poll_once()
     assert poller.snapshot["on"] is True
 
-    await store.add_schedule("p1", "06:00", "off")
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 5, 0))
     sched = Scheduler(store, {"p1": poller})
     now = datetime(2026, 7, 4, 6, 0, 10)
 
@@ -925,6 +926,106 @@ async def test_scheduler_fires_once_per_day(rig):
 
     await store.delete_schedule("p1", (await store.list_schedules("p1"))[0]["id"])
     assert await store.list_schedules("p1") == []
+
+
+async def test_scheduler_rule_added_after_its_time_waits_for_tomorrow(rig):
+    # a timer added at 14:00 for 06:00 must not fire on the next tick: the <= catch-up
+    # is for restarts, not new rules — that would be a write nobody asked for right now
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 14, 0))
+    sched = Scheduler(store, {"p1": poller})
+
+    await sched.check_once(datetime(2026, 7, 4, 14, 0, 20))
+    assert poller.snapshot["on"] is True
+    assert await pump.get_reg(R.REG_ON_OFF) == 1
+
+    await sched.check_once(datetime(2026, 7, 5, 6, 0))
+    assert poller.snapshot["on"] is False
+    fired = [e for e in await store.get_events("p1", 1)
+             if e["type"] == "power_write" and e["code"] == "accepted"]
+    assert len(fired) == 1
+
+
+async def test_scheduler_rule_added_before_its_time_fires_same_day(rig):
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+    assert poller.snapshot["on"] is True
+
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 5, 0))
+    sched = Scheduler(store, {"p1": poller})
+
+    await sched.check_once(datetime(2026, 7, 4, 5, 59))   # not yet
+    assert poller.snapshot["on"] is True
+    await sched.check_once(datetime(2026, 7, 4, 6, 0))
+    assert poller.snapshot["on"] is False
+
+
+async def test_scheduler_rule_added_in_its_own_minute_waits_for_tomorrow(rig):
+    # "at or before now": a 06:00 timer added at 06:00:30 is already past, not a fire-now
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+
+    await store.add_schedule("p1", "06:00", "off", now=datetime(2026, 7, 4, 6, 0, 30))
+    sched = Scheduler(store, {"p1": poller})
+    await sched.check_once(datetime(2026, 7, 4, 6, 0, 50))
+    assert poller.snapshot["on"] is True
+    await sched.check_once(datetime(2026, 7, 5, 6, 0))
+    assert poller.snapshot["on"] is False
+
+
+async def test_scheduler_midnight_rule_added_at_2359_fires_at_midnight(rig):
+    # "00:00" sorts before "23:59", so it is stamped today — and still fires at the
+    # midnight one minute later, because that is already tomorrow's date
+    from datetime import datetime
+    from bridge.scheduler import Scheduler
+
+    pump, poller, store = rig
+    poller.app_cfg.guardrails.restrict_unattended_writes = False  # raw on/off for this test
+    await poller.poll_once()
+
+    await store.add_schedule("p1", "00:00", "off", now=datetime(2026, 7, 4, 23, 59))
+    sched = Scheduler(store, {"p1": poller})
+    await sched.check_once(datetime(2026, 7, 4, 23, 59, 20))
+    assert poller.snapshot["on"] is True
+    await sched.check_once(datetime(2026, 7, 5, 0, 0, 5))
+    assert poller.snapshot["on"] is False
+
+
+async def test_api_timer_added_after_its_time_is_stamped_fired_today(rig):
+    # the only production caller (POST /pumps/{id}/schedules) passes no clock, so the store
+    # must use wall time: "00:00" is always at or before now, hence always stamped today
+    from datetime import date
+    from types import SimpleNamespace
+    from bridge import api as api_mod
+    from bridge.auth import Principal
+
+    pump, poller, store = rig
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        pollers={"p1": poller}, store=store)))
+    principal = Principal(source="test", can_write=True, authenticated=True)
+
+    before = date.today().isoformat()
+    await api_mod.add_schedule(request, "p1",
+                               api_mod.ScheduleRequest(time="00:00", action="off"),
+                               principal=principal)
+    after = date.today().isoformat()
+    rows = await store._query("SELECT last_fired_date FROM schedules WHERE pump_id=?", ("p1",))
+    assert len(rows) == 1 and rows[0]["last_fired_date"] in (before, after)
 
 
 async def test_runtime_edges_become_events(rig):

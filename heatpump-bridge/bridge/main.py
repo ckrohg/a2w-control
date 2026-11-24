@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 
 from .api import router, validation_error_handler
 from .auth import UI_COOKIE, cookie_secure, load_or_create_ui_secret, mint_session
-from .config import AppConfig, load_config
+from .config import AppConfig, guardrail_warnings, load_config
 from .exporter import Exporter
 from .guardrails import SetpointGuard
 from .hub_client import HubClient
@@ -38,6 +38,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
     cfg = config or load_config()
+    for warning in guardrail_warnings(cfg):
+        logging.getLogger(__name__).warning(warning)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -65,6 +67,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
+        for poller in pollers.values():   # #76: what a comm/offline event records about the Pi's own links
+            poller.hub_link_up = (lambda: hub_client.connected if hub_client.enabled else None)
+            poller.peers = pollers
 
         async def span_notify(title, message, priority="default", *, tier, resolved=False, action=None):
             from . import notify

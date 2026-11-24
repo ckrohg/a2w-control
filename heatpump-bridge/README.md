@@ -86,7 +86,8 @@ bridge/
                     self-heal and offline escalation stand down, flagged per pump to the hub
   backup_fallback.py  #210 Pi-local backup-element gate: CLOSE "Buffer Tank" when every pump
                     has been down for hold_min; close-only, shadow by default
-  sysstat.py        stdlib-only Pi health sampler (CPU, load, RAM, disk, SoC temp, uptime)
+  sysstat.py        stdlib-only Pi health sampler (CPU, load, RAM, disk, SoC temp, uptime, and
+                    the Pi's own Wi-Fi link, see "System stats")
   discovery.py      LAN discovery of W610 gateways (USR UDP broadcast + TCP sweep); MAC helpers
                     for the poller's identity check
   w610_config.py    EXPERIMENTAL remote W610 serial-side configuration over the vendor UDP channel
@@ -103,6 +104,41 @@ deploy/             Pi systemd units (bridge, auto-update timer, watchdog timer)
                     config template, bootstrap/update scripts, W610 / Tailscale / cloudflared /
                     Railway-hub guides
 ```
+
+## Comm stats
+
+Each pump's `comm` object (`/api/pumps/{id}/status`, the hub frame's per-pump snapshot, the
+UI comm footer) carries the counters from `CommStats` in `bridge/modbus_client.py`. They
+count from when the pump's client was created: bridge start, or a gateway reassignment
+(`apply_gateway`), which is the only place they reset.
+
+Added for #76 (additive; every earlier field keeps its meaning and its total):
+
+- `last_rtt_ms`, `max_rtt_ms`: round trip of the latest answered Modbus request and the
+  worst one since the stats were created, on a monotonic clock. Requests that got no reply
+  are in `timeouts`, not here.
+- `slow_requests`: answered requests slower than `SLOW_RTT_MS` (1000 ms, a constant in
+  `modbus_client.py`; `PumpClient(slow_rtt_ms=…)` overrides it). This is "slow with the
+  link up".
+- `crc_errors`: bytes arrived but no valid frame (bad CRC or a short frame — which includes
+  a frame a WiFi stall cut short and a single noise byte). It is counted *alongside*
+  `timeouts`, never instead of it: pymodbus drops such a frame without raising, so the
+  request still ends as a timeout and counts in `timeouts` **and** in `crc_errors`. It is
+  counted nowhere else, so `timeouts − crc_errors` is true silence (polls where the pump
+  sent nothing at all).
+- `mismatched_frames`: a reply that passed its CRC but has the wrong shape, typically a late
+  reply matched to the next request after a WiFi stall. It counts in `io_errors` (as it
+  always did) **and** in `mismatched_frames`, never in `crc_errors` or `timeouts`, and
+  records no round trip (the reply may belong to an earlier request). `io_errors` keeps
+  every increment it had before; CRC failures were never in it, they were in `timeouts`.
+
+The silent drop of bad-CRC and short frames is pymodbus behaviour, pinned by the wire tests
+in `tests/test_comm_latency_crc.py` at pymodbus 3.13.1. `pyproject.toml` allows
+`pymodbus>=3.9`, so re-run those tests after any pymodbus upgrade: if a later version raises
+on a bad frame instead, `crc_errors` stops counting.
+
+The SQLite `comm_stats` table has fixed columns and no JSON column, so the new fields are
+not persisted there; they are live values only. `/api/health` does not carry comm stats.
 
 ## Write guardrails (always on)
 
@@ -293,6 +329,33 @@ There are no config keys. The watch runs whenever breaker control is configured 
 `span.passphrase`), uses the `self_heal.circuits` map, and its timings are module constants. Status
 appears in `/api/health.deliberate_stops`.
 
+## Comm events
+
+Each `comm`/`offline` event's `detail` records what the Pi could see at that moment (#76):
+`hub_link_up` (the hub WebSocket was connected), `peer_pump_online` (the other pump was still
+online), `gateway_reachable` (this pump's W610 accepted a TCP connect within 1 s, or the
+bridge still held its session open) and `gateway_probe_result`, why that probe ended: `ok`,
+`refused`, `timeout`, `unreachable` (no route or no network on the Pi) or `error` (the probe
+itself failed). Each is `null` when unknown, next to `category` and `last_error_category`
+(`null` too after a rediscovery rebuilt the client).
+
+Read the pair of events, one per pump, and the ones after them, not the first one alone.
+When the Pi loses its own Wi-Fi, the first offline event usually records `hub_link_up`
+true (the hub link can take tens of seconds to notice), `peer_pump_online` true (the other
+pump has not reached its threshold yet) and `gateway_reachable` false. On its own that looks
+like the W610's Wi-Fi. The second pump's event, a few seconds later, then shows the peer
+offline too, and soon `hub_link_up` turns false. So:
+
+- both pumps offline within one poll interval or so, with `hub_link_up` false in the later
+  event, is the Pi's own network;
+- one pump offline, the other still online through its next events, the hub up and
+  `gateway_reachable` false, is that gateway's Wi-Fi;
+- a reachable gateway whose polls still fail is the serial side or the pump.
+
+A pump whose breaker a person switched off at the SPAN panel (#212, a deliberate stop) does
+not answer polls either, so as the other pump's peer it reads as `peer_pump_online` false.
+Check `/api/health.deliberate_stops` before you read that as an outage.
+
 ## Hub link
 
 `bridge/hub_client.py`. The Pi dials OUT to the Railway hub over WebSocket and holds the
@@ -329,6 +392,23 @@ The phone push (#211/#237) POSTs to 6bb's token-protected `/api/external/alert`.
 sent with it. If either is unset, pages arrive by email only. Each push carries a per-incident tag, so the
 all-clear replaces the page on the phone. Email needs `resend_api_key` + `resend_to`. Keep the keys
 out of the repo like the other tokens.
+
+## System stats
+
+`bridge/sysstat.py`. The scheduler records one Pi health row a minute in `system_stats` (kept 90 days).
+The latest row is served at `/api/system`, the series at `/api/system/history`, and the latest row rides
+the analytics push as `system`.
+
+**The Pi's own Wi-Fi** (#76). Each row also carries `wifi_signal_dbm` and `wifi_link_quality` (the level
+and "link" columns of the `wlan0` row in `/proc/net/wireless`), `wifi_bssid` and `wifi_freq_mhz` (the
+in-use row of `nmcli dev wifi list`, read without a rescan), and `wifi_bssid_changes`, the number of
+times this bridge process has seen the Pi move to a different access point. The Pi's dropouts were
+diagnosed as roaming between weak 2.4 GHz mesh nodes, so the next comm flap can be laid against these
+columns: a weak signal or a roam at that minute points at the Pi's radio, a steady link points at the
+W610 gateways. The counter restarts at 0 with the bridge, so read it together with `uptime_s`. A source
+that cannot be read (no `/proc/net/wireless`, nmcli missing, failing or slower than 1 s) leaves its
+fields null; it never fails the sample. The keys are additive: the mirror stores only the columns it
+knows, so the Wi-Fi columns are in the Pi's DB and `/api/system` until the mirror adds them.
 
 ## Phases
 

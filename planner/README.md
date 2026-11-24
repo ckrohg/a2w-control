@@ -393,7 +393,7 @@ heartbeats every poll (§Phase B).
 | `HYGIENE_SUMMER_INTERVAL_H` | = the base interval | The I8 interval in the cool-tank regime (outdoor ≥ 55 °F). |
 | `BANK_F` | `0` | #58 afternoon bank: raise the day's warmest-hour block to `dhwFloor + BANK_F`. Clamped to 0–15; 0 = off. |
 | `DHW_FLOOR_F` | `120` | DHW-ready floor, which also sets the idle target. Clamped to 112–125; unparseable = 120. `/health.dhw.floor_f`. |
-| `DHW_SHOWER_WINDOWS` | unset | Owner-declared shower windows, `HH:MM-HH:MM,…` local time, merged into the learned pre-boost peaks. `/health.dhw.shower_windows`. |
+| `DHW_SHOWER_WINDOWS` | unset | Owner-declared shower windows, `HH:MM-HH:MM,…` local time, added to the learned pre-boost peaks. A declared start always opens a window, the hour before it is kept free so that window's boost lands there, and learned peaks that end before the first declared start get no boost (learned `[2,6]`,`[7,13]` + `06:00-10:00` → `[6,13]`: one boost, at 05:00, none at night). Declare the earliest showers of the day. `/health.dhw.shower_windows`. |
 | `WINTER_DP_ENABLED` | off | `1` lets the winter DP solve raise commanded targets. The solve itself always runs in shadow when the forecast dips below 55 °F (`/health.winter_dp`). |
 | `FLOOR_CADENCE` | on | `0` disables the per-poll demand-floor re-check (#136). On: a floor ≥ 3 °F above the plan's current block raises that block in place, raises only. `/health.demand_floor_cadence`. |
 | `SHADOW_EVERY_MIN` | `60` | Shadow-plan cadence; also sets the demand feed's "healthy" window (cadence + 5 min, at least 35). |

@@ -9,7 +9,8 @@ from bridge.sysstat import SystemStats
 
 EXPECTED_KEYS = {"ts", "cpu_pct", "load1", "load5", "load15", "ncpu", "mem_used_pct",
                  "mem_total_mb", "mem_avail_mb", "disk_used_pct", "disk_free_gb",
-                 "disk_total_gb", "cpu_temp_c", "uptime_s"}
+                 "disk_total_gb", "cpu_temp_c", "uptime_s", "wifi_signal_dbm",
+                 "wifi_link_quality", "wifi_bssid", "wifi_freq_mhz", "wifi_bssid_changes"}
 
 
 def test_read_returns_full_key_set():
@@ -22,8 +23,8 @@ def test_read_returns_full_key_set():
 
 def test_values_are_json_safe_and_cpu_needs_two_reads():
     s = SystemStats().read()
-    for v in s.values():
-        assert v is None or isinstance(v, (int, float))
+    for k, v in s.items():
+        assert v is None or isinstance(v, str if k == "wifi_bssid" else (int, float))
     # first read has no previous /proc/stat baseline → cpu_pct can't be a delta yet
     assert s["cpu_pct"] is None
 

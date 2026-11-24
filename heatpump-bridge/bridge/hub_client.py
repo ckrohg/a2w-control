@@ -54,6 +54,9 @@ class HubClient:
         self.pump_power = None        # pump_power.PumpPower — power_w is the SPAN circuit's draw, never the registers
         self._task: asyncio.Task | None = None
         self._breaker_tasks: set[asyncio.Task] = set()
+        # True only while a hub WebSocket session is open (set/cleared in _run). The pollers
+        # read it at a comm/offline edge to tell a Pi-side outage from a gateway one (#76).
+        self.connected = False
 
     @property
     def enabled(self) -> bool:
@@ -82,7 +85,11 @@ class HubClient:
                 ) as ws:
                     backoff = _BACKOFF_MIN_S  # connected cleanly -> reset the backoff
                     log.info("hub link established: %s", self.cfg.url)
-                    await self._session(ws)
+                    self.connected = True
+                    try:
+                        await self._session(ws)
+                    finally:
+                        self.connected = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — swallow + retry, never raise into bridge

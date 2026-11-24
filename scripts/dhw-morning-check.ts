@@ -11,7 +11,10 @@
  * scripts/dhw-morning.test.ts).
  *
  * Windows are production's: learnDhwWindows over the --learn-days of tank history before --from, then
- * mergeWindows(peakWindows(hourScores), the declared shower windows) — index.ts shadowOnce. Production relearns every
+ * boostWindows(peakWindows(hourScores), the declared shower windows) — index.ts shadowOnce, where a declared start
+ * always opens a window and a learned peak that ends before the first declared start is dropped. (Before that rule the
+ * planner took the plain union, so a morning planned earlier may show its boost on the hour before the LEARNED start
+ * and read NO_BOOST here.) Production relearns every
  * hour over a rolling 14 d; this check learns ONCE, so a peak that moved inside the checked range is judged against
  * the windows as they stood before --from. --windows overrides the declared windows (default: the DHW_SHOWER_WINDOWS
  * env, as the planner reads it); with the learner returning null, only the declared windows are used.
@@ -24,7 +27,7 @@
  */
 import { Store } from "../planner/src/store";
 import { assertLocalDatabaseUrl } from "../planner/src/local-db";
-import { learnDhwWindows, mergeWindows, peakWindows } from "../planner/src/dhw";
+import { boostWindows, learnDhwWindows, peakWindows } from "../planner/src/dhw";
 import {
   TZ, DEFAULT_FAIL_BELOW_F, etInstant, etParts, shiftDay, daysBetween, parseWindowsArg, windowLabel, windowTimes,
   evaluateWindow, summarize, formatTable, formatSummary,
@@ -98,9 +101,9 @@ async function main(): Promise<void> {
     const learned = learnDhwWindows(history);
     const peaks = learned ? peakWindows(learned.hourScores) : [];
     const declared = parseWindowsArg(DECLARED_RAW);
-    const windows = mergeWindows(peaks, declared);
+    const windows = boostWindows(peaks, declared);
     const source = learned
-      ? `learned peaks ${fmtWindows(peaks)} (${learned.days} d, ${learned.drawEvents} draw events in the ${LEARN_DAYS} d before ${days[0]}) merged with declared ${fmtWindows(declared)} (${DECLARED_FROM})`
+      ? `learned peaks ${fmtWindows(peaks)} (${learned.days} d, ${learned.drawEvents} draw events in the ${LEARN_DAYS} d before ${days[0]}) combined (boostWindows) with declared ${fmtWindows(declared)} (${DECLARED_FROM})`
       : `declared ${fmtWindows(declared)} (${DECLARED_FROM}) only — the learner returned null on ${history.length} tank rows in the ${LEARN_DAYS} d before ${days[0]}`;
     say(`windows checked: ${fmtWindows(windows)} — ${source}`);
     if (!windows.length) throw new Error(`no windows to check: the learner found no peak hours and none were declared — pass --windows "06:30-10:00"`);
