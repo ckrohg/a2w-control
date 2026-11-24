@@ -2355,6 +2355,8 @@ async function loop(): Promise<void> {
 async function loopBody(): Promise<void> {
   // restore FIRST, so this tick's stage / SPAN evaluation reconciles adopted episodes before any re-send (codex pass 5)
   await restoreAlertState();
+  // a latch whose all-clear went out but whose delete failed: delete it now, before it can outlive a restart (#324 review)
+  await latches.retryReleases();
   try {
     await pollOnce();
     lastPollAt = new Date().toISOString();
