@@ -4,8 +4,14 @@ Persistent Node/TypeScript relay between the **Pi bridge** (WebSocket, dials out
 and the **optimizer + Vercel dashboard** (HTTP). It buffers the latest pump state
 the Pi pushes and forwards setpoint commands to the Pi, awaiting an ack.
 
-Setpoint is the **only** relayed action by design. Power/mode/parameter changes
-stay human-only on the direct LAN/Funnel path and are never relayed by the hub.
+The hub relays exactly **three** actions, and nothing else: a **setpoint** (`/api/command`,
+client token only), the per-pump **write-enable arm/disarm** (`/api/write-enable`) and an
+allowlisted **SPAN breaker action** (`/api/breaker`). The last two are double-gated: they need
+the client bearer **and** a separate `X-Arm-Token: HUB_ARM_TOKEN` header. The dashboard's
+server holds that token and sends it only after a fresh password re-entry; the planner holds it
+too when its backup-element gate is live (`BACKUP_GATE=live`) and uses it for `/api/breaker`
+on the backup element only. Pump power/mode/parameter writes are not relayed at all — those
+stay human-only on the direct LAN/Funnel path.
 
 ## Architecture
 
@@ -73,7 +79,7 @@ A nack is a **normal** outcome (guardrails still apply on the Pi).
 | ------------------ | ------- |
 | `HUB_PI_TOKEN`     | Bearer token the Pi presents on its WS handshake. Wrong/absent → WS close `4401`. |
 | `HUB_CLIENT_TOKEN` | Bearer token the optimizer + dashboard present on HTTP. |
-| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both off). Held only by the dashboard's server, released only after a fresh password re-entry. |
+| `HUB_ARM_TOKEN`    | SEPARATE secret for `/api/write-enable` and `/api/breaker` (unset = both answer 503). Two holders: the dashboard's server, which sends it only after a fresh password re-entry; and the planner when its backup-element gate is live (`BACKUP_GATE=live`), which uses it for `/api/breaker` on the backup element only. |
 | `HUB_READONLY_TOKEN` | Optional. Read-only bearer for the 6bb home app (#190) — see below. Unset = off, nothing changes. |
 | `PORT`             | HTTP + WS port. Railway injects this automatically; defaults to `8080`. |
 | `NTFY_TOPIC`       | Optional. Dead-man watchdog: ntfy topic to alert if the Pi goes silent. Same topic the Pi uses. Unset → watchdog off. |
@@ -137,15 +143,39 @@ npm run typecheck
    declared in `.railway/railway.ts` at the repo root and written to the service with
    `railway config apply` — which redeploys both services, so read that file's header
    first. There is no `railway.toml` any more (#164).
-2. **Set the two tokens** as service variables:
+2. **Set the tokens** as service variables:
    - `HUB_PI_TOKEN` = a long random secret (share with the Pi)
    - `HUB_CLIENT_TOKEN` = a different long random secret (share with the optimizer + dashboard)
+   - `HUB_ARM_TOKEN` = a third secret (share with the dashboard's server, and with the planner
+     only if its backup-element gate runs live); leave unset to keep `/api/write-enable` and
+     `/api/breaker` switched off (both answer 503)
    - `PORT` is provided by Railway automatically — do not hardcode it.
 3. **Generate a public domain** (Settings → Networking → Generate Domain). This
    gives you the public host, e.g. `a2w-hub-production.up.railway.app`.
    - HTTP base URL: `https://a2w-hub-production.up.railway.app`
    - Pi WS URL: `wss://a2w-hub-production.up.railway.app/pi`
-4. Verify: `curl https://<host>/health` → `{"ok":true,"pi_connected":false,"last_state_ts":null}`.
+4. Verify: `curl https://<host>/health`. On a fresh boot, before the Pi has connected, the body
+   (`hub/src/index.ts` — the first three fields are the deploy-gate/drift-check contract, the rest
+   are the #166 dropout tracker's snapshot) looks like:
+
+   ```json
+   {
+     "ok": true,
+     "pi_connected": false,
+     "last_state_ts": null,
+     "pi_dropouts_24h": 0,
+     "pi_dropouts_7d": 0,
+     "longest_dropout_min": 0,
+     "last_dropout": null,
+     "current_dropout_min": null,
+     "tracking_since": "2026-11-21T12:00:00.000Z"
+   }
+   ```
+
+   Once the Pi is on, `pi_connected` flips to `true` and `last_state_ts` carries the `ts` of
+   the latest pushed state. If the Pi then drops, `current_dropout_min` counts up from the
+   moment it was lost; when it reconnects, `last_dropout` becomes
+   `{"start":"<ISO>","end":"<ISO>","minutes":<n>}` and the counters move.
 
 > Public URL: fill in after generating the Railway domain, then paste it into the
 > Pi config and the Vercel dashboard env below.
@@ -170,13 +200,17 @@ changes. If the hub is down it keeps retrying — LAN + Funnel control are unaff
 
 ## Wiring the Vercel dashboard
 
-Set env vars on the Vercel project:
+Set env vars on the Vercel project (names as `analytics-mirror/` reads them — see its
+README and `.env.example`):
 
 ```
-A2W_HUB_URL=https://a2w-hub-production.up.railway.app
-A2W_HUB_CLIENT_TOKEN=<HUB_CLIENT_TOKEN>   # must match the hub's HUB_CLIENT_TOKEN
+HUB_URL=https://a2w-hub-production.up.railway.app
+HUB_CLIENT_TOKEN=<HUB_CLIENT_TOKEN>   # must match the hub's HUB_CLIENT_TOKEN
+HUB_ARM_TOKEN=<HUB_ARM_TOKEN>         # must match the hub's HUB_ARM_TOKEN; server-only
 ```
 
-The dashboard reads `GET /api/state` and posts setpoints to `POST /api/command`
-with the `Authorization: Bearer <A2W_HUB_CLIENT_TOKEN>` header. The optimizer
-uses the same base URL + client token.
+The dashboard's server routes read `GET /api/state`, post setpoints to `POST /api/command`
+with `Authorization: Bearer <HUB_CLIENT_TOKEN>`, and add `X-Arm-Token` for
+`/api/write-enable` and `/api/breaker` only after the owner has re-entered the password. The
+optimizer uses the same base URL + client token, and adds `X-Arm-Token` only for `/api/breaker` on
+the backup element when `BACKUP_GATE=live` (it needs none otherwise).
