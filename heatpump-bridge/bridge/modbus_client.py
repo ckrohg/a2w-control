@@ -161,6 +161,12 @@ class PumpClient:
         if category == "timeout" and self._rx_bytes > 0:
             self.stats.crc_errors += 1
 
+    # @purpose: Whether this client holds an open TCP session to the gateway right now —
+    # read-only state, no traffic (the poller's offline attribution, #76, reads it).
+    @property
+    def connected(self) -> bool:
+        return bool(self._client.connected)
+
     async def _ensure_connected(self) -> None:
         if self._client.connected:
             return

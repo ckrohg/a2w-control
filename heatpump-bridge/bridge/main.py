@@ -67,6 +67,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         exporter = Exporter(cfg.analytics, pollers, store, db_path=cfg.db_path)
         exporter.start()
         hub_client = HubClient(cfg.hub, pollers)
+        for poller in pollers.values():   # #76: what a comm/offline event records about the Pi's own links
+            poller.hub_link_up = (lambda: hub_client.connected if hub_client.enabled else None)
+            poller.peers = pollers
 
         async def span_notify(title, message, priority="default", *, tier, resolved=False, action=None):
             from . import notify

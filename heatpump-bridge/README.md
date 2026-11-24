@@ -329,6 +329,33 @@ There are no config keys. The watch runs whenever breaker control is configured 
 `span.passphrase`), uses the `self_heal.circuits` map, and its timings are module constants. Status
 appears in `/api/health.deliberate_stops`.
 
+## Comm events
+
+Each `comm`/`offline` event's `detail` records what the Pi could see at that moment (#76):
+`hub_link_up` (the hub WebSocket was connected), `peer_pump_online` (the other pump was still
+online), `gateway_reachable` (this pump's W610 accepted a TCP connect within 1 s, or the
+bridge still held its session open) and `gateway_probe_result`, why that probe ended: `ok`,
+`refused`, `timeout`, `unreachable` (no route or no network on the Pi) or `error` (the probe
+itself failed). Each is `null` when unknown, next to `category` and `last_error_category`
+(`null` too after a rediscovery rebuilt the client).
+
+Read the pair of events, one per pump, and the ones after them, not the first one alone.
+When the Pi loses its own Wi-Fi, the first offline event usually records `hub_link_up`
+true (the hub link can take tens of seconds to notice), `peer_pump_online` true (the other
+pump has not reached its threshold yet) and `gateway_reachable` false. On its own that looks
+like the W610's Wi-Fi. The second pump's event, a few seconds later, then shows the peer
+offline too, and soon `hub_link_up` turns false. So:
+
+- both pumps offline within one poll interval or so, with `hub_link_up` false in the later
+  event, is the Pi's own network;
+- one pump offline, the other still online through its next events, the hub up and
+  `gateway_reachable` false, is that gateway's Wi-Fi;
+- a reachable gateway whose polls still fail is the serial side or the pump.
+
+A pump whose breaker a person switched off at the SPAN panel (#212, a deliberate stop) does
+not answer polls either, so as the other pump's peer it reads as `peer_pump_online` false.
+Check `/api/health.deliberate_stops` before you read that as an outage.
+
 ## Hub link
 
 `bridge/hub_client.py`. The Pi dials OUT to the Railway hub over WebSocket and holds the
