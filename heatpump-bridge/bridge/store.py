@@ -9,6 +9,7 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -312,10 +313,17 @@ class Store:
             "SELECT id, time_hhmm, action, enabled FROM schedules WHERE pump_id=?"
             " ORDER BY time_hhmm", (pump_id,))
 
-    async def add_schedule(self, pump_id: str, time_hhmm: str, action: str) -> None:
+    async def add_schedule(self, pump_id: str, time_hhmm: str, action: str,
+                           now: datetime | None = None) -> None:
+        """A rule whose time has already passed today is born fired-today, so its first
+        firing is tomorrow — due_schedules' <= catch-up is for restarts and stalled
+        ticks, not for a timer added at 14:00 for 06:00 (an unrequested write now)."""
+        now = now or datetime.now()
+        last_fired = now.strftime("%Y-%m-%d") if time_hhmm <= now.strftime("%H:%M") else None
         await self._exec(
-            "INSERT INTO schedules (pump_id, time_hhmm, action) VALUES (?,?,?)",
-            (pump_id, time_hhmm, action))
+            "INSERT INTO schedules (pump_id, time_hhmm, action, last_fired_date)"
+            " VALUES (?,?,?,?)",
+            (pump_id, time_hhmm, action, last_fired))
 
     async def delete_schedule(self, pump_id: str, schedule_id: int) -> None:
         await self._exec("DELETE FROM schedules WHERE id=? AND pump_id=?",
