@@ -1,5 +1,9 @@
+// @purpose Password sign-in: exchange the view password for the a2w_view session cookie.
+// PUBLIC (lib/gate.ts lists it open), so a malformed or oversized body is a 400/413 from
+// lib/login-input.ts and never a 500; the compare is constant-time in lib/password.ts.
 import { NextResponse } from "next/server";
-import crypto from "crypto";
+import { readLoginPassword } from "@/lib/login-input";
+import { passwordMatches } from "@/lib/password";
 
 export const runtime = "nodejs";
 
@@ -12,17 +16,12 @@ export async function POST(req: Request) {
   if (!expected || !sessionSecret) {
     return NextResponse.json({ error: "auth not configured" }, { status: 500 });
   }
-  let password = "";
-  try {
-    password = (await req.json())?.password ?? "";
-  } catch {
-    /* empty */
+  const body = await readLoginPassword(req);
+  if (!body.ok) {
+    return NextResponse.json({ error: body.error }, { status: body.status });
   }
   // Constant-time compare so a timer can't recover the password character by character.
-  const given = Buffer.from(password);
-  const want = Buffer.from(expected);
-  const ok = given.length === want.length && crypto.timingSafeEqual(given, want);
-  if (!ok) {
+  if (!passwordMatches(body.password, expected)) {
     return NextResponse.json({ error: "incorrect password" }, { status: 401 });
   }
   const res = NextResponse.json({ ok: true });
