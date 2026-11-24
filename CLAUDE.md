@@ -92,9 +92,10 @@ The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; ed
 **Next (owner plan, updated 2026-11-24):** #293–#302, #304, #306 and #311 are on main; so are #303 (freeze-risk page
 hysteresis) and #305 (spanwatch split), both 2026-11-23, #321 (hot-water pre-boost) and #307 (dashboard sign-in
 hardening). Bridge PRs #308, #309, #310, #315 and #322 are bridge code only: on main, they reach the Pi with the
-December tag (planned Tue 2026-12-01). Gated merges: #324 then #325 Tue Nov 24 13:07 ET; #316 (hub: a Pi link drop
-answers a pending setpoint at once with a 504) then #326 (planner: `stage_never_called` judged for every mapped stage,
-shadow) Wed Nov 25 10:00 ET; #327 Fri Nov 27 13:03; #328 Mon Nov 30 13:03. #319 (bridge backup: catch-up, no database
+December tag (planned Tue 2026-12-01). #324 and #325 merged through the gate on Tue Nov 24. Next gated merges:
+#316 (hub: a Pi link drop answers a pending setpoint at once with a 504) then #326 (planner: `stage_never_called`
+judged for every mapped stage, shadow) Wed Nov 25 10:00 ET; #327 Fri Nov 27 13:03; #328 Mon Nov 30 13:03. #319 (bridge
+backup: catch-up, no database
 lock, only complete files) is ready and rides the December tag; #313 merges last on Dec 1. The element-calibration
 night did not run on Sun Nov 22; it is re-dated to Thu Nov 26 22:30 → Fri Nov 27 03:00 ET, decided at 18:00 that day
 (the forecast shows an evening wind front; storm mode armed or an outage means no-go), runbook
