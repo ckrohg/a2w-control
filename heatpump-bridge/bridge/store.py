@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import json
 import logging
+import os
+import pathlib
+import shutil
 import sqlite3
 import threading
 import time
@@ -98,6 +103,109 @@ _SYSTEM_COLS = ("ts", "cpu_pct", "load1", "load5", "load15", "ncpu", "mem_used_p
                 "mem_total_mb", "mem_avail_mb", "disk_used_pct", "disk_free_gb",
                 "disk_total_gb", "cpu_temp_c", "uptime_s",
                 *(name for name, _ in _SYSTEM_ADDED_COLS))
+
+# busy timeout of backup()'s own read-only connection: a brief lock (WAL recovery after a
+# crash) waits instead of failing the night's backup
+BACKUP_BUSY_TIMEOUT_S = 10.0
+# free space the copy needs on the backups volume, as a multiple of the database's size: the
+# copy itself plus its rollback journal's headroom. Less than that and it writes nothing, so
+# retries can't fill the card and make the live database's own commits fail (SQLITE_FULL).
+BACKUP_SPACE_FACTOR = 1.2
+BACKUP_SLOW_S = 60.0       # a copy slower than this logs a WARNING (it takes ~19 s on the Pi)
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _backup_into(src: sqlite3.Connection, dest: str) -> None:
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+
+
+def backup_complete(path: str) -> bool:
+    """Whether `path` starts with the SQLite header — Store.backup only ever puts a complete,
+    verified copy under its final name, so this is the whole "done" check (16 bytes: never a
+    quick_check of the 211 MB file). Raises OSError (an unreadable folder) except ENOENT."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
+    except FileNotFoundError:
+        return False
+
+
+def _rm_part(tmp: str) -> None:
+    """Remove an unfinished copy and every sidecar SQLite may have left beside it."""
+    for name in (tmp, tmp + "-journal", tmp + "-wal", tmp + "-shm"):
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+
+
+def _fsync(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _copy_db(src_uri: str, dest: str) -> float:
+    """Copy the database at `src_uri` to `dest` and return how long it took. Runs in ONE
+    worker thread, which opens, uses and closes both connections (sqlite3 thread affinity).
+
+    The copy is written to `dest + ".part"` (which the scheduler's bridge-*.db glob never
+    matches), verified (quick_check, page count), made a self-contained single file
+    (journal_mode=DELETE), fsynced, and only then renamed onto `dest` — so `dest` only ever
+    holds a complete copy, even if the process is killed mid-copy or the awaiting task is
+    cancelled (the thread then just finishes). Any failure removes the .part file and its
+    sidecars. A run killed before the rename (or a rename that fails) leaves them; the next
+    run removes them first."""
+    t0 = time.monotonic()
+    tmp = dest + ".part"
+    _rm_part(tmp)
+    src = sqlite3.connect(src_uri, uri=True, timeout=BACKUP_BUSY_TIMEOUT_S)
+    try:
+        # pin ONE read snapshot: the page count measured here is the one the copy is made of
+        src.execute("BEGIN")
+        src.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        n_pages = src.execute("PRAGMA page_count").fetchall()[0][0]
+        page_size = src.execute("PRAGMA page_size").fetchall()[0][0]
+        need = n_pages * page_size * BACKUP_SPACE_FACTOR
+        free = shutil.disk_usage(os.path.dirname(dest) or ".").free
+        if free < need:
+            logging.getLogger(__name__).warning(
+                "backup: only %.0f MB free for a %.0f MB copy — nothing written",
+                free / 1e6, n_pages * page_size / 1e6)
+            raise OSError(errno.ENOSPC, f"too little free space for the backup ({free} < {need:.0f} bytes)")
+        dst = sqlite3.connect(tmp)
+        try:
+            # pages=-1: ONE step inside the pinned snapshot, never restarted (see Store.backup)
+            src.backup(dst, pages=-1)
+            mode = dst.execute("PRAGMA journal_mode=DELETE").fetchall()[0][0]
+            check = dst.execute("PRAGMA quick_check").fetchall()[0][0]
+            copied = dst.execute("PRAGMA page_count").fetchall()[0][0]
+            if mode != "delete" or check != "ok" or copied != n_pages:
+                raise sqlite3.DatabaseError(
+                    f"backup copy failed verification (journal_mode={mode}, quick_check={check}, "
+                    f"pages {copied} of {n_pages})")
+        finally:
+            dst.close()
+        src.rollback()
+        _fsync(tmp)
+    except BaseException:
+        _rm_part(tmp)
+        raise
+    finally:
+        src.close()
+    os.replace(tmp, dest)
+    _fsync(os.path.dirname(dest) or ".")
+    took = time.monotonic() - t0
+    log = logging.getLogger(__name__)
+    log.info("backup: %s copied in %.1f s", os.path.basename(dest), took)
+    if took > BACKUP_SLOW_S:
+        log.warning("backup: %s took %.0f s (over %.0f s)", os.path.basename(dest), took, BACKUP_SLOW_S)
+    return took
 
 
 class Store:
@@ -351,17 +459,43 @@ class Store:
     # --- maintenance (run nightly by the scheduler) -----------------------------
     async def backup(self, dest: str) -> None:
         """Consistent online backup via SQLite's backup API — survives SD card death
-        as long as yesterday's copy does. Under the connection lock (touches _conn)."""
-        async with self._conn_lock:
-            def _run():
-                with self._thread_lock:      # see _thread_lock (#94)
-                    dst = sqlite3.connect(dest)
-                    try:
-                        with dst:
-                            self._conn.backup(dst)
-                    finally:
-                        dst.close()
-            await asyncio.to_thread(_run)
+        as long as yesterday's copy does.
+
+        Takes NEITHER _conn_lock nor _thread_lock and never touches self._conn, so no other
+        store call (polls, lease reverts, a breaker cycle's audit write) queues behind the copy
+        (#319 lets it run in the daytime). It reads from its OWN read-only connection to the file,
+        opened, used and closed inside this one worker thread and never stored on self — so
+        no second thread ever shares a connection, which is what #94 was about. In WAL mode
+        that reader blocks no writer.
+
+        Consistency: the copy pins one read transaction first and backup() with pages=-1
+        copies everything in ONE step inside it, so the file is the database as of that
+        snapshot. Commits by self._conn during the copy go to the WAL past that snapshot and
+        are not in the copy; nothing restarts (SQLite restarts a backup only BETWEEN steps, and
+        there is just one). The bridge only ever auto-checkpoints (PASSIVE), which stops short
+        of a live reader's snapshot rather than failing or waiting; the WAL drains on a later
+        checkpoint.
+
+        `dest` only ever holds a complete, verified, single-file copy (see _copy_db: written
+        to dest + ".part", checked, fsynced, renamed). Too little free space for the copy
+        raises OSError(ENOSPC) without writing anything. A failure removes what it wrote and
+        re-raises; the caller has nothing to clean up.
+
+        In-memory store (":memory:" or ""; tests only): a second connection cannot see it,
+        so that case alone still copies from self._conn under both locks, straight to dest."""
+        if self.path in ("", ":memory:"):
+            async with self._conn_lock:
+                def _run():
+                    with self._thread_lock:      # see _thread_lock (#94)
+                        _backup_into(self._conn, dest)
+                await asyncio.to_thread(_run)
+            return
+        src_uri = pathlib.Path(self.path).absolute().as_uri() + "?mode=ro"
+        def _run():
+            # both connections private to this worker thread: opened here, closed here even
+            # on error. A cancelled caller does not stop it; it finishes (or cleans up) alone.
+            _copy_db(src_uri, dest)
+        await asyncio.to_thread(_run)
 
     async def prune(self, *, samples_days: float = 365, comm_days: float = 90,
                     system_days: float = 90) -> None:
