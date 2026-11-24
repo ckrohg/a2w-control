@@ -14,10 +14,14 @@ from . import notify
 from .config import NotifyConfig
 from .guardrails import GuardrailError
 from .poller import PumpPoller
-from .store import Store
+from .store import Store, backup_complete
 from .sysstat import SystemStats
 
 log = logging.getLogger(__name__)
+
+# the hourly backup retry is spaced on this clock, never the wall clock (a step back must
+# not retry at once); a module attribute so tests can drive it without touching asyncio's clock
+_monotonic = time.monotonic
 
 CHECK_INTERVAL_S = 20      # < 1 minute so no HH:MM slot is ever skipped
 MAINTENANCE_HHMM = "03:30"  # nightly backup + retention pruning
@@ -43,12 +47,11 @@ class Scheduler:
         self.heartbeat_url = heartbeat_url
         self.notifications = notifications
         self._task: asyncio.Task | None = None
-        # Restart-safe "already ran today": seeded from the newest backups/bridge-YYYYMMDD.db
-        # so repeated daytime restarts don't re-run the backup each time (the catch-up gate in
-        # check_once would otherwise fire on the first tick after every restart).
-        self._last_maintenance_date: str | None = self._last_backup_date()
-        # earliest wall-clock time a failed backup may be retried (None = no retry pending)
-        self._maintenance_retry_at: datetime | None = None
+        # The date _backup_done last confirmed — a cache only: the file on disk is the truth,
+        # so a restart re-reads it instead of re-running today's backup.
+        self._last_maintenance_date: str | None = None
+        # earliest _monotonic() time a failed backup may be retried (None = no retry pending)
+        self._maintenance_retry_mono: float | None = None
         # One sampler for the process lifetime (CPU% is a delta across reads); disk usage is
         # measured on the volume that holds the DB, which is what actually fills up.
         self._sysstat = SystemStats(str(Path(store.path).parent))
@@ -94,31 +97,34 @@ class Scheduler:
         # maintenance gate is >= (not ==), like due_schedules: a restart or a tick held past
         # 60 s (two lease reverts over 2400-baud Modbus) spanning 03:30 must still run that
         # day's backup late rather than silently skip it — the backup is the only thing that
-        # survives an SD-card death. "Already ran today" is seeded from the backup files at
-        # construction, so a daytime restart does not re-run it. A backup that fails (or
-        # leaves no file / an empty one) retries once per MAINTENANCE_RETRY_S, not every tick.
+        # survives an SD-card death. "Already ran today" is _backup_done(today), read from the
+        # file itself (and cached per date), so a daytime restart does not re-run it and a
+        # stray future-dated file cannot stand in for it. A backup that fails (or leaves no
+        # valid file) retries once per MAINTENANCE_RETRY_S of monotonic time, not every tick;
+        # the wall clock only picks the date.
         hhmm = now.strftime("%H:%M")
         today = now.strftime("%Y-%m-%d")
-        retry_at = self._maintenance_retry_at
+        retry_at = self._maintenance_retry_mono
         if (hhmm >= MAINTENANCE_HHMM and self._last_maintenance_date != today
-                and (retry_at is None or now >= retry_at
-                     # wall clock stepped backwards: don't wait out the bogus gap
-                     or retry_at - now > timedelta(seconds=MAINTENANCE_RETRY_S))):
-            if retry_at is not None:
-                log.info("maintenance: retrying failed backup at %s", hhmm)
-            elif hhmm != MAINTENANCE_HHMM:
-                log.info("maintenance: running late at %s (scheduled %s)", hhmm, MAINTENANCE_HHMM)
-            # arm the retry first: even an exception escaping run_maintenance (e.g. mkdir on
-            # a read-only remounted card) must not retry every 20 s tick
-            self._maintenance_retry_at = now + timedelta(seconds=MAINTENANCE_RETRY_S)
-            await self.run_maintenance(now)
-            dest = self._backups_dir() / f"bridge-{now.strftime('%Y%m%d')}.db"
-            if dest.is_file() and dest.stat().st_size > 0:
+                and (retry_at is None or _monotonic() >= retry_at)):
+            if self._backup_done(today):
                 self._last_maintenance_date = today
-                self._maintenance_retry_at = None
+                self._maintenance_retry_mono = None
             else:
-                log.warning("maintenance: no backup written for %s — retrying at %s",
-                            today, self._maintenance_retry_at.strftime("%H:%M"))
+                if retry_at is not None:
+                    log.info("maintenance: retrying failed backup at %s", hhmm)
+                elif hhmm != MAINTENANCE_HHMM:
+                    log.info("maintenance: running late at %s (scheduled %s)", hhmm, MAINTENANCE_HHMM)
+                # arm the retry first: even an exception escaping run_maintenance (e.g. mkdir
+                # on a read-only remounted card) must not retry every 20 s tick
+                self._maintenance_retry_mono = _monotonic() + MAINTENANCE_RETRY_S
+                await self.run_maintenance(now)
+                if self._backup_done(today):
+                    self._last_maintenance_date = today
+                    self._maintenance_retry_mono = None
+                else:
+                    log.warning("maintenance: no backup written for %s — retrying at %s", today,
+                                (now + timedelta(seconds=MAINTENANCE_RETRY_S)).strftime("%H:%M"))
         due = await self.store.due_schedules(now.strftime("%H:%M"), now.strftime("%Y-%m-%d"))
         # catch-up semantics: mark ALL due rules fired, but execute only the LATEST per
         # pump — after downtime spanning "on at 06:00, off at 09:00", the net state
@@ -226,47 +232,52 @@ class Scheduler:
     def _backups_dir(self) -> Path:
         return Path(self.store.path).parent / "backups"
 
-    def _last_backup_date(self) -> str | None:
-        """YYYY-MM-DD of the newest non-empty backups/bridge-YYYYMMDD.db, or None if there
-        are none. Decided by file NAME (the date run_maintenance stamped it with), not mtime,
-        so a copied-in or clock-skewed file can't masquerade as today's run. An empty file is
-        a failed run and doesn't count. A future-dated name (clock jump) just seeds a date
-        that isn't today, so the gate still runs today's backup."""
-        backups = self._backups_dir()
-        dates = []
+    def _backup_done(self, today: str) -> bool:
+        """Whether today's ("YYYY-MM-DD") backups/bridge-YYYYMMDD.db is on disk: the file
+        exists and starts with the SQLite header. Store.backup only ever renames a complete,
+        verified copy onto that name, so 16 bytes decide it (never a quick_check of 211 MB).
+        Decided by today's NAME, so a copied-in or future-dated file can't stand in for it.
+        An unreadable folder (EACCES) reads as "not done" rather than raising, so the tick's
+        timers still fire."""
+        dest = self._backups_dir() / f"bridge-{today.replace('-', '')}.db"
         try:
-            if not backups.is_dir():
-                return None
-            for f in backups.glob("bridge-*.db"):
-                stamp = f.stem[len("bridge-"):]
-                if len(stamp) == 8 and stamp.isdigit() and f.stat().st_size > 0:
-                    dates.append(stamp)
-        except OSError:
-            # runs at construction: an unreadable dir must not stop the bridge starting;
-            # None just means "run today's backup"
-            log.exception("maintenance: could not read %s", backups)
-            return None
-        if not dates:
-            return None
-        newest = max(dates)
-        return f"{newest[:4]}-{newest[4:6]}-{newest[6:]}"
+            return backup_complete(str(dest))
+        except OSError as exc:
+            log.warning("maintenance: could not read %s (%s)", dest, exc)
+            return False
 
     async def run_maintenance(self, now: datetime) -> None:
         """Nightly: consistent DB backup (rotated) + retention pruning. A dead SD card
-        costs at most a day of history plus a bootstrap re-run."""
+        costs at most a day of history plus a bootstrap re-run. Store.backup removes what a
+        failed copy wrote; bridge-YYYYMMDD.db only ever holds a complete one."""
         backups = self._backups_dir()
         dest = backups / f"bridge-{now.strftime('%Y%m%d')}.db"
         try:
             backups.mkdir(exist_ok=True)
+            # an earlier day's copy killed mid-flight (Store.backup clears only today's .part)
+            for stale in backups.glob("bridge-*.db.part*"):
+                with contextlib.suppress(OSError):
+                    stale.unlink()
             await self.store.backup(str(dest))
         except Exception:
             log.exception("maintenance: backup %s failed", dest.name)
-            # a partial file must not read as "ran today" to the gate or after a restart
-            with contextlib.suppress(OSError):
-                dest.unlink()
             return
         try:
-            for old in sorted(backups.glob("bridge-*.db"))[:-BACKUPS_KEEP]:
+            # only dated copies take a retention slot, and none dated after tomorrow (a clock
+            # jump or a copied-in file): it would otherwise sort newest forever and push out a
+            # real backup
+            tomorrow = (now + timedelta(days=1)).strftime("%Y%m%d")
+            dated = []
+            for f in backups.glob("bridge-*.db"):
+                stamp = f.stem[len("bridge-"):]
+                if not (len(stamp) == 8 and stamp.isdigit()):
+                    continue
+                if stamp > tomorrow:
+                    log.warning("maintenance: %s is dated after tomorrow — left out of retention",
+                                f.name)
+                    continue
+                dated.append(f)
+            for old in sorted(dated)[:-BACKUPS_KEEP]:
                 old.unlink()
             await self.store.prune()
             log.info("maintenance: backup %s written, retention pruned", dest.name)
