@@ -1,6 +1,7 @@
 # @purpose: #76 item 4 — "slow with the link up" and CRC/framing trouble are visible in
 # CommStats instead of folded into generic counters: per-request round trip (last / max /
-# slow count, on an injected clock), and crc_errors counted ALONGSIDE timeouts / io_errors.
+# slow count, on an injected clock), crc_errors counted only ALONGSIDE timeouts (so
+# timeouts − crc_errors is true silence), and stale wrong-shape frames in mismatched_frames.
 # The raw-socket tests pin the pymodbus behaviour the split rests on: a bad-CRC or short
 # reply is dropped by the RTU framer without raising, so it surfaces as a timeout.
 from __future__ import annotations
@@ -144,7 +145,7 @@ async def test_silent_timeout_is_not_a_crc_error_and_has_no_rtt():
 
 async def test_timeout_with_reply_bytes_counts_crc_alongside_timeout():
     """Bytes came back but pymodbus found no valid frame: the request is still a timeout
-    (unchanged), and ALSO a crc_error. The byte count restarts with each request."""
+    (unchanged), and ALSO a crc_error. The reply-bytes flag clears with each request."""
     clock = _Clock()
     client = _stub_client(clock)
 
@@ -169,7 +170,10 @@ async def test_timeout_with_reply_bytes_counts_crc_alongside_timeout():
     assert client.stats.timeouts == 2 and client.stats.crc_errors == 1
 
 
-async def test_wrong_length_frame_counts_crc_and_keeps_io_errors():
+async def test_wrong_length_frame_counts_mismatched_and_keeps_io_errors():
+    """A CRC-valid frame of the wrong shape is a stale/foreign reply, not a garbled one:
+    io_errors (as before) and mismatched_frames, never crc_errors — and no rtt, since the
+    reply may belong to an earlier request and would read falsely fast."""
     clock = _Clock()
     client = _stub_client(clock)
     _reply_after(client, clock, 0.1, n=40)                # a 40-register reply to a 9 read
@@ -177,7 +181,72 @@ async def test_wrong_length_frame_counts_crc_and_keeps_io_errors():
         await client.read_block(R.BLOCK_STATUS)
     assert exc.value.category == "io"
     assert client.stats.io_errors == 1                    # backward compatible total
-    assert client.stats.crc_errors == 1
+    assert client.stats.mismatched_frames == 1
+    assert client.stats.crc_errors == 0 and client.stats.timeouts == 0
+    assert client.stats.last_rtt_ms is None and client.stats.max_rtt_ms is None
+    assert client.stats.as_dict()["mismatched_frames"] == 1
+
+
+async def test_timeouts_minus_crc_errors_is_true_silence():
+    """The documented identity: after silent timeouts, garbled replies and a stale frame,
+    timeouts − crc_errors is exactly the number of polls where the pump sent nothing."""
+    clock = _Clock()
+    client = _stub_client(clock)
+
+    async def silent(addr, count=1, device_id=1):
+        raise ModbusIOException("No response received after 0 retries")
+
+    async def garbled(addr, count=1, device_id=1):
+        client._trace_packet(False, b"\x01\x03\x12\xff")
+        raise ModbusIOException("No response received after 0 retries")
+
+    async def noise_byte(addr, count=1, device_id=1):
+        client._trace_packet(False, b"\x00")
+        raise ModbusIOException("No response received after 0 retries")
+
+    plan = [silent, garbled, silent, noise_byte, "stale", silent, garbled]
+    for step in plan:
+        if step == "stale":
+            _reply_after(client, clock, 0.05, n=40)       # CRC-valid, wrong shape
+        else:
+            client._client.read_holding_registers = step
+        with pytest.raises(ModbusError):
+            await client.read_block(R.BLOCK_STATUS)
+
+    s = client.stats
+    assert s.timeouts - s.crc_errors == plan.count(silent) == 3
+    assert s.crc_errors == 3                              # 2 garbled + 1 noise byte
+    assert s.mismatched_frames == 1 and s.io_errors == 1
+    d = s.as_dict()
+    assert d["timeouts"] - d["crc_errors"] == 3 and d["mismatched_frames"] == 1
+
+
+async def test_write_path_records_rtt_and_counts_garbled_reply_like_reads():
+    clock = _Clock()
+    client = _stub_client(clock)
+
+    async def write_ok(address, value, device_id=1):
+        clock.t += 0.3
+        return _FakeResp(0)
+
+    client._client.write_register = write_ok
+    _reply_after(client, clock, 0.1, n=1)                 # the read-back
+    await client.write_register_verified(R.BLOCK_STATUS.start, 0)
+    assert client.stats.max_rtt_ms == pytest.approx(300.0)   # the write's own round trip
+    assert client.stats.last_rtt_ms == pytest.approx(100.0)  # then the read-back's
+
+    async def write_garbled(address, value, device_id=1):
+        client._trace_packet(False, b"\x01\x06\x00")
+        raise ModbusIOException("No response received after 0 retries")
+
+    client._client.write_register = write_garbled
+    with pytest.raises(ModbusError) as exc:
+        await client.write_register_verified(R.BLOCK_STATUS.start, 0)
+    assert exc.value.category == "timeout"
+    s = client.stats
+    assert s.timeouts == 1 and s.crc_errors == 1
+    assert s.io_errors == 0 and s.mismatched_frames == 0
+    assert s.last_rtt_ms == pytest.approx(100.0)          # unanswered: rtt untouched
 
 
 async def _one_reply_server(reply: bytes):
@@ -242,6 +311,7 @@ def test_fresh_stats_start_empty():
     d = CommStats().as_dict()
     assert d["last_rtt_ms"] is None and d["max_rtt_ms"] is None
     assert d["slow_requests"] == 0 and d["crc_errors"] == 0
+    assert d["mismatched_frames"] == 0
 
 
 async def test_max_resets_with_the_client_on_gateway_change(tmp_path):
