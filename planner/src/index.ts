@@ -1715,8 +1715,9 @@ async function shadowOnce(): Promise<void> {
   // current hour every recompute. A history read failure means no memory — the pre-fix plan — never a skipped plan.
   // priorExcursionsKnown says the history was READ (even if empty): only then, AND with a measured dwell
   // (sanitizeDueNow().measured), does the soak use it (a soak in progress keeps its full hour, a new soak never lands
-  // on the hour in progress and starts by the interval's limit, at most SOAK_MAX_RUN_H soak hours in a row) — an
-  // unreadable history must never drop a running soak mid-hour, so it leaves the soak exactly as before.
+  // on the hour in progress and starts by the interval's limit, at most SOAK_MAX_RUN_H soak hours in a row). An
+  // unreadable history is not an empty one (memory mode would read it as "no soak in progress"), so the soak is then
+  // PLACED exactly as before; the 12 h rest still applies whenever the dwell was measured, without the limit.
   let priorExcursionsKnown = true;
   const priorExcursions = priorExcursionsFromPlans(await store.recentPlans(26).catch(() => { priorExcursionsKnown = false; return []; }), Date.now());
   const opts = { ...(learned ? { ...DEFAULT_OPTS, dhwWindows: learned.windows, preBoosts } : DEFAULT_OPTS), bankF: BANK_F, priorExcursions, priorExcursionsKnown };

@@ -231,6 +231,10 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
   const cool25 = (ts: Date) => ts.getDate() === 25 ? 50 - ts.getHours() : 30;
   assert.deepEqual(soaks(planAt(23, soakAt([23]), { due: true, temp: cool25 })), ["24@23", "25@0"], "(no run: the 25th's warmest, 00:00)");
   assert.deepEqual(soaks(planAt(23, soakAt([21, 22, 23]), { due: true, temp: cool25 })), ["24@23", "25@1"], "00:00 would be the 4th: next-warmest");
+  // …and on draft[2] (review of ae4b5ec): overdue with a soak at 21:00 behind it marks 22:00 and 23:00; today has 2 blocks
+  // left, so the day loop reaches the 25th, whose warmest hour 00:00 is draft[2] and would be the 4th in a row.
+  assert.deepEqual(soaks(planAt(22, soakAt([21]), { due: true, urgent: true, temp: cool25 })), ["24@22", "24@23", "25@1"], "00:00 would be the 4th: next-warmest");
+  assert.deepEqual(soaks(planAt(22, [], { due: true, urgent: true, temp: cool25 })), ["24@22", "24@23", "25@0"], "(no soak at 21:00: 00:00 is the 3rd, allowed)");
 }
 
 // 8. A KEPT SOAK IN A COLD HOUR flows through the winter guard like a freshly placed soak: never below the kept target.
@@ -266,12 +270,11 @@ const KNOWN_ABSENT = null; // planAt: omit priorExcursionsKnown entirely
   assert.deepEqual(soaks(planAt(9, [p0842], { due: false, rested: true, known: KNOWN_ABSENT })), []);
   // The hour after: the kept soak is not carried into the next hour.
   assert.deepEqual(soaks(planAt(10, [p0842, flip], { due: false, rested: true })), [], "10:42: the soak had its hour; nothing is kept beyond it");
-  // The cap still binds: a block that would be the 4th consecutive soak hour is not kept.
-  const run: Stored[] = []; let prev = planAt(5, [], { due: true, urgent: true });
-  run.push(prev);
-  for (const h of [6, 7]) { prev = planAt(h, run, { due: true, urgent: true }); run.push(prev); }
-  assert.ok(run.every((r) => r.plan[0].sani), "three overdue soak hours in a row (05, 06, 07)");
-  assert.deepEqual(soaks(planAt(8, run, { due: false, rested: true })), [], `the ${SOAK_MAX_RUN_H + 1}th hour is not kept`);
+  // The cap still binds: a soak the history placed on the hour in progress is not kept as the 4th consecutive soak hour.
+  const soakAt = (hs: number[]): Stored[] => [{ computedAt: new Date(at(-2)), plan: hs.map((h) => (
+    { ts: new Date(2026, 10, 24, h).toISOString(), outdoor_f: 40, tank_target_f: 140, hp1_setpoint_f: 145, reason: "daily sanitize", sani: true })) }];
+  assert.deepEqual(soaks(planAt(8, soakAt([6, 7, 8]), { due: false, rested: true })), ["24@8"], "the 3rd hour is kept");
+  assert.deepEqual(soaks(planAt(8, soakAt([5, 6, 7, 8]), { due: false, rested: true })), [], `the ${SOAK_MAX_RUN_H + 1}th hour is not kept`);
 }
 
 // 9. END TO END — the real AutoPilot (flat-target mode) over the cooling day: plans land at :42, the auto-pilot polls at

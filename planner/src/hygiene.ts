@@ -115,8 +115,9 @@ export const SOAK_LEAD_H = 3.5;
  *  qualifying dwell in the lookback (which includes "telemetry was down, cannot prove one happened").
  *  URGENT = the window has lapsed (the plan stops shopping for the warmest hour). DUE = soak ~a day before
  *  the window lapses, but never within SOAK_REST_H of the last dwell; urgent always implies due. RESTED = no
- *  dwell within SOAK_REST_H (or none known), so a soak in progress has not qualified yet; due always implies
- *  rested, but not the reverse: with the 60 h interval a soak is due only from 36 h. */
+ *  dwell within SOAK_REST_H (or none known), so a soak in progress has not qualified yet. For an interval of
+ *  SOAK_REST_H or more (26 and 60 in use) due implies rested, but not the reverse: with the 60 h interval a
+ *  soak is due only from 36 h. Nothing relies on the implication. */
 export function soakDue(hoursSince: number | null, intervalH: number): { due: boolean; urgent: boolean; rested: boolean } {
   const urgent = hoursSince == null || hoursSince >= intervalH;
   const rested = hoursSince == null || hoursSince >= SOAK_REST_H;

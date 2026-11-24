@@ -198,7 +198,8 @@ const at = (min: number, tankF: number | null): HygieneReading => ({ ts: new Dat
   assert.deepEqual(d(60, 60), { due: true, urgent: true, rested: true });
   assert.deepEqual(d(null, 26), { due: true, urgent: true, rested: true }, "no qualifying dwell in the lookback: due and urgent");
   assert.deepEqual(d(null, 60), { due: true, urgent: true, rested: true });
-  for (const i of [26, 60]) for (let h = 0; h <= 70; h += 0.5) { const v = d(h, i); assert.ok(!v.urgent || v.due, "urgent implies due"); assert.ok(!v.due || v.rested, "due implies rested"); }
+  for (const i of [12, 26, 60, 72]) for (let h = 0; h <= 80; h += 0.5) { const v = d(h, i); assert.ok(!v.urgent || v.due, "urgent implies due"); assert.ok(!v.due || v.rested, "due implies rested (interval of 12 h or more)"); }
+  assert.deepEqual(d(9, 8), { due: true, urgent: true, rested: false }, "an interval under the rest period (env-settable): lapsed and due without being rested");
 }
 
 console.log("hygiene.test.ts: all assertions passed ✓");

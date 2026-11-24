@@ -89,8 +89,11 @@ export interface ShadowOpts {
    * 2026-11-24 (a soak gets a full hour): true when the plan history behind priorExcursions was READ (even if empty).
    * Only then, and only with sanitizeDueMeasured, does the soak use the memory (memory mode) — a soak in progress is
    * kept to the end of its hour, a new soak never lands on the hour in progress and starts by sanitizeLimitMs, the
-   * overdue soak spans two blocks, at most SOAK_MAX_RUN_H consecutive soak hours. Anything but `true` = the soak
-   * exactly as before (an unreadable history must never drop a running soak in the middle of its hour).
+   * overdue soak spans two blocks, at most SOAK_MAX_RUN_H consecutive soak hours. Anything but `true` = the soak is
+   * PLACED exactly as before: an unreadable history is not an empty one, and memory mode would read it as "no soak in
+   * progress". What is not as before even then: with a measured dwell, `sanitizeDue` already carries the 12 h rest
+   * (hygiene.ts soakDue), and the limit that goes with it is not applied here — a history that stays unreadable for
+   * hours can let the interval lapse, and the overdue backstop then answers as it did before 2026-11-24.
    */
   priorExcursionsKnown?: boolean;
   /**
@@ -118,8 +121,8 @@ export interface ShadowOpts {
 
 /**
  * Most consecutive soak hours (2026-11-24): in memory mode a block is not marked or kept as a soak if it would be the
- * 4th consecutive one, so an overdue soak whose dwell never qualifies runs 3 h, rests 1 h, and tries again instead of
- * holding 140 °F without bound.
+ * 4th consecutive one, so an overdue soak whose dwell never qualifies holds at most 3 soak hours (the first from about
+ * :47, so about 2 h 20 min the first time), rests one hour, and tries again instead of holding 140 °F without bound.
  */
 export const SOAK_MAX_RUN_H = 3;
 
@@ -330,14 +333,19 @@ export function computeShadowPlan(
     };
     if (sanitizeUrgent && draft.length && allowed0) overdue(draft[0]);
     keepSoakInProgress(sanitizeUrgent ? "OVERDUE" : "daily");
-    // draft[1]'s run counts draft[0] only when draft[0] is a soak in THIS plan (then continues into the history).
-    const allowed1 = !memory || (draft.length > 0 && draft[0].sani ? 1 + run0 : 0) < SOAK_MAX_RUN_H;
-    if (memory && sanitizeUrgent && draft.length > 1 && allowed1) overdue(draft[1]);
+    /** Soak hours in a row immediately before draft[i]: this plan's blocks and, when they reach back to the hour in
+     *  progress, the history's run before it. */
+    const soakRunBeforeBlock = (i: number) => { let n = 0; let k = i - 1; while (k >= 0 && draft[k].sani) { n++; k--; } return k < 0 ? n + run0 : n; };
+    /** The cap, for any block: draft[i] may become a soak only if it would not be the (SOAK_MAX_RUN_H + 1)th in a row.
+     *  (The overdue pair on 22:00 and 23:00 after a soak at 21:00 must not be followed by tomorrow's soak at 00:00.) */
+    const capAllows = (i: number) => !memory || soakRunBeforeBlock(i) < SOAK_MAX_RUN_H;
+    if (memory && sanitizeUrgent && draft.length > 1 && capAllows(1)) overdue(draft[1]);
     const limitMs = memory && Number.isFinite(opts.sanitizeLimitMs) ? (opts.sanitizeLimitMs as number) : null;
     for (const [, ds] of byDay) {
       if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
       if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
-      const cands = memory ? ds.filter((d) => d !== draft[0] && (d !== draft[1] || allowed1)) : ds;
+      const cands = memory ? ds.filter((d) => d !== draft[0] && capAllows(draft.indexOf(d))) : ds;
+      if (!cands.length) continue;
       const warmest = cands.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
       let chosen = warmest;
       let why = "warmest hour";
@@ -355,7 +363,7 @@ export function computeShadowPlan(
     // (found replaying 8 weeks: without this, a limit that had just passed planned nothing for 3 h and then went
     // overdue). The soak goes on the last future hour that still starts by the limit, else on the next hour.
     if (memory && limitMs != null && draft.length > 1 && limitMs <= draft[draft.length - 1].f.ts.getTime() && !draft.some((d) => d.sani || d.target >= opts.sanitizeF)) {
-      const future = draft.slice(1).filter((d) => d !== draft[1] || allowed1);
+      const future = draft.slice(1); // no block is a soak here, so the cap cannot refuse any of them
       const inTime = future.filter((d) => d.f.ts.getTime() <= limitMs);
       const late = inTime.length ? inTime[inTime.length - 1] : future[0];
       if (late) {
