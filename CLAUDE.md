@@ -75,8 +75,11 @@ The live config sits OUTSIDE the repo, so no merge, tag or deploy changes it; ed
   (`SIXBB_ALERT_*`; Pi `notifications.sixbb_alert_*`). Email is unchanged. Nobody subscribes to the ntfy topic.
   The lease-revert "planner not commanding setpoints" alert stays record-tier (#191, owner 2026-11-11).
 - **SPAN local API v1 is removed 2026-12-31** (#199): the v2 transport (`bridge/span_v2.py`, MQTT eBus) shipped in
-  release-20261102-1 pinned to `transport: v1`. The flip to `auto` is a Pi config change
-  (`reference/span-v2-cutover.md` (#299) and `span-v2-local-api.md` step 3); drift-check [10] fails a pinned v1 from 2026-12-15.
+  release-20261102-1 pinned to `transport: v1`. **`transport: auto` is live on the Pi since 2026-11-24 11:28 ET** (explicit
+  key in `~/bridge-data/config.yaml`; backup `config.yaml.bak-20261124-v2auto`): reads over v2, and the first real v2 write was
+  proven the same day with a verified 60 s power-cycle of Air-Water 2 (owner-instructed; `reference/span-v2-cutover.md` §3–§4,
+  #199 comment 2026-11-24). Next: #313 makes v2 the code default in the December tag, then explicit `transport: v2`; never
+  rely on the absent-key default. drift-check [10] fails a pinned v1 from 2026-12-15.
 - **DB backups** cover the live Railway Postgres 18 again (#203). Restore with `scripts/analyze-local.sh`; on the
   administrator Mac, put `~/micromamba/envs/pg/bin` on PATH first.
 
