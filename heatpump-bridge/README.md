@@ -105,6 +105,41 @@ deploy/             Pi systemd units (bridge, auto-update timer, watchdog timer)
                     Railway-hub guides
 ```
 
+## Comm stats
+
+Each pump's `comm` object (`/api/pumps/{id}/status`, the hub frame's per-pump snapshot, the
+UI comm footer) carries the counters from `CommStats` in `bridge/modbus_client.py`. They
+count from when the pump's client was created: bridge start, or a gateway reassignment
+(`apply_gateway`), which is the only place they reset.
+
+Added for #76 (additive; every earlier field keeps its meaning and its total):
+
+- `last_rtt_ms`, `max_rtt_ms`: round trip of the latest answered Modbus request and the
+  worst one since the stats were created, on a monotonic clock. Requests that got no reply
+  are in `timeouts`, not here.
+- `slow_requests`: answered requests slower than `SLOW_RTT_MS` (1000 ms, a constant in
+  `modbus_client.py`; `PumpClient(slow_rtt_ms=…)` overrides it). This is "slow with the
+  link up".
+- `crc_errors`: bytes arrived but no valid frame (bad CRC or a short frame — which includes
+  a frame a WiFi stall cut short and a single noise byte). It is counted *alongside*
+  `timeouts`, never instead of it: pymodbus drops such a frame without raising, so the
+  request still ends as a timeout and counts in `timeouts` **and** in `crc_errors`. It is
+  counted nowhere else, so `timeouts − crc_errors` is true silence (polls where the pump
+  sent nothing at all).
+- `mismatched_frames`: a reply that passed its CRC but has the wrong shape, typically a late
+  reply matched to the next request after a WiFi stall. It counts in `io_errors` (as it
+  always did) **and** in `mismatched_frames`, never in `crc_errors` or `timeouts`, and
+  records no round trip (the reply may belong to an earlier request). `io_errors` keeps
+  every increment it had before; CRC failures were never in it, they were in `timeouts`.
+
+The silent drop of bad-CRC and short frames is pymodbus behaviour, pinned by the wire tests
+in `tests/test_comm_latency_crc.py` at pymodbus 3.13.1. `pyproject.toml` allows
+`pymodbus>=3.9`, so re-run those tests after any pymodbus upgrade: if a later version raises
+on a bad frame instead, `crc_errors` stops counting.
+
+The SQLite `comm_stats` table has fixed columns and no JSON column, so the new fields are
+not persisted there; they are live values only. `/api/health` does not carry comm stats.
+
 ## Write guardrails (always on)
 
 Setpoint writes are clamped (422 outside the configured heating clamp), rate-limited
