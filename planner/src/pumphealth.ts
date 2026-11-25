@@ -18,8 +18,9 @@
  *                      ≤ 2 °F AND the unit's mean ΔT over it < 1.5 °C, for 30 min (a flat tank ALONE is house load — measured)
  *   stage_never_called — #172: the tank more than 3 °F below the CURVE IN FORCE (not SensorLinx's tank_target_f, which
  *                      freezes while the HBX idles) for 2 h straight, under HEAT DEMAND and below the curve's WWSD the
- *                      whole time, and HBX stage 2 never called in that time: half the plant sat out a recovery (pump2
- *                      idle at a 16 °C inlet while pump1 recovered alone at 32 °F). Not judged during a deliberate stop
+ *                      whole time, and an HBX stage never called in that time: half the plant sat out a recovery (pump2
+ *                      idle at a 16 °C inlet while pump1 recovered alone at 32 °F). Judged for EVERY mapped stage, since
+ *                      HBX rotation lets either stage lead (stageNeverCalledVerdicts). Not judged during a deliberate stop
  *                      (#212), a lowering of the curve (a setback), a spell without heat demand or above WWSD (the HBX
  *                      calls nothing then and the tank coasts — "staging didn't call it (normal)"), or blind/stale data
  * Thresholds are MEASURED: knowledge/reference/pump-health-baseline-20261019.md. A window whose data is stale or gappy is
@@ -285,7 +286,8 @@ const etClock = (s: number) => new Date(s * 1000).toLocaleTimeString("en-US", { 
  * own WWSD, so a window with a poll without demand, or at/above the WWSD of the curve in force then, is not judged
  * either (stale-target.ts: an idle device proves nothing) — that is the "staging didn't call it (normal)" case #172
  * separates from a fault, and it must not pollute the shadow record. Missing, gappy or stale HBX data, a missing demand
- * flag, or a window whose curve is unknown → unknown.
+ * flag, or a window whose curve is unknown → unknown. index.ts judges every mapped stage, not only stage 2 (the lag stage
+ * in the Oct incident): with HBX rotation either stage can lead, so the stage left out can be either one.
  */
 export function evaluateStageNeverCalled(stage: string, pumpId: string, hbx: TankReading[], curves: CurveVersion[], stopped: StoppedPump[], nowS: number): Verdict {
   const v = (state: VerdictState, reason: string, metrics: Record<string, number | null> = {}): Verdict => ({ kind: "stage_never_called", pumpId, state, reason, metrics });
@@ -362,6 +364,15 @@ export function evaluateStageNeverCalled(stage: string, pumpId: string, hbx: Tan
       : `, nor any other stage`) +
     `. This is not a deliberate stop (no pump is switched off), not a setback (the curve was not lowered) and not a data gap (the HBX readings cover all 2 h), ` +
     `and staging had every reason to call: heat demand was active and outdoor stayed below the curve's WWSD (${r1(wwsdF)} °F) for all 2 h`, m);
+}
+
+/**
+ * stage_never_called for every stage in the STAGE_PUMP_MAP (stage → pump id), one verdict per stage in stage order. HBX
+ * rotation is on, so either stage can lead and either can be the one never added; each verdict carries its own pump id,
+ * and the episodes are keyed by (check, pump). The same `curves` and `stopped` serve every stage.
+ */
+export function stageNeverCalledVerdicts(stageMap: Record<string, string>, hbx: TankReading[], curves: CurveVersion[], stopped: StoppedPump[], nowS: number): Verdict[] {
+  return Object.entries(stageMap).map(([stage, pumpId]) => evaluateStageNeverCalled(stage, pumpId, hbx, curves, stopped, nowS));
 }
 
 // ── episodes ──────────────────────────────────────────────────────────────────────────────────────────────────────────
