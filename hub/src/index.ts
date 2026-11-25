@@ -29,6 +29,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { IncomingMessage } from "node:http";
 import { createDropoutTracker } from "./dropouts";
 import { breakerAckTimeoutMs, bridgeSupportsBreaker, parseGraceMs, validateBreakerBody } from "./breaker";
+import { failPendingOnDisconnect, parseCommandBody, PI_DISCONNECTED_DETAIL, PI_REPLACED_DETAIL, settlePending, type PendingEntry } from "./command";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -288,34 +289,31 @@ let piSilenceAlerted = false;
  * socket that is still `piSocket`, and the tracker ignores repeats in either direction. */
 const piDropouts = createDropoutTracker();
 
-/** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
- * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
- * the replacement check, and the eventual `close` event count at most once between them. */
-function markDisconnected(sock: WebSocket): void {
-  if (piSocket !== sock) return;
-  piSocket = null;
-  piDropouts.disconnected();
-  console.log("[hub] Pi disconnected");
-}
-
-interface PendingCommand {
-  resolve: (ack: AckMessage) => void;
-  timer: NodeJS.Timeout;
-}
-
 /** command_id -> pending command awaiting its ack. */
-const pending = new Map<string, PendingCommand>();
+const pending = new Map<string, PendingEntry<AckMessage>>();
 
 /**
  * Resolve a pending command exactly once. Clears its timeout and removes it from
  * the map so it can never be resolved twice.
  */
 function settleCommand(commandId: string, ack: AckMessage): void {
-  const entry = pending.get(commandId);
-  if (!entry) return; // already settled (timeout or duplicate ack)
-  pending.delete(commandId);
-  clearTimeout(entry.timer);
-  entry.resolve(ack);
+  settlePending(pending, commandId, ack); // false = already settled (timeout or duplicate ack)
+}
+
+/** The ONE place the Pi link goes down. Idempotent: only the socket that is still `piSocket`
+ * can take the link down, so the terminate path, a CLOSING socket noticed by the ping timer or
+ * the replacement check, and the eventual `close` event count at most once between them.
+ * Every /api/command setpoint still awaiting an ack is answered now (504 PI_DISCONNECTED_DETAIL,
+ * "no Pi connected: …"): the link it would arrive on is gone, so there is nothing to wait 10 s
+ * for — but the Pi may have applied the write, so it is a 504 (outcome unknown), never a 502
+ * (refused). A late ack on the dying socket is then a no-op (settled once). Breaker and
+ * write-enable commands are left to their own 504 (command.ts onLinkLost). */
+function markDisconnected(sock: WebSocket): void {
+  if (piSocket !== sock) return;
+  piSocket = null;
+  piDropouts.disconnected();
+  const failed = failPendingOnDisconnect(pending, "dropped");
+  console.log(`[hub] Pi disconnected${failed ? ` — failed ${failed} pending command(s)` : ""}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,41 +391,20 @@ if (process.env.HUB_E2E_CLIENT_ONLY_GET === "1") {
  * POST /api/command — body {pump_id, value_c, lease_minutes?, source?}.
  * Assigns command_id, relays to the Pi, awaits the matching ack (10s timeout).
  *   200 {ok:true, setpoint_c}  on ack ok
- *   502 {ok:false, detail}     on nack
- *   504                        on ack timeout
+ *   502 {ok:false, detail}     on nack (the Pi refused)
+ *   504 {ok:false, detail}     on ack timeout ("ack timeout"), or at once when the Pi link drops
+ *                              (PI_DISCONNECTED_DETAIL) or its socket is replaced by a new Pi
+ *                              connection (PI_REPLACED_DETAIL) before the ack; in both the write
+ *                              may or may not have been applied
  *   503                        if no Pi connected
  */
 app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
-  const body = (req.body ?? {}) as Record<string, unknown>;
-  const pumpId = body.pump_id;
-  const valueC = body.value_c;
-
-  if (typeof pumpId !== "string" || pumpId.length === 0) {
-    res.status(400).json({ ok: false, detail: "pump_id is required (string)" });
+  const parsed = parseCommandBody(req.body);
+  if (!parsed.ok) {
+    res.status(400).json({ ok: false, detail: parsed.detail });
     return;
   }
-  if (typeof valueC !== "number" || !Number.isFinite(valueC)) {
-    res.status(400).json({ ok: false, detail: "value_c is required (number)" });
-    return;
-  }
-
-  let leaseMinutes: number | null = null;
-  if (body.lease_minutes !== undefined && body.lease_minutes !== null) {
-    if (typeof body.lease_minutes !== "number" || !Number.isFinite(body.lease_minutes)) {
-      res.status(400).json({ ok: false, detail: "lease_minutes must be a number when provided" });
-      return;
-    }
-    leaseMinutes = body.lease_minutes;
-  }
-
-  let source = "optimizer";
-  if (body.source !== undefined && body.source !== null) {
-    if (typeof body.source !== "string") {
-      res.status(400).json({ ok: false, detail: "source must be a string when provided" });
-      return;
-    }
-    source = body.source;
-  }
+  const { pump_id: pumpId, value_c: valueC, lease_minutes: leaseMinutes, source } = parsed.cmd;
 
   const sock = piSocket;
   if (!sock || sock.readyState !== WebSocket.OPEN) {
@@ -455,6 +432,9 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
 
   pending.set(commandId, {
     timer,
+    onLinkLost: (why) => {
+      res.status(504).json({ ok: false, detail: why === "replaced" ? PI_REPLACED_DETAIL : PI_DISCONNECTED_DETAIL });
+    },
     resolve: (ack: AckMessage) => {
       if (ack.ok) {
         res.status(200).json({ ok: true, setpoint_c: ack.setpoint_c });
@@ -482,7 +462,9 @@ app.post("/api/command", requireClientAuth, (req: Request, res: Response) => {
  * only after a fresh password re-entry — a stolen session or the ordinary client token
  * alone can never arm. Relays the write_enable action to the Pi (which applies its own
  * loud ceremony: audit event + high-priority push on enable) and awaits the ack.
- * 503 if HUB_ARM_TOKEN is unset (feature off), 401 on a bad arm token.
+ * 503 if HUB_ARM_TOKEN is unset (feature off), 401 on a bad arm token. A Pi link drop or socket
+ * replacement before the ack is not answered early: the request waits out the 10 s ack timeout
+ * (504 "ack timeout").
  */
 app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) => {
   const armToken = process.env.HUB_ARM_TOKEN ?? "";
@@ -555,6 +537,10 @@ app.post("/api/write-enable", requireClientAuth, (req: Request, res: Response) =
  *   501                             the connected bridge predates breaker control
  *   503 no Pi / arming not configured · 504 no ack in time (the action may still complete:
  *                                    the dashboard reads the live relay state from /api/state)
+ * A Pi link drop or socket replacement does NOT answer this route early (unlike /api/command's
+ * immediate 504): the bridge finishes a
+ * breaker action on its own once it has it, so the request waits out off_s + grace and gets the
+ * 504 above. command.e2e.test.ts pins this.
  */
 app.post("/api/breaker", requireClientAuth, (req: Request, res: Response) => {
   const armToken = process.env.HUB_ARM_TOKEN ?? "";
@@ -797,6 +783,14 @@ wss.on("connection", (ws: WebSocket) => {
     // registered yet — and once this socket takes over, the old one's late `close` would be
     // ignored. Register it now so this connect closes it as a short episode (Codex, PR #178).
     if (old.readyState !== WebSocket.OPEN) markDisconnected(old);
+    else {
+      // Still OPEN, so no dropout — but the Pi acks only on the socket a command came in on, and
+      // this one is about to be closed: answer its pending setpoints now (504 PI_REPLACED_DETAIL,
+      // which does not say "no Pi connected": the Pi is here) rather than at the 10 s ack timeout.
+      // Done before `piSocket = ws`, so no new command is swept.
+      const failed = failPendingOnDisconnect(pending, "replaced");
+      if (failed) console.log(`[hub] Pi socket replaced — failed ${failed} pending command(s)`);
+    }
     try {
       old.close(4000, "replaced by new Pi connection");
     } catch {
