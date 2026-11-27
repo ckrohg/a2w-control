@@ -869,8 +869,15 @@ scripts/rehearsal/run.sh boost-expiry     # #232: as-found 165/145 in force at 4
 ```
 
 **Hour-independent by construction** (eval 2026-09-30, F1): the plan's daily 140 °F soak goes to the warmest
-*remaining* hour of the local day, so a falling forecast run in the late afternoon would put the soak on the current
-block — the driver then refuses to draw beside it and the demand floor rides the soak's 145 °F ceiling; the harness
+*remaining* hour of the local day (since 2026-11-24, with a readable plan history AND a measured dwell, the warmest
+hour *after* the one in progress: a soak placed on the current block got ~15 min, never the 30-min dwell; a soak
+already in progress keeps its hour until its dwell qualifies, also when the outdoor reading crosses 55 °F mid-soak
+and the interval becomes 60 h; a new soak starts no later than 3.5 h before the interval runs out — else on the last
+hour that does, or on the next hour if that limit has passed; at most 3 soak hours in a row; the soak is not due again
+within 12 h of a qualifying dwell. With the dwell not measured the soak is placed as before, with no per-day memory;
+with the dwell measured but the plan history unreadable it is placed as before too, and only the 12 h rest applies), so a falling
+forecast run in the late afternoon would put the soak on (or right after) the current block — the driver then
+refuses to draw beside it and the demand floor rides the soak's 145 °F ceiling; the harness
 passed at 01:00 and failed at 17:30 on the same planner. The fake now shapes the served forecast
 (`scripts/rehearsal/forecast-shape.ts`): the local day holding the hour 4 h from now has its warmest hour at or after
 that hour (a +0.5 °F nudge, logged in `fake.log` as `forecastShape`), and a day with < 6 blocks left gets no soak.

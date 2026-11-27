@@ -100,6 +100,31 @@ export function hygieneIntervalH(
   return Math.min(Math.max(chosen, 1), HYGIENE_HARD_MAX_H);
 }
 
+/** Rest period after a qualifying dwell (hours): the soak is not due again sooner than this. Measured
+ *  2026-11-24 over 8 weeks: the old 3 h floor made 15 of 47 soaks run within 12 h of the previous dwell
+ *  (on a cooling day the warmest hour left is always the current one, so a soak repeated). */
+export const SOAK_REST_H = 12;
+
+/** Lead (hours): the latest a soak may START is SOAK_LEAD_H hours before the interval runs out — the planner's
+ *  look-back loses the last dwell 30 minutes early, a soak needs about 40 minutes to reach 134 °F after a possible
+ *  5-minute refusal, then 30 minutes of dwell, plus a margin. If that soak fails, the overdue backstop is the
+ *  second try. */
+export const SOAK_LEAD_H = 3.5;
+
+/** Demand-aware soak gate (pure). `hoursSince` = hours since the last qualifying dwell ended, null = no
+ *  qualifying dwell in the lookback (which includes "telemetry was down, cannot prove one happened").
+ *  URGENT = the window has lapsed (the plan stops shopping for the warmest hour). DUE = soak ~a day before
+ *  the window lapses, but never within SOAK_REST_H of the last dwell; urgent always implies due. RESTED = no
+ *  dwell within SOAK_REST_H (or none known), so a soak in progress has not qualified yet. For an interval of
+ *  SOAK_REST_H or more (26 and 60 in use) due implies rested, but not the reverse: with the 60 h interval a
+ *  soak is due only from 36 h. Nothing relies on the implication. */
+export function soakDue(hoursSince: number | null, intervalH: number): { due: boolean; urgent: boolean; rested: boolean } {
+  const urgent = hoursSince == null || hoursSince >= intervalH;
+  const rested = hoursSince == null || hoursSince >= SOAK_REST_H;
+  const due = urgent || (rested && hoursSince >= intervalH - 24);
+  return { due, urgent, rested };
+}
+
 /** Draw-gap stats over an ASCENDING list of DHW draw times (from `detectDrawTimes` in dhw.ts) — the
  *  STAGNATION half of the Legionella condition, which the temperature-indexed interval above cannot
  *  see. Growth needs a lukewarm tank AND days without a draw; `hygieneIntervalH` only knows the

@@ -85,7 +85,46 @@ export interface ShadowOpts {
    * already commanded, so a replan late in the hour does not rewrite it.
    */
   priorExcursions?: PriorExcursion[];
+  /**
+   * 2026-11-24 (a soak gets a full hour): true when the plan history behind priorExcursions was READ (even if empty).
+   * Only then, and only with sanitizeDueMeasured, does the soak use the memory (memory mode) — a soak in progress is
+   * kept to the end of its hour, a new soak never lands on the hour in progress and starts by sanitizeLimitMs, the
+   * overdue soak spans two blocks, at most SOAK_MAX_RUN_H consecutive soak hours. Anything but `true` = the soak is
+   * PLACED exactly as before: an unreadable history is not an empty one, and memory mode would read it as "no soak in
+   * progress". What is not as before even then: with a measured dwell, `sanitizeDue` already carries the 12 h rest
+   * (hygiene.ts soakDue), and the limit that goes with it is not applied here — a history that stays unreadable for
+   * hours can let the interval lapse, and the overdue backstop then answers as it did before 2026-11-24.
+   */
+  priorExcursionsKnown?: boolean;
+  /**
+   * index.ts sanitizeDueNow().measured: the last dwell was actually read (auto-sanitize on, no error). Memory mode
+   * needs this AND priorExcursionsKnown; anything but `true` (`sanitizeDue` is then the unconditional daily soak) = the
+   * soak exactly as before, so a refused or cut-short soak is retried the same day.
+   */
+  sanitizeDueMeasured?: boolean;
+  /**
+   * index.ts sanitizeDueNow().limitMs (epoch ms): the latest START of a new soak — the last measured dwell's end +
+   * (interval − SOAK_LEAD_H). In memory mode a new soak goes on the day's warmest remaining hour if it starts by this,
+   * else on the last hour that does. If no day can take it in time (the limit falls on an evening with fewer than 6
+   * blocks left, or has already passed), it goes on the last future hour that starts by the limit, else on the next
+   * hour. null / absent / not finite = no limit (the warmest remaining hour).
+   */
+  sanitizeLimitMs?: number | null;
+  /**
+   * index.ts sanitizeDueNow().rested: no dwell has qualified within SOAK_REST_H (or none is known). In memory mode a
+   * soak in progress keeps its hour while this is true, even when `sanitizeDue` is false: the interval follows the
+   * current outdoor reading, so a reading that crosses 55 °F in the middle of a soak turns "due" off with no dwell
+   * behind it (2 of 38 replayed soaks ended after 40 minutes that way). Anything but `true` = kept only while due.
+   */
+  sanitizeRested?: boolean;
 }
+
+/**
+ * Most consecutive soak hours (2026-11-24): in memory mode a block is not marked or kept as a soak if it would be the
+ * 4th consecutive one, so an overdue soak whose dwell never qualifies holds at most 3 soak hours (the first from about
+ * :47, so about 2 h 20 min the first time), rests one hour, and tries again instead of holding 140 °F without bound.
+ */
+export const SOAK_MAX_RUN_H = 3;
 
 /** A bank / soak / pre-boost block the plan history placed at an hour that has started (ts ≤ now). */
 export interface PriorExcursion {
@@ -246,6 +285,24 @@ export function computeShadowPlan(
     if (!byDay.has(day)) byDay.set(day, []);
     byDay.get(day)!.push(d);
   }
+  // The soak's memory (see "A SOAK GETS A FULL HOUR" below): readable plan history AND a measured dwell.
+  const memory = opts.priorExcursionsKnown === true && opts.sanitizeDueMeasured === true;
+  const priorSoaks = memory ? (opts.priorExcursions ?? []).filter((p) => p.sani) : [];
+  const priorSoakAt = new Set(priorSoaks.map((p) => new Date(p.ts).getTime()));
+  /** Consecutive started hours the history shows as soaks immediately before `ms` (ms − 1 h, − 2 h, …). */
+  const soakRunBefore = (ms: number) => { let n = 0; while (priorSoakAt.has(ms - (n + 1) * 3_600_000)) n++; return n; };
+  const run0 = memory && draft.length ? soakRunBefore(draft[0].f.ts.getTime()) : 0;
+  const allowed0 = !memory || run0 < SOAK_MAX_RUN_H;
+  /** Keep a soak the history placed on the hour in progress. The commanded target may include a raise by the winter
+   *  guard or a demand floor from the previous plan; it is bounded by sanitizeCapF. */
+  const keepSoakInProgress = (label: "OVERDUE" | "daily") => {
+    const keptSoak = draft.length && allowed0 ? priorSoaks.find((p) => new Date(p.ts).getTime() === draft[0].f.ts.getTime()) : undefined;
+    if (!keptSoak) return;
+    const first = draft[0];
+    first.target = Math.min(opts.sanitizeCapF, Math.max(opts.sanitizeF, keptSoak.tank_target_f ?? opts.sanitizeF));
+    first.sani = true;
+    first.reason = `${label} sanitize to ${Math.round(first.target)}°F = 60°C (I8 pasteurization in progress; kept from the previous plan so the soak gets its full hour)`;
+  };
   if (sanitizeDue) {
     // DEADLINE BACKSTOP. `sanitizeUrgent` = the hygiene window has actually LAPSED (no qualifying
     // dwell anywhere in the interval), as opposed to merely approaching. Then price stops mattering:
@@ -257,20 +314,69 @@ export function computeShadowPlan(
     // pasteurizations reached 75.2 h — past HYGIENE_HARD_MAX_H (72 h). The day-skip below
     // (`ds.length < 6`) makes that worse by deferring a late-in-the-day soak a further ~24 h.
     // Costs a few cents on the rare occasion it fires; hygiene is not a thing to optimise for price.
-    if (sanitizeUrgent && draft.length) {
-      const first = draft[0];
-      first.target = opts.sanitizeF;
-      first.sani = true;
-      first.reason = `OVERDUE sanitize to ${opts.sanitizeF}°F = 60°C (I8 window lapsed — earliest hour, not the warmest)`;
-    }
+    //
+    // A SOAK GETS A FULL HOUR (2026-11-24; only in MEMORY MODE = a readable plan history, opts.priorExcursionsKnown,
+    // AND a measured dwell, opts.sanitizeDueMeasured). draft[0] is the hour in progress: a soak placed on it at :42 was
+    // written at ~:47 and replaced by the next block at ~:07 — ~15 min at 140 °F, never the 30-min dwell (11 of 47
+    // soaks over 8 weeks; the overdue path repeated it hourly). So in memory mode: a soak the history placed on the
+    // hour in progress is KEPT at its commanded target until its dwell qualifies (the rest period begins; it may then
+    // end before its hour does), also when "due" turned off only because the interval lengthened (opts.sanitizeRested); a NEW soak never takes the hour in progress (the warmest of
+    // the day's other blocks, but no later than the last hour that starts by opts.sanitizeLimitMs, so the 12 h rest
+    // cannot make the interval lapse); the overdue soak spans the hour in progress AND the next; and no block becomes
+    // the (SOAK_MAX_RUN_H + 1)th consecutive soak hour, so a soak that never qualifies cannot hold 140 °F without
+    // bound. Outside memory mode (history unreadable, or the dwell not measured — auto-sanitize off or the one-cycle
+    // error path): exactly the pre-2026-11-24 plan, which retries a refused or cut-short soak the same day.
+    const overdue = (d: Draft) => {
+      d.target = opts.sanitizeF;
+      d.sani = true;
+      d.reason = `OVERDUE sanitize to ${opts.sanitizeF}°F = 60°C (I8 window lapsed — earliest hour, not the warmest)`;
+    };
+    if (sanitizeUrgent && draft.length && allowed0) overdue(draft[0]);
+    keepSoakInProgress(sanitizeUrgent ? "OVERDUE" : "daily");
+    /** Soak hours in a row immediately before draft[i]: this plan's blocks and, when they reach back to the hour in
+     *  progress, the history's run before it. */
+    const soakRunBeforeBlock = (i: number) => { let n = 0; let k = i - 1; while (k >= 0 && draft[k].sani) { n++; k--; } return k < 0 ? n + run0 : n; };
+    /** The cap, for any block: draft[i] may become a soak only if it would not be the (SOAK_MAX_RUN_H + 1)th in a row.
+     *  (The overdue pair on 22:00 and 23:00 after a soak at 21:00 must not be followed by tomorrow's soak at 00:00.) */
+    const capAllows = (i: number) => !memory || soakRunBeforeBlock(i) < SOAK_MAX_RUN_H;
+    if (memory && sanitizeUrgent && draft.length > 1 && capAllows(1)) overdue(draft[1]);
+    const limitMs = memory && Number.isFinite(opts.sanitizeLimitMs) ? (opts.sanitizeLimitMs as number) : null;
     for (const [, ds] of byDay) {
       if (ds.length < 6) continue; // partial day at the horizon edge — next plan covers it
       if (ds.some((d) => d.target >= opts.sanitizeF)) continue;
-      const warmest = ds.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
-      warmest.target = opts.sanitizeF;
-      warmest.sani = true;
-      warmest.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, warmest hour)`;
+      const cands = memory ? ds.filter((d) => d !== draft[0] && capAllows(draft.indexOf(d))) : ds;
+      if (!cands.length) continue;
+      const warmest = cands.reduce((a, b) => (b.f.outdoorF > a.f.outdoorF ? b : a));
+      let chosen = warmest;
+      let why = "warmest hour";
+      if (limitMs != null) {
+        const inTime = cands.filter((d) => d.f.ts.getTime() <= limitMs);
+        if (!inTime.length) continue; // every hour left starts after the limit: no new soak this day
+        if (!inTime.includes(warmest)) { chosen = inTime[inTime.length - 1]; why = "last hour before the interval runs out"; }
+      }
+      chosen.target = opts.sanitizeF;
+      chosen.sani = true;
+      chosen.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, ${why})`;
     }
+    // No day could take the soak in time although the limit lies inside this horizon: today has fewer than 6 blocks
+    // left and the limit falls before tomorrow, or the limit has already passed. Do not wait for the interval to lapse
+    // (found replaying 8 weeks: without this, a limit that had just passed planned nothing for 3 h and then went
+    // overdue). The soak goes on the last future hour that still starts by the limit, else on the next hour.
+    if (memory && limitMs != null && draft.length > 1 && limitMs <= draft[draft.length - 1].f.ts.getTime() && !draft.some((d) => d.sani || d.target >= opts.sanitizeF)) {
+      const future = draft.slice(1); // no block is a soak here, so the cap cannot refuse any of them
+      const inTime = future.filter((d) => d.f.ts.getTime() <= limitMs);
+      const late = inTime.length ? inTime[inTime.length - 1] : future[0];
+      if (late) {
+        late.target = opts.sanitizeF;
+        late.sani = true;
+        late.reason = `daily sanitize to ${opts.sanitizeF}°F = 60°C (I8 pasteurization, ${inTime.length ? "last hour before the interval runs out" : "the interval is about to run out"})`;
+      }
+    }
+  } else if (memory && opts.sanitizeRested === true) {
+    // Not due, yet no dwell has qualified within the rest period: "due" turned off for another reason than this
+    // soak's own dwell. The interval follows the current outdoor reading, so a reading that crosses 55 °F mid-soak
+    // makes the 26 h interval 60 h (due only from 36 h). The soak in progress still gets its hour; nothing new is planned.
+    keepSoakInProgress("daily");
   }
 
   // #58 afternoon bank: one block/day at the day's warmest hour raised to dhwFloorF + bankF
@@ -392,7 +498,9 @@ export function computeShadowPlan(
     chosen.reason = `pre-boost to ${Math.round(to)}°F for ${window} (${sag}${boostF < pb.boostF ? `, capped at +${MAX_PREBOOST_F}` : ""}; hour before the bell, ${chosen.f.outdoorF.toFixed(0)}°F)`;
   }
 
-  // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF. Executed by the proven
+  // I8 thermal hygiene: boost the day's warmest (cheapest) hour to sanitizeF — in memory mode (readable plan history
+  // and a measured dwell), the warmest hour AFTER the one in progress that starts by the interval's limit, a soak
+  // already in progress keeps its hour, and at most SOAK_MAX_RUN_H soak hours in a row. Executed by the proven
   // plan→autopilot→Phase B path — Phase B leads the pump setpoints off THIS block's current-hour target
   // (phaseb.ts), so the 140°F soak clears I1 instead of deadlocking. Gated on `sanitizeDue`: the caller
   // passes true for the conservative daily soak (auto-sanitize OFF) or when a pasteurization is actually
