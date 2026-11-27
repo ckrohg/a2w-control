@@ -1,5 +1,15 @@
 {
   "crons": [
     { "path": "/api/digest", "schedule": "0 12 * * 1" }
-  ]
+  ],
+  "git": {
+    "deploymentEnabled": {
+      "claude/**": false,
+      "delegate/**": false,
+      "codex/**": false,
+      "fix/**": false,
+      "verify/**": false,
+      "rebase/**": false
+    }
+  }
 }
