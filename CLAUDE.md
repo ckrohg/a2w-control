@@ -1,27 +1,11 @@
-# TENET — a2w-control
+# a2w-control
 
-You are in a TENET workspace. Every session, use these tools:
+TENET runs as **tenet-core**: the journal, the session board and delegation. Its tools are already in every session.
 
-**Start:** `tenet_context` — get project state, recent journals, team activity
-**Work:** `tenet_journal_write` — record every feature, decision, fix, discovery (mandatory)
-**Check:** `tenet_memory_search` — search past decisions before making new ones
-**Skills:** `/skill <name>` — load specialized instructions on demand
-
-## Journal Protocol
-
-Write journal entries AS YOU WORK, not at session end. Each entry needs:
-- type: feature | decision | fix | discovery
-- title: short description
-- summary: 2-3 sentences
-- files: relevant paths
-- next: what should happen next
-
-## Rules
-
-- Journal every significant action — no exceptions
-- Every code file gets a `@purpose` header comment
-- Search memory before making architectural decisions
-- Use `/skill` to load domain expertise — don't guess
+- **Other sessions:** the start-up briefing names your session id and who else is working here, with what they've claimed. Claim files before changing shared ones (`session_claim`), and message a session before touching what it holds (`session_message`).
+- **Journal:** commits are journaled automatically. Write one entry per decision or discovery and one at the end (`journal_write`). Check `journal_search` before re-deciding something.
+- **Delegate:** research and reviews go to `delegate_to_claude_code` (account B, `claude-fable-5-2`). Tests, docs and contained fixes go to `queue_task`.
+- Every code file gets a `@purpose` header comment.
 
 ## Current Focus
 
